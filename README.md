@@ -1,0 +1,75 @@
+# Repo
+
+**General-purpose repository skills for Claude Code.**
+
+Repo is a collection of skills for keeping any git repository healthy and productive — auditing hygiene, tidying clutter, and launching cloud dev sessions with the repo ready to go. Skills install into a target repository (the consumer repo) and are invoked from Claude Code as `/repo:<command>`.
+
+**Sibling projects:** [Loom](https://github.com/rjwalters/loom) orchestrates AI development workers around a forge. [Anvil](https://github.com/rjwalters/anvil) orchestrates long-form artifact creation. Repo is the toolbox both of them assume: generic repository hygiene and environment skills that work in any repo. All three can be installed side by side.
+
+## Skills
+
+| Command | What it does |
+|---|---|
+| `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
+| `/repo:clean` | Tidy up — build artifacts, caches, temp files, empty dirs, stale worktrees |
+| `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
+| `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |
+| `/repo:gitignore` | Gitignore audit — over-ignored files, under-ignored build artifacts, stale rules |
+| `/repo:links` | Validate internal cross-references — markdown links, CLAUDE.md paths, skill graphs |
+| `/repo:orphans` | Find unreferenced files — dead scripts, stale data, outputs without sources |
+| `/repo:readme` | Check README accuracy against actual directory contents |
+
+All hygiene skills are **report-first**: they present findings and wait for direction before changing anything.
+
+## Installation
+
+The installer copies the skill files into a target repository's `.claude/` directory and appends a marker-bounded section to its `CLAUDE.md`.
+
+```bash
+# Install everything into the current directory
+./install.sh .
+
+# Install into another repo
+./install.sh ~/projects/my-app
+
+# Install only specific skills
+./install.sh --skills=clean,remote ~/projects/my-app
+
+# Preview without writing
+./install.sh --dry-run ~/projects/my-app
+
+# Non-interactive
+./install.sh -y ~/projects/my-app
+```
+
+To remove: `./uninstall.sh /path/to/target-repo`.
+
+### Write footprint
+
+The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
+
+- `.claude/skills/repo/` — the domain skill file plus install metadata
+- `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
+- `CLAUDE.md` — one marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace the block in place
+
+Nothing else in the target repository is read or modified.
+
+## Repository layout
+
+```
+skills/repo/SKILL.md     Domain overview installed to .claude/skills/repo/
+commands/repo/*.md       Command files installed to .claude/commands/repo/
+install.sh               Installer
+uninstall.sh             Uninstaller
+```
+
+## Adding a skill
+
+1. Create `commands/repo/<name>.md` with the standard frontmatter (`name`, `description`, `domain: repo`, `type: command`, `user-invocable: true`).
+2. Add a `[[<name>]]` row to the commands table in `skills/repo/SKILL.md`.
+3. Add a row to the Skills table in this README.
+4. Keep it **general**: no org-specific hostnames, project names, branch names, or infrastructure paths. If a check needs configuration, read it from the consumer repo (e.g. `.claude/remote.json`), never hardcode it.
+
+## License
+
+MIT
