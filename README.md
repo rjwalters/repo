@@ -11,8 +11,10 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | Command | What it does |
 |---|---|
 | `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
-| `/repo:clean` | Tidy up — build artifacts, caches, temp files, empty dirs, stale worktrees |
+| `/repo:reset` | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to main |
+| `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
 | `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
+| `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |
 | `/repo:gitignore` | Gitignore audit — over-ignored files, under-ignored build artifacts, stale rules |
 | `/repo:links` | Validate internal cross-references — markdown links, CLAUDE.md paths, skill graphs |
@@ -33,7 +35,7 @@ The installer copies the skill files into a target repository's `.claude/` direc
 ./install.sh ~/projects/my-app
 
 # Install only specific skills
-./install.sh --skills=clean,remote ~/projects/my-app
+./install.sh --skills=reset,remote ~/projects/my-app
 
 # Preview without writing
 ./install.sh --dry-run ~/projects/my-app

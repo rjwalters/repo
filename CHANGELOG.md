@@ -4,8 +4,9 @@
 
 Initial release.
 
-- Skills: `repo:audit`, `repo:clean`, `repo:remote`, `repo:branches`,
-  `repo:gitignore`, `repo:links`, `repo:orphans`, `repo:readme`
+- Skills: `repo:audit`, `repo:reset`, `repo:tidy`, `repo:remote`,
+  `repo:update-tools`, `repo:branches`, `repo:gitignore`, `repo:links`,
+  `repo:orphans`, `repo:readme`
 - `install.sh` / `uninstall.sh` following the Anvil/Loom consumer-repo pattern
   (namespaced `.claude/` copies, marker-bounded CLAUDE.md block, install metadata)
 - Hygiene skills ported from an internal monorepo and generalized to work in

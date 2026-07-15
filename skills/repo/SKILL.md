@@ -19,8 +19,10 @@ costs.
 | Command | What it does |
 |---------|--------------|
 | [[audit]] | Full sweep — runs all hygiene checks, produces a summary report |
-| [[clean]] | Tidy up — build artifacts, caches, temp files, empty dirs, stale worktrees |
+| [[reset]] | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to the default branch |
+| [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH |
+| [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | [[branches]] | Branch & worktree hygiene — merged PRs, orphaned branches, stale worktrees |
 | [[gitignore]] | Gitignore hygiene — over-ignored files, under-ignored build artifacts |
 | [[links]] | Internal cross-references — markdown links, CLAUDE.md paths, skill graph |
@@ -29,10 +31,12 @@ costs.
 
 ## When to Use
 
+- After finishing a task, to get back to a known-good state (`reset`)
 - After a large refactor, consolidation, or import (`audit`, `links`, `readme`)
-- When the working tree feels messy (`clean`, `orphans`)
+- When the working tree feels messy (`tidy`, `orphans`)
 - When `git branch` output has grown unmanageable (`branches`)
 - When local hardware isn't enough or you need a clean Linux box (`remote`)
+- Periodically, to keep installed tool packages current (`update-tools`)
 - Periodically (monthly) as general hygiene (`audit`)
 - Before a demo, handoff, or onboarding (clean up before they arrive)
 

@@ -1,12 +1,12 @@
 ---
-name: "clean"
-description: "Tidy up the repository — build artifacts, caches, temp files, empty dirs, stale worktrees"
+name: "tidy"
+description: "Tidy up the repository — build artifacts, caches, temp files, empty dirs"
 domain: repo
 type: command
 user-invocable: true
 ---
 
-# /repo:clean — Tidy Up
+# /repo:tidy — Tidy Up
 
 Sweep the working tree for clutter and clean it up. Report-first: inventory
 everything, categorize by confidence, then delete only what the user approves
@@ -15,9 +15,9 @@ everything, categorize by confidence, then delete only what the user approves
 ## Usage
 
 ```
-/repo:clean                    # Inventory + report, then discuss
-/repo:clean --apply            # Report, then delete the SAFE category without asking per-item
-/repo:clean packages/core      # Scope to one subtree
+/repo:tidy                    # Inventory + report, then discuss
+/repo:tidy --apply            # Report, then delete the SAFE category without asking per-item
+/repo:tidy packages/core      # Scope to one subtree
 ```
 
 ## Steps
@@ -57,8 +57,8 @@ Also look for junk by pattern, wherever it lives:
   category may be tracked by git or match a source-code extension.
 - **ASK** — probably junk but needs a human call: untracked files that aren't
   gitignored (could be unsaved work!), large files, stale-looking logs, old
-  `tmp/` contents, stale worktrees and their branches (hand off to
-  [[branches]] for those).
+  `tmp/` contents. Stale worktrees, branches, and stashes are [[reset]]'s
+  job — point there instead of handling them here.
 - **KEEP** — flagged only as information: tracked files that look like they
   don't belong (build output that got committed — point to [[gitignore]]).
 
