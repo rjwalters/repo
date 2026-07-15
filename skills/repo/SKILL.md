@@ -19,6 +19,7 @@ costs.
 | Command | What it does |
 |---------|--------------|
 | [[help]] | Explain the installed `/repo:*` commands — what each does, where to start |
+| [[all]] | The whole hygiene pass in order — audit, tidy, update-tools, reset — each report-first |
 | [[audit]] | Full sweep — runs all hygiene checks, produces a summary report |
 | [[reset]] | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to the default branch |
 | [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |

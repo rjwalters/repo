@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 (2026-07-15)
+
+- Add `repo:all` — umbrella command that runs the full hygiene pass in order
+  (audit → tidy → update-tools → reset), each stage report-first. Excludes
+  `repo:remote` since it provisions paid infrastructure.
+
 ## 0.1.0 (2026-07-14)
 
 Initial release.
