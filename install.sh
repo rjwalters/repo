@@ -38,6 +38,33 @@ COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unkno
 MARKER_BEGIN='<!-- BEGIN REPO-SKILLS -->'
 MARKER_END='<!-- END REPO-SKILLS -->'
 
+# Template variables substituted into installed files at install time (the Loom
+# pattern). Command/SKILL authors may use these; the installer renders them on
+# copy and fails fast if a known placeholder survives into an installed file.
+# The consumer-repo identity (owner/name) is derived from its git remote below;
+# repo-specific behavior is otherwise read at runtime, not baked in here.
+TEMPLATE_PLACEHOLDERS=('{{REPO_OWNER}}' '{{REPO_NAME}}' '{{REPO_SKILLS_VERSION}}' '{{REPO_SKILLS_COMMIT}}' '{{INSTALL_DATE}}')
+INSTALL_DATE="$(date -u +%Y-%m-%d)"
+REPO_OWNER="OWNER"
+REPO_NAME="REPO"
+
+render() {  # stdin -> stdout with template variables substituted
+  sed \
+    -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
+    -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
+    -e "s|{{REPO_SKILLS_VERSION}}|${VERSION}|g" \
+    -e "s|{{REPO_SKILLS_COMMIT}}|${COMMIT}|g" \
+    -e "s|{{INSTALL_DATE}}|${INSTALL_DATE}|g"
+}
+
+assert_no_placeholders() {  # <file> <label> — fail if a known placeholder leaked through
+  local file="$1" label="$2" ph found=()
+  for ph in "${TEMPLATE_PLACEHOLDERS[@]}"; do
+    grep -qF "$ph" "$file" && found+=("$ph")
+  done
+  [[ ${#found[@]} -eq 0 ]] || error "Unsubstituted template placeholder(s) in $label: ${found[*]}"
+}
+
 TARGET=""
 SKILLS_FILTER=""
 DRY_RUN=false
@@ -77,6 +104,17 @@ if [[ ! -d "$TARGET/.git" ]] && ! git -C "$TARGET" rev-parse --git-dir >/dev/nul
   fi
 fi
 
+# Derive the consumer repo's identity for template substitution (best-effort:
+# parse owner/name from the origin remote, else fall back to the directory name).
+REPO_NAME="$(basename "$TARGET")"
+_remote="$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null || true)"
+if [[ -n "$_remote" ]]; then
+  _remote="${_remote%.git}"
+  REPO_NAME="${_remote##*/}"
+  _rest="${_remote%/*}"
+  REPO_OWNER="${_rest##*[:/]}"
+fi
+
 # Resolve command selection
 ALL_COMMANDS="$(list_commands)"
 if [[ -n "$SKILLS_FILTER" ]]; then
@@ -99,6 +137,7 @@ info "Commands: $(echo "$COMMANDS" | tr '\n' ' ')"
 echo ""
 
 if [[ "$DRY_RUN" == true ]]; then
+  echo "Template identity: {{REPO_OWNER}}=$REPO_OWNER {{REPO_NAME}}=$REPO_NAME"
   echo "Would write:"
   echo "  $TARGET/.claude/skills/repo/SKILL.md"
   echo "  $TARGET/.claude/skills/repo/install-metadata.json"
@@ -116,13 +155,15 @@ fi
 
 # 1. Skill file
 mkdir -p "$TARGET/.claude/skills/repo"
-cp "$SOURCE_ROOT/skills/repo/SKILL.md" "$TARGET/.claude/skills/repo/SKILL.md"
+render <"$SOURCE_ROOT/skills/repo/SKILL.md" >"$TARGET/.claude/skills/repo/SKILL.md"
+assert_no_placeholders "$TARGET/.claude/skills/repo/SKILL.md" ".claude/skills/repo/SKILL.md"
 success "Installed .claude/skills/repo/SKILL.md"
 
 # 2. Command files
 mkdir -p "$TARGET/.claude/commands/repo"
 while IFS= read -r cmd; do
-  cp "$SOURCE_ROOT/commands/repo/$cmd.md" "$TARGET/.claude/commands/repo/$cmd.md"
+  render <"$SOURCE_ROOT/commands/repo/$cmd.md" >"$TARGET/.claude/commands/repo/$cmd.md"
+  assert_no_placeholders "$TARGET/.claude/commands/repo/$cmd.md" "commands/repo/$cmd.md"
 done <<<"$COMMANDS"
 success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude/commands/repo/"
 

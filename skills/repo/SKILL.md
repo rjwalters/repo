@@ -23,6 +23,7 @@ costs.
 | [[audit]] | Full sweep — runs all hygiene checks, produces a summary report |
 | [[reset]] | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to the default branch |
 | [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |
+| [[release]] | Cut a release — pre-flight, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH |
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | [[branches]] | Branch & worktree hygiene — merged PRs, orphaned branches, stale worktrees |

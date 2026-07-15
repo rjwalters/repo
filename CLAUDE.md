@@ -30,6 +30,25 @@ user-invocable: true
 Command files are prompts, not code: they instruct Claude step by step, with
 runnable shell snippets where exactness matters.
 
+### Template variables
+
+`install.sh` renders a small set of `{{PLACEHOLDER}}` variables into every
+installed SKILL.md and command file (the Loom pattern), and **fails the install
+if a known placeholder survives** the copy. Available placeholders:
+
+| Placeholder | Value at install time |
+|-------------|-----------------------|
+| `{{REPO_OWNER}}` | Consumer repo owner (from its `origin` remote; `OWNER` if none) |
+| `{{REPO_NAME}}` | Consumer repo name (remote, else target dir name) |
+| `{{REPO_SKILLS_VERSION}}` | This package's `VERSION` |
+| `{{REPO_SKILLS_COMMIT}}` | This package's short commit |
+| `{{INSTALL_DATE}}` | Install date (UTC, `YYYY-MM-DD`) |
+
+Prefer reading repo-specific facts at runtime (principle 1) over baking them in.
+Reach for a placeholder only when a value must be fixed at install time. When
+porting a Loom skill, replace its `{{workspace}}` with `{{REPO_NAME}}` — or,
+better, reword to read the context at runtime.
+
 Rules for every skill:
 
 1. **General by design.** No org names, project names, hostnames, branch

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 (2026-07-15)
+
+- Add `repo:release` — interactive release flow (pre-flight checks, CHANGELOG
+  completeness + version-drift gates, semver decision, CHANGELOG draft, version
+  bump, tag, GitHub Release). Discovers the version tool at release time
+  (`scripts/version.sh`, cargo, bumpversion, poetry, npm) and adds a plain
+  `VERSION`-file tier. Ported and generalized from Loom's release skill, which
+  will be retired in favor of this one.
+- `install.sh` now renders `{{PLACEHOLDER}}` template variables into installed
+  files at copy time (`{{REPO_OWNER}}`, `{{REPO_NAME}}`, `{{REPO_SKILLS_VERSION}}`,
+  `{{REPO_SKILLS_COMMIT}}`, `{{INSTALL_DATE}}`), following the Loom pattern, and
+  fails fast if a known placeholder survives into an installed file.
+
 ## 0.2.0 (2026-07-15)
 
 - Add `repo:all` — umbrella command that runs the full hygiene pass in order
