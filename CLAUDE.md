@@ -53,7 +53,7 @@ Rules for every skill:
 
 1. **General by design.** No org names, project names, hostnames, branch
    lists, or infrastructure paths. Repo-specific knowledge is read from the
-   consumer repo at runtime (its CLAUDE.md, `.claude/remote.json`, …).
+   consumer repo at runtime (its CLAUDE.md, `.env`, …).
 2. **Apply safe fixes, gate destructive ones.** Fix-capable hygiene commands
    apply their safe, reversible fixes by default and report each change; they
    accept `--ask` to restore review-and-confirm. Anything irreversible —

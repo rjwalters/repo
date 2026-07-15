@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Rework `repo:remote` around the target repo's **`.env`** (retiring
+  `.claude/remote.json`): namespaced `REPO_REMOTE_*` settings plus standard
+  cloud-cred vars. Provisioning credentials drive the cloud CLI locally and are
+  never copied to the VM. Adds `--configure` (guided `.env` setup wizard) and
+  pinned `REPO_REMOTE_INSTANCE_ID` reuse with write-back on create. The SSH
+  session lands in the synced repo (or the dev container), ready to run `claude`.
+- **GPU support in `repo:remote` (closes #1).** Hardware is chosen by instance
+  type (GPU family inferred); the environment by an optional checked-in
+  Dockerfile (`REPO_REMOTE_DOCKERFILE`) run with `--gpus all`. On AWS, GPU hosts
+  default to the *Deep Learning Base OSS Nvidia Driver GPU AMI* (driver + Docker
+  + `nvidia-container-toolkit`), so `nvidia-smi` and `docker run --gpus all` work
+  out of the box; a post-boot `nvidia-smi` sanity check surfaces GPU liveness,
+  and a `VcpuLimitExceeded` launch failure prints the exact quota remediation
+  (Service Quotas → EC2 → `L-DB2E81BA`).
 - Add `repo:docs` — the canonical documentation-health command. Adds a content-
   accuracy layer (prose, feature/command tables, CHANGELOG currency, code
   examples vs the real tree) on top of, and subsuming, `repo:readme` (structure)

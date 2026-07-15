@@ -77,7 +77,7 @@ uninstall.sh             Uninstaller
 1. Create `commands/repo/<name>.md` with the standard frontmatter (`name`, `description`, `domain: repo`, `type: command`, `user-invocable: true`).
 2. Add a `[[<name>]]` row to the commands table in `skills/repo/SKILL.md`.
 3. Add a row to the Skills table in this README.
-4. Keep it **general**: no org-specific hostnames, project names, branch names, or infrastructure paths. If a check needs configuration, read it from the consumer repo (e.g. `.claude/remote.json`), never hardcode it.
+4. Keep it **general**: no org-specific hostnames, project names, branch names, or infrastructure paths. If a check needs configuration, read it from the consumer repo (e.g. its `.env` or `CLAUDE.md`), never hardcode it.
 
 ## License
 

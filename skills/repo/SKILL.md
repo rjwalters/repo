@@ -60,7 +60,7 @@ costs.
    limit scope (e.g., `/repo:readme docs/`). Without it, they scan the full repo.
 3. **General by design.** These commands make no assumptions about org,
    project structure, or infrastructure. Anything repo-specific is read from
-   the consumer repo's own files (CLAUDE.md conventions, `.claude/remote.json`),
+   the consumer repo's own files (CLAUDE.md conventions, `.env`),
    never hardcoded.
 4. **Don't be noisy.** Only flag things that are actually wrong or confusing.
    A missing README in a tiny utility directory isn't worth flagging.
