@@ -39,7 +39,10 @@ Rules for every skill:
    for direction. Anything that creates or destroys resources shows the exact
    plan (and cost, for cloud resources) before acting.
 3. **Wire it up.** A new command needs: the command file, a `[[wikilink]]` row
-   in `skills/repo/SKILL.md`, and a row in README.md's Skills table.
+   in `skills/repo/SKILL.md`, and a row in README.md's Skills table. Do **not**
+   add it to the installed CLAUDE.md block — that block is a fixed-size pointer
+   to `/repo:help` and SKILL.md by design (matching Loom/Anvil), so it never
+   goes stale as commands are added.
 
 ## Testing the installer
 
