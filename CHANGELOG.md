@@ -4,7 +4,7 @@
 
 Initial release.
 
-- Skills: `repo:audit`, `repo:reset`, `repo:tidy`, `repo:remote`,
+- Skills: `repo:help`, `repo:audit`, `repo:reset`, `repo:tidy`, `repo:remote`,
   `repo:update-tools`, `repo:branches`, `repo:gitignore`, `repo:links`,
   `repo:orphans`, `repo:readme`
 - `install.sh` / `uninstall.sh` following the Anvil/Loom consumer-repo pattern

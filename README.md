@@ -10,6 +10,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 
 | Command | What it does |
 |---|---|
+| `/repo:help` | Explain the installed `/repo:*` commands — what each does, where to start |
 | `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
 | `/repo:reset` | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to main |
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |

@@ -80,14 +80,15 @@ fi
 # Resolve command selection
 ALL_COMMANDS="$(list_commands)"
 if [[ -n "$SKILLS_FILTER" ]]; then
-  SELECTED=""
+  # help is the entry point and only describes what is installed — always include it
+  SELECTED="help"$'\n'
   IFS=',' read -ra wanted <<<"$SKILLS_FILTER"
   for w in "${wanted[@]}"; do
     w="$(echo "$w" | tr -d '[:space:]')"
     [[ -f "$SOURCE_ROOT/commands/repo/$w.md" ]] || error "Unknown skill '$w' (run --list to see available skills)"
     SELECTED+="$w"$'\n'
   done
-  COMMANDS="$(echo "$SELECTED" | sed '/^$/d')"
+  COMMANDS="$(echo "$SELECTED" | sed '/^$/d' | sort -u)"
 else
   COMMANDS="$ALL_COMMANDS"
 fi
@@ -153,8 +154,9 @@ BLOCK_FILE="$(mktemp)"
     echo "- \`/repo:$cmd\` — $desc"
   done <<<"$COMMANDS"
   echo ""
-  echo "Details: \`.claude/skills/repo/SKILL.md\`. All hygiene commands are report-first —"
-  echo "they present findings and wait for direction before changing anything."
+  echo "Start with \`/repo:help\`. Details: \`.claude/skills/repo/SKILL.md\`. All hygiene"
+  echo "commands are report-first — they present findings and wait for direction before"
+  echo "changing anything."
   echo ""
   echo "$MARKER_END"
 } >"$BLOCK_FILE"
@@ -175,4 +177,4 @@ fi
 rm -f "$BLOCK_FILE"
 
 echo ""
-success "Repo Skills v$VERSION installed. Try /repo:audit in Claude Code."
+success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code."
