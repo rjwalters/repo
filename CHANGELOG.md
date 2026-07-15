@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-07-15)
 
 - Rework `repo:remote` around the target repo's **`.env`** (retiring
   `.claude/remote.json`): namespaced `REPO_REMOTE_*` settings plus standard
