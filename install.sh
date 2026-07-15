@@ -140,24 +140,17 @@ success "Wrote install-metadata.json"
 
 # 4. CLAUDE.md block (replace existing block in place, else append)
 CLAUDE_MD="$TARGET/CLAUDE.md"
+# The block is intentionally lightweight: a pointer to the real docs, not an
+# inlined command dump. `/repo:help` and SKILL.md carry the authoritative,
+# always-current command list; duplicating it here just goes stale.
 BLOCK_FILE="$(mktemp)"
 {
   echo "$MARKER_BEGIN"
-  echo ""
-  echo "## Repo Skills"
-  echo ""
-  echo "This repository has [Repo Skills](https://github.com/rjwalters/repo) v$VERSION installed."
-  echo "General repository hygiene and environment commands, invoked as \`/repo:<command>\`:"
-  echo ""
-  while IFS= read -r cmd; do
-    desc="$(grep -m1 '^description:' "$SOURCE_ROOT/commands/repo/$cmd.md" | sed 's/^description: *//; s/^"//; s/"$//')"
-    echo "- \`/repo:$cmd\` — $desc"
-  done <<<"$COMMANDS"
-  echo ""
-  echo "Start with \`/repo:help\`. Details: \`.claude/skills/repo/SKILL.md\`. All hygiene"
-  echo "commands are report-first — they present findings and wait for direction before"
-  echo "changing anything."
-  echo ""
+  echo "This repository has [Repo Skills](https://github.com/rjwalters/repo) v$VERSION installed —"
+  echo "general repository hygiene and environment commands invoked as \`/repo:<command>\`. Run"
+  echo "\`/repo:help\` for the command list, or see \`.claude/skills/repo/SKILL.md\` for the full"
+  echo "guide. Hygiene commands are report-first: they present findings and wait before changing"
+  echo "anything. Managed by \`install.sh\` — edit outside the markers only."
   echo "$MARKER_END"
 } >"$BLOCK_FILE"
 

@@ -53,7 +53,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
-- `CLAUDE.md` — one marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace the block in place
+- `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
 
