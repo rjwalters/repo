@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- Add `repo:docs` — the canonical documentation-health command. Adds a content-
+  accuracy layer (prose, feature/command tables, CHANGELOG currency, code
+  examples vs the real tree) on top of, and subsuming, `repo:readme` (structure)
+  and `repo:links` (cross-references), which remain callable on their own.
+  `repo:all` now runs an explicit **Docs** stage (audit → docs → tidy →
+  update-tools → reset).
+- **Behavior change — apply safe fixes by default.** Fix-capable hygiene
+  commands now apply their safe, reversible fixes (doc/link/gitignore edits,
+  `tidy`'s regenerable SAFE clutter) automatically and report each change,
+  instead of only reporting. Run any of them with `--ask` to restore the
+  old review-and-confirm flow. Irreversible removals stay gated behind an
+  explicit opt-in (`--prune`); `tidy`'s old `--apply` is now the default (kept
+  as an alias).
+- Add a **permanent-loss check** before any branch or worktree deletion
+  (`repo:branches`, `repo:reset`): a branch with commits found nowhere else, or
+  a worktree with uncommitted changes, is never removed automatically —
+  regardless of `--prune`.
+- `repo:readme` now flags missing READMEs by *browsability* — top-level and
+  significant subdirectories within two levels of the repo root get one so
+  GitHub renders docs at each level a visitor navigates to — with tiered
+  severity to stay quiet on trivial leaf dirs.
+- Add `install.sh --dev` — symlinks source command/SKILL files into the target's
+  `.claude/` instead of render-copying, so edits are live with no re-install. It
+  is the only mode allowed to target the source repo itself (dogfooding), and it
+  gitignores the machine-local `.claude/` symlinks while leaving CLAUDE.md
+  untouched. The same pattern applies to sibling tool repos (Loom, Anvil).
+
 ## 0.3.0 (2026-07-15)
 
 - Add `repo:release` — interactive release flow (pre-flight checks, CHANGELOG

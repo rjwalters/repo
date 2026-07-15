@@ -191,7 +191,8 @@ Release:   GitHub Release created  (or: tag push only — no release workflow)
 
 ## Principles
 
-Same as every repo command: **report first, act second** — nothing is committed,
+Cutting a release is irreversible and outward-facing, so unlike the safe-fix
+hygiene commands it stays **report first, act second** — nothing is committed,
 tagged, or pushed without a yes. **General by design** — the tool and the file
 set are discovered, never assumed. If the repo needs a release-time reminder
 (e.g. "bump the protocol version when the API changes"), keep it in the repo's

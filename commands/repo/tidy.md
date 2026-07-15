@@ -8,17 +8,21 @@ user-invocable: true
 
 # /repo:tidy — Tidy Up
 
-Sweep the working tree for clutter and clean it up. Report-first: inventory
-everything, categorize by confidence, then delete only what the user approves
-(or only the SAFE category with `--apply`).
+Sweep the working tree for clutter and clean it up. Inventory everything,
+categorize by confidence, then by default delete the SAFE category (clutter
+that is regenerable with certainty and holds no unique work) and report what
+was freed. Items that could be real work (ASK) are always presented for a human
+call, never auto-deleted.
 
 ## Usage
 
 ```
-/repo:tidy                    # Inventory + report, then discuss
-/repo:tidy --apply            # Report, then delete the SAFE category without asking per-item
+/repo:tidy                    # Inventory, delete the SAFE category, report; ASK items presented
+/repo:tidy --ask              # Walk every category interactively before deleting anything
 /repo:tidy packages/core      # Scope to one subtree
 ```
+
+(`--apply` is accepted as a synonym for the default, for muscle memory.)
 
 ## Steps
 
@@ -84,10 +88,10 @@ KEEP (informational):
 
 ### 4. Apply
 
-- Without `--apply`: walk through categories with the user; delete what they
-  approve.
-- With `--apply`: delete the SAFE category immediately, then present ASK items
-  as usual. Never auto-delete anything in ASK, no matter the flags.
+- Default: delete the SAFE category immediately, then present ASK items for a
+  decision. Never auto-delete anything in ASK, no matter the flags.
+- With `--ask`: walk through every category with the user, including SAFE;
+  delete only what they approve.
 
 Use `git clean -fdX -- <paths>` for gitignored artifacts and plain `rm` only
 for pattern-matched junk you listed in the report. After deleting, re-run the

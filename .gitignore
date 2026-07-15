@@ -1,1 +1,4 @@
 .DS_Store
+
+# Repo Skills dev-mode symlinks (machine-local, do not commit)
+.claude/

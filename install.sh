@@ -5,6 +5,8 @@
 #
 # Options:
 #   --skills=a,b,c   Install only these commands (default: all)
+#   --dev            Symlink source files instead of copying (for dogfooding);
+#                    allows installing into the source repo itself
 #   --list           List available commands and exit
 #   --dry-run        Show what would be written without writing
 #   -y, --yes        Non-interactive mode (skip confirmation prompts)
@@ -14,6 +16,7 @@
 #   ./install.sh ~/projects/my-app
 #   ./install.sh --skills=clean,remote .
 #   ./install.sh --dry-run ~/projects/my-app
+#   ./install.sh --dev .            # dogfood: live /repo:* here via symlinks
 
 set -euo pipefail
 
@@ -69,6 +72,7 @@ TARGET=""
 SKILLS_FILTER=""
 DRY_RUN=false
 YES=false
+DEV=false
 
 usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -81,6 +85,7 @@ list_commands() {
 for arg in "$@"; do
   case "$arg" in
     --skills=*) SKILLS_FILTER="${arg#--skills=}" ;;
+    --dev)      DEV=true ;;
     --list)     list_commands; exit 0 ;;
     --dry-run)  DRY_RUN=true ;;
     -y|--yes)   YES=true ;;
@@ -94,7 +99,9 @@ done
 [[ -n "$TARGET" ]] || TARGET="."
 TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || error "Target directory does not exist"
 
-[[ "$TARGET" == "$SOURCE_ROOT" ]] && error "Refusing to install into the repo-skills source repo itself"
+if [[ "$TARGET" == "$SOURCE_ROOT" && "$DEV" != true ]]; then
+  error "Refusing to install into the repo-skills source repo itself (use --dev to dogfood via symlinks)"
+fi
 
 if [[ ! -d "$TARGET/.git" ]] && ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
   warning "$TARGET is not a git repository"
@@ -133,10 +140,12 @@ fi
 
 echo ""
 info "Repo Skills v$VERSION ($COMMIT) → $TARGET"
+[[ "$DEV" == true ]] && info "Dev mode: symlinking source files (edits are live)"
 info "Commands: $(echo "$COMMANDS" | tr '\n' ' ')"
 echo ""
 
 if [[ "$DRY_RUN" == true ]]; then
+  [[ "$DEV" == true ]] && echo "Dev mode: files below are symlinks into $SOURCE_ROOT"
   echo "Template identity: {{REPO_OWNER}}=$REPO_OWNER {{REPO_NAME}}=$REPO_NAME"
   echo "Would write:"
   echo "  $TARGET/.claude/skills/repo/SKILL.md"
@@ -153,17 +162,28 @@ if [[ "$YES" != true ]]; then
   [[ -z "$reply" || "$reply" =~ ^[Yy] ]] || { info "Installation cancelled"; exit 0; }
 fi
 
+# In dev mode we symlink source files (edits are live, no re-install needed);
+# otherwise we render template variables and copy. We symlink per-file rather
+# than whole directories so install-metadata.json and any target-only files
+# stay real and never leak back into the source tree.
+install_file() {  # <source-abs> <dest-abs> <label>
+  if [[ "$DEV" == true ]]; then
+    ln -sf "$1" "$2"
+  else
+    render <"$1" >"$2"
+    assert_no_placeholders "$2" "$3"
+  fi
+}
+
 # 1. Skill file
 mkdir -p "$TARGET/.claude/skills/repo"
-render <"$SOURCE_ROOT/skills/repo/SKILL.md" >"$TARGET/.claude/skills/repo/SKILL.md"
-assert_no_placeholders "$TARGET/.claude/skills/repo/SKILL.md" ".claude/skills/repo/SKILL.md"
+install_file "$SOURCE_ROOT/skills/repo/SKILL.md" "$TARGET/.claude/skills/repo/SKILL.md" ".claude/skills/repo/SKILL.md"
 success "Installed .claude/skills/repo/SKILL.md"
 
 # 2. Command files
 mkdir -p "$TARGET/.claude/commands/repo"
 while IFS= read -r cmd; do
-  render <"$SOURCE_ROOT/commands/repo/$cmd.md" >"$TARGET/.claude/commands/repo/$cmd.md"
-  assert_no_placeholders "$TARGET/.claude/commands/repo/$cmd.md" "commands/repo/$cmd.md"
+  install_file "$SOURCE_ROOT/commands/repo/$cmd.md" "$TARGET/.claude/commands/repo/$cmd.md" "commands/repo/$cmd.md"
 done <<<"$COMMANDS"
 success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude/commands/repo/"
 
@@ -173,13 +193,28 @@ success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude
   echo "  \"version\": \"$VERSION\","
   echo "  \"commit\": \"$COMMIT\","
   echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+  echo "  \"dev\": $DEV,"
   echo "  \"source\": \"$SOURCE_ROOT\","
   echo "  \"commands\": [$(echo "$COMMANDS" | sed 's/.*/"&"/' | paste -sd, -)]"
   echo "}"
 } >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
 
-# 4. CLAUDE.md block (replace existing block in place, else append)
+# 4. CLAUDE.md block (replace existing block in place, else append).
+# Skipped in dev mode: the symlinked install is machine-local (absolute symlinks
+# must not be committed), so instead of advertising it in a committed CLAUDE.md
+# we ensure .claude/ is gitignored and leave CLAUDE.md untouched.
+if [[ "$DEV" == true ]]; then
+  GITIGNORE="$TARGET/.gitignore"
+  if [[ ! -f "$GITIGNORE" ]] || ! grep -qxF '.claude/' "$GITIGNORE"; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""; echo "# Repo Skills dev-mode symlinks (machine-local, do not commit)"; echo ".claude/"; } >>"$GITIGNORE"
+    success "Added .claude/ to .gitignore"
+  fi
+  echo ""
+  success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code."
+  exit 0
+fi
+
 CLAUDE_MD="$TARGET/CLAUDE.md"
 # The block is intentionally lightweight: a pointer to the real docs, not an
 # inlined command dump. `/repo:help` and SKILL.md carry the authoritative,

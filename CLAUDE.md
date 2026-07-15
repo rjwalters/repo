@@ -54,9 +54,14 @@ Rules for every skill:
 1. **General by design.** No org names, project names, hostnames, branch
    lists, or infrastructure paths. Repo-specific knowledge is read from the
    consumer repo at runtime (its CLAUDE.md, `.claude/remote.json`, …).
-2. **Report first, fix second.** Hygiene commands present findings and wait
-   for direction. Anything that creates or destroys resources shows the exact
-   plan (and cost, for cloud resources) before acting.
+2. **Apply safe fixes, gate destructive ones.** Fix-capable hygiene commands
+   apply their safe, reversible fixes by default and report each change; they
+   accept `--ask` to restore review-and-confirm. Anything irreversible —
+   deleting branches, worktrees, stashes, or untracked files, or
+   creating/destroying resources — is never automatic: show the exact plan (and
+   cost, for cloud resources), run a permanent-loss check, and act only on
+   explicit opt-in. Commands whose only action is consequential (`orphans`,
+   `update-tools`, `release`, `remote`) confirm first by nature.
 3. **Wire it up.** A new command needs: the command file, a `[[wikilink]]` row
    in `skills/repo/SKILL.md`, and a row in README.md's Skills table. Do **not**
    add it to the installed CLAUDE.md block — that block is a fixed-size pointer
@@ -71,6 +76,22 @@ tmp=$(mktemp -d) && git -C "$tmp" init -q
 ./install.sh -y "$tmp"          # idempotency: block replaced, not duplicated
 ./uninstall.sh -y "$tmp"        # everything gone, CLAUDE.md block removed
 ```
+
+## Dogfooding
+
+Run this repo's own `/repo:*` commands against itself with `--dev`:
+
+```bash
+./install.sh --dev -y .         # symlinks source files into .claude/, live edits
+```
+
+`--dev` symlinks each command/SKILL file (rather than render-copying) so edits to
+`commands/repo/*.md` are immediately live — no re-install. It's the only mode
+allowed to target the source repo itself. Because the symlinks are absolute and
+machine-local, dev mode gitignores `.claude/` and leaves this dev-guide CLAUDE.md
+untouched (no consumer-facing REPO-SKILLS block). `./uninstall.sh -y .` removes
+the symlinks without touching the source. The same pattern applies to sibling
+tool repos (Loom, Anvil).
 
 ## Releasing
 

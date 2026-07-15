@@ -11,7 +11,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | Command | What it does |
 |---|---|
 | `/repo:help` | Explain the installed `/repo:*` commands — what each does, where to start |
-| `/repo:all` | The whole hygiene pass in order — audit, tidy, update-tools, reset — each report-first |
+| `/repo:all` | The whole hygiene pass in order — audit, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
 | `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
 | `/repo:reset` | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to main |
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
@@ -20,11 +20,12 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |
 | `/repo:gitignore` | Gitignore audit — over-ignored files, under-ignored build artifacts, stale rules |
+| `/repo:docs` | Documentation health — content accuracy, README structure, and cross-references (canonical docs command) |
 | `/repo:links` | Validate internal cross-references — markdown links, CLAUDE.md paths, skill graphs |
 | `/repo:orphans` | Find unreferenced files — dead scripts, stale data, outputs without sources |
 | `/repo:readme` | Check README accuracy against actual directory contents |
 
-All hygiene skills are **report-first**: they present findings and wait for direction before changing anything.
+Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `release`, `remote`) always confirm first.
 
 ## Installation
 
@@ -45,6 +46,9 @@ The installer copies the skill files into a target repository's `.claude/` direc
 
 # Non-interactive
 ./install.sh -y ~/projects/my-app
+
+# Dev mode: symlink source files for live editing (dogfooding)
+./install.sh --dev .
 ```
 
 To remove: `./uninstall.sh /path/to/target-repo`.
