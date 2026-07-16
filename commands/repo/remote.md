@@ -369,7 +369,10 @@ VM to interactive login.
 2. **gh — inline, no file.** Export the resolved `REPO_REMOTE_GH_TOKEN` as
    `GH_TOKEN` in the remote shell for the `docker run` above, then inside the
    container `gh auth setup-git` and confirm with `gh auth status`. The token
-   lives only in the container env.
+   lives only in the container env. **Note:** `gh` infers the repo from the
+   local `.git` remote — so `gh pr/issue` commands need the **clone** path
+   (step 5), not a rsync-only tree (which excludes `.git`). If the VM has no
+   `.git`, pass `-R <owner>/<repo>` explicitly for label/PR/issue operations.
 
 3. **Claude pool — token files (Loom needs them as files).** Copy the resolved
    `*.token` files to the VM at `~/<repo-name>/.loom/tokens/` (`chmod 600`,
