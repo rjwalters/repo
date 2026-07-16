@@ -153,7 +153,14 @@ if [[ "$DRY_RUN" == true ]]; then
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
   done <<<"$COMMANDS"
-  echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
+  if [[ "$DEV" == true ]]; then
+    echo "  $TARGET/.gitignore (.claude/ entry; CLAUDE.md skipped in dev mode)"
+  elif git -C "$TARGET" check-ignore -q .claude/commands/repo 2>/dev/null \
+    || git -C "$TARGET" check-ignore -q .claude/skills/repo 2>/dev/null; then
+    echo "  $TARGET/CLAUDE.md (skipped — install destination is gitignored)"
+  else
+    echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
+  fi
   exit 0
 fi
 
@@ -216,6 +223,28 @@ if [[ "$DEV" == true ]]; then
 fi
 
 CLAUDE_MD="$TARGET/CLAUDE.md"
+
+# If the install destination is gitignored in the target, the command/skill
+# files we just wrote are effectively machine-local (they won't be committed),
+# so a tracked CLAUDE.md pointer would advertise /repo:* commands whose files
+# aren't in the repo. Mirror dev mode here: skip the CLAUDE.md block entirely.
+# Probe each destination separately (check-ignore -q accepts only one pathname)
+# and skip if *either* is ignored, since a split state is itself broken. The
+# probe exits non-zero outside a git repo or when nothing is ignored, which
+# correctly falls through to the write path.
+dest_is_gitignored() {
+  git -C "$TARGET" check-ignore -q .claude/commands/repo 2>/dev/null \
+    || git -C "$TARGET" check-ignore -q .claude/skills/repo 2>/dev/null
+}
+if dest_is_gitignored; then
+  warning "Install destination (.claude/commands, .claude/skills) is gitignored in $TARGET;"
+  warning "skipping the CLAUDE.md pointer block (a committed pointer to uncommitted command"
+  warning "files is not what you want). The /repo:* commands still work in-session."
+  echo ""
+  success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code."
+  exit 0
+fi
+
 # The block is intentionally lightweight: a pointer to the real docs, not an
 # inlined command dump. `/repo:help` and SKILL.md carry the authoritative,
 # always-current command list; duplicating it here just goes stale.
