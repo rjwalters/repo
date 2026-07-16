@@ -46,9 +46,29 @@ CHANGELOG entry — cheap to catch now, expensive to reconstruct later. **No-op 
 `CHANGELOG.md` is absent** (Phase 4 bootstraps it).
 
 ```bash
-[ -f CHANGELOG.md ] || echo "(no CHANGELOG.md — skipping gate)"
-# For each of the last ~5 tags (git tag --sort=-v:refname), check that
-# CHANGELOG.md contains a header for its version (strip a leading 'v').
+if [ ! -f CHANGELOG.md ]; then
+  echo "(no CHANGELOG.md — skipping gate)"
+else
+  # For each of the last ~5 tags, check CHANGELOG.md has a header for its
+  # version. The accepted header shape is format-AGNOSTIC: this repo uses the
+  # bracket-LESS "## 0.4.1 (2026-07-16)" form, but Keep-a-Changelog
+  # "## [0.4.1] - 2026-07-16" is equally valid. Accept BOTH — with an optional
+  # leading 'v' and optional surrounding brackets — and match the version's
+  # dots LITERALLY (escape them) so "0.4.1" cannot spuriously match "0X4X1" or
+  # "0.4.10". This mirrors the optional-bracket extraction Phase 6 uses
+  # (sed "/^## \[\?$NEW/…") and additionally tolerates a leading 'v' on the
+  # header, so the read side (this gate) and the write side (Phase 4 draft /
+  # Phase 6 extract) never disagree about what a version header looks like.
+  for tag in $(git tag --sort=-v:refname | head -5); do
+    ver="${tag#v}"                                     # strip a leading 'v'
+    ver_re="$(printf '%s' "$ver" | sed 's/\./\\./g')"  # escape dots -> literal
+    if grep -Eq "^##[[:space:]]+v?\[?${ver_re}\]?([[:space:]]|\$)" CHANGELOG.md; then
+      echo "ok: $ver"
+    else
+      echo "MISSING: $ver"
+    fi
+  done
+fi
 ```
 
 For any tag missing an entry, surface the gap and offer: **[b]** backfill it now
