@@ -12,15 +12,17 @@ Stand up (or reuse) a cloud VM with this repository cloned and synced, then
 open a live SSH session in a new terminal window — landing in the repo, ready
 to run `claude` and continue the work on the remote host.
 
-Configuration and credentials are read from the target repo's **`.env`**
-(see below). The provisioning credentials there are used locally to drive the
-cloud CLI; they are **never** copied to the VM.
+Configuration is read from two layers (see below): shared cloud credentials
+from **`~/.config/repo/remote.env`** (reused across every repo), with the
+target repo's **`.env`** layered on top for per-repo machine settings — and
+free to override any shared value. The provisioning credentials are used
+locally to drive the cloud CLI; they are **never** copied to the VM.
 
 ## Usage
 
 ```
 /repo:remote                   # Read .env, bring up / reuse the host, open SSH
-/repo:remote --configure       # Guided setup: create/update .env (provider, creds, machine)
+/repo:remote --configure       # Guided setup: shared creds (~/.config/repo/remote.env) + repo .env (machine)
 /repo:remote gcp               # Override REPO_REMOTE_PROVIDER for this run
 /repo:remote aws
 /repo:remote --status          # List instances created by this command
@@ -31,14 +33,31 @@ cloud CLI; they are **never** copied to the VM.
 First time in a repo? Run `/repo:remote --configure` to build the `.env` below,
 then `/repo:remote` to launch.
 
-## Configuration — `.env`
+## Configuration — two layers
 
-Read settings from the target repo's `.env` (at the git root). Variables are
-namespaced `REPO_REMOTE_*` so they don't collide with the app's own vars; the
-provisioning credentials use their standard cloud names.
+Settings come from two files, loaded in order so the repo can override the
+shared defaults:
+
+1. **`~/.config/repo/remote.env`** — shared cloud identity, reused by every
+   repo. Loaded **first**. This is where the provisioning credentials belong,
+   plus any default you want everywhere (e.g. `REPO_REMOTE_PROVIDER`,
+   `AWS_REGION`, `REPO_REMOTE_SSH_KEY`). Honors `$XDG_CONFIG_HOME` — the exact
+   path is `${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env`. Not in any git
+   repo, so it is never at risk of being committed; keep it `chmod 600`.
+2. **`<repo>/.env`** (at the git root) — per-repo machine settings. Loaded
+   **second**, so any variable it sets overrides the shared file. This is where
+   `REPO_REMOTE_INSTANCE_ID` and the hardware/software/session knobs live. A
+   repo that needs a *different* cloud account/region can also override the
+   credentials here.
+
+Variables are namespaced `REPO_REMOTE_*` so they don't collide with the app's
+own vars; the provisioning credentials use their standard cloud names. Either
+file may set any variable — the split below is the recommended home for each,
+not a hard rule.
 
 ```bash
-REPO_REMOTE_PROVIDER=aws                  # aws | gcp
+# ── ~/.config/repo/remote.env  (shared across all repos) ─────────────────
+REPO_REMOTE_PROVIDER=aws                  # aws | gcp  (default; a repo or arg can override)
 
 # --- provisioning credentials (used locally; NEVER copied to the VM) ---
 AWS_ACCESS_KEY_ID=...
@@ -46,9 +65,12 @@ AWS_SECRET_ACCESS_KEY=...
 AWS_REGION=us-west-2
 # gcp instead: GCP_PROJECT, GCP_ZONE, GOOGLE_APPLICATION_CREDENTIALS=/abs/sa.json
 
+REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session (fine to share)
+
+# ── <repo>/.env  (per-repo; overrides the shared file) ───────────────────
 # --- instance (hardware) ---
 REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge      # gcp: machineType; a GPU family (g6e.*, g2-*) implies a GPU host
-REPO_REMOTE_INSTANCE_ID=                  # reuse this exact instance when set
+REPO_REMOTE_INSTANCE_ID=                  # reuse this exact instance when set (ALWAYS per-repo)
 REPO_REMOTE_DISK_GB=100
 REPO_REMOTE_IMAGE=                         # optional host-image override (else: Ubuntu LTS, or the GPU AMI on GPU hosts)
 REPO_REMOTE_GPU=                          # GCP accelerator (e.g. nvidia-l4:1); AWS infers GPU from the instance family
@@ -59,36 +81,45 @@ REPO_REMOTE_SETUP="make setup"            # optional first-boot command; fallbac
 
 # --- session ---
 REPO_REMOTE_IDLE_SHUTDOWN_MIN=120
-REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
-credentials are required. Everything else falls back to built-in defaults: GCP
-`e2-standard-4` / AWS `m5.xlarge`, 50 GB disk, latest Ubuntu LTS, no GPU,
-120-minute idle shutdown.
+credentials are required — from **either** layer. Everything else falls back to
+built-in defaults: GCP `e2-standard-4` / AWS `m5.xlarge`, 50 GB disk, latest
+Ubuntu LTS, no GPU, 120-minute idle shutdown.
 
 **Credential hygiene — check first, every run:**
-- If `.env` exists but is **not** gitignored, stop and warn: it holds
-  credentials and must never be committed. Offer to add it to `.gitignore`.
-- If there's no `.env`, or the provider's credentials are missing, say exactly
-  which variables are needed and point the user at `/repo:remote --configure`
-  — don't silently fall back to ambient cloud auth (that would be
-  non-deterministic across machines).
+- If the shared file `~/.config/repo/remote.env` exists but is group- or
+  world-readable, warn and offer to `chmod 600` it — it holds secrets.
+- If the repo's `.env` exists but is **not** gitignored, stop and warn: it may
+  hold credentials and must never be committed. Offer to add it to
+  `.gitignore`.
+- If neither layer supplies the provider's credentials, say exactly which
+  variables are needed and point the user at `/repo:remote --configure` — don't
+  silently fall back to ambient cloud auth (that would be non-deterministic
+  across machines).
 
 ## `--configure` — guided `.env` setup
 
-An interactive wizard that builds (or updates) the target repo's `.env` so a
-plain `/repo:remote` just works afterward. Run it on first use, or to change
-the machine.
+An interactive wizard that builds (or updates) the two config files so a plain
+`/repo:remote` just works afterward. Run it on first use, or to change the
+machine.
 
-1. **Protect the file first.** Before writing any credential, ensure `.env` is
-   gitignored; if it isn't, add it and say so. Never proceed with secrets going
-   into a tracked file.
-2. **Read what's already there.** If `.env` exists, parse the current
-   `REPO_REMOTE_*` and cloud-cred values and use them as defaults so the wizard
-   is non-destructive to unrelated vars.
+By default it writes **credentials to the shared `~/.config/repo/remote.env`**
+(so you set them up once for every repo) and **machine settings to the repo's
+`.env`**. Offer to put credentials in the repo `.env` instead only if the user
+wants a repo-specific account/region.
+
+1. **Protect both files first.** Before writing any credential: ensure the
+   repo's `.env` is gitignored (add it and say so if not); and create
+   `~/.config/repo/remote.env` with `chmod 600` (mkdir -p its parent). Never
+   proceed with secrets going into a tracked or world-readable file.
+2. **Read what's already there.** Parse the current values from **both** the
+   shared file and the repo `.env` (repo wins) and use them as defaults so the
+   wizard is non-destructive to unrelated vars in either file.
 3. **Provider.** Ask `aws` or `gcp`.
-4. **Credentials.** Guide, don't mishandle:
+4. **Credentials** (written to the shared file by default). Guide, don't
+   mishandle:
    - If a working CLI session or profile already exists (`aws sts
      get-caller-identity`, `gcloud auth list`), offer to reuse its
      account/region/project and derive what you can.
@@ -104,29 +135,37 @@ the machine.
    environment (`REPO_REMOTE_DOCKERFILE`) — the recommended path, and what makes
    GPU work cleanly. If none, offer an optional first-boot `REPO_REMOTE_SETUP`
    command instead.
-7. **SSH key.** Ask which SSH key to use (`REPO_REMOTE_SSH_KEY`).
+7. **SSH key.** Ask which SSH key to use (`REPO_REMOTE_SSH_KEY`); it goes in
+   the shared file by default (a key path is usually the same everywhere).
 8. **Validate & write.** Run the provider identity check with the entered
-   credentials to prove they work. Then show the resulting `.env` (secrets
-   masked), get a yes, and write it — merging into any existing `.env`,
-   preserving unrelated lines.
+   credentials to prove they work. Then show **both** resulting files (shared
+   creds and repo `.env`, secrets masked), get a yes, and write each — merging
+   into any existing content, preserving unrelated lines. Credentials +
+   shared defaults go to `~/.config/repo/remote.env`; `REPO_REMOTE_*` machine
+   settings go to `<repo>/.env`.
 9. Offer to run `/repo:remote` right away.
 
 ## Steps
 
 ### 1. Load and validate config
 
-Read `.env` from the git root and resolve the effective settings (a provider
-argument overrides `REPO_REMOTE_PROVIDER`). Run the credential-hygiene checks
-above. Echo the resolved plan (provider, instance type, disk, GPU, region/zone)
-without printing secret values.
+Load both layers and resolve the effective settings (a provider argument
+overrides `REPO_REMOTE_PROVIDER` from either file). Run the credential-hygiene
+checks above. Echo the resolved plan (provider, instance type, disk, GPU,
+region/zone) without printing secret values.
 
-### 2. Authenticate the provider with the `.env` credentials
+### 2. Authenticate the provider with the resolved credentials
 
-Load the credentials into the environment for the provisioning calls only —
-scoped to this command, never persisted to the VM:
+Load the shared file first, then the repo `.env` on top, into the environment
+for the provisioning calls only — scoped to this command, never persisted to
+the VM. Repo values override shared ones because the repo file is sourced last:
 
 ```bash
-set -a; . "$(git rev-parse --show-toplevel)/.env"; set +a
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env"
+set -a
+[ -f "$CONFIG_HOME" ] && . "$CONFIG_HOME"                      # shared cloud creds + defaults
+[ -f "$(git rev-parse --show-toplevel)/.env" ] && . "$(git rev-parse --show-toplevel)/.env"  # per-repo (overrides)
+set +a
 ```
 
 - **AWS**: the exported `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
@@ -208,8 +247,9 @@ Detect that specific error and print the exact remediation instead of the raw
 message: **Service Quotas → EC2 → quota code `L-DB2E81BA`** → request a limit
 ≥ the instance's vCPU count, then retry once approved.
 
-**After a successful create, write the new ID back to `.env`** so the next run
-reuses it automatically:
+**After a successful create, write the new ID back to the repo's `.env`** (the
+git root, never the shared file — the instance handle is per-repo) so the next
+run reuses it automatically:
 
 ```
 REPO_REMOTE_INSTANCE_ID=<new-id>
@@ -321,7 +361,8 @@ written back to `.env`, and the teardown command (`/repo:remote --down`).
 ## `--status` and `--down`
 
 - `--status`: list all instances labeled `repo-remote=<repo-name>` with state
-  and uptime; estimate accumulated cost. Uses the `.env` credentials.
+  and uptime; estimate accumulated cost. Uses the resolved credentials (shared
+  file + repo `.env`).
 - `--down`: stop them (confirm first, listing exactly what will stop);
   `--down --delete` terminates/deletes instead — confirm with the instance
   names spelled out, since disks go with them. On delete, offer to clear
@@ -336,6 +377,9 @@ written back to `.env`, and the teardown command (`/repo:remote --down`).
    the pinned `REPO_REMOTE_INSTANCE_ID`) — never enumerate-and-guess
 3. **Never copy `.env`, credentials, or keys to the VM** — provisioning creds
    are local-only; the VM authenticates to the forge on its own
-4. **Refuse to run if `.env` is not gitignored** — it holds credentials
+4. **Keep both config files out of harm's way** — refuse to run if the repo's
+   `.env` exists and is not gitignored (it may hold credentials); warn and offer
+   to `chmod 600` the shared `~/.config/repo/remote.env` if it's readable by
+   others
 5. **Always install the idle-shutdown guard** — a VM that outlives the session
    should turn itself off
