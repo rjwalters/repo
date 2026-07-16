@@ -73,7 +73,12 @@ REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session (fine t
 # Claude account pool (token FILES) is copied to the VM's .loom/tokens/
 # (chmod 600) so a Loom install there can rotate accounts. Prefer
 # scoped/short-lived tokens.
-REPO_REMOTE_GH_TOKEN=                      # GitHub PAT (repo-scoped recommended) → gh + git-over-https on the VM
+REPO_REMOTE_GH_TOKEN=                      # GitHub PAT → gh + git-over-https on the VM.
+                                           # Fine-grained, scoped to the target repo. For Loom-style
+                                           # label workflows grant Contents + Issues + Pull requests
+                                           # (all Read/write): issue labels need Issues:write, PR labels
+                                           # need Pull requests:write. Sets existing labels only — no
+                                           # label *creation* needed (Loom never invents labels).
 
 # Claude Code multi-account pool (the Loom pattern — same triples as
 # lean-genius/.env). Registry lives here; the raw 1-year OAuth tokens live in
