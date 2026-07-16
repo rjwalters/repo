@@ -313,10 +313,13 @@ rsync -az --delete \
   ./ <host>:~/<repo-name>/
 ```
 
-**Never copy `.env`, keys, or anything credential-like to the VM** — the
+**Never copy the *provisioning* `.env` or cloud keys to the VM** — the
 `.gitignore` filter already excludes a gitignored `.env`; double-check it's
-excluded and call it out. The VM authenticates to the forge on its own (e.g.
-`gh auth login` there), not with your local secrets.
+excluded and call it out. This is the provisioning-credential class (Safety
+Rule 3). The separate, opt-in **dev-session auth** (the gh token and the Claude
+account pool) *is* placed on the VM deliberately — see step 6a; that path
+replaces interactive `gh auth login` / `claude` login when the tokens are
+configured.
 
 ### 6. Bootstrap the dev environment
 
@@ -382,9 +385,13 @@ VM to interactive login.
    env) to **account 1's** token so a plain `claude` works immediately.
 
    ```bash
-   # local -> VM, over the SSH channel; never the provisioning creds
-   rsync -az --chmod=D700,F600 -e "ssh -i $REPO_REMOTE_SSH_KEY" \
+   # local -> VM, over the SSH channel; never the provisioning creds.
+   # NOTE: rsync --chmod is GNU-rsync only and fails on macOS's system rsync,
+   # so set the perms in a follow-up ssh step instead of relying on it.
+   rsync -az -e "ssh -i $REPO_REMOTE_SSH_KEY" \
      "<resolved-tokens-dir>/" <host>:~/<repo-name>/.loom/tokens/
+   ssh -i "$REPO_REMOTE_SSH_KEY" <host> \
+     'chmod 700 ~/<repo-name>/.loom/tokens && chmod 600 ~/<repo-name>/.loom/tokens/*.token'
    ```
 
 4. **Verify:** `docker exec repo-remote-<name> bash -lc 'claude --version && gh auth status'`.
