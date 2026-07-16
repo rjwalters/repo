@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 (2026-07-16)
+
+- **Fix `install.sh` (non-dev): skip the tracked `CLAUDE.md` pointer when the
+  install destination is gitignored (#4, #5).** Installing into a repo that
+  gitignores `.claude/commands` / `.claude/skills` (e.g. a Loom workspace) no
+  longer appends a committed `/repo:*` pointer to `CLAUDE.md` that would point
+  at uncommitted, machine-local files. The non-dev path now probes each
+  destination with `git check-ignore` and, when ignored, prints a notice and
+  skips the block — mirroring the existing dev-mode behavior.
+
 ## 0.4.0 (2026-07-15)
 
 - Rework `repo:remote` around the target repo's **`.env`** (retiring
