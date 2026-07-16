@@ -60,7 +60,10 @@ release tag), **[c]** continue and leave the gap, or **[a]** abort.
 
 Detect the host repo's bump mechanism. **First match wins**, in this order. An
 explicit `scripts/version.sh` is honored first; a plain `VERSION` file is the
-most-general fallback.
+most-general fallback. Because `npm` is matched on `package.json` alone — before
+the `VERSION` fallback — the result is **provisional** whenever both files
+coexist: reconcile it against the root `VERSION` file (see *Cross-source
+reconciliation* below) before treating `VERSION_TOOL` as final.
 
 ```bash
 VERSION_TOOL="" ; WHY=""
@@ -90,13 +93,60 @@ echo "${VERSION_TOOL:-<none>} — ${WHY:-no tool detected}"
 silently — offer: **[m]** manual (they edit manifests, you commit + tag), or
 **[a]** abort.
 
-### Drift gate (multi-file tools only)
+### Cross-source reconciliation (VERSION vs package.json)
 
-Tools with more than one version-bearing file can disagree, and a blind bump
-would mis-delta the drifted one. Before reading the current version, verify
-agreement — `./scripts/version.sh check` (fatal if it fails), a `bumpversion
---dry-run --allow-dirty` probe (advisory), etc. Single-source tools
-(`cargo` inheritance, `poetry`, `npm`, `version-file`) are drift-free — skip.
+`npm` is matched on the mere presence of `package.json`, so a repo that keeps a
+plain root `VERSION` file **and** a `package.json` detects as `npm` even when
+`VERSION` is the maintained source of truth — a blind `npm version` would then
+bump and tag the wrong line. Whenever the provisional tool is `npm` **and** a
+root `VERSION` file also exists **and** `package.json` carries a `version` field,
+read both and reconcile before finalizing `VERSION_TOOL`:
+
+```bash
+# Runs only when detection landed on npm but a root VERSION file also coexists.
+if [ "$VERSION_TOOL" = "npm" ] && [ -f VERSION ] && grep -q '"version"' package.json; then
+  PKG_VER="$(node -p "require('./package.json').version" 2>/dev/null \
+    || grep -m1 '"version"' package.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+  FILE_VER="$(head -1 VERSION | tr -d '[:space:]')"
+  TAG_VER="$(git tag --sort=-v:refname | head -1 | sed 's/^v//')"
+  if [ "$PKG_VER" = "$FILE_VER" ]; then
+    echo "VERSION and package.json agree ($FILE_VER) — keeping npm, no change"
+  else
+    echo "DRIFT: package.json=$PKG_VER  VERSION=$FILE_VER  (latest tag: ${TAG_VER:-<none>})"
+    # Do NOT proceed on npm. Recommend the source that matches the latest tag.
+  fi
+fi
+```
+
+- **They agree** → behave exactly as today: keep `VERSION_TOOL="npm"`, no new
+  prompt, no behavior change.
+- **They disagree** → **do not silently select `npm`.** Surface the drift to the
+  operator and confirm which source is authoritative before any bump. Use the
+  **latest git tag as the tie-breaker**: whichever of `package.json` / `VERSION`
+  matches `git tag --sort=-v:refname | head -1` (leading `v` stripped) is the
+  recommended authoritative source — set `VERSION_TOOL` to `version-file` or
+  `npm` accordingly once the operator confirms.
+- **Tie-breaker unavailable** (no tags yet, or neither value matches the latest
+  tag) → present both values and let the operator choose explicitly; never
+  default to `npm`.
+
+This keys off runtime file existence and values only — no repo-specific names or
+numbers — consistent with *General by design* and *report first, act second*.
+
+### Drift gate (multi-source)
+
+Version-bearing state can disagree in two ways, and a blind bump would mis-delta
+the drifted one. Before reading the current version, verify agreement:
+
+- **Within a single tool** — tools with more than one version-bearing file
+  (`./scripts/version.sh check`, fatal if it fails; a `bumpversion --dry-run
+  --allow-dirty` probe, advisory; etc.). `cargo` inheritance and `poetry` keep
+  their version in one place, so this within-tool check is a no-op for them.
+- **Across sources** — `npm`/`package.json` and a plain root `VERSION` file are
+  **separate sources that can disagree** (e.g. a vestigial `package.json` left at
+  a placeholder version). Do **not** treat `npm` or `version-file` as
+  unconditionally drift-free: when both files exist, run the *Cross-source
+  reconciliation* above before bumping.
 
 ## Phase 3 — Gather changes & decide the bump
 
