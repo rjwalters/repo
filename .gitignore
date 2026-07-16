@@ -13,8 +13,6 @@
 .loom/spawn-loop-state.json
 .loom/issue-failures.json
 .loom/interventions/
-.loom/worktrees/
-.loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
 .loom/claims/
@@ -29,6 +27,8 @@
 .loom/metrics/
 .loom/usage-cache.json
 .loom/claude-config/
+.loom/logs/
+.loom/worktrees/
+.loom/state.json
 .loom/*.log
 .loom/*.sock
-.loom/logs/
