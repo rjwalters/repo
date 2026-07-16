@@ -32,3 +32,6 @@
 .loom/state.json
 .loom/*.log
 .loom/*.sock
+
+# repo:remote per-repo config (may hold overrides; never commit)
+.env
