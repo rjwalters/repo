@@ -67,6 +67,25 @@ AWS_REGION=us-west-2
 
 REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session (fine to share)
 
+# --- dev-session auth (optional; used ON the VM) ---
+# Unlike the provisioning creds above, these DO travel to the VM so gh/claude
+# work there. The gh token rides the SSH channel into the container env; the
+# Claude account pool (token FILES) is copied to the VM's .loom/tokens/
+# (chmod 600) so a Loom install there can rotate accounts. Prefer
+# scoped/short-lived tokens.
+REPO_REMOTE_GH_TOKEN=                      # GitHub PAT (repo-scoped recommended) → gh + git-over-https on the VM
+
+# Claude Code multi-account pool (the Loom pattern — same triples as
+# lean-genius/.env). Registry lives here; the raw 1-year OAuth tokens live in
+# ~/.config/repo/tokens/<file>. Account 1 becomes the default
+# CLAUDE_CODE_OAUTH_TOKEN for a plain `claude`; the whole pool is copied to the
+# VM for Loom rotation. A current-repo pool (its own .env ACCOUNT_* +
+# .loom/tokens/) OVERRIDES this shared one.
+ACCOUNT_EMAIL_1=you@example.com
+ACCOUNT_KEY_1=<key>
+ACCOUNT_TOKEN_FILE_1=you-example.token    # relative to ~/.config/repo/tokens/
+# ACCOUNT_EMAIL_2 / ACCOUNT_KEY_2 / ACCOUNT_TOKEN_FILE_2 = ...  (add more accounts)
+
 # ── <repo>/.env  (per-repo; overrides the shared file) ───────────────────
 # --- instance (hardware) ---
 REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge      # gcp: machineType; a GPU family (g6e.*, g2-*) implies a GPU host
@@ -87,6 +106,24 @@ Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
 credentials are required — from **either** layer. Everything else falls back to
 built-in defaults: GCP `e2-standard-4` / AWS `m5.xlarge`, 50 GB disk, latest
 Ubuntu LTS, no GPU, 120-minute idle shutdown.
+
+**Two classes of secret — treat them differently:**
+- **Provisioning credentials** (`AWS_*`, `GCP_*`) drive the cloud CLI *locally*
+  and are **never** copied to the VM.
+- **Dev-session auth** (`REPO_REMOTE_GH_TOKEN`, the `ACCOUNT_*` Claude pool) is
+  **optional** and, when set, is **placed on the VM by design** so `gh` and
+  `claude` work there. The gh token rides the SSH channel into the container
+  env (no file on disk); the Claude pool's **token files** are copied to the
+  VM's `.loom/tokens/` at `chmod 600` (they must be files for Loom to rotate
+  them). Use scoped/short-lived tokens; the whole set is wiped when the box is
+  terminated. If unset, the VM stays unauthenticated and you log in there
+  interactively.
+
+**Pool resolution (layered, like the config files):** the shared pool is
+`~/.config/repo/remote.env`'s `ACCOUNT_*` registry + `~/.config/repo/tokens/`.
+If the **current repo** already carries its own pool (`.env` `ACCOUNT_*` +
+`.loom/tokens/`, as a Loom repo does), that repo pool **wins** and is the one
+shipped — so remoting a Loom repo carries *its* accounts, not the shared set.
 
 **Credential hygiene — check first, every run:**
 - If the shared file `~/.config/repo/remote.env` exists but is group- or
@@ -288,8 +325,11 @@ How the repo declares its environment decides the path:
   ```bash
   docker build -t repo-remote-<name> -f "$REPO_REMOTE_DOCKERFILE" ~/<repo-name>
   docker run -d --name repo-remote-<name> $GPUS \
+    -e GH_TOKEN -e CLAUDE_CODE_OAUTH_TOKEN \
     -v ~/<repo-name>:/work -w /work repo-remote-<name> sleep infinity
   #   GPUS="--gpus all" on GPU hosts, empty otherwise
+  #   GH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN are read from the remote shell env,
+  #   set inline over SSH from the resolved pool (see 6a) — never a file.
   ```
 
   This is what makes GPU clean: the **host** (GPU AMI) supplies the driver +
@@ -312,9 +352,39 @@ docker exec repo-remote-<name> nvidia-smi             # the dev container sees i
 If it fails, report it (driver/AMI or toolkit mismatch) and stop rather than
 proceeding as if the box were ready.
 
+#### 6a. Wire dev-session auth (gh + Claude account pool)
+
+Only if the corresponding secrets are configured — otherwise skip and leave the
+VM to interactive login.
+
+1. **Resolve the pool (repo wins over shared).** If the current repo carries its
+   own pool (`.env` `ACCOUNT_*` **and** `.loom/tokens/`), use it; else fall back
+   to the shared `~/.config/repo/remote.env` registry + `~/.config/repo/tokens/`.
+
+2. **gh — inline, no file.** Export the resolved `REPO_REMOTE_GH_TOKEN` as
+   `GH_TOKEN` in the remote shell for the `docker run` above, then inside the
+   container `gh auth setup-git` and confirm with `gh auth status`. The token
+   lives only in the container env.
+
+3. **Claude pool — token files (Loom needs them as files).** Copy the resolved
+   `*.token` files to the VM at `~/<repo-name>/.loom/tokens/` (`chmod 600`,
+   `chmod 700` the dir) and append the `ACCOUNT_*` registry to
+   `~/<repo-name>/.env` on the VM, reproducing the Loom layout so a Loom install
+   there rotates accounts. Set `CLAUDE_CODE_OAUTH_TOKEN` (for the `docker run`
+   env) to **account 1's** token so a plain `claude` works immediately.
+
+   ```bash
+   # local -> VM, over the SSH channel; never the provisioning creds
+   rsync -az --chmod=D700,F600 -e "ssh -i $REPO_REMOTE_SSH_KEY" \
+     "<resolved-tokens-dir>/" <host>:~/<repo-name>/.loom/tokens/
+   ```
+
+4. **Verify:** `docker exec repo-remote-<name> bash -lc 'claude --version && gh auth status'`.
+   Report which account is active and how many are in the pool.
+
 Then, either path:
-- Offer to install Claude Code so you can pick the work right back up
-  (`curl -fsSL https://claude.ai/install.sh | sh`, or the npm package)
+- Claude Code ships **in the Dockerfile** (container path); for the no-Dockerfile
+  path, offer to install it (`curl -fsSL https://claude.ai/install.sh | bash`).
 - Write/refresh a local SSH config entry so the connection is one word:
 
 ```
@@ -365,7 +435,8 @@ written back to `.env`, and the teardown command (`/repo:remote --down`).
   file + repo `.env`).
 - `--down`: stop them (confirm first, listing exactly what will stop);
   `--down --delete` terminates/deletes instead — confirm with the instance
-  names spelled out, since disks go with them. On delete, offer to clear
+  names spelled out, since disks go with them (the Claude pool token files on
+  the disk go with them too). On delete, offer to clear
   `REPO_REMOTE_INSTANCE_ID` from `.env` so the next run starts fresh.
 
 ## Safety Rules
@@ -375,8 +446,12 @@ written back to `.env`, and the teardown command (`/repo:remote --down`).
    GPU pricing especially)
 2. **Only ever touch instances carrying this repo's `repo-remote` label** (or
    the pinned `REPO_REMOTE_INSTANCE_ID`) — never enumerate-and-guess
-3. **Never copy `.env`, credentials, or keys to the VM** — provisioning creds
-   are local-only; the VM authenticates to the forge on its own
+3. **Two secret classes, handled differently** — **provisioning credentials**
+   (`AWS_*`/`GCP_*`) are local-only and **never** reach the VM; **dev-session
+   auth** (`REPO_REMOTE_GH_TOKEN`, the `ACCOUNT_*` Claude pool) is opt-in and
+   goes to the VM *by design* (gh token in the container env; pool token files
+   at `chmod 600` under the VM's `.loom/tokens/`). Never copy the provisioning
+   `.env` wholesale — carry only the resolved dev-session secrets.
 4. **Keep both config files out of harm's way** — refuse to run if the repo's
    `.env` exists and is not gitignored (it may hold credentials); warn and offer
    to `chmod 600` the shared `~/.config/repo/remote.env` if it's readable by
