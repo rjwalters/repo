@@ -14,7 +14,7 @@ each change; add `--ask` to review findings and confirm first. Anything
 irreversible — deleting a branch, worktree, stash, or untracked file — is never
 automatic: it takes an explicit opt-in and passes a permanent-loss check.
 Commands whose only action is consequential (`orphans`, `update-tools`,
-`release`, `remote`) always confirm first by nature. The environment commands (`remote`) stand up
+`followups`, `release`, `remote`) always confirm first by nature. The environment commands (`remote`) stand up
 infrastructure only after showing exactly what they will create and what it
 costs.
 
@@ -30,6 +30,7 @@ costs.
 | [[release]] | Cut a release — pre-flight, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH |
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
+| [[followups]] | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | [[branches]] | Branch & worktree hygiene — merged PRs, orphaned branches, stale worktrees |
 | [[gitignore]] | Gitignore hygiene — over-ignored files, under-ignored build artifacts |
 | [[docs]] | Documentation health — content accuracy, README structure, cross-references (canonical docs command) |
