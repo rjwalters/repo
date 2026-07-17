@@ -35,3 +35,6 @@
 
 # repo:remote per-repo config (may hold overrides; never commit)
 .env
+
+# Guard hook diagnostic logs (runtime artifact, never committed)
+hooks/logs/

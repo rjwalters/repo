@@ -27,9 +27,15 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 
 Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `release`, `remote`) always confirm first.
 
+## Destructive-command protection
+
+Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructive.sh`) into the target repo's `.claude/settings.json`. It runs before every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /` or `$HOME`, force-push to `main`, fork bombs, `curl … | sh`, `gh repo delete`, cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`, …) and **asks** for confirmation on reversible-but-risky ones (`git reset --hard`, `kubectl delete`, `docker rm`, credential reads). Scoped deletes like `rm -rf node_modules` are allowed.
+
+Two categories are opt-out per repo for repos where they don't apply — SQL (`REPO_GUARD_SQL` / `guards.sqlDdl`) and cloud CLIs (`REPO_GUARD_CLOUD` / `guards.cloudCli`). See [`skills/repo/SKILL.md`](skills/repo/SKILL.md#destructive-command-guard-pretooluse-hook) for the full pattern list and resolution order. If the target already has a compatible guard wired (e.g. Loom's), the installer defers to it rather than adding a duplicate.
+
 ## Installation
 
-The installer copies the skill files into a target repository's `.claude/` directory and appends a marker-bounded section to its `CLAUDE.md`.
+The installer copies the skill files into a target repository's `.claude/` directory, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
 
 ```bash
 # Install everything into the current directory
@@ -58,7 +64,9 @@ To remove: `./uninstall.sh /path/to/target-repo`.
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
+- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall)
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
+- `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
@@ -66,10 +74,12 @@ Nothing else in the target repository is read or modified.
 ## Repository layout
 
 ```
-skills/repo/SKILL.md     Domain overview installed to .claude/skills/repo/
-commands/repo/*.md       Command files installed to .claude/commands/repo/
-install.sh               Installer
-uninstall.sh             Uninstaller
+skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
+commands/repo/*.md           Command files installed to .claude/commands/repo/
+hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
+hooks/repo/tests/run.sh      Test harness for the guard hook (bash, no framework needed)
+install.sh                   Installer
+uninstall.sh                 Uninstaller
 ```
 
 ## Adding a skill
