@@ -18,6 +18,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:release` | Cut a release — pre-flight checks, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
+| `/repo:followups` | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |
 | `/repo:gitignore` | Gitignore audit — over-ignored files, under-ignored build artifacts, stale rules |
 | `/repo:docs` | Documentation health — content accuracy, README structure, and cross-references (canonical docs command) |
@@ -25,7 +26,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:orphans` | Find unreferenced files — dead scripts, stale data, outputs without sources |
 | `/repo:readme` | Check README accuracy against actual directory contents |
 
-Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `release`, `remote`) always confirm first.
+Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `followups`, `release`, `remote`) always confirm first.
 
 ## Destructive-command protection
 
