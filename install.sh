@@ -150,6 +150,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "Would write:"
   echo "  $TARGET/.claude/skills/repo/SKILL.md"
   echo "  $TARGET/.claude/skills/repo/install-metadata.json"
+  echo "  $TARGET/.claude/skills/repo/.install-local.json (machine-local, gitignored)"
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
   done <<<"$COMMANDS"
@@ -159,6 +160,7 @@ if [[ "$DRY_RUN" == true ]]; then
     || git -C "$TARGET" check-ignore -q .claude/skills/repo 2>/dev/null; then
     echo "  $TARGET/CLAUDE.md (skipped — install destination is gitignored)"
   else
+    echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry)"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
   fi
   exit 0
@@ -195,17 +197,48 @@ done <<<"$COMMANDS"
 success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude/commands/repo/"
 
 # 3. Install metadata
+# Tracked file: only fields that are identical for any machine installing the
+# same version/commit/skill-set, so repeat installs of a release are byte-
+# reproducible and no machine-local path/timestamp leaks into consumer history.
 {
   echo "{"
   echo "  \"version\": \"$VERSION\","
   echo "  \"commit\": \"$COMMIT\","
-  echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
   echo "  \"dev\": $DEV,"
-  echo "  \"source\": \"$SOURCE_ROOT\","
   echo "  \"commands\": [$(echo "$COMMANDS" | sed 's/.*/"&"/' | paste -sd, -)]"
   echo "}"
 } >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
+
+# Machine-local sidecar (gitignored): the absolute source-clone path and the
+# run-specific install timestamp. These are meaningless in any other clone and
+# must never be committed. /repo:update-tools reads `source` from here to prefer
+# the local source clone; this mirrors the existing .loom/loom-source-path
+# precedent for the identical Loom-self-install problem.
+{
+  echo "{"
+  echo "  \"source\": \"$SOURCE_ROOT\","
+  echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+  echo "}"
+} >"$TARGET/.claude/skills/repo/.install-local.json"
+success "Wrote .install-local.json (machine-local, gitignored)"
+
+# Ensure the sidecar is gitignored on every install. Dev mode ignores the whole
+# .claude/ tree in step 4 below (which already covers the sidecar), so only the
+# copy install needs an explicit entry here. Guard with check-ignore so we skip
+# when the path is already ignored (e.g. destination-gitignored installs), and
+# grep so a re-install never appends a duplicate line.
+if [[ "$DEV" != true ]] \
+  && ! git -C "$TARGET" check-ignore -q .claude/skills/repo/.install-local.json 2>/dev/null; then
+  GITIGNORE="$TARGET/.gitignore"
+  SIDECAR_IGNORE=".claude/skills/repo/.install-local.json"
+  if [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$SIDECAR_IGNORE" "$GITIGNORE"; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
+      echo "# Repo Skills machine-local install metadata (absolute source path + timestamp)"
+      echo "$SIDECAR_IGNORE"; } >>"$GITIGNORE"
+    success "Added $SIDECAR_IGNORE to .gitignore"
+  fi
+fi
 
 # 4. CLAUDE.md block (replace existing block in place, else append).
 # Skipped in dev mode: the symlinked install is machine-local (absolute symlinks
