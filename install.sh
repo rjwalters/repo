@@ -151,6 +151,8 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/SKILL.md"
   echo "  $TARGET/.claude/skills/repo/install-metadata.json"
   echo "  $TARGET/.claude/skills/repo/.install-local.json (machine-local, gitignored)"
+  echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
+  echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
   done <<<"$COMMANDS"
@@ -181,6 +183,69 @@ install_file() {  # <source-abs> <dest-abs> <label>
   else
     render <"$1" >"$2"
     assert_no_placeholders "$2" "$3"
+  fi
+}
+
+# The PreToolUse guard hook's installed command, as Claude Code resolves it
+# (${CLAUDE_PROJECT_DIR} expands to the consumer repo root at hook time).
+HOOK_INSTALL_REL=".claude/skills/repo/hooks/guard-destructive.sh"
+HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${HOOK_INSTALL_REL}"
+SETTINGS_JSON="$TARGET/.claude/settings.json"
+
+# Idempotently wire the guard-destructive.sh PreToolUse/Bash hook into the
+# target's .claude/settings.json WITHOUT clobbering anything else in the file.
+# Unlike Loom (which owns and wholesale-copies its settings.json), Repo Skills
+# must assume the consumer may already have their own hooks/permissions — so we
+# JSON-merge with jq via a temp-file-and-mv write (never redirect jq straight
+# onto the file: a mid-read jq failure would truncate it).
+merge_settings_hook() {
+  local settings="$SETTINGS_JSON" cmd="$HOOK_CMD" tmp
+  [[ -f "$settings" ]] || echo '{}' >"$settings"
+
+  # Refuse to touch a malformed file rather than risk corrupting it.
+  if ! jq -e . "$settings" >/dev/null 2>&1; then
+    warning "Skipping hook wiring: $settings is not valid JSON (wire it by hand)"
+    return
+  fi
+
+  # Idempotent re-install: our exact command is already present.
+  if jq -e --arg c "$cmd" '
+        (.hooks.PreToolUse // []) | any(.[]?;
+          (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c)))
+      ' "$settings" >/dev/null 2>&1; then
+    info "PreToolUse guard already wired in .claude/settings.json (no change)"
+    return
+  fi
+
+  # Coexistence: another guard-destructive.sh (e.g. Loom's .loom/hooks copy) is
+  # already wired under a Bash matcher. Defer to it rather than double-guard —
+  # two guards would both fire on every command and risk a double-prompt.
+  if jq -e '
+        (.hooks.PreToolUse // []) | any(.[]?;
+          (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
+            (.command // "") | test("guard-destructive\\.sh"))))
+      ' "$settings" >/dev/null 2>&1; then
+    info "A destructive-command guard is already wired in .claude/settings.json — deferring to it (not adding a duplicate)"
+    return
+  fi
+
+  tmp="$(mktemp)"
+  if jq --arg c "$cmd" '
+        .hooks //= {} |
+        .hooks.PreToolUse //= [] |
+        if (.hooks.PreToolUse | any(.[]?; .matcher == "Bash"))
+        then .hooks.PreToolUse |= map(
+          if .matcher == "Bash"
+          then .hooks = ((.hooks // []) + [{type: "command", command: $c}])
+          else . end)
+        else .hooks.PreToolUse += [{matcher: "Bash", hooks: [{type: "command", command: $c}]}]
+        end
+      ' "$settings" >"$tmp"; then
+    mv "$tmp" "$settings"
+    success "Wired PreToolUse guard into .claude/settings.json"
+  else
+    rm -f "$tmp"
+    warning "Failed to update $settings — left unchanged"
   fi
 }
 
@@ -239,6 +304,19 @@ if [[ "$DEV" != true ]] \
     success "Added $SIDECAR_IGNORE to .gitignore"
   fi
 fi
+
+# 3b. Destructive-command guard hook + settings.json wiring.
+# Colocated under the skill's own directory so uninstall's `rm -rf
+# .claude/skills/repo` removes the script for free; only the settings.json entry
+# needs explicit removal. render+copy drops the exec bit (the hook has no
+# template placeholders, so assert_no_placeholders passes), so re-set it; in dev
+# mode install_file symlinks and the chmod is a harmless no-op on the source.
+mkdir -p "$TARGET/.claude/skills/repo/hooks"
+install_file "$SOURCE_ROOT/hooks/repo/guard-destructive.sh" \
+  "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" "hooks/repo/guard-destructive.sh"
+chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
+success "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+merge_settings_hook
 
 # 4. CLAUDE.md block (replace existing block in place, else append).
 # Skipped in dev mode: the symlinked install is machine-local (absolute symlinks
