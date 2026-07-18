@@ -2,6 +2,17 @@
 
 # Repo Skills dev-mode symlinks (machine-local, do not commit)
 .claude/
+
+# repo:remote per-repo config (may hold overrides; never commit)
+.env
+
+# Guard hook diagnostic logs (runtime artifact, never committed)
+hooks/logs/
+
+# Loom install metadata holds a machine-local source path + timestamp
+.loom/install-metadata.json
+# >>> loom-managed (do not edit) >>>
+# Loom runtime state (don't commit these)
 .loom-in-use
 .loom-checkpoint
 .loom/.daemon.pid
@@ -13,6 +24,8 @@
 .loom/spawn-loop-state.json
 .loom/issue-failures.json
 .loom/interventions/
+.loom/worktrees/
+.loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
 .loom/claims/
@@ -27,14 +40,7 @@
 .loom/metrics/
 .loom/usage-cache.json
 .loom/claude-config/
-.loom/logs/
-.loom/worktrees/
-.loom/state.json
 .loom/*.log
 .loom/*.sock
-
-# repo:remote per-repo config (may hold overrides; never commit)
-.env
-
-# Guard hook diagnostic logs (runtime artifact, never committed)
-hooks/logs/
+.loom/logs/
+# <<< loom-managed <<<
