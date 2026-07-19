@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **`repo:tidy`: regenerable caches are no longer auto-deleted by default.**
+  Compilation/tool/build output (`__pycache__/`, `*.pyc`, `.pytest_cache/`,
+  `.mypy_cache/`, `.ruff_cache/`, `dist/`, `.turbo/`, `.astro/`, coverage) moves
+  out of the auto-deleted SAFE tier into a new **CACHE** tier that is kept by
+  default and cleared only with the new `--caches` flag — deleting a cache is
+  safe but forces a costly rebuild, so it is opt-in. The default `tidy` now
+  auto-deletes pure junk only (OS/editor droppings, merge/patch leftovers, empty
+  dirs). `node_modules/` joins the virtualenv denylist (always ASK, never a
+  `--caches` target). `repo:all` keeps caches by default in its Tidy stage and
+  forwards `--caches` when the operator passes it.
+
 ## 0.4.2 (2026-07-19)
 
 - **Add a destructive-command PreToolUse guard hook (#19).** Installing Repo
