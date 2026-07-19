@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Add a destructive-command PreToolUse guard hook (#19).** Installing Repo
+  Skills now wires `guard-destructive.sh` into the target repo's
+  `.claude/settings.json` (merged in, never wholesale-copied). It runs before
+  every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /`
+  or `$HOME`, force-push to `main`, fork bombs, `curl … | sh`, `gh repo delete`,
+  cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`) and
+  **asks** on reversible-but-risky ones (`git reset --hard`, `kubectl delete`,
+  `docker rm`, credential reads); scoped deletes like `rm -rf node_modules` are
+  allowed. The SQL and cloud-CLI categories are opt-out per repo
+  (`REPO_GUARD_SQL` / `REPO_GUARD_CLOUD`). If the target already has a compatible
+  guard wired (e.g. Loom's), the installer defers instead of adding a duplicate;
+  `uninstall.sh` removes only the entry it owns.
+- **Add `repo:followups` — capture session follow-on work as issues (#20).**
+  Files follow-on work discovered during a session as GitHub issues, either here
+  or in upstream tool repos, always confirmed first.
+- **`repo:remote`: load shared cloud credentials from `~/.config/repo/remote.env`
+  (#10).** Provisioning credentials resolve from a shared user-level env file,
+  layered under the per-repo `.env`.
+- **`repo:remote`: dogfood dev environment (#11).** The cloud session comes up
+  with Claude Code, a multi-account token pool, and `gh` label auth ready to use.
+- **Fix: keep machine-local install state out of tracked metadata (#17).** The
+  install's source path and timestamp move from the tracked
+  `install-metadata.json` into a gitignored `.install-local.json` sidecar, so a
+  committed install no longer carries another machine's local path.
+
 ## 0.4.1 (2026-07-16)
 
 - **Fix `install.sh` (non-dev): skip the tracked `CLAUDE.md` pointer when the
