@@ -59,6 +59,7 @@ stashes, untracked files) always need an explicit opt-in.
 | /repo:reset | Done with a task — get back on main, synced, stale state reviewed |
 | /repo:tidy  | Working tree cluttered with build artifacts and temp files |
 | /repo:remote | Need a cloud dev box (GCP/AWS) with this repo ready to go |
+| /repo:release | Cut a release — pre-flight, semver, CHANGELOG, version bump, tag, GitHub Release |
 
 ### Periodic maintenance
 | /repo:audit | Monthly sweep, or after a big refactor/import |
