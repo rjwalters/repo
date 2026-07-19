@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 (2026-07-19)
 
 - **Add a destructive-command PreToolUse guard hook (#19).** Installing Repo
   Skills now wires `guard-destructive.sh` into the target repo's
