@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 (2026-07-19)
 
 - **`repo:tidy`: regenerable caches are no longer auto-deleted by default.**
   Compilation/tool/build output (`__pycache__/`, `*.pyc`, `.pytest_cache/`,
