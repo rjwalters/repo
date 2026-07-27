@@ -54,6 +54,38 @@ COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unkno
 MARKER_BEGIN='<!-- BEGIN REPO-SKILLS -->'
 MARKER_END='<!-- END REPO-SKILLS -->'
 
+claude_md_has_block() { [[ -f "$TARGET/CLAUDE.md" ]] && grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md"; }
+
+# A pointer block committed by an earlier install goes permanently stale once
+# the destination becomes gitignored (or dev-symlinked): every later install
+# skips CLAUDE.md, yet the committed block still names a version and claims to
+# be managed. That stale version reads as authoritative — worse than no block —
+# so on the skip paths we offer to remove the orphan rather than leave it.
+reconcile_orphaned_block() {
+  claude_md_has_block || return 0
+  warning "CLAUDE.md contains a REPO-SKILLS block from an earlier install. In this"
+  warning "configuration it will never be updated again, so its version claim is stale"
+  warning "(or will silently go stale) while still reading as authoritative."
+  if [[ "$YES" != true && ! -t 0 ]]; then
+    warning "No TTY to confirm removal — leaving the stale block in place. Re-run with"
+    warning "--yes to remove it, or delete the marker-bounded block from CLAUDE.md manually."
+    return 0
+  fi
+  if confirm "Remove the orphaned REPO-SKILLS block from CLAUDE.md? [Y/n] " Y; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
+      $0 == begin { skip = 1; next }
+      $0 == end   { skip = 0; next }
+      !skip       { print }
+    ' "$TARGET/CLAUDE.md" >"$tmp"
+    mv "$tmp" "$TARGET/CLAUDE.md"
+    success "Removed orphaned REPO-SKILLS block from CLAUDE.md"
+  else
+    warning "Keeping the stale block. install.sh no longer manages it; update or remove it by hand."
+  fi
+}
+
 # Template variables substituted into installed files at install time (the Loom
 # pattern). Command/SKILL authors may use these; the installer renders them on
 # copy and fails fast if a known placeholder survives into an installed file.
@@ -168,9 +200,16 @@ if [[ "$DRY_RUN" == true ]]; then
   done <<<"$COMMANDS"
   if [[ "$DEV" == true ]]; then
     echo "  $TARGET/.gitignore (.claude/ entry; CLAUDE.md skipped in dev mode)"
+    if claude_md_has_block; then
+      echo "  $TARGET/CLAUDE.md (existing REPO-SKILLS block is orphaned/stale — would offer removal)"
+    fi
   elif git -C "$TARGET" check-ignore -q .claude/commands/repo 2>/dev/null \
     || git -C "$TARGET" check-ignore -q .claude/skills/repo 2>/dev/null; then
-    echo "  $TARGET/CLAUDE.md (skipped — install destination is gitignored)"
+    if claude_md_has_block; then
+      echo "  $TARGET/CLAUDE.md (pointer skipped — destination gitignored; existing REPO-SKILLS block is orphaned/stale — would offer removal)"
+    else
+      echo "  $TARGET/CLAUDE.md (skipped — install destination is gitignored)"
+    fi
   else
     echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry)"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
@@ -335,6 +374,7 @@ if [[ "$DEV" == true ]]; then
     { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""; echo "# Repo Skills dev-mode symlinks (machine-local, do not commit)"; echo ".claude/"; } >>"$GITIGNORE"
     success "Added .claude/ to .gitignore"
   fi
+  reconcile_orphaned_block
   echo ""
   success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code."
   exit 0
@@ -358,6 +398,7 @@ if dest_is_gitignored; then
   warning "Install destination (.claude/commands, .claude/skills) is gitignored in $TARGET;"
   warning "skipping the CLAUDE.md pointer block (a committed pointer to uncommitted command"
   warning "files is not what you want). The /repo:* commands still work in-session."
+  reconcile_orphaned_block
   echo ""
   success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code."
   exit 0
