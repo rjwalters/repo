@@ -11,6 +11,12 @@ hooks/logs/
 
 # Loom install metadata holds a machine-local source path + timestamp
 .loom/install-metadata.json
+
+# Loom runtime state the loom-managed block below misses (upstream: rjwalters/loom).
+# Kept outside that block deliberately — it is regenerated on every Loom update,
+# so entries added inside it would be lost. Remove these once upstream covers them.
+.loom/sweep-checkpoint/
+.loom/locks/
 # >>> loom-managed (do not edit) >>>
 # Loom runtime state (don't commit these)
 .loom-in-use

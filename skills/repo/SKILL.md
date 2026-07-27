@@ -26,6 +26,7 @@ costs.
 | [[all]] | The whole hygiene pass in order — audit, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
 | [[audit]] | Full sweep — runs all hygiene checks, produces a summary report |
 | [[reset]] | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to the default branch |
+| [[handoff]] | Roll the session safely — file follow-ups, reset, check for a CLI update, write a handoff note the next session reads first |
 | [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |
 | [[release]] | Cut a release — pre-flight, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH |
@@ -132,3 +133,28 @@ or malformed config keeps the guard on; the opt-in toggles are the inverse.
 The full stable interface (input/output contract, exit semantics, every env
 name) is documented in the hook's own header — downstream tools (e.g. Loom's
 installer) gate on it via this repo's release version.
+
+## Handoff-note hook (SessionStart)
+
+The installer wires a second hook, `session-start-handoff.sh`, as two
+`SessionStart` entries — one matching `startup`, one matching `resume`. When
+[[handoff]] has left a note at `.claude/handoff.md`, the hook emits it as
+session context via `hookSpecificOutput.additionalContext`: the note's path,
+its age, an outline built from its `#`/`##` headers, and a staleness warning
+once the note passes seven days. It renders headers only, never the full body —
+a real handoff note runs to several KB, far too much to inject on every launch.
+
+Behavioral contract:
+
+- **Read-only.** It never writes, deletes, or modifies the note. Absorbing the
+  note and deleting it is [[handoff]]'s own one-shot contract.
+- **Silent when there is nothing to say.** No note, or an unreadable one, means
+  no output and exit 0.
+- **Fails open.** Malformed stdin, a missing `cwd`, or any internal error exits
+  0 with no output. A hook fault must never block session start.
+- **Skips `/clear`.** `clear` is not a process relaunch, so re-emitting the
+  banner there would be noise.
+
+There are no configuration toggles — the hook's behavior is fixed. To disable
+it, remove its `SessionStart` entries from `.claude/settings.json` (or run
+`uninstall.sh`, which removes only the entries it owns).

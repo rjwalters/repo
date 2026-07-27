@@ -35,6 +35,12 @@ Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructi
 
 Every category is configurable per repo (`REPO_GUARD_*`/`REPO_*` env vars or `guards.*` config keys, with legacy `LOOM_*` names honored). See [`skills/repo/SKILL.md`](skills/repo/SKILL.md#destructive-command-guard-pretooluse-hook) for the toggle table and resolution order. If the target already has a compatible guard wired (e.g. a pre-consolidation Loom install), the installer defers to it rather than adding a duplicate.
 
+## Handoff notes at session start
+
+Installing Repo Skills also wires a **SessionStart hook** (`session-start-handoff.sh`). When `/repo:handoff` has left a note at `.claude/handoff.md`, the hook surfaces it as session context on startup and resume — path, age, a section outline, and a staleness warning once the note passes seven days — so a rolled session opens already knowing what the last one left behind.
+
+It is strictly read-only: it never writes or deletes the note (absorbing it and removing it is `/repo:handoff`'s own one-shot contract), it stays silent when no note exists, and it fails open, so a hook error can never block session start. It deliberately does not fire on `/clear`, which is not a process relaunch.
+
 ## Installation
 
 The installer copies the skill files into a target repository's `.claude/` directory, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
@@ -67,8 +73,10 @@ The installer is designed to coexist with whatever already lives in the consumer
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
 - `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall)
+- `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
+- `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
 - `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
@@ -79,8 +87,10 @@ Nothing else in the target repository is read or modified.
 skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
 commands/repo/*.md           Command files installed to .claude/commands/repo/
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
-hooks/repo/tests/run.sh      Quick smoke suite for the guard hook (bash, no framework needed)
+hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
+hooks/repo/tests/run.sh      Smoke suite covering both hooks (bash, no framework needed)
 hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
+hooks/repo/tests/test-session-start-handoff.sh  Handoff-hook suite (run.sh delegates to it)
 hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regression suite
 install.sh                   Installer
 uninstall.sh                 Uninstaller
