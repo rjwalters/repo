@@ -11,8 +11,9 @@
 # file, each in its own block that folds the suite's verdict into this runner's
 # PASS/FAIL totals and records a line in the per-suite breakdown. To add another
 # suite, copy one of those blocks; nothing else needs to change. Currently
-# delegated: test-guard-destructive.sh (the full guard regression suite) and
-# test-session-start-handoff.sh.
+# delegated: test-guard-destructive.sh (the full guard regression suite),
+# test-session-start-handoff.sh, test-install-claude-md-markers.sh, and
+# commands/repo/tests/test-branches-loss-check.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -283,6 +284,45 @@ else
     FAIL=$((FAIL + 1))
     printf '  FAIL %-52s -> suite failed; output follows\n' "test-install-claude-md-markers.sh"
     printf '%s\n' "$MD_OUT" | sed 's/^/    /'
+fi
+
+# The command files under commands/repo/ are prose, not scripts, so they have no
+# harness of their own. The permanent-loss check in branches.md is the exception:
+# it is a self-contained set of git invocations that can be run against fixtures.
+# It lives outside hooks/repo/tests/, but `pnpm test` stays the one entry point,
+# so delegate to it here and fold its real PASS/FAIL counts into the totals the
+# same way the guard regression suite above does (repo#36).
+echo
+echo "-- branches.md permanent-loss check (delegated suite) --"
+BL_TEST="$TESTS_DIR/../../../commands/repo/tests/test-branches-loss-check.sh"
+if [[ ! -f "$BL_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-branches-loss-check.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-branches-loss-check.sh" "$BL_TEST"
+else
+    BL_OUT="$(bash "$BL_TEST" 2>&1)"
+    BL_STATUS=$?
+    BL_PASS="$(suite_count Passed "$BL_OUT")"
+    BL_FAIL="$(suite_count Failed "$BL_OUT")"
+    if ! [[ "$BL_PASS" =~ ^[0-9]+$ && "$BL_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        BL_PASS=0
+        BL_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-branches-loss-check.sh" "$BL_STATUS"
+        strip_ansi "$BL_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$BL_STATUS" -ne 0 || "$BL_FAIL" -ne 0 ]]; then
+        [[ "$BL_FAIL" -eq 0 ]] && BL_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-branches-loss-check.sh" "$BL_PASS" "$BL_FAIL" "$BL_STATUS"
+        strip_ansi "$BL_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-branches-loss-check.sh" "$BL_PASS"
+    fi
+    PASS=$((PASS + BL_PASS))
+    FAIL=$((FAIL + BL_FAIL))
+    record_suite "test-branches-loss-check.sh" "$BL_PASS" "$BL_FAIL" "branches.md loss check"
 fi
 
 echo
