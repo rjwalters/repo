@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **`install.sh` fails loudly instead of silently when it can't prompt (#27).**
+  Without a TTY and without `--yes`, the confirmation prompts previously died on
+  a failed `read` with exit 1 and no output. Both prompts now go through a
+  `confirm()` helper: no TTY (or a closed stdin) produces a clear error telling
+  you to re-run with `--yes`, and `--yes` skips confirmation as before.
+
 ## 0.4.3 (2026-07-19)
 
 - **`repo:tidy`: regenerable caches are no longer auto-deleted by default.**

@@ -34,6 +34,19 @@ info()    { echo -e "${BLUE}ℹ $*${NC}"; }
 success() { echo -e "${GREEN}✓ $*${NC}"; }
 warning() { echo -e "${YELLOW}⚠ $*${NC}"; }
 
+confirm() {  # <prompt> <default: Y|N> — returns 0 to proceed; honors --yes, never fails silently
+  local prompt="$1" default="$2" reply
+  [[ "$YES" == true ]] && return 0
+  [[ -t 0 ]] || error "Interactive confirmation unavailable (no TTY). Re-run with --yes (-y) to proceed non-interactively."
+  read -r -p "$prompt" reply \
+    || error "Confirmation prompt failed (stdin closed). Re-run with --yes (-y) to proceed non-interactively."
+  if [[ "$default" == Y ]]; then
+    [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+  else
+    [[ "$reply" =~ ^[Yy] ]]
+  fi
+}
+
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SOURCE_ROOT/VERSION" 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -105,10 +118,7 @@ fi
 
 if [[ ! -d "$TARGET/.git" ]] && ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
   warning "$TARGET is not a git repository"
-  if [[ "$YES" != true ]]; then
-    read -r -p "Install anyway? [y/N] " reply
-    [[ "$reply" =~ ^[Yy] ]] || { info "Installation cancelled"; exit 0; }
-  fi
+  confirm "Install anyway? [y/N] " N || { info "Installation cancelled"; exit 0; }
 fi
 
 # Derive the consumer repo's identity for template substitution (best-effort:
@@ -168,10 +178,7 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
-if [[ "$YES" != true ]]; then
-  read -r -p "Proceed? [Y/n] " reply
-  [[ -z "$reply" || "$reply" =~ ^[Yy] ]] || { info "Installation cancelled"; exit 0; }
-fi
+confirm "Proceed? [Y/n] " Y || { info "Installation cancelled"; exit 0; }
 
 # In dev mode we symlink source files (edits are live, no re-install needed);
 # otherwise we render template variables and copy. We symlink per-file rather
