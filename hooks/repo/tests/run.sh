@@ -182,6 +182,26 @@ else
     printf '%s\n' "$SS_OUT" | sed 's/^/    /'
 fi
 
+# install.sh / uninstall.sh CLAUDE.md marker-block surgery (repo#38). Same
+# delegation shape as the handoff suite above: it drives the installers against
+# scratch git repos rather than piping hook payloads, so it shares nothing with
+# expect() and folds in as a single case.
+echo
+echo "-- install/uninstall CLAUDE.md markers (delegated suite) --"
+MD_TEST="$TESTS_DIR/test-install-claude-md-markers.sh"
+if [[ ! -f "$MD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    printf '  FAIL %-52s -> not found at %s\n' "test-install-claude-md-markers.sh" "$MD_TEST"
+elif MD_OUT="$(bash "$MD_TEST" 2>&1)"; then
+    PASS=$((PASS + 1))
+    printf '  ok   %-52s -> %s\n' "test-install-claude-md-markers.sh" \
+        "$(printf '%s\n' "$MD_OUT" | awk '/^  Total:/ {print $2 " cases pass"}')"
+else
+    FAIL=$((FAIL + 1))
+    printf '  FAIL %-52s -> suite failed; output follows\n' "test-install-claude-md-markers.sh"
+    printf '%s\n' "$MD_OUT" | sed 's/^/    /'
+fi
+
 echo
 echo "==============================="
 echo "PASS: $PASS   FAIL: $FAIL"

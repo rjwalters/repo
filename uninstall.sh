@@ -8,14 +8,23 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 error()   { echo -e "${RED}✗ Error: $*${NC}" >&2; exit 1; }
 info()    { echo -e "${BLUE}ℹ $*${NC}"; }
 success() { echo -e "${GREEN}✓ $*${NC}"; }
+warning() { echo -e "${YELLOW}⚠ $*${NC}"; }
+
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MARKER_BEGIN='<!-- BEGIN REPO-SKILLS -->'
 MARKER_END='<!-- END REPO-SKILLS -->'
+
+# Marker-string-anchored CLAUDE.md surgery, shared with install.sh. Never
+# rewrite the block by hand here — see lib/claude-md-block.sh (repo#38).
+# shellcheck source=lib/claude-md-block.sh
+source "$SOURCE_ROOT/lib/claude-md-block.sh"
 
 # The PreToolUse guard command install.sh wires into .claude/settings.json. The
 # hook *script* lives under .claude/skills/repo/hooks/ and is removed with the
@@ -134,14 +143,15 @@ fi
 rmdir "$TARGET/.claude/skills" "$TARGET/.claude/commands" "$TARGET/.claude" 2>/dev/null || true
 
 if [[ -f "$TARGET/CLAUDE.md" ]] && grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md"; then
-  TMP="$(mktemp)"
-  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
-    $0 == begin { skip = 1; next }
-    $0 == end   { skip = 0; next }
-    !skip       { print }
-  ' "$TARGET/CLAUDE.md" >"$TMP"
-  mv "$TMP" "$TARGET/CLAUDE.md"
-  success "Removed REPO-SKILLS block from CLAUDE.md"
+  if claude_md_block_rewrite "$TARGET/CLAUDE.md" "$MARKER_BEGIN" "$MARKER_END"; then
+    info "Backed up CLAUDE.md to $CLAUDE_MD_BLOCK_BACKUP before rewriting"
+    success "Removed REPO-SKILLS block from CLAUDE.md"
+  else
+    warning "Refusing to rewrite $TARGET/CLAUDE.md: $CLAUDE_MD_BLOCK_ERROR"
+    warning "The marker layout cannot be resolved unambiguously, and guessing risks"
+    warning "deleting content this uninstaller does not own. CLAUDE.md is untouched —"
+    warning "remove the REPO-SKILLS block by hand."
+  fi
 fi
 
 success "Repo Skills uninstalled"
