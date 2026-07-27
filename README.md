@@ -81,8 +81,10 @@ commands/repo/*.md           Command files installed to .claude/commands/repo/
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/tests/run.sh      Quick smoke suite for the guard hook (bash, no framework needed)
 hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
+hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regression suite
 install.sh                   Installer
 uninstall.sh                 Uninstaller
+lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
 ```
 
 ## Adding a skill

@@ -54,6 +54,11 @@ COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unkno
 MARKER_BEGIN='<!-- BEGIN REPO-SKILLS -->'
 MARKER_END='<!-- END REPO-SKILLS -->'
 
+# Marker-string-anchored CLAUDE.md surgery, shared with uninstall.sh. Never
+# rewrite the block by hand here — see lib/claude-md-block.sh (repo#38).
+# shellcheck source=lib/claude-md-block.sh
+source "$SOURCE_ROOT/lib/claude-md-block.sh"
+
 claude_md_has_block() { [[ -f "$TARGET/CLAUDE.md" ]] && grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md"; }
 
 # A pointer block committed by an earlier install goes permanently stale once
@@ -72,15 +77,15 @@ reconcile_orphaned_block() {
     return 0
   fi
   if confirm "Remove the orphaned REPO-SKILLS block from CLAUDE.md? [Y/n] " Y; then
-    local tmp
-    tmp="$(mktemp)"
-    awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
-      $0 == begin { skip = 1; next }
-      $0 == end   { skip = 0; next }
-      !skip       { print }
-    ' "$TARGET/CLAUDE.md" >"$tmp"
-    mv "$tmp" "$TARGET/CLAUDE.md"
-    success "Removed orphaned REPO-SKILLS block from CLAUDE.md"
+    if claude_md_block_rewrite "$TARGET/CLAUDE.md" "$MARKER_BEGIN" "$MARKER_END"; then
+      info "Backed up CLAUDE.md to $CLAUDE_MD_BLOCK_BACKUP before rewriting"
+      success "Removed orphaned REPO-SKILLS block from CLAUDE.md"
+    else
+      warning "Refusing to rewrite $TARGET/CLAUDE.md: $CLAUDE_MD_BLOCK_ERROR"
+      warning "The marker layout cannot be resolved unambiguously, and guessing risks"
+      warning "deleting content this installer does not own. CLAUDE.md is untouched."
+      error "Could not safely remove the orphaned REPO-SKILLS block; fix the markers in $TARGET/CLAUDE.md by hand (skills and commands were installed)."
+    fi
   else
     warning "Keeping the stale block. install.sh no longer manages it; update or remove it by hand."
   fi
@@ -508,14 +513,16 @@ BLOCK_FILE="$(mktemp)"
 } >"$BLOCK_FILE"
 
 if [[ -f "$CLAUDE_MD" ]] && grep -qF "$MARKER_BEGIN" "$CLAUDE_MD"; then
-  TMP="$(mktemp)"
-  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" -v block="$BLOCK_FILE" '
-    $0 == begin { skip = 1; while ((getline line < block) > 0) print line; close(block); next }
-    $0 == end   { skip = 0; next }
-    !skip       { print }
-  ' "$CLAUDE_MD" >"$TMP"
-  mv "$TMP" "$CLAUDE_MD"
-  success "Updated REPO-SKILLS block in CLAUDE.md"
+  if claude_md_block_rewrite "$CLAUDE_MD" "$MARKER_BEGIN" "$MARKER_END" "$BLOCK_FILE"; then
+    info "Backed up CLAUDE.md to $CLAUDE_MD_BLOCK_BACKUP before rewriting"
+    success "Updated REPO-SKILLS block in CLAUDE.md"
+  else
+    rm -f "$BLOCK_FILE"
+    warning "Refusing to update the REPO-SKILLS block in $CLAUDE_MD: $CLAUDE_MD_BLOCK_ERROR"
+    warning "The marker layout cannot be resolved unambiguously, and guessing risks"
+    warning "deleting content this installer does not own. CLAUDE.md is untouched."
+    error "Could not safely update the REPO-SKILLS block; fix the markers in $CLAUDE_MD by hand (skills and commands were installed)."
+  fi
 else
   { [[ -s "$CLAUDE_MD" ]] && echo ""; cat "$BLOCK_FILE"; } >>"$CLAUDE_MD"
   success "Appended REPO-SKILLS block to CLAUDE.md"
