@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-07-27)
 
 - **New command: `/repo:handoff` — roll the Claude session safely (#28).** A
   composed ritual for the hard session boundary (restart, CLI upgrade, fresh
@@ -20,6 +20,12 @@
   a failed `read` with exit 1 and no output. Both prompts now go through a
   `confirm()` helper: no TTY (or a closed stdin) produces a clear error telling
   you to re-run with `--yes`, and `--yes` skips confirmation as before.
+
+- **`repo:update-tools` lands confirmed updates on the default branch (#26).**
+  A confirmed tool bump is now committed per-tool
+  (`chore(tooling): update <tool> <old>→<new>`) and fast-forwarded onto the
+  default branch instead of being left staged; `--no-commit`/`--stage-only`
+  restores the old leave-it-for-review behavior. Never pushes.
 
 ## 0.4.3 (2026-07-19)
 
