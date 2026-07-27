@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.0 (2026-07-27)
+
+- **`guard-destructive.sh` is now the canonical generic destructive-command
+  guard (#30).** The full precision lineage developed in rjwalters/loom's copy
+  is ported here — quote-aware command segmentation, literal-text redaction of
+  `--body`/`-m`/`--title`/`--notes`/`--comment` values, comment stripping, the
+  structural read-only fast path, branch-aware force-op scoping
+  (`guards.forceScope`), repo-scoped `rm` protection (`guards.rmScope`, default
+  `repo`), the un-isolated `git read-tree` ask, verb-narrowed cloud asks,
+  opt-in reversible-GitHub asks (`guards.reversibleGh`), and the opt-in JSONL
+  decision-telemetry log (`guards.decisionLog`) — along with Loom's ~440-case
+  regression suite (`hooks/repo/tests/test-guard-destructive.sh`). Every
+  toggle resolves `REPO_*` env → legacy `LOOM_*` env →
+  `.claude/skills/repo/config.json` → legacy `.loom/config.json` → default;
+  the legacy Loom surfaces (env names, config path, `.loom/worktrees`
+  allowlist) are a permanent part of the guard's stable interface, which is
+  now documented in the hook header. **Downstream installers (Loom's
+  consolidation, rjwalters/loom#4041) should gate on repo-skills ≥ 0.6.0 when
+  deciding to skip their own generic guard.**
+- **Pipe-to-shell false positives fixed (#29).** The `curl … | sh` block now
+  fires only when the piped-to *command* is actually a shell (optionally
+  sudo-/path-prefixed `sh`/`bash`/`zsh`/`dash`/`ksh`/`csh`/`tcsh`/`fish`/
+  `pwsh`) — piping a download to `sudo tee /usr/share/…`, `shasum`, or any
+  path containing `sh` no longer denies, and quoting such a pipeline in an
+  issue body no longer blocks the `gh` command carrying it. Multi-stage
+  pipelines (`curl … | gunzip | sh`) and `bash -c` payloads still deny.
+- **Behavior changes vs the 0.5.0 guard**, inherited from Loom's precision
+  work: outside-repo `rm -rf` targets are now denied by default (opt out with
+  `guards.rmScope:"off"`); `gh pr close` / `gh issue close` / `gh label
+  delete` no longer ask by default (trivially reversible; opt back in with
+  `guards.reversibleGh:true`); read-only cloud calls (`aws … describe*`,
+  `aws s3 ls`) no longer prompt; `aws ec2 terminate-instances` is a
+  toggle-gated ask instead of a hard deny. The Repo Skills refinement gating
+  `az`/`gcloud … delete` denies behind `guards.cloudCli` is preserved.
+
 ## 0.5.0 (2026-07-27)
 
 - **New command: `/repo:handoff` — roll the Claude session safely (#28).** A
