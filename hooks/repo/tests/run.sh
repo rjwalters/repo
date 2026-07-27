@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Test harness for guard-destructive.sh.
+# Test harness for the Repo Skills hooks — the entry point `pnpm test` runs.
 #
 # Pure bash — no external test framework required (Repo Skills ships no test
-# runner, and bats is not assumed to be installed). Each case pipes a Claude
-# Code PreToolUse JSON payload ({"tool_input":{"command":...},"cwd":...}) to the
-# hook and asserts the resulting permissionDecision (deny / ask / allow).
+# runner, and bats is not assumed to be installed). Each guard case pipes a
+# Claude Code PreToolUse JSON payload ({"tool_input":{"command":...},"cwd":...})
+# to guard-destructive.sh and asserts the resulting permissionDecision
+# (deny / ask / allow). The SessionStart handoff hook's suite is delegated to at
+# the end of this file (see test-session-start-handoff.sh).
 #
 # Usage: ./hooks/repo/tests/run.sh
 # Exit status: 0 if all cases pass, 1 otherwise.
@@ -159,6 +161,26 @@ rm -rf "$CFG_REPO" "$LOOM_REPO"
 echo "-- edge: cwd absent / non-git --"
 expect deny  "rm -rf / with empty cwd"         "" "rm -rf /"
 expect allow "ls with nonexistent cwd"         "/nonexistent/path/xyz" "ls"
+
+# The SessionStart handoff hook ships its own suite rather than inline cases:
+# its payload shape, assertions, and install/uninstall wiring checks share
+# nothing with the guard's expect() helper above. Delegate to it and fold the
+# verdict in as a single case so `pnpm test` covers both hooks.
+echo
+echo "-- session-start-handoff.sh (delegated suite) --"
+SS_TEST="$TESTS_DIR/test-session-start-handoff.sh"
+if [[ ! -f "$SS_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    printf '  FAIL %-52s -> not found at %s\n' "test-session-start-handoff.sh" "$SS_TEST"
+elif SS_OUT="$(bash "$SS_TEST" 2>&1)"; then
+    PASS=$((PASS + 1))
+    printf '  ok   %-52s -> %s\n' "test-session-start-handoff.sh" \
+        "$(printf '%s\n' "$SS_OUT" | awk '/^  Total:/ {print $2 " cases pass"}')"
+else
+    FAIL=$((FAIL + 1))
+    printf '  FAIL %-52s -> suite failed; output follows\n' "test-session-start-handoff.sh"
+    printf '%s\n' "$SS_OUT" | sed 's/^/    /'
+fi
 
 echo
 echo "==============================="
