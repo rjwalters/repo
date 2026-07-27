@@ -5,8 +5,17 @@
 # runner, and bats is not assumed to be installed). Each guard case pipes a
 # Claude Code PreToolUse JSON payload ({"tool_input":{"command":...},"cwd":...})
 # to guard-destructive.sh and asserts the resulting permissionDecision
-# (deny / ask / allow). The SessionStart handoff hook's suite is delegated to at
-# the end of this file (see test-session-start-handoff.sh).
+# (deny / ask / allow).
+#
+# Sibling suites are NOT inlined here — they are delegated to at the end of this
+# file, each in its own block that folds the suite's verdict into this runner's
+# PASS/FAIL totals and records a line in the per-suite breakdown. To add another
+# suite, copy one of those blocks; nothing else needs to change. Currently
+# delegated: test-guard-destructive.sh (the full guard regression suite) and
+# test-session-start-handoff.sh.
+#
+# `pnpm test` is this repo's only automated gate — there is no CI — so it must
+# run every case, not a smoke subset (repo#36).
 #
 # Usage: ./hooks/repo/tests/run.sh
 # Exit status: 0 if all cases pass, 1 otherwise.
@@ -68,6 +77,32 @@ expect() {
         FAIL=$((FAIL + 1))
         printf '  FAIL %-52s -> got %s, want %s\n' "$label" "$actual" "$expected"
     fi
+}
+
+# --- delegated-suite plumbing ----------------------------------------------
+# Shared by every delegated block at the end of this file. Delegated suites all
+# print the same trailing summary shape:
+#
+#     =========================================
+#       Total:  444
+#       Passed: 444
+#       Failed: 0
+#     =========================================
+#
+# strip_ansi <text> -> same text with ANSI colour escapes removed.
+strip_ansi() { printf '%s\n' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
+
+# suite_count <Total|Passed|Failed> <suite-output> -> the N from that summary
+# line, or empty string if the suite did not print one.
+suite_count() { strip_ansi "$2" | awk -v f="$1:" '$1 == f { print $2; exit }'; }
+
+# Per-suite breakdown lines, printed above the final aggregate totals so the
+# result is never one opaque number.
+# record_suite <label> <pass> <fail> [note]
+SUITE_LINES=()
+record_suite() {
+    SUITE_LINES+=("$(printf '  %-38s %4s pass  %4s fail%s' \
+        "$1" "$2" "$3" "${4:+  ($4)}")")
 }
 
 echo "guard-destructive.sh test suite"
@@ -162,6 +197,47 @@ echo "-- edge: cwd absent / non-git --"
 expect deny  "rm -rf / with empty cwd"         "" "rm -rf /"
 expect allow "ls with nonexistent cwd"         "/nonexistent/path/xyz" "ls"
 
+# Everything above is this runner's own inline smoke coverage; everything below
+# is delegated. Snapshot the split so the breakdown can attribute cases.
+record_suite "run.sh inline smoke cases" "$PASS" "$FAIL"
+
+# The full guard-destructive regression suite ships as its own file so it stays
+# runnable standalone (./hooks/repo/tests/test-guard-destructive.sh). Delegate
+# to it and fold its real PASS/FAIL counts — not a single collapsed case — into
+# this runner's totals, so `pnpm test` genuinely covers all of it (repo#36).
+echo
+echo "-- test-guard-destructive.sh (delegated full regression suite) --"
+GD_TEST="$TESTS_DIR/test-guard-destructive.sh"
+if [[ ! -f "$GD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-guard-destructive.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-guard-destructive.sh" "$GD_TEST"
+else
+    GD_OUT="$(bash "$GD_TEST" 2>&1)"
+    GD_STATUS=$?
+    GD_PASS="$(suite_count Passed "$GD_OUT")"
+    GD_FAIL="$(suite_count Failed "$GD_OUT")"
+    if ! [[ "$GD_PASS" =~ ^[0-9]+$ && "$GD_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        GD_PASS=0
+        GD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-guard-destructive.sh" "$GD_STATUS"
+        strip_ansi "$GD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GD_STATUS" -ne 0 || "$GD_FAIL" -ne 0 ]]; then
+        [[ "$GD_FAIL" -eq 0 ]] && GD_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-guard-destructive.sh" "$GD_PASS" "$GD_FAIL" "$GD_STATUS"
+        strip_ansi "$GD_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-guard-destructive.sh" "$GD_PASS"
+    fi
+    PASS=$((PASS + GD_PASS))
+    FAIL=$((FAIL + GD_FAIL))
+    record_suite "test-guard-destructive.sh" "$GD_PASS" "$GD_FAIL" "full regression"
+fi
+
 # The SessionStart handoff hook ships its own suite rather than inline cases:
 # its payload shape, assertions, and install/uninstall wiring checks share
 # nothing with the guard's expect() helper above. Delegate to it and fold the
@@ -171,18 +247,28 @@ echo "-- session-start-handoff.sh (delegated suite) --"
 SS_TEST="$TESTS_DIR/test-session-start-handoff.sh"
 if [[ ! -f "$SS_TEST" ]]; then
     FAIL=$((FAIL + 1))
+    record_suite "test-session-start-handoff.sh" 0 1 "not found"
     printf '  FAIL %-52s -> not found at %s\n' "test-session-start-handoff.sh" "$SS_TEST"
 elif SS_OUT="$(bash "$SS_TEST" 2>&1)"; then
     PASS=$((PASS + 1))
+    record_suite "test-session-start-handoff.sh" \
+        "$(suite_count Passed "$SS_OUT")" "$(suite_count Failed "$SS_OUT")" \
+        "folded into totals as 1 case"
     printf '  ok   %-52s -> %s\n' "test-session-start-handoff.sh" \
         "$(printf '%s\n' "$SS_OUT" | awk '/^  Total:/ {print $2 " cases pass"}')"
 else
     FAIL=$((FAIL + 1))
+    record_suite "test-session-start-handoff.sh" \
+        "$(suite_count Passed "$SS_OUT")" "$(suite_count Failed "$SS_OUT")" \
+        "suite failed; folded into totals as 1 case"
     printf '  FAIL %-52s -> suite failed; output follows\n' "test-session-start-handoff.sh"
     printf '%s\n' "$SS_OUT" | sed 's/^/    /'
 fi
 
 echo
+echo "==============================="
+echo "Per-suite breakdown"
+printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
 echo "==============================="
 echo "PASS: $PASS   FAIL: $FAIL"
 [[ "$FAIL" -eq 0 ]]
