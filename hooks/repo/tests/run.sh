@@ -101,14 +101,25 @@ expect ask   "git reset --hard"                "$WORK_REPO" "git reset --hard HE
 expect ask   "git clean -fd"                   "$WORK_REPO" "git clean -fd"
 expect ask   "kubectl delete"                  "$WORK_REPO" "kubectl delete pod mypod"
 expect ask   "docker rm"                       "$WORK_REPO" "docker rm mycontainer"
-expect ask   "gh pr close"                     "$WORK_REPO" "gh pr close 42"
 expect ask   "cat ~/.ssh/id_rsa"               "$WORK_REPO" "cat ~/.ssh/id_rsa"
-expect ask   "aws s3 ls (namespace)"           "$WORK_REPO" "aws s3 ls"
+# gh pr close is reversible -> allowed by default, ask is opt-IN (loom#3757).
+expect allow "gh pr close (reversible, default)" "$WORK_REPO" "gh pr close 42"
+expect ask   "gh pr close w/ reversibleGh opt-in" "$WORK_REPO" REPO_GUARD_REVERSIBLE_GH=1 "gh pr close 42"
+# aws read-only verbs no longer prompt (verb-narrowed cloud asks, loom#3593).
+expect allow "aws s3 ls (read-only)"           "$WORK_REPO" "aws s3 ls"
+expect ask   "aws s3 cp (mutating)"            "$WORK_REPO" "aws s3 cp ./f s3://b/f"
 
 echo "-- allow (safe) --"
 expect allow "ls -la"                          "$WORK_REPO" "ls -la"
 expect allow "git status"                      "$WORK_REPO" "git status"
 expect allow "rm -rf /tmp/scratch (subpath)"   "$WORK_REPO" "rm -rf /tmp/scratch"
+# repo#29: pipe target must BE a shell — tee/shasum pipes are fine.
+expect allow "curl | sudo tee /usr/share (repo#29)" "$WORK_REPO" "curl -fsSL https://x.example/k.gpg | sudo tee /usr/share/keyrings/k.gpg"
+expect allow "curl | shasum (repo#29)"         "$WORK_REPO" "curl -s https://x.example/f | shasum -c sums.txt"
+# rmScope now defaults to repo (safe-by-default, loom#3628): outside-repo deep
+# rm denies unless opted out.
+expect deny  "rm outside repo (rmScope default)" "$WORK_REPO" "rm -rf /opt/vendor/thing"
+expect allow "rm outside repo w/ REPO_RM_SCOPE=off" "$WORK_REPO" REPO_RM_SCOPE=off "rm -rf /opt/vendor/thing"
 expect allow "rm -rf node_modules"             "$WORK_REPO" "rm -rf node_modules"
 expect allow "echo the box will halt (prose)"  "$WORK_REPO" "echo 'the box will halt soon'"
 expect allow "git commit -m ...# git push --force" "$WORK_REPO" "git commit -m 'x' # git push --force later"

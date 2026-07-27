@@ -31,9 +31,9 @@ Hygiene skills **apply their safe, reversible fixes by default** and report each
 
 ## Destructive-command protection
 
-Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructive.sh`) into the target repo's `.claude/settings.json`. It runs before every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /` or `$HOME`, force-push to `main`, fork bombs, `curl … | sh`, `gh repo delete`, cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`, …) and **asks** for confirmation on reversible-but-risky ones (`git reset --hard`, `kubectl delete`, `docker rm`, credential reads). Scoped deletes like `rm -rf node_modules` are allowed.
+Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructive.sh`) into the target repo's `.claude/settings.json`. This is the **canonical generic destructive-command guard** — Loom and other tooling defer to this copy rather than shipping their own. It runs before every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /` or `$HOME` or outside-repo targets, force-push to `main`, fork bombs, piping a download into a shell, `gh repo delete`, cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`, …) and **asks** for confirmation on risky-but-legitimate ones (force ops, mutating cloud verbs, `kubectl delete`, credential reads). Read-only commands take a zero-fork fast path; scoped deletes like `rm -rf node_modules` are allowed; quote-aware parsing and literal-text redaction keep prose, commit messages, and issue bodies from tripping it.
 
-Two categories are opt-out per repo for repos where they don't apply — SQL (`REPO_GUARD_SQL` / `guards.sqlDdl`) and cloud CLIs (`REPO_GUARD_CLOUD` / `guards.cloudCli`). See [`skills/repo/SKILL.md`](skills/repo/SKILL.md#destructive-command-guard-pretooluse-hook) for the full pattern list and resolution order. If the target already has a compatible guard wired (e.g. Loom's), the installer defers to it rather than adding a duplicate.
+Every category is configurable per repo (`REPO_GUARD_*`/`REPO_*` env vars or `guards.*` config keys, with legacy `LOOM_*` names honored). See [`skills/repo/SKILL.md`](skills/repo/SKILL.md#destructive-command-guard-pretooluse-hook) for the toggle table and resolution order. If the target already has a compatible guard wired (e.g. a pre-consolidation Loom install), the installer defers to it rather than adding a duplicate.
 
 ## Installation
 
@@ -79,7 +79,8 @@ Nothing else in the target repository is read or modified.
 skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
 commands/repo/*.md           Command files installed to .claude/commands/repo/
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
-hooks/repo/tests/run.sh      Test harness for the guard hook (bash, no framework needed)
+hooks/repo/tests/run.sh      Quick smoke suite for the guard hook (bash, no framework needed)
+hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 ```
