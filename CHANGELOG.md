@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **New command: `/repo:handoff` — roll the Claude session safely (#28).** A
+  composed ritual for the hard session boundary (restart, CLI upgrade, fresh
+  start): `followups` first (before reset prunes state a follow-up may
+  reference), `reset` second, a best-effort CLI version check third, and last a
+  handoff note scoped to what only the session knows — in-flight state,
+  decisions with rationale, empirically-discovered traps, and the precise next
+  action, each tagged `[verified]` / `[believed-done]` / `[attempted]`. The
+  note lives at gitignored `.claude/handoff.md` with a READ-FIRST pointer in
+  the agent's auto-memory index; both are one-shot and deleted by the next
+  session after absorbing. Ends with copy-pasteable restart instructions — it
+  never pretends to drive the restart itself. `--dry-run` previews everything
+  and writes nothing.
+
 - **`install.sh` fails loudly instead of silently when it can't prompt (#27).**
   Without a TTY and without `--yes`, the confirmation prompts previously died on
   a failed `read` with exit 1 and no output. Both prompts now go through a

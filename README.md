@@ -14,6 +14,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:all` | The whole hygiene pass in order — audit, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
 | `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
 | `/repo:reset` | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to main |
+| `/repo:handoff` | Roll the session safely — file follow-ups, reset, check for a CLI update, write a handoff note the next session reads first |
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
 | `/repo:release` | Cut a release — pre-flight checks, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
