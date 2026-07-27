@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.1 (2026-07-27)
+
+- **`install.sh` now reconciles an orphaned CLAUDE.md pointer block (#31).**
+  When an earlier install committed the REPO-SKILLS pointer and the destination
+  later became gitignored (or dev-symlinked), every subsequent install skipped
+  CLAUDE.md entirely — leaving a committed block that claims "Managed by
+  `install.sh`" while its version drifts stale forever. Both skip paths now
+  detect the orphan, warn that it can no longer be maintained, and offer to
+  remove it (default Yes; auto-accepted under `--yes`), reusing
+  `uninstall.sh`'s marker-bounded removal so surrounding CLAUDE.md content
+  survives intact. `--dry-run` surfaces the condition (`existing REPO-SKILLS
+  block is orphaned/stale — would offer removal`) instead of reporting a
+  plain skip.
+
 ## 0.6.0 (2026-07-27)
 
 - **`guard-destructive.sh` is now the canonical generic destructive-command
