@@ -180,6 +180,27 @@ else
   COMMANDS="$ALL_COMMANDS"
 fi
 
+# Hook install paths and the commands Claude Code resolves them to
+# (${CLAUDE_PROJECT_DIR} expands to the consumer repo root at hook time).
+# Declared before the --dry-run enumeration below so that listing and doing
+# read from the same constants and cannot drift.
+HOOK_INSTALL_REL=".claude/skills/repo/hooks/guard-destructive.sh"
+HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${HOOK_INSTALL_REL}"
+
+# The SessionStart handoff hook, same resolution. Claude Code's SessionStart
+# matchers key on the session SOURCE ("startup" | "resume" | "clear" |
+# "compact" | "fork"), not on a tool name. We wire the two literal sources the
+# hook acts on rather than an alternation like "startup|resume": alternation is
+# documented for tool matchers but NOT for SessionStart, and a matcher that
+# silently matched nothing would leave the hook inert with no error. Two literal
+# entries use only documented values. The hook re-checks .source itself, so this
+# is belt-and-braces rather than a load-bearing filter.
+SESSIONSTART_HOOK_INSTALL_REL=".claude/skills/repo/hooks/session-start-handoff.sh"
+SESSIONSTART_HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${SESSIONSTART_HOOK_INSTALL_REL}"
+SESSIONSTART_SOURCES=(startup resume)
+
+SETTINGS_JSON="$TARGET/.claude/settings.json"
+
 echo ""
 info "Repo Skills v$VERSION ($COMMIT) → $TARGET"
 [[ "$DEV" == true ]] && info "Dev mode: symlinking source files (edits are live)"
@@ -194,7 +215,9 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/install-metadata.json"
   echo "  $TARGET/.claude/skills/repo/.install-local.json (machine-local, gitignored)"
   echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
+  echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
   echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
+  echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
   done <<<"$COMMANDS"
@@ -231,12 +254,6 @@ install_file() {  # <source-abs> <dest-abs> <label>
     assert_no_placeholders "$2" "$3"
   fi
 }
-
-# The PreToolUse guard hook's installed command, as Claude Code resolves it
-# (${CLAUDE_PROJECT_DIR} expands to the consumer repo root at hook time).
-HOOK_INSTALL_REL=".claude/skills/repo/hooks/guard-destructive.sh"
-HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${HOOK_INSTALL_REL}"
-SETTINGS_JSON="$TARGET/.claude/settings.json"
 
 # Idempotently wire the guard-destructive.sh PreToolUse/Bash hook into the
 # target's .claude/settings.json WITHOUT clobbering anything else in the file.
@@ -289,6 +306,66 @@ merge_settings_hook() {
       ' "$settings" >"$tmp"; then
     mv "$tmp" "$settings"
     success "Wired PreToolUse guard into .claude/settings.json"
+  else
+    rm -f "$tmp"
+    warning "Failed to update $settings — left unchanged"
+  fi
+}
+
+# Idempotently wire session-start-handoff.sh into the target's
+# .claude/settings.json under hooks.SessionStart, once per managed source
+# matcher. Same discipline as merge_settings_hook above: refuse to touch
+# malformed JSON, no-op when already wired, defer to an equivalent hook someone
+# else wired, and write via temp-file-and-mv so a mid-read jq failure can never
+# truncate the consumer's settings. Existing SessionStart entries — hand-authored
+# or another tool's — are appended to, never replaced.
+merge_settings_sessionstart_hook() {
+  local settings="$SETTINGS_JSON" cmd="$SESSIONSTART_HOOK_CMD" tmp sources_json
+  sources_json="$(jq -nc '$ARGS.positional' --args "${SESSIONSTART_SOURCES[@]}")"
+  [[ -f "$settings" ]] || echo '{}' >"$settings"
+
+  if ! jq -e . "$settings" >/dev/null 2>&1; then
+    warning "Skipping SessionStart hook wiring: $settings is not valid JSON (wire it by hand)"
+    return
+  fi
+
+  # Idempotent re-install: our exact command is already present under EVERY
+  # source matcher we manage (a partial wiring falls through and is completed).
+  if jq -e --arg c "$cmd" --argjson sources "$sources_json" '
+        (.hooks.SessionStart // []) as $ss |
+        ($sources | all(. as $m | $ss | any(.[]?;
+          (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c)))))
+      ' "$settings" >/dev/null 2>&1; then
+    info "SessionStart handoff hook already wired in .claude/settings.json (no change)"
+    return
+  fi
+
+  # Coexistence: a DIFFERENT session-start-handoff.sh is already wired (e.g. a
+  # copy living at another path). Defer rather than surfacing the note twice.
+  if jq -e --arg c "$cmd" '
+        (.hooks.SessionStart // []) | any(.[]?;
+          (.hooks // []) | any(.[]?;
+            ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c)))
+      ' "$settings" >/dev/null 2>&1; then
+    info "A handoff SessionStart hook is already wired in .claude/settings.json — deferring to it (not adding a duplicate)"
+    return
+  fi
+
+  tmp="$(mktemp)"
+  if jq --arg c "$cmd" --argjson sources "$sources_json" '
+        .hooks //= {} |
+        .hooks.SessionStart //= [] |
+        reduce ($sources[]) as $m (.;
+          if (.hooks.SessionStart | any(.[]?; .matcher == $m))
+          then .hooks.SessionStart |= map(
+            if (.matcher == $m) and (((.hooks // []) | any(.[]?; .command == $c)) | not)
+            then .hooks = ((.hooks // []) + [{type: "command", command: $c}])
+            else . end)
+          else .hooks.SessionStart += [{matcher: $m, hooks: [{type: "command", command: $c}]}]
+          end)
+      ' "$settings" >"$tmp"; then
+    mv "$tmp" "$settings"
+    success "Wired SessionStart handoff hook into .claude/settings.json"
   else
     rm -f "$tmp"
     warning "Failed to update $settings — left unchanged"
@@ -363,6 +440,17 @@ install_file "$SOURCE_ROOT/hooks/repo/guard-destructive.sh" \
 chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/hooks/guard-destructive.sh"
 merge_settings_hook
+
+# 3c. SessionStart handoff hook + settings.json wiring. Same colocation and
+# chmod rationale as the guard above. Wired unconditionally, like the guard:
+# both the script and its settings entry live entirely inside the target repo,
+# so there is nothing to gate behind a confirm and behaviour is identical with
+# and without --yes.
+install_file "$SOURCE_ROOT/hooks/repo/session-start-handoff.sh" \
+  "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" "hooks/repo/session-start-handoff.sh"
+chmod +x "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" 2>/dev/null || true
+success "Installed .claude/skills/repo/hooks/session-start-handoff.sh"
+merge_settings_sessionstart_hook
 
 # 4. CLAUDE.md block (replace existing block in place, else append).
 # Skipped in dev mode: the symlinked install is machine-local (absolute symlinks
