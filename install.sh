@@ -195,11 +195,12 @@ HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${HOOK_INSTALL_REL}"
 # The SessionStart handoff hook, same resolution. Claude Code's SessionStart
 # matchers key on the session SOURCE ("startup" | "resume" | "clear" |
 # "compact" | "fork"), not on a tool name. We wire the two literal sources the
-# hook acts on rather than an alternation like "startup|resume": alternation is
-# documented for tool matchers but NOT for SessionStart, and a matcher that
-# silently matched nothing would leave the hook inert with no error. Two literal
-# entries use only documented values. The hook re-checks .source itself, so this
-# is belt-and-braces rather than a load-bearing filter.
+# hook acts on rather than an alternation like "startup|resume". Alternation
+# would work — SessionStart matchers are split on "|" the same way tool matchers
+# are — but two literal entries state the intent without depending on that
+# shared behavior, and each entry reads unambiguously in a consumer's
+# settings.json. The hook re-checks .source itself, so this is belt-and-braces
+# rather than a load-bearing filter.
 SESSIONSTART_HOOK_INSTALL_REL=".claude/skills/repo/hooks/session-start-handoff.sh"
 SESSIONSTART_HOOK_CMD="\${CLAUDE_PROJECT_DIR}/${SESSIONSTART_HOOK_INSTALL_REL}"
 SESSIONSTART_SOURCES=(startup resume)
