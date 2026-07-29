@@ -1,50 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-07-29)
 
-- **CLAUDE.md marker surgery is now anchored to the marker string, closing a
-  data-loss bug (#38, PR #42).** Previously `install.sh`/`uninstall.sh` bounded
-  the REPO-SKILLS block by whole physical lines, so when `<!-- END REPO-SKILLS
-  -->` shared one line with an adjacent tool's `<!-- BEGIN … -->`, block removal
-  could silently delete that neighbouring tool's marker block. Removal now
-  anchors to the marker **substring** and a validation guard
-  (`claude_md_block_validate`) gates every rewrite.
-- **New refusal conditions (user-visible behavior change).** The guard refuses
-  to rewrite — and, in `install.sh`, exits non-zero — when the marker layout is
-  unresolvable: the `<!-- BEGIN REPO-SKILLS -->` count is not exactly 1, the
-  `<!-- END REPO-SKILLS -->` count is not exactly 1, or the END marker appears
-  before the BEGIN marker. On refusal, CLAUDE.md is left byte-for-byte untouched
-  and the warning names the offending condition. This is deliberate: the repo
-  applies safe fixes automatically and gates destructive ones rather than
-  guessing at an ambiguous layout. **Installs that previously proceeded (mangling
-  or no-op'ing) against such a CLAUDE.md now fail loudly instead.**
-- **Known limitation — quoting the markers as prose or in a code fence now
-  triggers a refusal.** Marker counting is substring-based, so a consumer
-  CLAUDE.md that *mentions* `<!-- BEGIN REPO-SKILLS -->` (documenting the
-  convention, or pasting an example inside a code fence) counts as a duplicate
-  marker and its install fails with exit 1. Fence-aware detection is
-  intentionally **not** implemented — it would reintroduce the ambiguity-guessing
-  #42 removed. If you need to show the markers as an example, alter them so they
-  are not literal occurrences (e.g. a non-ASCII hyphen, `BEGIN REPO‑SKILLS`, or a
-  broken-up string).
-- **A refusal from `reconcile_orphaned_block` leaves a partial install.** That
-  refusal path (and the update path) fires *after* skills and commands have
-  already been installed, so a refused run is a partial install — the warning
-  already says "(skills and commands were installed)". The remedy is not to
-  assume nothing was written: **correct the markers so exactly one BEGIN and one
-  END exist, in that order, then re-run the installer** (which reconciles the
-  now-valid block). CLAUDE.md itself is never modified by a refused run.
-- **`/repo:release` now supports per-project release policy at named phase
-  boundaries (#43).** A repo can inject its own procedural steps — gates, extra
-  manifest edits, post-release deploys — via a single `.repo/release-policy.md`
-  file with `## seam: <name>` sections, without forking the 269-line command.
-  Seven seams are exposed (`pre-flight`, `pre-changelog-style`, `pre-apply`,
-  `pre-push`, `post-push`, `pre-github-release`, `post-summary`); steps augment
-  the phase by default, or replace its default action with a `(replace)` marker.
-  A new Phase 0 loads the file and **warns before Phase 1 on any seam name that
-  binds to no phase boundary**, closing the silent-failure mode that orphaned
-  policy migrating off Loom's removed `/loom:release` skill (all five of its old
-  seam names carry over unchanged).
+New commands and installer features:
+
+- **`/repo:host-optimize` — audit and prepare a Mac (or Linux box) for heavy Loom/agent build use (#50, PR #63).** Reports host-readiness across 8 checks and applies consequence-tiered fixes; SIP/Gatekeeper actions are print-only, sudo setup delegates to `/repo:sudo`.
+- **`/repo:sudo` — opt-in passwordless-sudo setup via a validated `sudoers.d` drop-in (#49, PR #67).** `--scoped`/`--status`/`--remove`, always-confirm, and a validate-in-isolation-before-install sequence so a bad drop-in can never lock you out of root.
+- **`/repo:release` now supports per-project release policy at named phase boundaries (#43, PR #68).** A repo can inject procedural steps via a single `.repo/release-policy.md` with `## seam: <name>` sections (seven seams; augment by default, `(replace)` to substitute). Phase 0 warns before Phase 1 on any seam that binds to nothing, closing the silent-failure mode for policy migrating off Loom's removed `/loom:release` (all five old seam names carry over).
+- **`/repo:release` now folds an existing `## Unreleased` CHANGELOG section into the version entry at draft time (#70, PR #75).** Opt-in on the heading's presence; deduplicates against git-log-derived bullets by issue/PR number.
+- **Headless `scripts/repo/repo-remote.sh` provisioning entry point for `/repo:remote` (#52, PR #57).** `up`/`status`/`down` with a cost-consent gate preserved under `--yes` (missing cost-relevant config is a loud `exit 2`, never a silent default); consumed by `loom fleet add-worker`.
+- **Optional install-time shell `claude` wrapper that surfaces a pending `/repo:handoff` note to the human (#35, PR #65).** Behind `--shell-wrapper`; strict no-op without it, always diff-then-confirm, backup-before-edit, marker-bounded and idempotent, fail-transparent by construction.
+- **SessionStart hook that surfaces a pending `/repo:handoff` note to the next Claude session (#34, PR #34/#47).** Documented, with the matcher rationale corrected.
+
+CI and test coverage:
+
+- **New GitHub Actions workflow runs the full ~530-case suite on every PR and push to `main` (#48, PR #55);** `package.json`'s `check:ci`/`check:all` stubs are repointed at `pnpm test`. A companion decision was recorded (#73, PR #74) to deliberately not require the check on `main` yet, with a note that any future enable must use classic branch protection (not a ruleset) so `merge-pr.sh` detects it.
+- **The full guard-destructive and delegated suites now fold into `pnpm test` at real case counts (#40, #44 PR #56),** with a breakdown-sums-to-headline drift self-check; the branches loss-check suite skips merge-tree assertions on git < 2.38 and covers the degraded fallback (#46, PR #64).
+
+`guard-destructive.sh` correctness (the destructive-command guard):
+
+- **Dangerous strings quoted as `echo`/`printf` data no longer false-block (#53, PR #58)** — the guard's own piped self-tests and issue-filing were being blocked by their own payloads.
+- **`extract_rm_targets()` is now quote-aware across newlines (#60, PR #69),** and the same whole-command lexer is shared via `ml_segment()` so `parse_force_ops()` and `lifecycle_or_cloud_reason()` stop false-blocking multi-line quoted data (#71, PR #76).
+- **Command-word substitutions resolving to `rm` are now caught (#72, PR #77)** — `$(which rm) -rf /`, the backtick form, `env`/`sudo` wrappers, and `~`/`$HOME` targets now deny like their literal counterparts, closing a deny-floor false negative. The safety floor (command-substitution smuggling, `bash -c`/`sh -c`, pipe-to-shell) is unchanged.
+
+Installer and hygiene fixes:
+
+- **CLAUDE.md marker surgery is anchored to the marker string, closing a data-loss bug (#38, PR #42).** `install.sh`/`uninstall.sh` previously bounded the REPO-SKILLS block by whole physical lines, so a shared line with an adjacent tool's marker could delete that neighbour's block. Removal now anchors to the marker substring and a validation guard (`claude_md_block_validate`) gates every rewrite, refusing (and in `install.sh`, exiting non-zero) on an unresolvable layout: BEGIN count ≠ 1, END count ≠ 1, or END before BEGIN. Known limitation — quoting the markers as prose/in a code fence now counts as a duplicate and triggers the refusal (fence-aware detection is intentionally not implemented); a `reconcile_orphaned_block` refusal leaves a partial install (fix the markers to one ordered pair and re-run). Announced in the changelog for consumers (#45, PR #62).
+- **`install.sh` gates the CLAUDE.md pointer on the commands/ ignore state alone (#51, PR #61),** so a mixed gitignore state (`skills/` ignored, `commands/` tracked via a `!` negation) no longer wrongly skips the pointer block.
+- **The `/repo:handoff` note body is inlined under the size cap in the SessionStart hook (#33, PR #54).**
+- **`node_modules` is correctly ignored in issue worktrees (#59, PR #66)** — the directory-only `node_modules/` pattern missed the worktree symlink; dropping the trailing slash matches both.
+- **`/repo:branches` permanent-loss check: corrected the `--not` toggle and made it content-aware (#41, PR #41),** so a branch with commits found nowhere else is never auto-pruned.
+
+Tooling:
+
+- Loom updated to v0.16.0; daemon roleRunner + champion-on-idle enabled for this workspace; `pnpm-lock.yaml` is now tracked.
 
 ## 0.6.1 (2026-07-27)
 
