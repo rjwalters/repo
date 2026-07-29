@@ -199,6 +199,12 @@ resolve_settings() {
   # Non-cost-relevant fields DO fall back to defaults (matches the prose command).
   DISK_GB="${REPO_REMOTE_DISK_GB:-50}"
   IDLE_MIN="${REPO_REMOTE_IDLE_SHUTDOWN_MIN:-120}"
+  # Idle-exit marker contract (see commands/repo/remote.md). A daemon-managed
+  # host (e.g. one running loom-daemon) may write this file on clean idle-exit;
+  # the guard treats its mtime as an authoritative "idle since" timestamp. The
+  # path is always embedded in the guard so the contract is self-contained and
+  # works standalone — it stays inert until the file actually exists on-host.
+  IDLE_MARKER="${REPO_REMOTE_IDLE_MARKER:-/var/run/repo-remote-daemon-idle.marker}"
 
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
@@ -252,6 +258,23 @@ require_cost_config() {
 # A forgotten VM — GPU ones especially — must turn itself off. Emitted as a
 # cloud-init script that installs a cron watchdog running `shutdown -h` after
 # IDLE_MIN minutes with no active SSH session and low CPU.
+#
+# "Activity" is defined by exactly two local signals: an open SSH session (`who`)
+# OR CPU load average > 0.2. There is NO process-name veto — a running daemon
+# (loom-daemon or otherwise) does NOT, by itself, keep this host alive. If a
+# future daemon-presence veto is ever wanted it must be added deliberately here
+# and documented; it is not implied by the current logic.
+#
+# Idle-exit marker contract (published by this repo so a daemon side can conform
+# without this repo depending on it): when $IDLE_MARKER exists on-host, the guard
+# treats its mtime as an authoritative "idle since" timestamp and shuts down
+# IDLE_MIN minutes after that mtime — REPLACING (not supplementing) its own
+# $STAMP-based countdown start for that pass. A daemon that idle-exits cleanly can
+# `touch` this file to hand the guard a precise idle-start instead of waiting for
+# the guard's own load-average sampling to first read idle. The guard works
+# standalone: with no marker file present it falls back to the unchanged
+# who/load/$STAMP behavior. The marker path is always embedded (default below,
+# overridable via REPO_REMOTE_IDLE_MARKER) so the branch is inert-but-ready.
 idle_guard_userdata() {
   cat <<EOF
 #!/bin/bash
@@ -260,9 +283,29 @@ cat >/usr/local/bin/repo-remote-idle-check <<'GUARD'
 #!/bin/bash
 IDLE_MIN=${IDLE_MIN}
 STAMP=/var/run/repo-remote-idle.stamp
+# Idle-exit marker: mtime = authoritative "idle since" (e.g. written by
+# loom-daemon on clean idle-exit). Overridable via REPO_REMOTE_IDLE_MARKER.
+MARKER=${IDLE_MARKER}
+# An active SSH session or non-trivial CPU load is real activity: reset the
+# idle timer and veto shutdown regardless of any marker (never power off a box
+# someone is actively using). No process-name check — see the note in the
+# generating script.
 if who | grep -q . || [ "\$(awk '{print (\$1 > 0.2)}' /proc/loadavg)" = "1" ]; then
   date +%s > "\$STAMP"; exit 0
 fi
+# Marker present ⇒ its mtime REPLACES the local \$STAMP countdown start. The
+# on-host image is Ubuntu (GNU coreutils), so \`stat -c %Y\` is authoritative;
+# the \`|| echo 0\` guards a vanished/unreadable file. A future mtime (clock
+# skew) yields a negative age, which is never >= IDLE_MIN, so it can't trigger a
+# spurious shutdown.
+if [ -f "\$MARKER" ]; then
+  MARKER_AGE_MIN=\$(( ( \$(date +%s) - \$(stat -c %Y "\$MARKER" 2>/dev/null || echo 0) ) / 60 ))
+  if [ "\$MARKER_AGE_MIN" -ge "\$IDLE_MIN" ]; then
+    /sbin/shutdown -h now "repo-remote: daemon idle-exit marker aged \${MARKER_AGE_MIN}m"
+  fi
+  exit 0
+fi
+# No marker ⇒ unchanged local stamp-based countdown.
 [ -f "\$STAMP" ] || { date +%s > "\$STAMP"; exit 0; }
 NOW=\$(date +%s); LAST=\$(cat "\$STAMP")
 if [ \$(( (NOW - LAST) / 60 )) -ge "\$IDLE_MIN" ]; then

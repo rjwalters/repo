@@ -127,7 +127,8 @@ REPO_REMOTE_DOCKERFILE=./Dockerfile       # optional: build & run this checked-i
 REPO_REMOTE_SETUP="make setup"            # optional first-boot command; fallback when no Dockerfile
 
 # --- session ---
-REPO_REMOTE_IDLE_SHUTDOWN_MIN=120
+REPO_REMOTE_IDLE_SHUTDOWN_MIN=120         # interactive-host default; use ~20 for daemon-managed/worker hosts (see below)
+REPO_REMOTE_IDLE_MARKER=                   # optional idle-exit marker path (default: /var/run/repo-remote-daemon-idle.marker)
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -285,12 +286,75 @@ Requirements for the created instance:
   on AWS, quota-aware handling.
 - Install an idle-shutdown guard (cron checking SSH sessions + CPU, running
   `shutdown -h` after `REPO_REMOTE_IDLE_SHUTDOWN_MIN`) so a forgotten VM — GPU
-  ones especially — doesn't burn money
+  ones especially — doesn't burn money. See **The idle-shutdown guard** below for
+  its exact activity model, the daemon-host short-window recommendation, and the
+  idle-exit marker contract.
 - AWS: security group allowing SSH from the user's IP only, using
   `REPO_REMOTE_SSH_KEY`'s public key. GCP: prefer OS Login / IAP.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
 alternative zone or the next type down rather than failing.
+
+#### The idle-shutdown guard
+
+The guard is a cron watchdog (`/usr/local/bin/repo-remote-idle-check`, run every
+minute) installed via cloud-init user-data. It powers the host off with
+`shutdown -h` once it has been idle for `REPO_REMOTE_IDLE_SHUTDOWN_MIN` minutes.
+
+**Activity model (what keeps the host alive).** "Activity" is exactly two local
+signals: an **open SSH session** (`who`) **or** a **CPU load average > 0.2**.
+There is deliberately **no process-name veto** — a running background process
+(including `loom-daemon`) does **not**, on its own, keep the host alive. If a
+future daemon-presence veto is ever wanted, it must be added as a deliberate,
+documented change to `idle_guard_userdata()`; it is not implied by the current
+text. (This corrects an earlier problem statement that assumed a
+`pgrep -f loom-daemon` veto existed — it never did in this repo.)
+
+**Idle window — pick per host role:**
+
+- **Interactive hosts** (a human SSHes in to work): keep the default
+  `REPO_REMOTE_IDLE_SHUTDOWN_MIN=120`. The generous 2-hour margin is sized for
+  "operator stepped away from a session" so the box isn't yanked out from under
+  someone mid-task.
+- **Daemon-managed / worker hosts** (e.g. a box running `loom-daemon` for a
+  fleet, with no interactive operator): use a **short window such as
+  `REPO_REMOTE_IDLE_SHUTDOWN_MIN=20`**. These hosts have no human session to
+  protect, so the "operator forgot a session" margin is pure wasted spend — on a
+  c7i.2xlarge-class worker (~$8.60/day) the difference between a 120- and a
+  20-minute window is real money once the fleet goes quiet.
+
+**Idle-exit marker contract (`REPO_REMOTE_IDLE_MARKER`).** For daemon-managed
+hosts, the guard also honors an **idle-exit marker file** so a daemon can hand
+the guard a precise "idle since" time instead of waiting for the guard's own
+once-a-minute load sampling to first read idle. This is a self-contained
+contract published by `repo:remote` — the guard works standalone whether or not
+anything ever writes the file:
+
+- **Path.** `REPO_REMOTE_IDLE_MARKER` sets the file path the guard watches;
+  unset, it defaults to **`/var/run/repo-remote-daemon-idle.marker`**. The path
+  is always embedded in the generated guard, so the branch is present-but-inert
+  until the file exists on-host.
+- **Semantics.** When the marker file **exists**, the guard treats its **mtime**
+  as an authoritative "idle since" timestamp and powers off once that mtime is
+  older than `REPO_REMOTE_IDLE_SHUTDOWN_MIN` minutes — **replacing** (not
+  supplementing) its own internal stamp countdown for that pass. In other words:
+  shutdown fires `IDLE_MIN` minutes after the marker's mtime, independent of when
+  the guard's SSH/load sampling happened to first observe idleness.
+- **Safety precedence.** An active SSH session or CPU load > 0.2 still vetoes
+  shutdown *before* the marker is consulted — the guard never powers off a host
+  someone is actively using, even if a stale marker is present. A marker with a
+  **future** mtime (clock skew) yields a negative age and simply never triggers,
+  so it can't cause a spurious power-off.
+- **Producer contract (for a daemon side, e.g. loom's idle-exit).** On a clean
+  idle-exit, `touch` the marker path (creating/updating its mtime). To reset the
+  clock when work resumes, remove the file (or `touch` it again). The on-host
+  image is Ubuntu (GNU coreutils), so the guard reads the mtime with
+  `stat -c %Y`. This repo neither writes nor depends on any daemon writing the
+  file — the convention stands alone and a daemon may adopt it whenever it ships.
+
+On a daemon-managed host the two stages compose: the daemon's own idle-exit
+(writing the marker) is the first stage; this guard, `IDLE_MIN` minutes later, is
+the second and final stage that actually powers the box off.
 
 #### GPU hosts
 
