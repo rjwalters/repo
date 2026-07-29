@@ -468,6 +468,10 @@ Claude Code cannot host an interactive SSH session itself, so hand it to the OS
   terminal
 
 Tell the user they can start `claude` in that session to continue on the remote.
+On a freshly provisioned box, `/repo:sudo` is the companion step that unblocks
+root-level remediation over SSH — a non-interactive SSH session can't answer a
+`sudo` password prompt, so an agent stalls on it until a validated
+passwordless-sudo drop-in is installed.
 
 ### 8. Report
 

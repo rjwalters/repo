@@ -18,6 +18,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
 | `/repo:release` | Cut a release — pre-flight checks, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
+| `/repo:sudo` | Opt-in passwordless-sudo setup for a dev machine — install a `visudo`-validated `/etc/sudoers.d` drop-in (blanket `ALL` or a scoped command list) so an agent over SSH isn't blocked on password prompts; always confirmed, validated with rollback on failure |
 | `/repo:host-optimize` | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | `/repo:followups` | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
@@ -28,7 +29,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:orphans` | Find unreferenced files — dead scripts, stale data, outputs without sources |
 | `/repo:readme` | Check README accuracy against actual directory contents |
 
-Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `followups`, `release`, `remote`) always confirm first.
+Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `followups`, `release`, `remote`, `sudo`) always confirm first.
 
 ## Destructive-command protection
 

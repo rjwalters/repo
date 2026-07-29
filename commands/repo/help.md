@@ -60,6 +60,7 @@ stashes, untracked files) always need an explicit opt-in.
 | /repo:handoff | Rolling the session (context full, CLI update) — preserve what only the session knows, then restart |
 | /repo:tidy  | Working tree cluttered with build artifacts and temp files |
 | /repo:remote | Need a cloud dev box (GCP/AWS) with this repo ready to go |
+| /repo:sudo | One-time machine setup — grant passwordless sudo (validated drop-in) so an agent over SSH isn't blocked on password prompts |
 | /repo:release | Cut a release — pre-flight, semver, CHANGELOG, version bump, tag, GitHub Release |
 
 ### Periodic maintenance
