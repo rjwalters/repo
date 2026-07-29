@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **CLAUDE.md marker surgery is now anchored to the marker string, closing a
+  data-loss bug (#38, PR #42).** Previously `install.sh`/`uninstall.sh` bounded
+  the REPO-SKILLS block by whole physical lines, so when `<!-- END REPO-SKILLS
+  -->` shared one line with an adjacent tool's `<!-- BEGIN … -->`, block removal
+  could silently delete that neighbouring tool's marker block. Removal now
+  anchors to the marker **substring** and a validation guard
+  (`claude_md_block_validate`) gates every rewrite.
+- **New refusal conditions (user-visible behavior change).** The guard refuses
+  to rewrite — and, in `install.sh`, exits non-zero — when the marker layout is
+  unresolvable: the `<!-- BEGIN REPO-SKILLS -->` count is not exactly 1, the
+  `<!-- END REPO-SKILLS -->` count is not exactly 1, or the END marker appears
+  before the BEGIN marker. On refusal, CLAUDE.md is left byte-for-byte untouched
+  and the warning names the offending condition. This is deliberate: the repo
+  applies safe fixes automatically and gates destructive ones rather than
+  guessing at an ambiguous layout. **Installs that previously proceeded (mangling
+  or no-op'ing) against such a CLAUDE.md now fail loudly instead.**
+- **Known limitation — quoting the markers as prose or in a code fence now
+  triggers a refusal.** Marker counting is substring-based, so a consumer
+  CLAUDE.md that *mentions* `<!-- BEGIN REPO-SKILLS -->` (documenting the
+  convention, or pasting an example inside a code fence) counts as a duplicate
+  marker and its install fails with exit 1. Fence-aware detection is
+  intentionally **not** implemented — it would reintroduce the ambiguity-guessing
+  #42 removed. If you need to show the markers as an example, alter them so they
+  are not literal occurrences (e.g. a non-ASCII hyphen, `BEGIN REPO‑SKILLS`, or a
+  broken-up string).
+- **A refusal from `reconcile_orphaned_block` leaves a partial install.** That
+  refusal path (and the update path) fires *after* skills and commands have
+  already been installed, so a refused run is a partial install — the warning
+  already says "(skills and commands were installed)". The remedy is not to
+  assume nothing was written: **correct the markers so exactly one BEGIN and one
+  END exist, in that order, then re-run the installer** (which reconciles the
+  now-valid block). CLAUDE.md itself is never modified by a refused run.
+
 ## 0.6.1 (2026-07-27)
 
 - **`install.sh` now reconciles an orphaned CLAUDE.md pointer block (#31).**
