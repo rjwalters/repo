@@ -34,6 +34,17 @@
   assume nothing was written: **correct the markers so exactly one BEGIN and one
   END exist, in that order, then re-run the installer** (which reconciles the
   now-valid block). CLAUDE.md itself is never modified by a refused run.
+- **`/repo:release` now supports per-project release policy at named phase
+  boundaries (#43).** A repo can inject its own procedural steps — gates, extra
+  manifest edits, post-release deploys — via a single `.repo/release-policy.md`
+  file with `## seam: <name>` sections, without forking the 269-line command.
+  Seven seams are exposed (`pre-flight`, `pre-changelog-style`, `pre-apply`,
+  `pre-push`, `post-push`, `pre-github-release`, `post-summary`); steps augment
+  the phase by default, or replace its default action with a `(replace)` marker.
+  A new Phase 0 loads the file and **warns before Phase 1 on any seam name that
+  binds to no phase boundary**, closing the silent-failure mode that orphaned
+  policy migrating off Loom's removed `/loom:release` skill (all five of its old
+  seam names carry over unchanged).
 
 ## 0.6.1 (2026-07-27)
 

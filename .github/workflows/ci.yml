@@ -10,9 +10,23 @@ name: CI
 # well within a single job's budget, so there is no reason to split coverage and
 # risk it looking like it covers more than it does.
 #
-# Note: this workflow does NOT enable required-status-check branch protection.
-# Requiring this check to merge is a separate, deliberate decision (see #48's
-# acceptance criteria) and must not be silently enabled here.
+# Required-status-check branch protection is deliberately NOT enabled for this
+# check. Issue #73 evaluated requiring the `pnpm test (guard/handoff/loss-check
+# suite)` context on `main` and the operator decided (2026-07-29) NOT to require
+# it: this is a solo-operator repo with agent-driven merges where merge-pr.sh
+# already waits for configured checks and treats a red check as a stop signal,
+# so the throughput cost of a hard gate (an added CI wait plus forced sibling-PR
+# branch updates on every sweep-wave merge) is not worth it yet. Revisit if
+# collaborators join.
+#
+# LOAD-BEARING for any future enabler: if protection is ever enabled, it MUST be
+# CLASSIC branch protection (PUT /repos/{owner}/{repo}/branches/main/protection),
+# NOT a Repository Ruleset. merge-pr.sh's required-check detection
+# (forge_get_required_status_check_contexts) reads GraphQL
+# repository.ref.branchProtectionRule.requiredStatusCheckContexts, which only
+# classic protection populates. A ruleset leaves branchProtectionRule null, so
+# the detection returns empty, merge-pr.sh's no-required-checks fallback fires,
+# and the protection is silently bypassed by an immediate synchronous merge.
 
 on:
   pull_request:
