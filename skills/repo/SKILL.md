@@ -142,9 +142,12 @@ The installer wires a second hook, `session-start-handoff.sh`, as two
 `SessionStart` entries — one matching `startup`, one matching `resume`. When
 [[handoff]] has left a note at `.claude/handoff.md`, the hook emits it as
 session context via `hookSpecificOutput.additionalContext`: the note's path,
-its age, an outline built from its `#`/`##` headers, and a staleness warning
-once the note passes seven days. It renders headers only, never the full body —
-a real handoff note runs to several KB, far too much to inject on every launch.
+its age, a staleness warning once the note passes seven days, and the note
+itself. When the note is at or under a size cap (`MAX_BODY_BYTES`, 10 KB) the
+**full body is inlined**; above the cap it falls back to an outline built from
+the note's `#`/`##` headers plus an explicit oversize warning. Inlining the body
+is deliberate (issue #33): the load-bearing content lives in the body, and a
+headers-only summary conveys shape but nothing actionable.
 
 Behavioral contract:
 

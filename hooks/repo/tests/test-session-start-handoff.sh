@@ -13,8 +13,9 @@
 # The contract under test (see the hook's header):
 #   - fires only for source "startup"/"resume"
 #   - emits hookSpecificOutput.hookEventName == "SessionStart" with
-#     additionalContext summarizing .claude/handoff.md (path, age, staleness,
-#     section headers only)
+#     additionalContext describing .claude/handoff.md (path, age, staleness) and
+#     the note payload: the full body inlined at/under the size cap, a
+#     headers-only outline plus an oversize warning above it (issue #33)
 #   - never exits non-zero, never emits malformed JSON, never writes the note
 
 set -uo pipefail
@@ -109,7 +110,7 @@ make_repo() {  # <name> -> echoes path
 
 NOTE_BODY='# Handoff — 2026-07-27
 
-Prose that must never be injected wholesale.
+Prose that is inlined verbatim when the note is under the size cap.
 
 ## 1. In-flight — resolve before anything else
 
@@ -148,7 +149,7 @@ assert_contains  "startup: context names the note path"   "$CTX" "$FRESH/.claude
 assert_contains  "startup: context reports age"           "$CTX" "just now"
 assert_contains  "startup: renders a section header"      "$CTX" "1. In-flight — resolve before anything else"
 assert_contains  "startup: renders the title header"      "$CTX" "Handoff — 2026-07-27"
-assert_not_contains "startup: omits note body prose"      "$CTX" "PR #41 awaits review"
+assert_contains  "startup: inlines note body prose"       "$CTX" "PR #41 awaits review"
 assert_not_contains "startup: fresh note is not stale"    "$CTX" "STALE"
 # Exactly one JSON object on stdout (a second would corrupt the hook protocol).
 LINES=$(printf '%s' "$HOOK_OUT" | grep -c . || true)
@@ -208,33 +209,110 @@ assert_not_contains "6d old: below the stale threshold"   "$CTX" "STALE"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- header rendering is capped and headers-only --"
+echo "-- oversize fallback: header outline is capped and headers-only --"
 # ---------------------------------------------------------------------------
+# This note must exceed MAX_BODY_BYTES (10 KB) so the hook takes the headers-only
+# fallback; each section is padded to push the whole note past the cap.
 MANY="$(make_repo many)"
 {
     for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         echo "## Section $i"
         echo "body-line-$i should never be injected"
+        for _ in $(seq 1 20); do
+            echo "padding padding padding padding padding padding padding padding"
+        done
         echo ""
     done
     echo "### Deep heading level three"
 } > "$MANY/.claude/handoff.md"
 run_hook "$MANY" startup
 CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains     "cap: oversize note warns it is too large" "$CTX" "OVERSIZE"
 assert_contains     "cap: first header rendered"          "$CTX" "Section 1"
 assert_contains     "cap: ninth header rendered"          "$CTX" "Section 9"
 assert_not_contains "cap: tenth header dropped"           "$CTX" "Section 10"
 assert_not_contains "cap: body lines never injected"      "$CTX" "body-line-1 should never be injected"
 assert_not_contains "cap: h3 headings not treated as sections" "$CTX" "Deep heading level three"
 
-# A note with no headers at all is still announced (path + age), no crash.
+# A note with no headers at all is still announced (path + age), and since it is
+# small it is inlined verbatim.
 NOHDR="$(make_repo nohdr)"
 printf 'just some prose, no headings at all\n' > "$NOHDR/.claude/handoff.md"
 run_hook "$NOHDR" startup
 assert_eq        "no headers: exit 0"                     "0" "$HOOK_EXIT"
 CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
 assert_contains  "no headers: still announces the note"   "$CTX" "$NOHDR/.claude/handoff.md"
-assert_not_contains "no headers: prose not injected"      "$CTX" "just some prose"
+assert_contains  "no headers: inlines the prose body"     "$CTX" "just some prose"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- payload policy: capped body inline vs oversize fallback (issue #33) --"
+# ---------------------------------------------------------------------------
+# Under the cap: the FULL body is inlined verbatim, wrapped in markers, with no
+# oversize warning and the read-in-full directive present.
+UNDER="$(make_repo under)"
+printf '%s' "$NOTE_BODY" > "$UNDER/.claude/handoff.md"
+run_hook "$UNDER" startup
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "under cap: inlines full body prose"     "$CTX" "PR #41 awaits review"
+assert_contains  "under cap: inlines the next-action line" "$CTX" "Run the test suite."
+assert_contains  "under cap: wraps body in a begin marker" "$CTX" "BEGIN HANDOFF NOTE"
+assert_contains  "under cap: wraps body in an end marker"  "$CTX" "END HANDOFF NOTE"
+assert_not_contains "under cap: no oversize warning"      "$CTX" "OVERSIZE"
+assert_contains  "under cap: directive present"           "$CTX" "Read the note in full before doing anything else"
+
+# Over the cap: headers outline + oversize warning; body omitted, no markers, but
+# the read-in-full / one-shot directive is still present (BOTH branches carry it).
+OVER="$(make_repo over)"
+{
+    echo "# Oversize handoff"
+    echo "## First real section"
+    echo "load-bearing-sentence-in-the-body"
+    for _ in $(seq 1 220); do
+        echo "filler filler filler filler filler filler filler filler"
+    done
+} > "$OVER/.claude/handoff.md"
+run_hook "$OVER" startup
+assert_eq        "over cap: exit 0"                       "0" "$HOOK_EXIT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "over cap: emits oversize warning"       "$CTX" "OVERSIZE"
+assert_contains  "over cap: renders a header outline"     "$CTX" "First real section"
+assert_not_contains "over cap: omits the note body"       "$CTX" "load-bearing-sentence-in-the-body"
+assert_not_contains "over cap: no inline body markers"    "$CTX" "BEGIN HANDOFF NOTE"
+assert_contains  "over cap: directive present"            "$CTX" "Read the note in full before doing anything else"
+assert_contains  "over cap: one-shot delete directive"    "$CTX" "delete both the note and its pointer"
+
+# Boundary: a note of EXACTLY MAX_BODY_BYTES (10240) inlines (condition is <=).
+BND="$(make_repo boundary)"
+BOUND_FILE="$BND/.claude/handoff.md"
+printf '# Boundary note\nunique-boundary-sentinel\n' > "$BOUND_FILE"
+cur=$(wc -c < "$BOUND_FILE" | tr -d '[:space:]')
+pad=$((10240 - cur))
+if (( pad > 0 )); then
+    head -c "$pad" /dev/zero | tr '\0' 'x' >> "$BOUND_FILE"
+fi
+EXACT_BYTES=$(wc -c < "$BOUND_FILE" | tr -d '[:space:]')
+assert_eq        "boundary: note is exactly 10240 bytes"  "10240" "$EXACT_BYTES"
+run_hook "$BND" startup
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "boundary: exactly-cap note is inlined"  "$CTX" "unique-boundary-sentinel"
+assert_not_contains "boundary: exactly-cap not oversize"  "$CTX" "OVERSIZE"
+
+# One byte over the cap flips to the oversize fallback.
+OVER1="$(make_repo boundary_over)"
+OVER1_FILE="$OVER1/.claude/handoff.md"
+printf '# Boundary note\n## Over by one\nunique-over-sentinel\n' > "$OVER1_FILE"
+cur=$(wc -c < "$OVER1_FILE" | tr -d '[:space:]')
+pad=$((10241 - cur))
+if (( pad > 0 )); then
+    head -c "$pad" /dev/zero | tr '\0' 'x' >> "$OVER1_FILE"
+fi
+EXACT_BYTES=$(wc -c < "$OVER1_FILE" | tr -d '[:space:]')
+assert_eq        "boundary+1: note is exactly 10241 bytes" "10241" "$EXACT_BYTES"
+run_hook "$OVER1" startup
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "boundary+1: one byte over falls back"   "$CTX" "OVERSIZE"
+assert_not_contains "boundary+1: body omitted over cap"   "$CTX" "unique-over-sentinel"
 
 # ---------------------------------------------------------------------------
 echo ""
