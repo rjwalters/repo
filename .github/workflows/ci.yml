@@ -1,0 +1,68 @@
+name: CI
+
+# Runs the repository's full test suite (`pnpm test` -> hooks/repo/tests/run.sh,
+# the ~532-case guard/handoff/loss-check suite) on every pull request and on
+# every push to the default branch. Before this workflow the suite only ran when
+# a human remembered to run it locally, so `gh pr checks` reported "no checks
+# reported" and PRs merged unverified (issue #48).
+#
+# The suite is exercised on every push AND every PR (not split): it takes ~60s,
+# well within a single job's budget, so there is no reason to split coverage and
+# risk it looking like it covers more than it does.
+#
+# Note: this workflow does NOT enable required-status-check branch protection.
+# Requiring this check to merge is a separate, deliberate decision (see #48's
+# acceptance criteria) and must not be silently enabled here.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pnpm test (guard/handoff/loss-check suite)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The test harness (hooks/repo/tests/run.sh) hard-fails with
+      # "FATAL: jq is required" if jq is absent. ubuntu-latest ships jq, but
+      # install it defensively so the suite never fails for an unrelated reason.
+      - name: Ensure jq is available
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
+      # commands/repo/tests/test-branches-loss-check.sh needs git >= 2.38 (#46).
+      # ubuntu-latest currently ships git >= 2.43, which satisfies the floor;
+      # print it so a future runner-image regression below 2.38 is visible in the
+      # log rather than surfacing as an opaque loss-check failure.
+      - name: Report git version
+        run: git --version
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Runs ./hooks/repo/tests/run.sh via the package.json "test" script and
+      # fails the job on any nonzero exit (a failing assertion turns the check
+      # red — verified by fault injection, per #48's acceptance criteria).
+      - name: Run test suite
+        run: pnpm test

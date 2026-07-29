@@ -5,8 +5,8 @@
   "private": true,
   "scripts": {
     "worktree:return": "./.loom/scripts/worktree-return.sh",
-    "check:ci": "echo 'No CI checks configured. Customize this script for your project.' && exit 0",
-    "check:all": "echo 'No checks configured. Customize this script for your project.' && exit 0",
+    "check:ci": "pnpm test",
+    "check:all": "pnpm test",
     "test": "./hooks/repo/tests/run.sh",
     "lint": "echo 'No linter configured. Customize this script for your project.' && exit 0"
   }
