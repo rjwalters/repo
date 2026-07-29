@@ -378,6 +378,62 @@ assert_bytes "reconcile non-adjacent: whole-line removal (historical behavior)" 
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- install.sh gitignore gate: the pointer block is skipped only when commands/ is ignored --"
+
+# Mixed state (repo#51): commands/ tracked via a negation, skills/ still ignored.
+# The pointer advertises the /repo:* commands, which ARE committed here, so the
+# block MUST be written. An earlier OR'd probe (commands OR skills) wrongly
+# skipped it because skills/ is ignored.
+T12="$(new_target gitignore-mixed-commands-tracked)"
+printf '%s\n' '.claude/*' '!.claude/commands/' > "$T12/.gitignore"
+cat > "$T12/CLAUDE.md" <<'EOF'
+Project notes.
+
+<!-- BEGIN LOOM ORCHESTRATION -->
+Loom content.
+<!-- END LOOM ORCHESTRATION -->
+EOF
+
+# Sanity-check the fixture reproduces the reported split state before asserting
+# on install behavior: commands/ negated back in, skills/ still ignored.
+assert_eq       "gitignore mixed: commands/ is NOT ignored (negation resolved)" \
+                "1" "$(git -C "$T12" check-ignore -q .claude/commands/repo/help.md; echo $?)"
+assert_eq       "gitignore mixed: skills/ IS ignored" \
+                "0" "$(git -C "$T12" check-ignore -q .claude/skills/repo; echo $?)"
+
+OUT12="$(bash "$INSTALL_SH" -y "$T12" 2>&1)"; RC12=$?
+BODY12="$(slurp "$T12/CLAUDE.md")"
+assert_eq       "gitignore mixed: install exits 0" "0" "$RC12"
+assert_not_contains "gitignore mixed: does NOT skip the pointer block" \
+                "$OUT12" "skipping the CLAUDE.md pointer block"
+assert_contains "gitignore mixed: reports the append"     "$OUT12" "Appended REPO-SKILLS block to CLAUDE.md"
+assert_contains "gitignore mixed: REPO-SKILLS block IS written" \
+                "$BODY12" "<!-- BEGIN REPO-SKILLS -->"
+
+# Fully gitignored (`.claude/`): commands/ is machine-local, so a committed
+# pointer would advertise uncommitted command files. The block MUST be skipped.
+T13="$(new_target gitignore-fully-ignored)"
+printf '%s\n' '.claude/' > "$T13/.gitignore"
+cat > "$T13/CLAUDE.md" <<'EOF'
+Project notes.
+
+<!-- BEGIN LOOM ORCHESTRATION -->
+Loom content.
+<!-- END LOOM ORCHESTRATION -->
+EOF
+BEFORE13="$(slurp "$T13/CLAUDE.md")"
+
+OUT13="$(bash "$INSTALL_SH" -y "$T13" 2>&1)"; RC13=$?
+BODY13="$(slurp "$T13/CLAUDE.md")"
+assert_eq       "gitignore fully: install exits 0" "0" "$RC13"
+assert_contains "gitignore fully: skips the pointer block" \
+                "$OUT13" "skipping the CLAUDE.md pointer block"
+assert_not_contains "gitignore fully: no REPO-SKILLS block written" \
+                "$BODY13" "<!-- BEGIN REPO-SKILLS -->"
+assert_eq       "gitignore fully: CLAUDE.md untouched" "$BEFORE13" "$BODY13"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- guard: unresolvable marker layouts are refused, never guessed --"
 
 T9="$(new_target guard-unterminated)"
