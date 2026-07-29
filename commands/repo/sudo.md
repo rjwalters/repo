@@ -64,9 +64,12 @@ needed**:
 - **Linux** — nearly every distro ships `#includedir /etc/sudoers.d` in
   `/etc/sudoers`.
 
-Running `sudo visudo -c` after the write implicitly proves the include chain is
-active on either platform (it validates `/etc/sudoers` **and** every file it
-includes), so there is no need to detect the OS or hand-verify the directive.
+The candidate file is always syntax-checked **in isolation** with
+`sudo visudo -cf "$TMP"` *before* it is copied into `/etc/sudoers.d/` — a
+malformed drop-in never becomes live policy. After the validated file is
+installed, a full-chain `sudo visudo -c` (it validates `/etc/sudoers` **and**
+every file it includes) implicitly proves the include chain is active on either
+platform, so there is no need to detect the OS or hand-verify the directive.
 
 The written file always carries a **discoverability header** on its first line
 so `--status`, `--remove`, and any later host-posture audit (e.g.
@@ -174,9 +177,15 @@ Always show the **exact file contents** (including the header line) that will be
 written, name the target path, and get an explicit **yes** before touching
 anything — even without `--ask`. Never write silently.
 
-Build the file in a temp location, copy it into place at `0440`, then validate
-— and **remove it on any validation failure** so a typo can never leave `sudo`
-broken (a malformed sudoers file can lock the user out of root):
+Build the file in a temp location and **validate the candidate in isolation
+before it can go live** — only a syntactically valid file is ever copied into
+`/etc/sudoers.d/`. There is no separate "enable" step for a sudoers.d file: the
+`@includedir` / `#includedir` directive picks it up on the very next `sudo`
+parse, so a broken file that reaches the directory is *already* live policy —
+and because sudo fails closed on a syntax error, the rollback `sudo rm` could be
+denied by the very file it is trying to remove. Validating `$TMP` first makes
+that failure mode impossible; the post-install full-chain check is then only a
+belt-and-suspenders proof that the include wiring is sound:
 
 ```bash
 USER_NAME="$(id -un)"
@@ -193,23 +202,38 @@ TMP="$(mktemp)"
 } > "$TMP"
 chmod 440 "$TMP"
 
+# Validate the candidate BEFORE it can affect live policy. visudo -cf checks a
+# single file's syntax without installing it, so a malformed drop-in never
+# becomes active and we never depend on a possibly-broken sudo to undo it.
+if ! sudo visudo -cf "$TMP"; then
+  rm -f "$TMP"
+  echo "candidate sudoers failed validation — nothing installed" >&2
+  exit 1
+fi
+
+# Only a validated file reaches /etc/sudoers.d/:
 sudo cp "$TMP" "$DROPIN"
 sudo chmod 440 "$DROPIN"
 rm -f "$TMP"
 
-# ALWAYS validate before reporting success. On failure, remove the drop-in and
-# exit non-zero — never leave an unvalidated or broken file in place.
+# Belt-and-suspenders: full-chain re-check proves the include wiring too. If it
+# somehow fails, remove the drop-in and exit non-zero — never leave an
+# unvalidated or broken file in place. (This rollback is now reliable because
+# the file was already known-valid before it landed.)
 if ! sudo visudo -c; then
   sudo rm -f "$DROPIN"
-  echo "sudoers validation failed — removed ${DROPIN}, no change made" >&2
+  echo "post-install validation failed — removed ${DROPIN}, no change made" >&2
   exit 1
 fi
 ```
 
-The order is load-bearing: the file is written at `0440`, and `visudo -c` is
-the last gate before success. If it fails for **any** reason, the drop-in is
-deleted and the command exits non-zero — there is no path in which a
-failed-validation file survives.
+The order is load-bearing: the candidate is syntax-checked with
+`visudo -cf "$TMP"` **before** the `cp`, so a malformed drop-in never becomes
+live policy and the rollback never has to fight a broken sudo. The post-install
+`visudo -c` is the final full-chain gate; if it fails for **any** reason the
+drop-in is deleted and the command exits non-zero — there is no path in which a
+failed-validation file survives, and no path in which an unvalidated file goes
+live even momentarily.
 
 ### 6. Verify and report
 
@@ -230,11 +254,16 @@ it later.
 1. **Always confirm before writing** — show the exact file contents (header +
    grant line) and the target path, and act only on an explicit yes. There is
    no silent/auto-apply mode; confirmation is the only mode.
-2. **Always validate, always roll back on failure** — the drop-in is written at
-   `0440` and `sudo visudo -c` runs before the command reports success. On any
-   validation failure the file is removed and the command exits non-zero. A
-   broken sudoers file can lock the user out of root, so an unvalidated file is
-   never left behind.
+2. **Validate the candidate before it goes live, then roll back on failure** —
+   the candidate is built at `0440` in a temp file and syntax-checked in
+   isolation with `sudo visudo -cf "$TMP"` **before** it is copied into
+   `/etc/sudoers.d/`, so a malformed drop-in never becomes active policy (a
+   sudoers.d file is live the instant it lands, and sudo fails closed on a
+   syntax error — validating pre-install is what keeps the rollback reliable). A
+   post-install full-chain `sudo visudo -c` then re-checks the include wiring;
+   on any failure the file is removed and the command exits non-zero. A broken
+   sudoers file can lock the user out of root, so an unvalidated file is never
+   installed or left behind.
 3. **Idempotent** — re-running with the same scope detects the existing drop-in
    and no-ops; only a scope *change* prompts to overwrite.
 4. **Only ever touch this command's own drop-in** at
