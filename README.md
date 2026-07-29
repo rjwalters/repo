@@ -18,6 +18,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
 | `/repo:release` | Cut a release — pre-flight checks, semver decision, CHANGELOG, version bump, tag, GitHub Release |
 | `/repo:remote` | Launch a cloud dev session (GCP or AWS) with the repo ready to go, then open an SSH session |
+| `/repo:host-optimize` | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | `/repo:followups` | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |

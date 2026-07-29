@@ -64,6 +64,7 @@ stashes, untracked files) always need an explicit opt-in.
 
 ### Periodic maintenance
 | /repo:audit | Monthly sweep, or after a big refactor/import |
+| /repo:host-optimize | Prep/re-check a Mac (or Linux box) for heavy Loom/agent build use — Gatekeeper churn, backup-agent interference, build-tree bloat |
 | /repo:update-tools | Keep Loom/Anvil/Repo Skills installs current |
 
 ### Focused checks

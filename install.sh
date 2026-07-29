@@ -490,20 +490,32 @@ fi
 
 CLAUDE_MD="$TARGET/CLAUDE.md"
 
-# If the install destination is gitignored in the target, the command/skill
-# files we just wrote are effectively machine-local (they won't be committed),
-# so a tracked CLAUDE.md pointer would advertise /repo:* commands whose files
-# aren't in the repo. Mirror dev mode here: skip the CLAUDE.md block entirely.
-# Probe each destination separately (check-ignore -q accepts only one pathname)
-# and skip if *either* is ignored, since a split state is itself broken. The
-# probe exits non-zero outside a git repo or when nothing is ignored, which
-# correctly falls through to the write path.
+# If the commands destination is gitignored in the target, the command files we
+# just wrote are effectively machine-local (they won't be committed), so a
+# tracked CLAUDE.md pointer would advertise /repo:* commands whose files aren't
+# in the repo. Mirror dev mode here: skip the CLAUDE.md block entirely.
+#
+# Gate the decision on the commands destination *alone*, not commands OR skills.
+# The pointer block exists to advertise the /repo:* commands ("The /repo:*
+# commands still work in-session"), so what matters is whether those command
+# files are committed. A split state where commands/ is tracked (e.g. via a
+# `!.claude/commands/` negation) but skills/ is gitignored is legitimate — the
+# pointer is still correct because the commands it advertises are committed. An
+# earlier version OR'd both probes and wrongly skipped the pointer in that mixed
+# state (see issue #51). The `.claude/skills/repo/SKILL.md` reference in the
+# block degrades gracefully if skills/ is machine-local: only the link goes
+# stale, the commands still work.
+#
+# Probe a representative *file* path rather than the bare directory so git's
+# ignore resolution (including `!` negations and nested .gitignore files) is
+# evaluated the same way it would be for a real committed file. check-ignore -q
+# exits non-zero outside a git repo or when nothing is ignored, which correctly
+# falls through to the write path.
 dest_is_gitignored() {
-  git -C "$TARGET" check-ignore -q .claude/commands/repo 2>/dev/null \
-    || git -C "$TARGET" check-ignore -q .claude/skills/repo 2>/dev/null
+  git -C "$TARGET" check-ignore -q .claude/commands/repo/help.md 2>/dev/null
 }
 if dest_is_gitignored; then
-  warning "Install destination (.claude/commands, .claude/skills) is gitignored in $TARGET;"
+  warning "Install destination (.claude/commands) is gitignored in $TARGET;"
   warning "skipping the CLAUDE.md pointer block (a committed pointer to uncommitted command"
   warning "files is not what you want). The /repo:* commands still work in-session."
   reconcile_orphaned_block

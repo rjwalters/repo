@@ -29,6 +29,7 @@ costs.
 | [[handoff]] | Roll the session safely — file follow-ups, reset, check for a CLI update, write a handoff note the next session reads first |
 | [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |
 | [[release]] | Cut a release — pre-flight, semver decision, CHANGELOG, version bump, tag, GitHub Release |
+| [[host-optimize]] | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH. Its provisioning contract is implemented once in `scripts/repo/repo-remote.sh` (installed to `.claude/skills/repo/scripts/`); the interactive flow delegates to that script, which also serves as a headless `repo-remote up --yes --json` entry point for non-interactive callers (e.g. loom's `fleet add-worker`) |
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | [[followups]] | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
@@ -46,6 +47,7 @@ costs.
 - When the working tree feels messy (`tidy`, `orphans`)
 - When `git branch` output has grown unmanageable (`branches`)
 - When local hardware isn't enough or you need a clean Linux box (`remote`)
+- Before turning a Mac into a heavy Loom/agent build host (`host-optimize`)
 - Periodically, to keep installed tool packages current (`update-tools`)
 - Periodically (monthly) as general hygiene (`audit`)
 - Before a demo, handoff, or onboarding (clean up before they arrive)
