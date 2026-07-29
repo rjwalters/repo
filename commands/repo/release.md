@@ -19,10 +19,66 @@ at release time, never hardcoded, so this works in any repo.
 /repo:release                  # Interactive release from the default branch
 ```
 
+## Phase 0 — Load project release policy
+
+Before Phase 1, load the repo's **release policy** if it has one. This is the
+single supported way for a project to inject its own procedural steps (gates,
+extra manifest edits, post-release deploys) at named phase boundaries without
+forking this command — see **Extension points — per-project release policy**
+below for the full seam contract and semantics. Projects migrating off Loom's
+removed `/loom:release` skill re-home their policy here.
+
+The policy lives in **one** file at the repo root: **`.repo/release-policy.md`**.
+Each seam is an H2 section headed `## seam: <name>`. Read it, then **validate the
+declared seam names and surface any that don't bind**, so a typo'd or orphaned
+seam fails loudly instead of silently doing nothing:
+
+```bash
+POLICY_FILE=".repo/release-policy.md"
+KNOWN_SEAMS="pre-flight pre-changelog-style pre-apply pre-push post-push pre-github-release post-summary"
+AUGMENT_ONLY="post-push post-summary"   # no default action → '(replace)' is meaningless
+if [ ! -f "$POLICY_FILE" ]; then
+  echo "(no $POLICY_FILE — running with the built-in phases only, no behavior change)"
+else
+  echo "Project release policy: $POLICY_FILE"
+  # Enumerate declared seams from '## seam: <name>' headers (dropping an optional
+  # '(replace)' suffix) and check each against the known set.
+  grep -E '^##[[:space:]]+seam:[[:space:]]*' "$POLICY_FILE" | while IFS= read -r header; do
+    name="$(printf '%s' "$header" | sed -E 's/^##[[:space:]]+seam:[[:space:]]*//; s/[[:space:]]*\(replace\)[[:space:]]*$//; s/[[:space:]]+$//')"
+    mode="augment"
+    printf '%s' "$header" | grep -Eq '\(replace\)[[:space:]]*$' && mode="replace"
+    case " $KNOWN_SEAMS " in
+      *" $name "*)
+        case " $AUGMENT_ONLY " in
+          *" $name "*)
+            if [ "$mode" = replace ]; then
+              echo "  WARNING: seam '$name' is augment-only — '(replace)' is meaningless here and will be ignored"
+            else
+              echo "  bound: $name (augment)"
+            fi ;;
+          *) echo "  bound: $name ($mode)" ;;
+        esac ;;
+      *)
+        echo "  WARNING: unknown seam '$name' — it matches no phase boundary and will NOT run. Fix the name (see the seam table) or remove the section." ;;
+    esac
+  done
+fi
+```
+
+If any `WARNING:` line prints, **stop and show it to the operator before Phase 1
+proceeds.** An unknown or misused seam is almost always a typo, or policy written
+against a seam this command doesn't expose — silently ignoring it is the exact
+failure this mechanism exists to prevent. Offer **[c]** continue anyway (the
+offending section simply won't run) or **[a]** abort to fix the policy. When the
+policy is clean, note which seams are bound and carry that into the phases below.
+
 ## Phase 1 — Pre-flight
 
 Confirm the repo is safe to cut from. The CI gate degrades gracefully when no
 workflows exist.
+
+> Seam `pre-flight` fires at the start of this phase — run any bound policy steps
+> before (augment) or in place of (replace) the checks below.
 
 ```bash
 # CI status, if CI exists at all
@@ -193,12 +249,19 @@ level and **ask the user to confirm or override.**
 
 ## Phase 4 — Draft the CHANGELOG
 
+> Seam `pre-changelog-style` fires before drafting — run any bound policy steps
+> to enforce a house changelog style (augment) or produce the entry itself
+> (replace).
+
 If `CHANGELOG.md` exists, study its format and draft a new entry matching it
 (header with today's date, a summary line, grouped changes, issue refs). If it's
 **absent**, offer to bootstrap a "Keep a Changelog" template. Present the draft
 and iterate until approved. Omit empty sections.
 
 ## Phase 5 — Apply
+
+> Seam `pre-apply` fires before this phase — run any bound policy steps (e.g.
+> edit extra manifests) before (augment) or in place of (replace) the bump.
 
 Once approved:
 
@@ -231,6 +294,11 @@ Show the result and get final confirmation.
 
 ## Phase 6 — Push & release
 
+Three seams fire in this phase: `pre-push` (before the push), `post-push`
+(immediately after it succeeds), and `pre-github-release` (before
+`gh release create`). Run any bound policy steps at each boundary — e.g. a
+`pre-github-release` gate that holds the Release until publish workflows finish.
+
 After an explicit yes:
 
 ```bash
@@ -259,11 +327,103 @@ CHANGELOG: 1 entry added
 Release:   GitHub Release created  (or: tag push only — no release workflow)
 ```
 
+> Seam `post-summary` fires after the summary — run any bound policy steps (e.g.
+> deploy a docs site, notify a channel).
+
+## Extension points — per-project release policy
+
+The phases above are fixed, but a project can inject its own procedural steps at
+**named phase boundaries** ("seams") without forking this command. This is what
+projects migrating off Loom's removed `/loom:release` skill use to re-home
+release policy — gates, extra manifest edits, post-release deploys.
+
+### Where policy lives
+
+**One** file, at the repo root: **`.repo/release-policy.md`**. There is a single
+supported lookup path by design — no per-user, per-branch, or fallback locations.
+Advisory *reminders* (e.g. "bump the protocol version when the API changes") still
+belong in the repo's CLAUDE.md, which this command already reads as context; the
+policy file is specifically for **procedural steps bound to a seam**.
+
+### Policy file format
+
+Each seam is an H2 section whose header is `## seam: <name>`, optionally suffixed
+with `(replace)`. The section body is the prose/steps the command runs at that
+boundary. Non-seam prose (a title, notes) is ignored — only `## seam:` headers
+bind.
+
+```markdown
+# Release policy — my-project
+
+## seam: pre-github-release
+
+Hold the GitHub Release until both publish workflows finish:
+- `gh run watch <npm-publish-run>` and `<crates-publish-run>` must both be green.
+
+## seam: post-summary
+
+Deploy the docs site: `gh workflow run deploy-site.yml`.
+
+## seam: pre-push (replace)
+
+Push via the release-bot identity instead of the default push:
+`git -c user.name="release-bot" push origin "$(git symbolic-ref --short HEAD)" --follow-tags`
+```
+
+### Seams and semantics
+
+Steps **augment** by default — they run *in addition to* the phase's built-in
+action, at the boundary. Appending `(replace)` to the header makes the policy
+steps stand in for the phase's default action instead. `(replace)` is only
+meaningful where the boundary has a default action to replace:
+
+| Seam | Fires | Augment (default) | `(replace)` |
+|------|-------|-------------------|-------------|
+| `pre-flight` | start of Phase 1 | run policy steps, then the standard pre-flight checks | policy steps become the pre-flight gate; skip the built-in CI/clean-tree checks |
+| `pre-changelog-style` | before Phase 4 drafts the entry | run policy steps (e.g. enforce a house changelog style), then draft | policy steps produce the entry; skip the default draft heuristic |
+| `pre-apply` | before Phase 5 applies | run policy steps (e.g. edit extra manifests), then bump + commit + tag | policy steps perform the bump/commit/tag; skip the default apply dispatch |
+| `pre-push` | before the `git push` in Phase 6 | run policy steps (a final gate), then push | policy steps perform the push; skip the default `git push` |
+| `post-push` | immediately after the push succeeds | run policy steps | **augment-only** — no default action; a `(replace)` marker is ignored with a warning |
+| `pre-github-release` | before `gh release create` | run policy steps (e.g. wait for publish workflows), then create the Release | policy steps create the Release (or intentionally skip it); skip the default `gh release create` |
+| `post-summary` | after the Phase 7 summary | run policy steps (e.g. deploy a site) | **augment-only** — no default action; a `(replace)` marker is ignored with a warning |
+
+### Unknown seams are surfaced, never silently ignored
+
+Phase 0 enumerates every `## seam: <name>` in the policy file and checks each name
+against the table above. A header naming no known seam — a typo like
+`pre-changelog-styl`, or policy written against a seam this command doesn't expose
+— prints a `WARNING` shown to the operator **before Phase 1 proceeds**, rather
+than binding to nothing. Likewise, `(replace)` on an augment-only seam
+(`post-push`, `post-summary`) warns. This is the guarantee that migrated policy
+cannot silently stop firing.
+
+### Migrating from `/loom:release`
+
+Loom's removed `/loom:release` skill exposed five seams. **All five carry over
+under the same names**, so policy targeting them binds unchanged:
+
+| `/loom:release` seam | `/repo:release` seam | Change |
+|----------------------|----------------------|--------|
+| `pre-changelog-style` | `pre-changelog-style` | none (identity) |
+| `pre-push` | `pre-push` | none (identity) |
+| `post-push` | `post-push` | none (identity) |
+| `pre-github-release` | `pre-github-release` | none (identity) |
+| `post-summary` | `post-summary` | none (identity) |
+
+`/repo:release` adds two boundaries Loom didn't have — `pre-flight` and
+`pre-apply` — for gates that must run before the pre-flight checks or before the
+version bump. To migrate, move the policy text into `.repo/release-policy.md`
+under a `## seam: <name>` header for each old seam name. Nothing is dropped in the
+rename.
+
 ## Principles
 
 Cutting a release is irreversible and outward-facing, so unlike the safe-fix
 hygiene commands it stays **report first, act second** — nothing is committed,
 tagged, or pushed without a yes. **General by design** — the tool and the file
-set are discovered, never assumed. If the repo needs a release-time reminder
+set are discovered, never assumed. If the repo needs a release-time *reminder*
 (e.g. "bump the protocol version when the API changes"), keep it in the repo's
-own CLAUDE.md; this command reads that context at runtime.
+own CLAUDE.md; this command reads that context at runtime. Procedural policy that
+must *run* at a specific point — a gate, an extra manifest edit, a post-release
+deploy — goes in `.repo/release-policy.md` bound to a named seam instead (see
+**Extension points — per-project release policy** above).
