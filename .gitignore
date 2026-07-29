@@ -21,6 +21,7 @@ hooks/logs/
 # Loom runtime state (don't commit these)
 .loom-in-use
 .loom-checkpoint
+.loom-managed
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
@@ -28,16 +29,24 @@ hooks/logs/
 .loom/daemon-metrics.json
 .loom/loom-source-path
 .loom/spawn-loop-state.json
+.loom/spawn-loop.pid
+.loom/stop-spawn-loop
 .loom/issue-failures.json
 .loom/interventions/
 .loom/worktrees/
+.loom/worktrees-local/
 .loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
 .loom/claims/
+.loom/locks/
 .loom/signals/
 .loom/status/
 .loom/retry-state/
+.loom/exit-codes/
+.loom/sweep-checkpoint/
+.loom/sweep-run/
+.loom/stats/
 .loom/diagnostics/
 .loom/guide-docs-state.json
 .loom/metrics_state.json
@@ -46,6 +55,9 @@ hooks/logs/
 .loom/metrics/
 .loom/usage-cache.json
 .loom/claude-config/
+.loom/tokens/
+.loom/accounts.env
+.loom/CANARY
 .loom/*.log
 .loom/*.sock
 .loom/logs/
