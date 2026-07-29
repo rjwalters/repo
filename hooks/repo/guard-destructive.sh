@@ -1574,14 +1574,86 @@ fi
 
 extract_rm_targets() {
     # Emit one rm-target token per line for every local `rm -r/-f` invocation.
-    # Portable awk only (no GNU/BSD-specific escapes); replaces the shell
-    # separators with newlines, then inspects each simple command.
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
-    {
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
-        n = split($0, segs, "\n")
-        for (i = 1; i <= n; i++) {
-            seg = segs[i]
+    # Portable awk only (no GNU/BSD-specific escapes).
+    #
+    # MULTI-LINE QUOTE AWARENESS (#60): slurp the whole (possibly multi-line)
+    # command into ONE buffer, then segment ONCE with a quote-aware walk — instead
+    # of the old per-awk-record `$0 = qsplit($0)`, whose quote-tracking reset at
+    # every input newline because awk's default RS split the command into separate
+    # records. That per-record form false-blocked a multi-line quoted DATA literal
+    # (echo/printf/--body) whose interior line merely BEGINS with `rm -rf /`: the
+    # interior line was scanned as its own top-level segment with no memory that it
+    # is still inside an open quote from a prior line, so its command word resolved
+    # to a real `rm` and its lone `/` token hit the protected-root deny. Mirrors
+    # the buffer-slurp the catastrophic/ask redactors (strip_datasink_literals /
+    # strip_literal_text) and command_has_shell_segment() already use.
+    #
+    # This function keeps its OWN lexer rather than reusing qsplit()+split("\n"),
+    # because qsplit() emits a `\n` for each real separator while ALSO leaving a
+    # literal newline that lived inside an inert quoted span untouched — the two
+    # are then indistinguishable to a downstream `split(s, segs, "\n")`, which is
+    # exactly why the naive slurp-then-qsplit would still re-split the quoted
+    # `rm -rf /` line into its own segment. Here segmentation is done inline so an
+    # inert quoted span's embedded newlines never become segment boundaries.
+    #
+    # Segmentation contract (identical to qsplit()'s single-line behaviour, now
+    # correctly carried ACROSS embedded newlines):
+    #   - Separators `;` `&` (`&&`) `|` (`||`) OUTSIDE any quote split segments.
+    #   - A raw newline OUTSIDE any quote ALSO splits — so a GENUINE multi-line
+    #     command (`echo a<NL>rm -rf /<NL>echo b`, no enclosing quote) still yields
+    #     a real `rm -rf /` segment and still denies (safety floor preserved; this
+    #     matches the old per-record behaviour where each input line was a record).
+    #   - An INERT quoted span (no `$(` and no backtick) is copied VERBATIM, so its
+    #     embedded newlines/separators stay literal and never manufacture a phantom
+    #     `rm` segment out of quoted documentation prose (the #60 false block).
+    #   - A quoted span carrying command substitution (`$(` or a backtick) keeps
+    #     its separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
+    #     smuggled payload is never hidden behind an opening quote.
+    #   - An unterminated quote copies the remainder verbatim (best-effort; never
+    #     widens a deny into an allow).
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)   # single quote
+        DQ = sprintf("%c", 34)   # double quote
+        buf = ""
+        segc = 0
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        n = length(s)
+        seg = ""
+        i = 1
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == DQ || c == SQ) {
+                qc = c
+                ci = 0
+                for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
+                if (ci == 0) {
+                    seg = seg substr(s, i)   # unterminated quote: copy rest verbatim
+                    i = n + 1
+                    continue
+                }
+                inner = substr(s, i + 1, ci - i - 1)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
+                    i = ci + 1
+                    continue
+                }
+                seg = seg c   # command substitution present: keep separators ACTIVE
+                i++
+                continue
+            }
+            if (c == ";" || c == "&" || c == "|" || c == "\n") {
+                segs[++segc] = seg; seg = ""; i++; continue
+            }
+            seg = seg c
+            i++
+        }
+        segs[++segc] = seg
+        for (si = 1; si <= segc; si++) {
+            seg = segs[si]
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)

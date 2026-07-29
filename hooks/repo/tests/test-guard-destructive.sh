@@ -1822,6 +1822,68 @@ assert_deny "#53 safety: echo 'ok' | tee f ; <danger> still denies (separate seg
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Multi-line quoted literal, line-leading recursive-force delete (#60) ---${NC}"
+# =========================================================================
+#
+# extract_rm_targets() now slurps the WHOLE (possibly multi-line) command into
+# one buffer before its quote-aware segmentation, so a multi-line quoted DATA
+# literal whose interior line *begins* with a recursive-force root delete is no
+# longer mis-read as a real `rm` segment. The old per-awk-record `qsplit()` reset
+# quote state at every input newline, so the interior `rm -rf /` line was scanned
+# as its own top-level segment and false-blocked with `rm-protected-path`
+# (guard-destructive.sh:1698) — the scope-check path, NOT the raw catastrophic
+# scan. Safety floor: a GENUINE multi-line command, `$(`/backtick smuggling,
+# `bash -c`/`sh -c` payloads, and pipe-to-shell must ALL still deny.
+#
+# Danger phrase assembled at runtime so this very test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag.
+_ML_DANGER="rm -r""f /"
+
+# The three reproduced false-blocks (echo / printf / --body data sinks): the
+# recursive-force root delete appears only as a line-leading token inside an
+# inert multi-line quoted literal, so nothing executes → ALLOW.
+assert_allow "#60: multi-line echo literal with line-leading rm -rf / is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML_DANGER")"
+
+assert_allow "#60: multi-line printf literal with line-leading rm -rf / is allowed" \
+    "$(printf "printf '%%s\\\\n' \"line one\n%s\nline three\"" "$_ML_DANGER")"
+
+assert_allow "#60: multi-line --body literal with line-leading rm -rf / is allowed" \
+    "$(printf 'gh issue comment 60 --body "line one\n%s\nline three"' "$_ML_DANGER")"
+
+# --- SAFETY FLOOR: the multi-line buffer-slurp must NEVER widen a deny into an allow ---
+
+# A GENUINE (unquoted) multi-line command whose LATER real line is the danger
+# still denies — the raw newline is a real segment boundary, so `rm -rf /` is a
+# real simple command (regression-proofs the reproduction's safety spot-check).
+assert_deny "#60 safety: genuine multi-line command with rm -rf / on a later line still denies" \
+    "$(printf 'echo line-one\n%s\necho line-three' "$_ML_DANGER")"
+
+# Command substitution smuggled inside the SAME multi-line quoted literal keeps
+# its separators active (the span is not inert), so the payload still denies.
+assert_deny "#60 safety: command-substitution inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML_DANGER")"
+
+# Backtick substitution inside the same shape likewise still denies.
+assert_deny "#60 safety: backtick substitution inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n\`%s\`\nline three"' "$_ML_DANGER")"
+
+# bash -c / sh -c with a multi-line payload whose interior line leads with the
+# danger is NOT a data sink — the payload executes, so it must still deny.
+assert_deny "#60 safety: bash -c multi-line payload with line-leading rm -rf / still denies" \
+    "$(printf 'bash -c %sline one\n%s\nline three%s' "'" "$_ML_DANGER" "'")"
+
+assert_deny "#60 safety: sh -c multi-line payload with line-leading rm -rf / still denies" \
+    "$(printf 'sh -c %sline one\n%s\nline three%s' "'" "$_ML_DANGER" "'")"
+
+# A multi-line quoted literal piped into a shell that WOULD execute it still
+# denies (command_has_shell_segment() gate skips redaction so the raw scan sees it).
+assert_deny "#60 safety: multi-line quoted literal piped into sh still denies" \
+    "$(printf 'echo "line one\n%s\nline three" | sh' "$_ML_DANGER")"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
 # =========================================================================
 #
