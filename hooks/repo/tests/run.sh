@@ -345,6 +345,13 @@ else
     BL_STATUS=$?
     BL_PASS="$(suite_count Passed "$BL_OUT")"
     BL_FAIL="$(suite_count Failed "$BL_OUT")"
+    # This suite skips its merge-tree-dependent assertions on git < 2.38 (repo#46).
+    # Surface the skip count so a skipped-heavy run is visibly distinct from a full
+    # pass in the breakdown — skips are neither pass nor fail, so they do NOT feed
+    # the PASS/FAIL folding or the breakdown-sums-to-headline self-check.
+    BL_SKIP="$(suite_count Skipped "$BL_OUT")"
+    BL_NOTE="branches.md loss check"
+    [[ "$BL_SKIP" =~ ^[0-9]+$ && "$BL_SKIP" -gt 0 ]] && BL_NOTE+=" — $BL_SKIP skipped"
     if ! [[ "$BL_PASS" =~ ^[0-9]+$ && "$BL_FAIL" =~ ^[0-9]+$ ]]; then
         # Summary block missing or unparseable (e.g. the suite died early under
         # its own `set -e`). Never let that fold in as zero failures.
@@ -363,7 +370,7 @@ else
     fi
     PASS=$((PASS + BL_PASS))
     FAIL=$((FAIL + BL_FAIL))
-    record_suite "test-branches-loss-check.sh" "$BL_PASS" "$BL_FAIL" "branches.md loss check"
+    record_suite "test-branches-loss-check.sh" "$BL_PASS" "$BL_FAIL" "$BL_NOTE"
 fi
 
 # remote.md's provisioning contract is extracted into scripts/repo/repo-remote.sh
