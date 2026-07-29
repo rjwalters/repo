@@ -2013,6 +2013,8 @@ _S72_SUB_CMDV='$(command -v '"$_S72_RM"')'     # $(command -v rm)
 _S72_SUB_BT='`which '"$_S72_RM"'`'             # `which rm` (backtick form)
 _S72_SUB_NEST='$(echo $(which '"$_S72_RM"'))'  # nested substitution command word
 _S72_SUB_LS='$(which ls)'                       # benign control: resolves to ls, not rm
+_S72_TIL='~'                                     # bare tilde home target (kept literal)
+_S72_HOMEV='$''HOME'                             # literal $HOME token (split so the harness never expands it)
 
 # --- The deny-floor gap this issue closes (all four were ALLOWED before #72) ---
 
@@ -2037,6 +2039,23 @@ assert_deny "#72: \$(echo \$(which rm)) -rf / (nested substitution command word)
 # sudo-prefixed substitution command word is denied too (sudo is stripped first).
 assert_deny "#72: sudo \$(which rm) -rf / (sudo + substitution command word) denied" \
     "sudo $_S72_SUB_WHICH $_S72_RF /"
+
+# env-prefixed substitution command word is denied too: extract_rm_targets()
+# strips a leading `env` (and VAR=val assignments) alongside `sudo`, so `env`
+# no longer shields the substitution from the protected-path check. Matches the
+# literal `env rm -rf /` deny (Judge #77 blocker 2).
+assert_deny "#72: env \$(which rm) -rf / (env + substitution command word) denied" \
+    "env $_S72_SUB_WHICH $_S72_RF /"
+
+# Home-directory wipe via a substitution command word denies the same way the
+# literal `rm -rf ~` / `rm -rf \$HOME` ALWAYS_BLOCK patterns do — the
+# protected-path loop expands a bare `~`/`\$HOME` target before the check so the
+# substitution path is no longer asymmetric with literal rm (Judge #77 blocker 1).
+assert_deny "#72: \$(which rm) -rf ~ (substitution command word, bare tilde home) denied" \
+    "$_S72_SUB_WHICH $_S72_RF $_S72_TIL"
+
+assert_deny "#72: \$(which rm) -rf \$HOME (substitution command word, \$HOME token) denied" \
+    "$_S72_SUB_WHICH $_S72_RF $_S72_HOMEV"
 
 # --- NO BLANKET DENY: benign command-word substitutions must stay ALLOWED ---
 

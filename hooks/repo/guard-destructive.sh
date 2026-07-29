@@ -1403,8 +1403,14 @@ ALWAYS_BLOCK_PATTERNS=(
     # whitespace, so a command-word substitution like `$(which rm) -rf /` (where
     # `rm` is followed by `)`) does NOT match here. That shape is instead caught
     # by the extract_rm_targets() -> rm-protected-path path below, whose deny
-    # covers root, $HOME, AND every top-level dir — a superset of these three —
-    # so no parallel regex is needed for the substitution case.
+    # covers root, $HOME, AND every top-level dir — a superset of these three.
+    # For that superset claim to actually hold for the substitution shape, the
+    # extract path must recognize the SAME home/root targets these literal
+    # patterns do: extract_rm_targets() strips a leading `env` (and VAR=val
+    # assignments) as well as `sudo`, and the protected-path loop expands a bare
+    # `~`/`$HOME` target before the check — so `env $(which rm) -rf /`,
+    # `$(which rm) -rf ~`, and `$(which rm) -rf $HOME` all deny just like their
+    # literal counterparts. No parallel regex is needed for the substitution case.
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+/([^[:alnum:]._~/-]|$)'
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+~([^[:alnum:]._~/-]|$)'
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+\$HOME([^[:alnum:]._~/-]|$)'
@@ -1714,7 +1720,16 @@ extract_rm_targets() {
         for (si = 1; si <= segc; si++) {
             seg = segs[si]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading run of VAR=val assignments and sudo/env wrappers
+            # (in any order/repetition) so the REAL command word — a literal `rm`
+            # OR a command-word substitution — is what we classify. `env` is
+            # stripped alongside `sudo` (#72): `env $(which rm) -rf /` and
+            # `env rm -rf /` must be seen as an rm command word, not shielded
+            # behind the wrapper. The required trailing [ \t]+ in each sub()
+            # guarantees the while loop makes progress and terminates.
+            while (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg) || \
+                   sub(/^sudo[ \t]+/, "", seg) || \
+                   sub(/^env[ \t]+/, "", seg)) { }
             sub(/^[ \t]+/, "", seg)
             # Determine the argument tail and the token index to start scanning
             # from. Two command-word shapes emit targets:
@@ -1854,6 +1869,31 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
             *.pyc)
                 continue ;;
         esac
+
+        # Expand a leading `~` or `$HOME` token so home-directory targets are
+        # recognized the same way the literal-rm ALWAYS_BLOCK `$HOME`/`~`
+        # patterns handle them (#72). extract_rm_targets() emits the raw token,
+        # so a substitution-path target of `~` or `$HOME` (as in
+        # `$(which rm) -rf ~`) would otherwise be treated as a CWD-relative path
+        # and never flagged, an asymmetry vs. literal `rm -rf ~`/`rm -rf $HOME`.
+        # Only bare-home and home-subpath forms are expanded — this mirrors the
+        # literal floor exactly: bare `$HOME`/`~` deny (whole-home wipe) while a
+        # home *subpath* expands to a deeper path and stays allowed.
+        if [[ -n "$HOME" ]]; then
+            # The `~` in the case globs below is a LITERAL match against the
+            # emitted target token, not a path we want the shell to expand —
+            # SC2088 (tilde-does-not-expand-in-quotes) is exactly the intended
+            # behaviour here, so it is suppressed.
+            # shellcheck disable=SC2088
+            case "$target" in
+                '~')          target="$HOME" ;;
+                '~/'*)        target="$HOME/${target#\~/}" ;;
+                '$HOME')      target="$HOME" ;;
+                '$HOME/'*)    target="$HOME/${target#\$HOME/}" ;;
+                '${HOME}')    target="$HOME" ;;
+                '${HOME}/'*)  target="$HOME/${target#\$\{HOME\}/}" ;;
+            esac
+        fi
 
         # Resolve path to absolute (raw — normalization happens next).
         ABS_PATH=""
