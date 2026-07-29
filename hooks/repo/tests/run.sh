@@ -15,8 +15,9 @@
 # to the headline aggregate, so a miswired block can never make the headline
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
-# test-session-start-handoff.sh, test-install-claude-md-markers.sh, and
-# commands/repo/tests/test-branches-loss-check.sh.
+# test-session-start-handoff.sh, test-install-claude-md-markers.sh,
+# commands/repo/tests/test-branches-loss-check.sh, and
+# commands/repo/tests/test-repo-remote.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -363,6 +364,41 @@ else
     PASS=$((PASS + BL_PASS))
     FAIL=$((FAIL + BL_FAIL))
     record_suite "test-branches-loss-check.sh" "$BL_PASS" "$BL_FAIL" "branches.md loss check"
+fi
+
+# remote.md's provisioning contract is extracted into scripts/repo/repo-remote.sh
+# (the headless entry point for /repo:remote, repo#52). Like the loss-check suite
+# above, its tests live outside hooks/repo/tests/ but `pnpm test` stays the one
+# entry point, so delegate here and fold the real PASS/FAIL counts into the totals.
+echo
+echo "-- repo-remote.sh headless provisioning (delegated suite) --"
+RR_TEST="$TESTS_DIR/../../../commands/repo/tests/test-repo-remote.sh"
+if [[ ! -f "$RR_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-repo-remote.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-repo-remote.sh" "$RR_TEST"
+else
+    RR_OUT="$(bash "$RR_TEST" 2>&1)"
+    RR_STATUS=$?
+    RR_PASS="$(suite_count Passed "$RR_OUT")"
+    RR_FAIL="$(suite_count Failed "$RR_OUT")"
+    if ! [[ "$RR_PASS" =~ ^[0-9]+$ && "$RR_FAIL" =~ ^[0-9]+$ ]]; then
+        RR_PASS=0
+        RR_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-repo-remote.sh" "$RR_STATUS"
+        strip_ansi "$RR_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RR_STATUS" -ne 0 || "$RR_FAIL" -ne 0 ]]; then
+        [[ "$RR_FAIL" -eq 0 ]] && RR_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-repo-remote.sh" "$RR_PASS" "$RR_FAIL" "$RR_STATUS"
+        strip_ansi "$RR_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-repo-remote.sh" "$RR_PASS"
+    fi
+    PASS=$((PASS + RR_PASS))
+    FAIL=$((FAIL + RR_FAIL))
+    record_suite "test-repo-remote.sh" "$RR_PASS" "$RR_FAIL" "remote.md provisioning contract"
 fi
 
 echo

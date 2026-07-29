@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Test suite for scripts/repo/repo-remote.sh — the headless, scriptable
+# provisioning entry point documented (as prose) in commands/repo/remote.md and
+# consumed by loom's `fleet add-worker` (repo#52).
+#
+# Usage: ./commands/repo/tests/test-repo-remote.sh
+# Exit code 0 = all tests pass, 1 = failures detected.
+#
+# Structured like commands/repo/tests/test-branches-loss-check.sh: pure bash, no
+# framework, PASS/FAIL/TOTAL counters and a summary block. `pnpm test` delegates
+# to this file via hooks/repo/tests/run.sh.
+#
+# WHY THIS FILE EXISTS (repo#52): remote.md is prose an agent reads; the script
+# under test is the executable extraction of its provisioning contract. The two
+# things this suite pins down are the two things that can cost real money if
+# wrong:
+#   1. the cost gate — `up` (with or without --yes) must fail LOUDLY (exit 2)
+#      when a cost-relevant field (provider, credentials, instance type) is
+#      missing from config, never silently substitute a default;
+#   2. config-layer precedence — repo `.env` overrides the shared remote.env.
+# It also covers JSON output shape, GPU detection/cost, the idle-shutdown guard,
+# instance-id write-back, and the end-to-end up/status/down flow against a mock
+# `aws` CLI. A doc-drift block at the end asserts remote.md still documents the
+# subcommands/flags the script implements.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+RR="$REPO_ROOT/scripts/repo/repo-remote.sh"
+REMOTE_MD="$REPO_ROOT/commands/repo/remote.md"
+
+PASS=0
+FAIL=0
+TOTAL=0
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+if [[ ! -f "$RR" ]]; then
+    echo "FATAL: repo-remote.sh not found at $RR" >&2
+    exit 1
+fi
+if [[ ! -f "$REMOTE_MD" ]]; then
+    echo "FATAL: remote.md not found at $REMOTE_MD" >&2
+    exit 1
+fi
+
+SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# ---------------------------------------------------------------------------
+# Assertion helpers (same shape as test-branches-loss-check.sh)
+# ---------------------------------------------------------------------------
+ok() { TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1)); printf "  ${GREEN}PASS${NC}: %s\n" "$1"; }
+no() {
+    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
+    printf "  ${RED}FAIL${NC}: %s\n" "$1"
+    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
+    return 0
+}
+assert_eq()       { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi; }
+assert_contains() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3] in [$2]"; fi; }
+assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present"; fi; }
+
+# json_field <json> <key> -> value of a flat string/number/bool field
+json_field() {
+    printf '%s' "$1" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p; s/.*\"$2\":\\([0-9.a-z]*\\).*/\\1/p" | head -n1
+}
+
+# ---------------------------------------------------------------------------
+# A fixture repo + config layers. XDG_CONFIG_HOME points at a scratch dir so the
+# shared remote.env is a fixture; the repo `.env` lives at a scratch git root.
+# ---------------------------------------------------------------------------
+FIX="$SCRATCH/fixture"
+XDG="$FIX/xdg"
+REPO="$FIX/myrepo"
+SHARED="$XDG/repo/remote.env"
+mkdir -p "$XDG/repo" "$REPO"
+git -C "$REPO" init -q
+
+write_shared() { mkdir -p "$XDG/repo"; printf '%s\n' "$@" >"$SHARED"; }
+write_repo_env() { printf '%s\n' "$@" >"$REPO/.env"; }
+
+# run_rr <extra-env...> -- <args...>  -> runs the script in the fixture repo with
+# XDG_CONFIG_HOME set, SSH config redirected to scratch, and the mock aws on PATH.
+MOCK_BIN="$SCRATCH/bin"
+MOCK_LOG="$SCRATCH/aws.log"
+mkdir -p "$MOCK_BIN"
+RR_OUT=""; RR_ERR=""; RR_RC=0
+run_rr() {
+    local -a envs=()
+    while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
+    shift
+    : >"$MOCK_LOG"
+    local errf; errf="$(mktemp)"
+    RR_OUT="$(cd "$REPO" && env \
+        PATH="$MOCK_BIN:$PATH" \
+        XDG_CONFIG_HOME="$XDG" \
+        REPO_REMOTE_SSH_CONFIG="$SCRATCH/ssh_config" \
+        MOCK_AWS_LOG="$MOCK_LOG" \
+        "${envs[@]}" \
+        bash "$RR" "$@" 2>"$errf")"
+    RR_RC=$?
+    RR_ERR="$(cat "$errf")"; rm -f "$errf"
+}
+
+# ---------------------------------------------------------------------------
+# The mock `aws` CLI. Logs every invocation to $MOCK_AWS_LOG and returns canned
+# output for exactly the subcommands repo-remote.sh calls. Scenario is driven by
+# env vars so each test controls reuse/create/find behavior.
+# ---------------------------------------------------------------------------
+cat >"$MOCK_BIN/aws" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+case "$1 $2" in
+  "sts get-caller-identity")
+    [[ "${MOCK_AWS_AUTH_FAIL:-0}" == 1 ]] && exit 255
+    echo '{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/test"}'; exit 0 ;;
+  "ec2 describe-images")
+    echo "${MOCK_AWS_AMI:-ami-0ubuntu2204}"; exit 0 ;;
+  "ec2 describe-instances")
+    # --instance-ids (pinned lookup) vs --filters (tag find)
+    if printf '%s' "$*" | grep -q -- '--instance-ids'; then
+      echo "${MOCK_AWS_STATE:-None}"
+    else
+      # tag find / status: emit configured rows (may be empty)
+      printf '%s' "${MOCK_AWS_FIND:-}"
+    fi
+    exit 0 ;;
+  "ec2 run-instances")
+    if [[ "${MOCK_AWS_QUOTA_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (VcpuLimitExceeded) when calling the RunInstances operation" >&2
+      exit 254
+    fi
+    echo "${MOCK_AWS_NEW_ID:-i-0newinstance}"; exit 0 ;;
+  "ec2 wait"|"ec2 start-instances"|"ec2 stop-instances"|"ec2 terminate-instances")
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+MOCK
+chmod +x "$MOCK_BIN/aws"
+
+echo "repo-remote.sh test suite"
+echo "========================="
+echo ""
+
+# ---------------------------------------------------------------------------
+echo "-- the cost gate: missing required config fails LOUDLY, never defaults --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+rm -f "$REPO/.env"
+run_rr -- up --yes --json
+assert_eq   "missing instance type -> exit 2 (the cost gate)" "2" "$RR_RC"
+assert_contains "names the missing cost-relevant var" "$RR_ERR" "REPO_REMOTE_INSTANCE_TYPE"
+assert_not_contains "did NOT emit an up result (nothing provisioned)" "$RR_OUT" '"action":"up"'
+# The mock must not have been asked to launch anything.
+assert_eq "no cloud call made when the gate fails" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# Missing credentials is the same loud failure, even with a type present.
+write_shared "REPO_REMOTE_PROVIDER=aws"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --yes --json
+assert_eq   "missing credentials -> exit 2" "2" "$RR_RC"
+assert_contains "names AWS_ACCESS_KEY_ID" "$RR_ERR" "AWS_ACCESS_KEY_ID"
+
+# Missing provider entirely.
+write_shared "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --yes --json
+assert_eq   "missing provider -> exit 2" "2" "$RR_RC"
+assert_contains "names REPO_REMOTE_PROVIDER" "$RR_ERR" "REPO_REMOTE_PROVIDER"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- --yes still requires a pre-supplied instance type (removes prompt, not consent) --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+rm -f "$REPO/.env"
+run_rr -- up --yes --json
+assert_eq "--yes without instance type STILL fails (exit 2)" "2" "$RR_RC"
+assert_not_contains "no instance was created" "$(cat "$MOCK_LOG")" "run-instances"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- config-layer precedence: repo .env overrides shared remote.env --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" \
+             "AWS_REGION=us-west-2" "REPO_REMOTE_INSTANCE_TYPE=m5.large"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --json          # dry-run plan
+assert_eq "repo .env instance type wins over shared" "m5.2xlarge" "$(json_field "$RR_OUT" instance_type)"
+assert_eq "region resolved from shared layer" "us-west-2" "$(json_field "$RR_OUT" region)"
+# Shared provider stands when repo doesn't override it.
+assert_eq "provider resolved (shared)" "aws" "$(json_field "$RR_OUT" provider)"
+# Repo overrides provider too.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_PROVIDER=gcp"
+run_rr -- up --json
+assert_eq "repo .env provider (gcp) overrides shared (aws) -> gcp gate" "2" "$RR_RC"
+assert_contains "gcp path now demands GCP creds" "$RR_ERR" "GCP_PROJECT"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- dry-run plan: cost shown, NOTHING provisioned (plan-before-spend) --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --json
+assert_eq   "plain up is a dry run -> exit 0" "0" "$RR_RC"
+assert_contains "output marked dry_run" "$RR_OUT" '"dry_run":true'
+assert_eq   "plan carries the estimated hourly cost" "0.384" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
+assert_eq   "no cloud mutation in dry run" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- JSON output shape on a real (mocked) provision --"
+# ---------------------------------------------------------------------------
+run_rr MOCK_AWS_NEW_ID=i-0abc123 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "up --yes provisions -> exit 0" "0" "$RR_RC"
+assert_contains "JSON has instance id"   "$RR_OUT" '"instance_id":"i-0abc123"'
+assert_contains "JSON has a public ip field" "$RR_OUT" '"public_ip"'
+assert_contains "JSON has the ssh alias"  "$RR_OUT" '"ssh_alias":"repo-remote-myrepo"'
+assert_contains "JSON has estimated hourly cost" "$RR_OUT" '"estimated_hourly_cost_usd":0.384'
+assert_contains "JSON reports it created (not reused)" "$RR_OUT" '"reused":false'
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- provisioning applies the required tag, disk, type and idle guard --"
+# ---------------------------------------------------------------------------
+LOGTXT="$(cat "$MOCK_LOG")"
+assert_contains "instance tagged repo-remote=<name>" "$LOGTXT" "repo-remote,Value=myrepo"
+assert_contains "requested instance type is passed"  "$LOGTXT" "m5.2xlarge"
+assert_contains "disk size from config is applied"   "$LOGTXT" "VolumeSize=50"
+assert_contains "user-data (idle guard) is passed"   "$LOGTXT" "user-data"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- idle-shutdown guard content --"
+# ---------------------------------------------------------------------------
+# The idle guard embeds IDLE_MIN, sourced from config; assert that value flows
+# through by setting a distinct idle window and confirming the plan echoes it.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=45"
+run_rr -- up --json
+assert_eq "idle-shutdown window is read from config" "45" "$(json_field "$RR_OUT" idle_shutdown_min)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- instance-id write-back to repo .env (never the shared file) --"
+# ---------------------------------------------------------------------------
+run_rr MOCK_AWS_NEW_ID=i-0written MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "new id written back to repo .env" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0written"
+assert_not_contains "shared remote.env is NOT touched with an instance id" "$(cat "$SHARED")" "REPO_REMOTE_INSTANCE_ID"
+# A second run updates in place rather than appending a duplicate line.
+run_rr MOCK_AWS_NEW_ID=i-0second MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "write-back updates in place (one line only)" "1" "$(grep -c '^REPO_REMOTE_INSTANCE_ID=' "$REPO/.env")"
+assert_contains "write-back reflects the newest id" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0second"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- reuse: a running pinned instance is reused, not recreated --"
+# ---------------------------------------------------------------------------
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running -- up --yes --json
+assert_contains "reused the pinned running instance" "$RR_OUT" '"instance_id":"i-0pinned"'
+assert_contains "reported reused=true" "$RR_OUT" '"reused":true'
+assert_eq "no new instance launched on reuse" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+# A stopped pinned instance is started, still reused.
+run_rr MOCK_AWS_STATE=stopped -- up --yes --json
+assert_contains "stopped pinned instance is started" "$(cat "$MOCK_LOG")" "start-instances"
+assert_contains "still reported reused" "$RR_OUT" '"reused":true'
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- GPU detection + cost --"
+# ---------------------------------------------------------------------------
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
+run_rr -- up --json
+assert_contains "GPU family flagged gpu=true" "$RR_OUT" '"gpu":true'
+assert_eq "GPU instance carries a GPU-tier cost" "1.861" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
+# Unknown type -> approximate cost, still a number present.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=zz.unknown"
+run_rr -- up --json
+assert_contains "unknown type flagged approximate" "$RR_OUT" '"estimated_cost_approximate":true'
+assert_contains "unknown type still carries a cost number" "$RR_OUT" '"estimated_hourly_cost_usd":0.20'
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- GPU quota (VcpuLimitExceeded) surfaces the exact remediation --"
+# ---------------------------------------------------------------------------
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
+run_rr MOCK_AWS_QUOTA_FAIL=1 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "quota failure -> non-zero exit" "4" "$RR_RC"
+assert_contains "names the Service Quotas code" "$RR_ERR" "L-DB2E81BA"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- status: lists tagged instances as JSON --"
+# ---------------------------------------------------------------------------
+run_rr MOCK_AWS_FIND="i-0abc running m5.2xlarge 1.2.3.4 2026-07-29T00:00:00Z" -- status --json
+assert_eq   "status -> exit 0" "0" "$RR_RC"
+assert_contains "status action" "$RR_OUT" '"action":"status"'
+assert_contains "status lists the instance" "$RR_OUT" '"instance_id":"i-0abc"'
+assert_contains "status carries state" "$RR_OUT" '"state":"running"'
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- down: dry-run vs --yes, and --delete terminates --"
+# ---------------------------------------------------------------------------
+run_rr MOCK_AWS_FIND="i-0abc" -- down --json      # no --yes -> dry-run
+assert_contains "down without --yes is a dry run" "$RR_OUT" '"disposition":"dry-run"'
+assert_eq "dry-run down does not stop anything" "0" "$(grep -c 'stop-instances' "$MOCK_LOG" 2>/dev/null)"
+run_rr MOCK_AWS_FIND="i-0abc" -- down --yes --json
+assert_contains "down --yes stops" "$RR_OUT" '"disposition":"stopped"'
+assert_contains "stop-instances actually called" "$(cat "$MOCK_LOG")" "stop-instances"
+run_rr MOCK_AWS_FIND="i-0abc" -- down --yes --delete --json
+assert_contains "down --yes --delete terminates" "$RR_OUT" '"disposition":"terminated"'
+assert_contains "terminate-instances actually called" "$(cat "$MOCK_LOG")" "terminate-instances"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- auth failure stops loudly, no fallback --"
+# ---------------------------------------------------------------------------
+run_rr MOCK_AWS_AUTH_FAIL=1 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "auth failure -> exit 3" "3" "$RR_RC"
+assert_eq "no instance launched after auth failure" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- usage errors --"
+# ---------------------------------------------------------------------------
+run_rr -- ; assert_eq "no action -> usage error (64)" "64" "$RR_RC"
+run_rr -- bogus ; assert_eq "unknown arg -> usage error (64)" "64" "$RR_RC"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- doc drift: remote.md documents what the script implements --"
+# ---------------------------------------------------------------------------
+MD="$(cat "$REMOTE_MD")"
+assert_contains "remote.md documents the headless entry point" "$MD" "repo-remote"
+assert_contains "remote.md documents 'up' provisioning verb" "$MD" "repo-remote up"
+assert_contains "remote.md documents --yes for the non-interactive path" "$MD" "--yes"
+assert_contains "remote.md documents --json machine-readable output" "$MD" "--json"
+assert_contains "remote.md still documents --status" "$MD" "--status"
+assert_contains "remote.md still documents --down" "$MD" "--down"
+assert_contains "remote.md documents the repo-remote=<name> tag" "$MD" "repo-remote=<name>"
+assert_contains "remote.md documents the cost-gate contract" "$MD" "REPO_REMOTE_INSTANCE_TYPE"
+assert_contains "remote.md states --yes preserves consent" "$MD" "removes the prompt, not the consent"
+
+# The interactive steps must DELEGATE to the shared script, not re-issue cloud
+# CLI calls from prose (the "no behavior drift" acceptance criterion).
+assert_contains "remote.md delegates provisioning to the shared script" "$MD" "scripts/repo/repo-remote.sh"
+
+# install.sh must ship the script to consumer repos (packaging path).
+INSTALL_SH="$REPO_ROOT/install.sh"
+if [[ -f "$INSTALL_SH" ]]; then
+    IN="$(cat "$INSTALL_SH")"
+    assert_contains "install.sh copies repo-remote.sh into the skill scripts dir" \
+        "$IN" "scripts/repo-remote.sh"
+    assert_contains "install.sh chmod +x the installed script" \
+        "$IN" "chmod +x"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "========================================="
+echo "  Total:  $TOTAL"
+printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"
+printf "  ${RED}Failed${NC}: %s\n" "$FAIL"
+echo "========================================="
+
+if [[ $FAIL -gt 0 ]]; then
+    printf "\n${RED}TESTS FAILED${NC}\n"
+    exit 1
+fi
+printf "\n${GREEN}ALL TESTS PASSED${NC}\n"
+exit 0
