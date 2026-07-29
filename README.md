@@ -43,6 +43,25 @@ Installing Repo Skills also wires a **SessionStart hook** (`session-start-handof
 
 It is strictly read-only: it never writes or deletes the note (absorbing it and removing it is `/repo:handoff`'s own one-shot contract), it stays silent when no note exists, and it fails open, so a hook error can never block session start. It deliberately does not fire on `/clear`, which is not a process relaunch.
 
+### Optional: surface the note to the human too (`--shell-wrapper`)
+
+The `SessionStart` hook above gets the note into **Claude's** context. It shows the **human** nothing before the session starts — you quit, relaunch, and there's no visible signal that the previous session left instructions. Pass `--shell-wrapper` to `install.sh` to also opt into a shell `claude` wrapper that prints a compact banner (note path, age, a `##`-header outline, and a STALE warning past seven days) *before* Claude starts.
+
+This is the **one thing the installer writes outside the target repo** — it edits your shell rc (`~/.zshrc` or `~/.bashrc`, detected from `$SHELL`/`$ZSH_VERSION`/`$BASH_VERSION`; fish isn't supported yet and is skipped with a clear message rather than half-supported) — so it is treated with more care than everything else installed:
+
+- **Off by default.** `--yes`/non-interactive installs are a **strict no-op** for this feature unless `--shell-wrapper` is also passed — the rc file is neither read nor written. An interactive install without the flag still *offers* it via a confirm (default **N**), always showing the exact pending diff first.
+- **Marker-bounded and idempotent**, same convention as the `CLAUDE.md` block (`# BEGIN REPO-SKILLS CLAUDE WRAPPER` / `# END …`) — re-running `--shell-wrapper` replaces the block in place rather than duplicating it.
+- **Backed up before every edit.** The path is reported after install/uninstall.
+- **Preserves an existing `claude` alias.** If your rc already has `alias claude='command claude --dangerously-skip-permissions'` (or similar), its flags are folded into the new function and `unalias claude` runs ahead of the function definition so the two don't fight over which wins. Your original alias line is left untouched outside the markers. Anything outside that common single-line form is left alone with a message rather than guessed at.
+- **Never recurses and never breaks non-interactive invocations.** The function always calls `command claude`, and always falls through to it unmodified — the banner helper is skipped (not fatal) if it's ever missing, so scripted calls like `claude mcp list` behave exactly like the real binary.
+
+```bash
+./install.sh --shell-wrapper ~/projects/my-app       # interactive: offers a confirm either way
+./install.sh -y --shell-wrapper ~/projects/my-app    # non-interactive opt-in, no prompt
+```
+
+`uninstall.sh` removes the block (from both `~/.zshrc` and `~/.bashrc`, whichever has it) automatically, with the same backup discipline, and is a no-op if it was never installed.
+
 ## Installation
 
 The installer copies the skill files into a target repository's `.claude/` directory, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
@@ -65,6 +84,10 @@ The installer copies the skill files into a target repository's `.claude/` direc
 
 # Dev mode: symlink source files for live editing (dogfooding)
 ./install.sh --dev .
+
+# Opt into the shell `claude` wrapper (see "Optional: surface the note to the
+# human too" above) — off by default, edits your shell rc
+./install.sh --shell-wrapper ~/projects/my-app
 ```
 
 To remove: `./uninstall.sh /path/to/target-repo`.
@@ -84,6 +107,8 @@ The installer is designed to coexist with whatever already lives in the consumer
 
 Nothing else in the target repository is read or modified.
 
+Opt-in only, and outside the target repository: with `--shell-wrapper`, your shell rc (`~/.zshrc` or `~/.bashrc`) gains one marker-bounded block (`# BEGIN REPO-SKILLS CLAUDE WRAPPER` / `# END …`), backed up first — see "Optional: surface the note to the human too" above.
+
 ## Repository layout
 
 ```
@@ -96,11 +121,13 @@ hooks/repo/tests/run.sh      Smoke suite covering both hooks (bash, no framework
 hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
 hooks/repo/tests/test-session-start-handoff.sh  Handoff-hook suite (run.sh delegates to it)
 hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regression suite
+hooks/repo/tests/test-shell-wrapper.sh  claude shell wrapper suite (run.sh delegates to it)
 commands/repo/tests/test-branches-loss-check.sh  branches.md permanent-loss check suite (run.sh delegates)
 commands/repo/tests/test-repo-remote.sh  repo-remote.sh provisioning-contract suite (run.sh delegates)
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
+lib/shell-wrapper.sh         Opt-in claude shell wrapper (--shell-wrapper): detection, alias parsing, marker-bounded rc surgery
 ```
 
 ## Adding a skill

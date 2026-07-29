@@ -4,19 +4,27 @@
 # Usage: ./install.sh [OPTIONS] [/path/to/target-repo]
 #
 # Options:
-#   --skills=a,b,c   Install only these commands (default: all)
-#   --dev            Symlink source files instead of copying (for dogfooding);
-#                    allows installing into the source repo itself
-#   --list           List available commands and exit
-#   --dry-run        Show what would be written without writing
-#   -y, --yes        Non-interactive mode (skip confirmation prompts)
-#   -h, --help       Show this help
+#   --skills=a,b,c    Install only these commands (default: all)
+#   --dev             Symlink source files instead of copying (for dogfooding);
+#                     allows installing into the source repo itself
+#   --list            List available commands and exit
+#   --dry-run         Show what would be written without writing
+#   -y, --yes         Non-interactive mode (skip confirmation prompts)
+#   --shell-wrapper   Opt into a shell `claude` wrapper (edits ~/.zshrc or
+#                     ~/.bashrc — the only thing this installer writes outside
+#                     the target repo) that surfaces a pending /repo:handoff
+#                     note before Claude starts. Default: off. Even without
+#                     this flag, an interactive install still offers it via a
+#                     confirm (default N, diff shown first); under --yes it is
+#                     always a strict no-op unless this flag is also passed.
+#   -h, --help        Show this help
 #
 # Examples:
 #   ./install.sh ~/projects/my-app
 #   ./install.sh --skills=clean,remote .
 #   ./install.sh --dry-run ~/projects/my-app
 #   ./install.sh --dev .            # dogfood: live /repo:* here via symlinks
+#   ./install.sh -y --shell-wrapper ~/projects/my-app   # opt into the shell wrapper non-interactively
 
 set -euo pipefail
 
@@ -58,6 +66,12 @@ MARKER_END='<!-- END REPO-SKILLS -->'
 # rewrite the block by hand here — see lib/claude-md-block.sh (repo#38).
 # shellcheck source=lib/claude-md-block.sh
 source "$SOURCE_ROOT/lib/claude-md-block.sh"
+
+# Shell `claude` wrapper (opt-in via --shell-wrapper) — the one thing this
+# installer can write outside the target repo. See lib/shell-wrapper.sh
+# (repo#35) for the detection/parsing/rewrite logic and its safety contract.
+# shellcheck source=lib/shell-wrapper.sh
+source "$SOURCE_ROOT/lib/shell-wrapper.sh"
 
 claude_md_has_block() { [[ -f "$TARGET/CLAUDE.md" ]] && grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md"; }
 
@@ -123,8 +137,9 @@ SKILLS_FILTER=""
 DRY_RUN=false
 YES=false
 DEV=false
+SHELL_WRAPPER=false
 
-usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 list_commands() {
   for f in "$SOURCE_ROOT"/commands/repo/*.md; do
@@ -134,12 +149,13 @@ list_commands() {
 
 for arg in "$@"; do
   case "$arg" in
-    --skills=*) SKILLS_FILTER="${arg#--skills=}" ;;
-    --dev)      DEV=true ;;
-    --list)     list_commands; exit 0 ;;
-    --dry-run)  DRY_RUN=true ;;
-    -y|--yes)   YES=true ;;
-    -h|--help)  usage; exit 0 ;;
+    --skills=*)      SKILLS_FILTER="${arg#--skills=}" ;;
+    --dev)           DEV=true ;;
+    --list)          list_commands; exit 0 ;;
+    --dry-run)       DRY_RUN=true ;;
+    -y|--yes)        YES=true ;;
+    --shell-wrapper) SHELL_WRAPPER=true ;;
+    -h|--help)       usage; exit 0 ;;
     -*)         error "Unknown option: $arg (see --help)" ;;
     *)          [[ -n "$TARGET" ]] && error "Multiple targets given: $TARGET and $arg"
                 TARGET="$arg" ;;
@@ -243,6 +259,16 @@ if [[ "$DRY_RUN" == true ]]; then
   else
     echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry)"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
+  fi
+  if [[ "$SHELL_WRAPPER" == true ]]; then
+    _dry_run_sw_shell="$(shell_wrapper_detect_shell)" || _dry_run_sw_shell="unsupported"
+    if [[ "$_dry_run_sw_shell" == zsh || "$_dry_run_sw_shell" == bash ]]; then
+      echo "  $(shell_wrapper_rc_path "$_dry_run_sw_shell") (outside $TARGET — marker-bounded claude shell wrapper; --shell-wrapper)"
+    else
+      echo "  (--shell-wrapper given, but no supported shell detected — would skip: $_dry_run_sw_shell)"
+    fi
+  else
+    echo "  (pass --shell-wrapper to also preview the optional claude shell wrapper, outside $TARGET)"
   fi
   exit 0
 fi
@@ -471,6 +497,62 @@ install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
   "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" "scripts/repo/repo-remote.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/scripts/repo-remote.sh"
+
+# 3e. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
+# to the HUMAN before Claude starts (the SessionStart hook above is the half
+# Claude itself sees). This is the one thing install.sh writes outside the
+# target repo, so unlike every step above it is opt-in and defensive: a
+# strict no-op under --yes without --shell-wrapper, the pending diff is always
+# shown before anything is written, an interactive install without the flag
+# still offers it via confirm (default N), and the rc file is backed up before
+# every edit. Runs unconditionally (before the dev-mode / gitignored-target
+# early exits below) since it is independent of $TARGET entirely.
+if [[ "$YES" == true && "$SHELL_WRAPPER" != true ]]; then
+  : # strict no-op — the rc file is neither read nor written
+else
+  SW_SHELL="$(shell_wrapper_detect_shell)" || true
+  if [[ -z "$SW_SHELL" || "$SW_SHELL" == "unknown" ]]; then
+    warning "claude shell wrapper: could not detect a supported shell (checked \$SHELL, \$ZSH_VERSION, \$BASH_VERSION) — skipping"
+  elif [[ "$SW_SHELL" == "fish" ]]; then
+    warning "claude shell wrapper: detected fish, which isn't supported yet (zsh/bash only) — skipping rather than half-supporting it"
+  else
+    SW_RC="$(shell_wrapper_rc_path "$SW_SHELL")"
+    if ! shell_wrapper_plan "$SW_RC"; then
+      warning "claude shell wrapper: $SHELL_WRAPPER_ERROR"
+    else
+      SW_PREVIEW_BEFORE="$(mktemp)"
+      [[ -f "$SW_RC" ]] && cp "$SW_RC" "$SW_PREVIEW_BEFORE" || : >"$SW_PREVIEW_BEFORE"
+      SW_PREVIEW_AFTER="$(mktemp)"
+      cp "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER"
+      if ! shell_wrapper_install "$SW_PREVIEW_AFTER" "$SHELL_WRAPPER_FLAGS"; then
+        warning "claude shell wrapper: could not prepare a preview: $SHELL_WRAPPER_ERROR"
+        rm -f "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER"
+      else
+        echo ""
+        info "claude shell wrapper ($SW_SHELL) would change $SW_RC:"
+        diff -u "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER" | tail -n +3 || true
+        rm -f "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER" "$SHELL_WRAPPER_BACKUP"
+
+        SW_PROCEED=false
+        if [[ "$SHELL_WRAPPER" == true ]]; then
+          SW_PROCEED=true
+        elif confirm "Install the claude shell wrapper into $SW_RC? [y/N] " N; then
+          SW_PROCEED=true
+        fi
+
+        if [[ "$SW_PROCEED" == true ]]; then
+          if shell_wrapper_install "$SW_RC" "$SHELL_WRAPPER_FLAGS"; then
+            success "Installed claude shell wrapper into $SW_RC (backed up to $SHELL_WRAPPER_BACKUP)"
+          else
+            warning "claude shell wrapper: could not install it: $SHELL_WRAPPER_ERROR"
+          fi
+        else
+          info "Skipped the claude shell wrapper"
+        fi
+      fi
+    fi
+  fi
+fi
 
 # 4. CLAUDE.md block (replace existing block in place, else append).
 # Skipped in dev mode: the symlinked install is machine-local (absolute symlinks
