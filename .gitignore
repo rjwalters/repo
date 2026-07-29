@@ -1,5 +1,8 @@
 .DS_Store
 
+# Dependencies
+node_modules/
+
 # Repo Skills dev-mode symlinks (machine-local, do not commit)
 .claude/
 
