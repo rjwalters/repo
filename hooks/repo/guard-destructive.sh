@@ -924,6 +924,90 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 }
 '
 
+# =============================================================================
+# MULTI-LINE QUOTE-AWARE SEGMENTATION (#71)
+#
+# The three segment parsers (parse_force_ops, lifecycle_or_cloud_reason,
+# extract_rm_targets) originally segmented per awk INPUT RECORD with
+# `$0 = qsplit($0); split($0, segs, "\n")`. Because awk's default RS="\n" splits
+# a multi-line command into separate records BEFORE the pattern block runs,
+# qsplit()'s quote-tracking state — scoped to a single call — reset at every
+# embedded newline. An interior line of an otherwise-inert multi-line quoted
+# DATA literal (echo/printf/--body) was therefore lexed as its own top-level
+# segment with no memory that it is still inside an open quote from a prior line,
+# so a quoted `git push --force origin main` false-`ask`ed (parse_force_ops) and
+# a quoted `halt` false-`deny`ed (lifecycle_or_cloud_reason). PR #69 fixed the
+# identical defect in extract_rm_targets() with a whole-buffer slurp-then-segment
+# lexer; this shared helper generalizes that lexer so all three parsers segment
+# ONCE over the full command and cannot drift (the same rationale the _QSPLIT_AWK
+# header gives for sharing qsplit()).
+#
+# `ml_segment(buf, segs)` fills the caller's `segs[]` out-array (AWK passes arrays
+# by reference) with one entry per top-level segment and returns the count. It
+# deliberately does NOT reuse qsplit()+split("\n"): qsplit() emits a `\n` for each
+# REAL separator while ALSO leaving a literal newline that lived inside an inert
+# quoted span untouched, so the two become indistinguishable to a downstream
+# `split(s, segs, "\n")`. Segmentation is therefore done inline here, so an inert
+# quoted span's embedded newlines never become segment boundaries.
+#
+# Segmentation contract (identical to qsplit()'s single-line behaviour, now
+# correctly carried ACROSS embedded newlines):
+#   - Separators `;` `&` (`&&`) `|` (`||`) OUTSIDE any quote split segments.
+#   - A raw newline OUTSIDE any quote ALSO splits — so a GENUINE multi-line
+#     command still yields a real later-line segment and still denies (safety
+#     floor preserved; matches the old per-record behaviour where each input line
+#     was its own record).
+#   - An INERT quoted span (no `$(` and no backtick) is copied VERBATIM, so its
+#     embedded newlines/separators stay literal and never manufacture a phantom
+#     segment out of quoted documentation prose (the false positive).
+#   - A quoted span carrying command substitution (`$(` or a backtick) keeps its
+#     separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
+#     smuggled payload is never hidden behind an opening quote.
+#   - An unterminated quote copies the remainder verbatim (best-effort; never
+#     widens a deny into an allow).
+# =============================================================================
+_ML_QSPLIT_AWK='
+function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner) {
+    SQ = sprintf("%c", 39)   # single quote
+    DQ = sprintf("%c", 34)   # double quote
+    split("", segs)          # clear the caller-supplied out-array
+    s = buf
+    n = length(s)
+    seg = ""
+    segc = 0
+    i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == DQ || c == SQ) {
+            qc = c
+            ci = 0
+            for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
+            if (ci == 0) {
+                seg = seg substr(s, i)   # unterminated quote: copy rest verbatim
+                i = n + 1
+                continue
+            }
+            inner = substr(s, i + 1, ci - i - 1)
+            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
+                i = ci + 1
+                continue
+            }
+            seg = seg c   # command substitution present: keep separators ACTIVE
+            i++
+            continue
+        }
+        if (c == ";" || c == "&" || c == "|" || c == "\n") {
+            segs[++segc] = seg; seg = ""; i++; continue
+        }
+        seg = seg c
+        i++
+    }
+    segs[++segc] = seg
+    return segc
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -943,12 +1027,20 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 #   - reset --hard: always emitted with <target> = "@HEAD@".
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
 parse_force_ops() {
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
-    BEGIN { SEP = sprintf("%c", 31) }  # US (unit separator) — non-whitespace so
-                                       # bash read does not trim an empty cpath.
-    {
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
-        n = split($0, segs, "\n")
+    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    BEGIN {
+        SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
+                                 # read does not trim an empty cpath.
+        buf = ""
+    }
+    # Slurp the whole (possibly multi-line) command, then segment ONCE with the
+    # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
+    # interior line is a force-push phrase is no longer mis-read as a real
+    # segment (the pre-#71 per-record `qsplit()` reset quote state at each
+    # embedded newline).
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        n = ml_segment(buf, segs)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
@@ -1470,10 +1562,16 @@ fi
 lifecycle_or_cloud_reason() {
     # Emit a deny reason (one per line) for every segment whose command word is a
     # system-lifecycle command or an az/gcloud delete. Portable awk only.
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
-    {
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
-        n = split($0, segs, "\n")
+    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    BEGIN { buf = "" }
+    # Slurp the whole (possibly multi-line) command, then segment ONCE with the
+    # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
+    # interior line is a lifecycle/cloud word (e.g. `halt`) is no longer mis-read
+    # as a real segment (the pre-#71 per-record `qsplit()` reset quote state at
+    # each embedded newline, hard-denying inert quoted prose).
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        n = ml_segment(buf, segs)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
@@ -1588,70 +1686,23 @@ extract_rm_targets() {
     # the buffer-slurp the catastrophic/ask redactors (strip_datasink_literals /
     # strip_literal_text) and command_has_shell_segment() already use.
     #
-    # This function keeps its OWN lexer rather than reusing qsplit()+split("\n"),
-    # because qsplit() emits a `\n` for each real separator while ALSO leaving a
-    # literal newline that lived inside an inert quoted span untouched — the two
-    # are then indistinguishable to a downstream `split(s, segs, "\n")`, which is
-    # exactly why the naive slurp-then-qsplit would still re-split the quoted
-    # `rm -rf /` line into its own segment. Here segmentation is done inline so an
-    # inert quoted span's embedded newlines never become segment boundaries.
-    #
-    # Segmentation contract (identical to qsplit()'s single-line behaviour, now
-    # correctly carried ACROSS embedded newlines):
-    #   - Separators `;` `&` (`&&`) `|` (`||`) OUTSIDE any quote split segments.
-    #   - A raw newline OUTSIDE any quote ALSO splits — so a GENUINE multi-line
-    #     command (`echo a<NL>rm -rf /<NL>echo b`, no enclosing quote) still yields
-    #     a real `rm -rf /` segment and still denies (safety floor preserved; this
-    #     matches the old per-record behaviour where each input line was a record).
-    #   - An INERT quoted span (no `$(` and no backtick) is copied VERBATIM, so its
-    #     embedded newlines/separators stay literal and never manufacture a phantom
-    #     `rm` segment out of quoted documentation prose (the #60 false block).
-    #   - A quoted span carrying command substitution (`$(` or a backtick) keeps
-    #     its separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
-    #     smuggled payload is never hidden behind an opening quote.
-    #   - An unterminated quote copies the remainder verbatim (best-effort; never
-    #     widens a deny into an allow).
-    printf '%s' "$1" | awk '
-    BEGIN {
-        SQ = sprintf("%c", 39)   # single quote
-        DQ = sprintf("%c", 34)   # double quote
-        buf = ""
-        segc = 0
-    }
+    # Segmentation is delegated to the shared ml_segment() lexer (#71,
+    # _ML_QSPLIT_AWK) rather than reusing qsplit()+split("\n"), because qsplit()
+    # emits a `\n` for each real separator while ALSO leaving a literal newline
+    # that lived inside an inert quoted span untouched — the two are then
+    # indistinguishable to a downstream `split(s, segs, "\n")`, which is exactly
+    # why the naive slurp-then-qsplit would still re-split the quoted `rm -rf /`
+    # line into its own segment. ml_segment() walks the buffer once so an inert
+    # quoted span's embedded newlines never become segment boundaries. PR #69
+    # introduced this lexer inline here; #71 extracted it into the shared helper
+    # so parse_force_ops()/lifecycle_or_cloud_reason() reuse the SAME algorithm
+    # instead of duplicating it (see the _ML_QSPLIT_AWK header for the full
+    # segmentation contract).
+    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    BEGIN { buf = "" }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
-        s = buf
-        n = length(s)
-        seg = ""
-        i = 1
-        while (i <= n) {
-            c = substr(s, i, 1)
-            if (c == DQ || c == SQ) {
-                qc = c
-                ci = 0
-                for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
-                if (ci == 0) {
-                    seg = seg substr(s, i)   # unterminated quote: copy rest verbatim
-                    i = n + 1
-                    continue
-                }
-                inner = substr(s, i + 1, ci - i - 1)
-                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
-                    seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
-                    i = ci + 1
-                    continue
-                }
-                seg = seg c   # command substitution present: keep separators ACTIVE
-                i++
-                continue
-            }
-            if (c == ";" || c == "&" || c == "|" || c == "\n") {
-                segs[++segc] = seg; seg = ""; i++; continue
-            }
-            seg = seg c
-            i++
-        }
-        segs[++segc] = seg
+        segc = ml_segment(buf, segs)
         for (si = 1; si <= segc; si++) {
             seg = segs[si]
             sub(/^[ \t]+/, "", seg)

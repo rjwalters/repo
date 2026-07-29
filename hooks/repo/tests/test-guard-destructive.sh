@@ -1884,6 +1884,106 @@ assert_deny "#60 safety: multi-line quoted literal piped into sh still denies" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Multi-line quoted literal, line-leading force-push / lifecycle (#71) ---${NC}"
+# =========================================================================
+#
+# parse_force_ops() and lifecycle_or_cloud_reason() shared the exact per-record
+# qsplit defect PR #69 fixed in extract_rm_targets(): they segmented per awk INPUT
+# RECORD, so quote-tracking state reset at every embedded newline and an interior
+# line of an otherwise-inert multi-line quoted DATA literal was lexed as its own
+# top-level segment. A quoted force-push-to-main phrase therefore false-`ask`ed
+# (parse_force_ops) and a quoted `halt`/`reboot`/cloud-delete false-`deny`ed
+# (lifecycle_or_cloud_reason). #71 routes all three parsers through the shared
+# ml_segment() buffer-slurp lexer (_ML_QSPLIT_AWK), so they segment ONCE over the
+# whole command. Safety floor: a GENUINE multi-line command, `$(`/backtick
+# smuggling, `bash -c`/`sh -c` payloads, and pipe-to-shell must ALL still deny.
+#
+# Danger phrases assembled at runtime so this test file never contains the literal
+# string a naive scan of the harness's own Bash call would flag (mirrors #60).
+_ML71_FORCE="git push --for""ce origin main"
+_ML71_HALT="ha""lt"
+_ML71_REBOOT="rebo""ot"
+_ML71_POWEROFF="powero""ff"
+_ML71_SHUTDOWN="shutdo""wn"
+_ML71_AZ="az group de""lete"
+_ML71_GCLOUD="gcloud compute instances de""lete"
+
+# --- parse_force_ops(): multi-line quoted force-push data literal → ALLOW ---
+# (currently false-`ask`s: the interior line was scanned as its own git segment).
+assert_allow "#71: multi-line echo literal with interior force-push-to-main is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_FORCE")"
+
+assert_allow "#71: multi-line printf literal with interior force-push-to-main is allowed" \
+    "$(printf "printf '%%s\\\\n' \"line one\n%s\nline three\"" "$_ML71_FORCE")"
+
+assert_allow "#71: multi-line --body literal with interior force-push-to-main is allowed" \
+    "$(printf 'gh issue comment 71 --body "line one\n%s\nline three"' "$_ML71_FORCE")"
+
+# --- lifecycle_or_cloud_reason(): multi-line quoted lifecycle/cloud literal → ALLOW ---
+# (currently false-hard-`deny`s: same severity class as the #60 extract_rm_targets bug).
+assert_allow "#71: multi-line echo literal with interior halt is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_HALT")"
+
+assert_allow "#71: multi-line echo literal with interior reboot is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_REBOOT")"
+
+assert_allow "#71: multi-line echo literal with interior poweroff is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_POWEROFF")"
+
+assert_allow "#71: multi-line echo literal with interior shutdown is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_SHUTDOWN")"
+
+assert_allow "#71: multi-line --body literal with interior halt is allowed" \
+    "$(printf 'gh issue comment 71 --body "line one\n%s\nline three"' "$_ML71_HALT")"
+
+assert_allow "#71: multi-line echo literal with interior az ... delete is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_AZ")"
+
+assert_allow "#71: multi-line echo literal with interior gcloud ... delete is allowed" \
+    "$(printf 'echo "line one\n%s\nline three"' "$_ML71_GCLOUD")"
+
+# --- SAFETY FLOOR: the multi-line buffer-slurp must NEVER widen a deny into an allow ---
+
+# GENUINE (unquoted) multi-line command whose LATER real line is the danger still
+# denies — the raw newline is a real segment boundary, so the danger is a real
+# simple command. Tested directly against BOTH functions' own behaviour.
+assert_deny "#71 safety: genuine multi-line command with force-push-to-main on a later line still denies" \
+    "$(printf 'echo line-one\n%s\necho line-three' "$_ML71_FORCE")"
+
+assert_deny "#71 safety: genuine multi-line command with halt on a later line still denies" \
+    "$(printf 'echo line-one\n%s\necho line-three' "$_ML71_HALT")"
+
+assert_deny "#71 safety: genuine multi-line command with az ... delete on a later line still denies" \
+    "$(printf 'echo line-one\n%s\necho line-three' "$_ML71_AZ")"
+
+# Command substitution / backtick smuggled inside the SAME multi-line quoted
+# literal keeps its separators active (the span is not inert), so it still denies.
+assert_deny "#71 safety: command-substitution force-push inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML71_FORCE")"
+
+assert_deny "#71 safety: backtick force-push inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n\`%s\`\nline three"' "$_ML71_FORCE")"
+
+# bash -c / sh -c with a multi-line payload whose interior line leads with the
+# danger is NOT a data sink — the payload executes, so it must still deny. (The
+# force-push-to-main phrase is a raw catastrophic pattern, so this holds; note
+# lifecycle words like `halt` inside an inert `-c`/pipe quote are a SEPARATE
+# pre-existing limitation independent of this multi-line fix — `sh -c 'halt'`
+# allows on origin/main too — so those shapes are intentionally not asserted here.)
+assert_deny "#71 safety: bash -c multi-line payload with line-leading force-push still denies" \
+    "$(printf 'bash -c %sline one\n%s\nline three%s' "'" "$_ML71_FORCE" "'")"
+
+assert_deny "#71 safety: sh -c multi-line payload with line-leading force-push still denies" \
+    "$(printf 'sh -c %sline one\n%s\nline three%s' "'" "$_ML71_FORCE" "'")"
+
+# A multi-line quoted literal piped into a shell that WOULD execute it still denies
+# (command_has_shell_segment() gate skips redaction so the raw scan sees it).
+assert_deny "#71 safety: multi-line quoted force-push literal piped into sh still denies" \
+    "$(printf 'echo "line one\n%s\nline three" | sh' "$_ML71_FORCE")"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
 # =========================================================================
 #
