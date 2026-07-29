@@ -134,6 +134,17 @@ case "$1 $2" in
       echo "An error occurred (VcpuLimitExceeded) when calling the RunInstances operation" >&2
       exit 254
     fi
+    # Capture the generated user-data (idle guard) so the suite can assert on the
+    # guard script's content. --user-data is passed as `file://<path>`; the temp
+    # file still exists at call time (repo-remote.sh deletes it only afterwards).
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--user-data" ]]; then
+        f="${a#file://}"
+        [[ -f "$f" ]] && cat "$f" >"${MOCK_AWS_LOG}.userdata"
+      fi
+      prev="$a"
+    done
     echo "${MOCK_AWS_NEW_ID:-i-0newinstance}"; exit 0 ;;
   "ec2 wait"|"ec2 start-instances"|"ec2 stop-instances"|"ec2 terminate-instances")
     exit 0 ;;
@@ -247,6 +258,53 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- idle guard: generated script content + idle-exit marker contract --"
+# ---------------------------------------------------------------------------
+# The generated cloud-init user-data embeds a cron watchdog script. We capture
+# it (mock aws dumps --user-data to $MOCK_LOG.userdata on run-instances) and
+# assert on the guard's actual logic — the acceptance criteria for #78 require
+# asserting the *generated script* rather than powering off a real host.
+UD_CAP="$MOCK_LOG.userdata"
+
+# (a) Regression: with NO marker env var, the existing who/load/$STAMP behavior
+#     is present and unchanged, and the corrected mental model holds (SSH session
+#     or CPU load only — no process-name veto).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+rm -f "$UD_CAP"
+run_rr MOCK_AWS_NEW_ID=i-0guard MOCK_AWS_STATE=None -- up --yes --json
+UD="$(cat "$UD_CAP" 2>/dev/null)"
+assert_contains "guard keeps the SSH-session (who) activity check"   "$UD" 'who | grep -q .'
+assert_contains "guard keeps the CPU load-average activity check"    "$UD" '/proc/loadavg'
+assert_contains "guard keeps its local stamp countdown"              "$UD" 'STAMP=/var/run/repo-remote-idle.stamp'
+assert_contains "guard still shuts down on the local stamp path"     "$UD" 'repo-remote: idle for'
+assert_not_contains "no process-name veto is embedded (pgrep)"       "$UD" 'pgrep'
+assert_not_contains "no loom-daemon process veto is embedded"        "$UD" 'loom-daemon >/dev/null'
+
+# (b1) Marker branch is present with the default path when the env var is unset.
+assert_contains "guard embeds the default idle-exit marker path" \
+  "$UD" 'MARKER=/var/run/repo-remote-daemon-idle.marker'
+assert_contains "guard reads the marker mtime (GNU stat -c %Y)" \
+  "$UD" 'stat -c %Y "$MARKER"'
+assert_contains "guard shuts down on an aged idle-exit marker" \
+  "$UD" 'repo-remote: daemon idle-exit marker aged'
+# The marker branch must REPLACE (not merely supplement) the stamp countdown:
+# it exits before the stamp fallback is reached.
+assert_contains "marker branch exits before the stamp fallback (replaces it)" \
+  "$UD" 'exit 0
+fi
+# No marker'
+
+# (b2) Setting REPO_REMOTE_IDLE_MARKER overrides the embedded path.
+rm -f "$UD_CAP"
+run_rr MOCK_AWS_NEW_ID=i-0guard2 MOCK_AWS_STATE=None REPO_REMOTE_IDLE_MARKER=/run/custom-idle.marker \
+  -- up --yes --json
+UD2="$(cat "$UD_CAP" 2>/dev/null)"
+assert_contains "guard embeds the overridden marker path" "$UD2" 'MARKER=/run/custom-idle.marker'
+assert_not_contains "overridden path replaces the default" "$UD2" 'MARKER=/var/run/repo-remote-daemon-idle.marker'
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- instance-id write-back to repo .env (never the shared file) --"
 # ---------------------------------------------------------------------------
 run_rr MOCK_AWS_NEW_ID=i-0written MOCK_AWS_STATE=None -- up --yes --json
@@ -350,6 +408,16 @@ assert_contains "remote.md still documents --down" "$MD" "--down"
 assert_contains "remote.md documents the repo-remote=<name> tag" "$MD" "repo-remote=<name>"
 assert_contains "remote.md documents the cost-gate contract" "$MD" "REPO_REMOTE_INSTANCE_TYPE"
 assert_contains "remote.md states --yes preserves consent" "$MD" "removes the prompt, not the consent"
+
+# #78: the idle-exit marker contract and the daemon-host short-window guidance
+# are part of the implemented surface — remote.md must document them so the
+# script and its docs cannot silently diverge.
+assert_contains "remote.md documents the idle-exit marker env var" "$MD" "REPO_REMOTE_IDLE_MARKER"
+assert_contains "remote.md documents the default marker path" \
+  "$MD" "/var/run/repo-remote-daemon-idle.marker"
+assert_contains "remote.md documents the marker's mtime semantics" "$MD" "mtime"
+assert_contains "remote.md recommends a short idle window for daemon/worker hosts" \
+  "$MD" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=20"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).
