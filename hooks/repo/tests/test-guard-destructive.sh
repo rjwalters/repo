@@ -1725,6 +1725,103 @@ assert_allow "#3898: multi-line --body mentioning force-push-to-main is allowed"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Data-sink (echo/printf) quoted-literal false positive (#53) ---${NC}"
+# =========================================================================
+#
+# echo/printf PRINT their arguments; they never execute them, so a dangerous
+# string handed to echo/printf as a quoted literal is inert DATA — exactly like a
+# --body/-m value. strip_datasink_literals() redacts the quoted args of a
+# command whose first token is echo/printf (behind an optional sudo/env wrapper)
+# before the raw ALWAYS_BLOCK / ASK scans see them. This kills the meta
+# false-positive that blocked a guard self-test
+# (`echo '{"…":"<danger>"}' | guard-destructive.sh`) and blocked filing #53's
+# heredoc body. Safety floor: `$(`/backtick smuggling, bash -c/sh -c payloads,
+# and any pipeline that feeds a shell (`echo '<danger>' | sh`) must STILL deny.
+
+# Danger phrase assembled at runtime so this very test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag.
+_DS_DANGER="rm -r""f /"
+
+# The confirmed live repro: a JSON self-test payload piped into the guard. The
+# dangerous command appears ONLY as single-quoted JSON DATA to echo, and the pipe
+# target (guard-destructive.sh) is NOT a shell, so it must be ALLOWED.
+assert_allow "#53: echo JSON payload piped into guard-destructive.sh is allowed" \
+    "$(printf 'echo %s%s%s | .loom/hooks/guard-destructive.sh' \
+        "'" '{"tool_name":"Bash","tool_input":{"command":"'"$_DS_DANGER"'"}}' "'")"
+
+# Single-quoted dangerous string as a plain echo argument.
+assert_allow "#53: single-quoted danger as an echo argument is allowed" \
+    "echo '$_DS_DANGER'"
+
+# Double-quoted dangerous string as a plain echo argument (no command sub).
+assert_allow "#53: double-quoted danger as an echo argument is allowed" \
+    "echo \"$_DS_DANGER\""
+
+# printf is a data sink too.
+assert_allow "#53: single-quoted danger as a printf argument is allowed" \
+    "printf '%s' '$_DS_DANGER'"
+
+# A multi-line quoted echo literal used as documentation prose (prose precedes
+# the danger on each line, mirroring the #3898 --body convention — the raw
+# per-line extract_rm_targets limitation is shared with --body and out of scope).
+assert_allow "#53: multi-line echo documentation mentioning a dangerous command is allowed" \
+    "$(printf "echo 'context line one\nprose about %s obliterating root\ntrailing line'" "$_DS_DANGER")"
+
+# A force-push-to-main phrase quoted as echo data is also inert.
+assert_allow "#53: echo mentioning force-push-to-main is allowed" \
+    "echo 'never run git push --force origin main by hand'"
+
+# ASK tier: an ask-phrase quoted as echo data must not FALSE-ASK (mirrors #3756
+# for the --body path).
+assert_allow "#53: echo mentioning 'kubectl delete' does not false-ask" \
+    "echo 'to clean up, run kubectl delete deployment foo'"
+
+# --- SAFETY FLOOR: the data-sink redaction must NEVER widen a deny into an allow ---
+
+# A bare dangerous command (not quoted data) still denies.
+assert_deny "#53 safety: a bare dangerous command still denies" \
+    "$_DS_DANGER"
+
+# Command substitution inside an echo arg KEEPS the span active — the payload
+# actually executes, so it must still deny (mirrors strip_literal_text()'s floor).
+assert_deny "#53 safety: echo \"\$(<danger>)\" command substitution still denies" \
+    "echo \"\$($_DS_DANGER)\""
+
+# Backtick substitution inside an echo arg likewise still denies.
+assert_deny "#53 safety: echo with backtick substitution still denies" \
+    "echo \"\`$_DS_DANGER\`\""
+
+# Data PIPED into a shell that would execute it must still deny: the
+# command_has_shell_segment() gate skips redaction so the raw scan sees it.
+assert_deny "#53 safety: echo '<danger>' | sh still denies (piped to shell)" \
+    "echo '$_DS_DANGER' | sh"
+
+assert_deny "#53 safety: echo '<danger>' | bash still denies (piped to shell)" \
+    "echo '$_DS_DANGER' | bash"
+
+assert_deny "#53 safety: printf '<danger>' | sh still denies (piped to shell)" \
+    "printf '%s' '$_DS_DANGER' | sh"
+
+# echo piped directly INTO the dangerous command (rm is the pipe consumer, its
+# args are real) still denies — only echo's OWN quoted args are ever redacted.
+assert_deny "#53 safety: echo x | <danger> still denies (rm is the real consumer)" \
+    "echo x | $_DS_DANGER"
+
+# bash -c '<payload>' is NOT a data sink and is unaffected by the redaction.
+assert_deny "#53 safety: bash -c '<danger>' still denies (not a data sink)" \
+    "bash -c '$_DS_DANGER'"
+
+assert_deny "#53 safety: sh -c '<danger>' still denies (not a data sink)" \
+    "sh -c '$_DS_DANGER'"
+
+# A real dangerous command in a SEPARATE segment alongside an inert echo still
+# denies (the echo redaction is segment-scoped, never the whole line).
+assert_deny "#53 safety: echo 'ok' | tee f ; <danger> still denies (separate segment)" \
+    "echo 'ok' | tee f ; $_DS_DANGER"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
 # =========================================================================
 #
