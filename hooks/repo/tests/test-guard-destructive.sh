@@ -1984,6 +1984,92 @@ assert_deny "#71 safety: multi-line quoted force-push literal piped into sh stil
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Command-word substitution resolving to a delete binary (#72) ---${NC}"
+# =========================================================================
+#
+# A command whose command-word position is a SUBSTITUTION — `$(which rm)`,
+# `$(command -v rm)`, or the backtick equivalent — resolves to the delete binary
+# at execution time and never presents a literal `rm` token. All three of the
+# guard's rm checks (the ALWAYS_BLOCK root/home patterns, the cheap rm-scope
+# pre-check, and extract_rm_targets()'s per-segment command-word test) assumed
+# `rm` is immediately followed by whitespace, so a closing `)`/backtick let the
+# whole pipeline slip and `$(which rm) -rf /` was ALLOWED. extract_rm_targets()
+# now also treats a substitution in command-word position (post-qsplit,
+# post-sudo-strip) as a candidate rm invocation: it balanced-skips past the
+# substitution, then parses the argument tail with the SAME recursive/force +
+# non-flag-token logic. The match is keyed on SHAPE (substitution command word +
+# recursive/force flag + protected-path target), NOT on resolving what the
+# substitution names — so it cannot be bypassed by aliasing/`type -p`/PATH
+# tricks, and a benign substitution with no recursive/force flag stays allowed.
+#
+# Danger fragments assembled at runtime so this test file's own source never
+# carries a raw `$(which rm) -rf /` literal (mirrors _DS_DANGER / _ML_DANGER).
+# The `$(`/backtick text is built inside single quotes, so the harness's own
+# shell never command-substitutes it — it is passed to the guard as literal DATA.
+_S72_RM='r''m'                                 # delete-binary name, split
+_S72_RF='-r''f'                                # recursive-force flag, split
+_S72_SUB_WHICH='$(which '"$_S72_RM"')'         # $(which rm)
+_S72_SUB_CMDV='$(command -v '"$_S72_RM"')'     # $(command -v rm)
+_S72_SUB_BT='`which '"$_S72_RM"'`'             # `which rm` (backtick form)
+_S72_SUB_NEST='$(echo $(which '"$_S72_RM"'))'  # nested substitution command word
+_S72_SUB_LS='$(which ls)'                       # benign control: resolves to ls, not rm
+
+# --- The deny-floor gap this issue closes (all four were ALLOWED before #72) ---
+
+# 1. Catastrophic root target via a $(...) command-word substitution.
+assert_deny "#72: \$(which rm) -rf / (substitution command word, root) denied" \
+    "$_S72_SUB_WHICH $_S72_RF /"
+
+# 2. Protected NON-root top-level dir via $(command -v rm) — exercises the
+#    balanced-paren skip past an internal `-v` flag inside the substitution.
+assert_deny "#72: \$(command -v rm) -rf /etc (substitution command word, protected dir) denied" \
+    "$_S72_SUB_CMDV $_S72_RF /etc"
+
+# 3. Backtick command-word substitution form, catastrophic root target.
+assert_deny "#72: \`which rm\` -rf / (backtick command word, root) denied" \
+    "$_S72_SUB_BT $_S72_RF /"
+
+# 4. Nested substitution in command-word position still resolves to a protected
+#    target (the balanced-paren walk handles depth > 1).
+assert_deny "#72: \$(echo \$(which rm)) -rf / (nested substitution command word) denied" \
+    "$_S72_SUB_NEST $_S72_RF /"
+
+# sudo-prefixed substitution command word is denied too (sudo is stripped first).
+assert_deny "#72: sudo \$(which rm) -rf / (sudo + substitution command word) denied" \
+    "sudo $_S72_SUB_WHICH $_S72_RF /"
+
+# --- NO BLANKET DENY: benign command-word substitutions must stay ALLOWED ---
+
+# 5. AC baseline: a benign substitution with no recursive/force flag is allowed
+#    even though its target is a top-level-ish path — the shape signal is absent.
+assert_allow "#72: \$(which ls) -la /tmp (benign substitution, no rf flag) stays allowed" \
+    "$_S72_SUB_LS -la /tmp"
+
+# The heuristic keys on SHAPE, not on what the substitution names: a substitution
+# that literally resolves to rm but carries NO recursive/force flag stays allowed
+# (proves we do not blanket-deny every `$(...)` command word).
+assert_allow "#72: \$(which rm) -la /tmp (names rm but no rf flag) stays allowed" \
+    "$_S72_SUB_WHICH -la /tmp"
+
+# A recursive/force substitution deleting a genuinely scoped subpath is allowed —
+# only root / \$HOME / top-level dirs trip the protected-path deny.
+assert_allow "#72: \$(which rm) -rf /tmp/x (substitution, scoped subpath) stays allowed" \
+    "$_S72_SUB_WHICH $_S72_RF /tmp/x"
+
+# A plain benign command substitution unrelated to deletion is untouched.
+assert_allow "#72: echo \$(pwd) (benign substitution, no rf/target shape) stays allowed" \
+    'echo $(pwd)'
+
+# --- REGRESSION FLOOR: the #53/#60 smuggling-in-data denies must NOT change ---
+# The new command-word signal is strictly scoped to segments whose command word
+# begins with a substitution; a $(...) buried inside an inert data value keeps
+# denying via the EXISTING raw ALWAYS_BLOCK path, not this new one.
+assert_deny "#72 regression: \$(rm -rf /) smuggled inside a --body value still denies (#53/#60 floor)" \
+    "gh issue comment 1 --body \"text \$($_S72_RM $_S72_RF /) more\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
 # =========================================================================
 #
