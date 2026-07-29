@@ -16,7 +16,7 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
-# commands/repo/tests/test-branches-loss-check.sh, and
+# test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh, and
 # commands/repo/tests/test-repo-remote.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
@@ -325,6 +325,44 @@ else
     PASS=$((PASS + MD_PASS))
     FAIL=$((FAIL + MD_FAIL))
     record_suite "test-install-claude-md-markers.sh" "$MD_PASS" "$MD_FAIL" "CLAUDE.md markers"
+fi
+
+# install.sh --shell-wrapper / uninstall.sh's shell `claude` wrapper (repo#35).
+# Same delegation shape as the two suites above: drives the installers against
+# a scratch $HOME so real shell rc files are never touched. Fold its real
+# PASS/FAIL counts in and record a breakdown row, same discipline as every
+# other delegated suite here (repo#44).
+echo
+echo "-- shell claude wrapper (delegated suite) --"
+SW_TEST="$TESTS_DIR/test-shell-wrapper.sh"
+if [[ ! -f "$SW_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-shell-wrapper.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-shell-wrapper.sh" "$SW_TEST"
+else
+    SW_OUT="$(bash "$SW_TEST" 2>&1)"
+    SW_STATUS=$?
+    SW_PASS="$(suite_count Passed "$SW_OUT")"
+    SW_FAIL="$(suite_count Failed "$SW_OUT")"
+    if ! [[ "$SW_PASS" =~ ^[0-9]+$ && "$SW_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        SW_PASS=0
+        SW_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-shell-wrapper.sh" "$SW_STATUS"
+        strip_ansi "$SW_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SW_STATUS" -ne 0 || "$SW_FAIL" -ne 0 ]]; then
+        [[ "$SW_FAIL" -eq 0 ]] && SW_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-shell-wrapper.sh" "$SW_PASS" "$SW_FAIL" "$SW_STATUS"
+        strip_ansi "$SW_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-shell-wrapper.sh" "$SW_PASS"
+    fi
+    PASS=$((PASS + SW_PASS))
+    FAIL=$((FAIL + SW_FAIL))
+    record_suite "test-shell-wrapper.sh" "$SW_PASS" "$SW_FAIL" "claude shell wrapper"
 fi
 
 # The command files under commands/repo/ are prose, not scripts, so they have no

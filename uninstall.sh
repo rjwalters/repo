@@ -26,6 +26,30 @@ MARKER_END='<!-- END REPO-SKILLS -->'
 # shellcheck source=lib/claude-md-block.sh
 source "$SOURCE_ROOT/lib/claude-md-block.sh"
 
+# Shell `claude` wrapper removal (repo#35) — shared with install.sh's
+# --shell-wrapper opt-in.
+# shellcheck source=lib/shell-wrapper.sh
+source "$SOURCE_ROOT/lib/shell-wrapper.sh"
+
+# Candidate shell rc files that might carry our claude wrapper block, checked
+# regardless of the CURRENT $SHELL: the shell active at uninstall time may
+# differ from whichever was active when --shell-wrapper was installed, and
+# unlike install (which targets exactly one detected shell) uninstall's job is
+# to leave no orphaned block anywhere it could plausibly have landed.
+SW_CANDIDATES=()
+SW_ZSH_RC="$(shell_wrapper_rc_path zsh 2>/dev/null || true)"
+[[ -n "$SW_ZSH_RC" ]] && SW_CANDIDATES+=("$SW_ZSH_RC")
+SW_BASH_RC="$(shell_wrapper_rc_path bash 2>/dev/null || true)"
+[[ -n "$SW_BASH_RC" ]] && SW_CANDIDATES+=("$SW_BASH_RC")
+
+sw_any_present() {
+  local f
+  for f in "${SW_CANDIDATES[@]}"; do
+    shell_wrapper_block_present "$f" && return 0
+  done
+  return 1
+}
+
 # The PreToolUse guard command install.sh wires into .claude/settings.json. The
 # hook *script* lives under .claude/skills/repo/hooks/ and is removed with the
 # skills dir below; only this settings.json entry needs explicit removal.
@@ -124,6 +148,12 @@ if [[ -f "$TARGET/.claude/settings.json" ]] && \
      "$TARGET/.claude/settings.json" >/dev/null 2>&1; then
   echo "  .claude/settings.json SessionStart handoff entry"
 fi
+if sw_any_present; then
+  echo "Will also remove (outside $TARGET — your shell rc, from an earlier --shell-wrapper opt-in):"
+  for f in "${SW_CANDIDATES[@]}"; do
+    shell_wrapper_block_present "$f" && echo "  $f REPO-SKILLS CLAUDE WRAPPER block"
+  done
+fi
 
 if [[ "$YES" != true ]]; then
   read -r -p "Proceed? [y/N] " reply
@@ -141,6 +171,19 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 rmdir "$TARGET/.claude/skills" "$TARGET/.claude/commands" "$TARGET/.claude" 2>/dev/null || true
+
+# claude shell wrapper block, if a previous install opted in via
+# --shell-wrapper. Backed up before every edit, same as the CLAUDE.md surgery
+# above; no-op per candidate rc when our block isn't present there.
+for f in "${SW_CANDIDATES[@]}"; do
+  if shell_wrapper_block_present "$f"; then
+    if shell_wrapper_uninstall "$f"; then
+      success "Removed claude shell wrapper from $f (backed up to $SHELL_WRAPPER_BACKUP)"
+    else
+      warning "Could not remove the claude shell wrapper from $f: $SHELL_WRAPPER_ERROR"
+    fi
+  fi
+done
 
 if [[ -f "$TARGET/CLAUDE.md" ]] && grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md"; then
   if claude_md_block_rewrite "$TARGET/CLAUDE.md" "$MARKER_BEGIN" "$MARKER_END"; then
