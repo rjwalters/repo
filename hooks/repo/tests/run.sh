@@ -8,10 +8,13 @@
 # (deny / ask / allow).
 #
 # Sibling suites are NOT inlined here — they are delegated to at the end of this
-# file, each in its own block that folds the suite's verdict into this runner's
-# PASS/FAIL totals and records a line in the per-suite breakdown. To add another
-# suite, copy one of those blocks; nothing else needs to change. Currently
-# delegated: test-guard-destructive.sh (the full guard regression suite),
+# file, each in its own block that folds the suite's REAL per-case PASS/FAIL
+# counts into this runner's totals and records a line in the per-suite
+# breakdown. To add another suite, copy one of those blocks; nothing else needs
+# to change. A self-check after the breakdown asserts the breakdown columns sum
+# to the headline aggregate, so a miswired block can never make the headline
+# diverge from the breakdown (repo#44). Currently delegated:
+# test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh, and
 # commands/repo/tests/test-branches-loss-check.sh.
 #
@@ -98,12 +101,20 @@ strip_ansi() { printf '%s\n' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
 suite_count() { strip_ansi "$2" | awk -v f="$1:" '$1 == f { print $2; exit }'; }
 
 # Per-suite breakdown lines, printed above the final aggregate totals so the
-# result is never one opaque number.
+# result is never one opaque number. The pass/fail columns are also accumulated
+# into machine-readable running sums so the breakdown can be asserted to sum to
+# the headline aggregate — see the self-check after the breakdown is printed.
 # record_suite <label> <pass> <fail> [note]
 SUITE_LINES=()
+SUITE_PASS_SUM=0
+SUITE_FAIL_SUM=0
 record_suite() {
     SUITE_LINES+=("$(printf '  %-38s %4s pass  %4s fail%s' \
         "$1" "$2" "$3" "${4:+  ($4)}")")
+    # Sum the pass and fail COLUMNS (not row totals) so a future skip column can
+    # be added to the breakdown without weakening this invariant (repo#46).
+    [[ "$2" =~ ^[0-9]+$ ]] && SUITE_PASS_SUM=$((SUITE_PASS_SUM + $2))
+    [[ "$3" =~ ^[0-9]+$ ]] && SUITE_FAIL_SUM=$((SUITE_FAIL_SUM + $3))
 }
 
 echo "guard-destructive.sh test suite"
@@ -241,8 +252,9 @@ fi
 
 # The SessionStart handoff hook ships its own suite rather than inline cases:
 # its payload shape, assertions, and install/uninstall wiring checks share
-# nothing with the guard's expect() helper above. Delegate to it and fold the
-# verdict in as a single case so `pnpm test` covers both hooks.
+# nothing with the guard's expect() helper above. Delegate to it and fold its
+# real PASS/FAIL counts — not a single collapsed case — into this runner's
+# totals, so `pnpm test` genuinely reports every case it runs (repo#44).
 echo
 echo "-- session-start-handoff.sh (delegated suite) --"
 SS_TEST="$TESTS_DIR/test-session-start-handoff.sh"
@@ -250,40 +262,68 @@ if [[ ! -f "$SS_TEST" ]]; then
     FAIL=$((FAIL + 1))
     record_suite "test-session-start-handoff.sh" 0 1 "not found"
     printf '  FAIL %-52s -> not found at %s\n' "test-session-start-handoff.sh" "$SS_TEST"
-elif SS_OUT="$(bash "$SS_TEST" 2>&1)"; then
-    PASS=$((PASS + 1))
-    record_suite "test-session-start-handoff.sh" \
-        "$(suite_count Passed "$SS_OUT")" "$(suite_count Failed "$SS_OUT")" \
-        "folded into totals as 1 case"
-    printf '  ok   %-52s -> %s\n' "test-session-start-handoff.sh" \
-        "$(printf '%s\n' "$SS_OUT" | awk '/^  Total:/ {print $2 " cases pass"}')"
 else
-    FAIL=$((FAIL + 1))
-    record_suite "test-session-start-handoff.sh" \
-        "$(suite_count Passed "$SS_OUT")" "$(suite_count Failed "$SS_OUT")" \
-        "suite failed; folded into totals as 1 case"
-    printf '  FAIL %-52s -> suite failed; output follows\n' "test-session-start-handoff.sh"
-    printf '%s\n' "$SS_OUT" | sed 's/^/    /'
+    SS_OUT="$(bash "$SS_TEST" 2>&1)"
+    SS_STATUS=$?
+    SS_PASS="$(suite_count Passed "$SS_OUT")"
+    SS_FAIL="$(suite_count Failed "$SS_OUT")"
+    if ! [[ "$SS_PASS" =~ ^[0-9]+$ && "$SS_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        SS_PASS=0
+        SS_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-session-start-handoff.sh" "$SS_STATUS"
+        strip_ansi "$SS_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SS_STATUS" -ne 0 || "$SS_FAIL" -ne 0 ]]; then
+        [[ "$SS_FAIL" -eq 0 ]] && SS_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-session-start-handoff.sh" "$SS_PASS" "$SS_FAIL" "$SS_STATUS"
+        strip_ansi "$SS_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-session-start-handoff.sh" "$SS_PASS"
+    fi
+    PASS=$((PASS + SS_PASS))
+    FAIL=$((FAIL + SS_FAIL))
+    record_suite "test-session-start-handoff.sh" "$SS_PASS" "$SS_FAIL" "handoff hook"
 fi
 
 # install.sh / uninstall.sh CLAUDE.md marker-block surgery (repo#38). Same
 # delegation shape as the handoff suite above: it drives the installers against
 # scratch git repos rather than piping hook payloads, so it shares nothing with
-# expect() and folds in as a single case.
+# expect(). Fold its real PASS/FAIL counts in and record a breakdown row — it
+# previously folded in as a single uncounted case with no row at all (repo#44).
 echo
 echo "-- install/uninstall CLAUDE.md markers (delegated suite) --"
 MD_TEST="$TESTS_DIR/test-install-claude-md-markers.sh"
 if [[ ! -f "$MD_TEST" ]]; then
     FAIL=$((FAIL + 1))
+    record_suite "test-install-claude-md-markers.sh" 0 1 "not found"
     printf '  FAIL %-52s -> not found at %s\n' "test-install-claude-md-markers.sh" "$MD_TEST"
-elif MD_OUT="$(bash "$MD_TEST" 2>&1)"; then
-    PASS=$((PASS + 1))
-    printf '  ok   %-52s -> %s\n' "test-install-claude-md-markers.sh" \
-        "$(printf '%s\n' "$MD_OUT" | awk '/^  Total:/ {print $2 " cases pass"}')"
 else
-    FAIL=$((FAIL + 1))
-    printf '  FAIL %-52s -> suite failed; output follows\n' "test-install-claude-md-markers.sh"
-    printf '%s\n' "$MD_OUT" | sed 's/^/    /'
+    MD_OUT="$(bash "$MD_TEST" 2>&1)"
+    MD_STATUS=$?
+    MD_PASS="$(suite_count Passed "$MD_OUT")"
+    MD_FAIL="$(suite_count Failed "$MD_OUT")"
+    if ! [[ "$MD_PASS" =~ ^[0-9]+$ && "$MD_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        MD_PASS=0
+        MD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-install-claude-md-markers.sh" "$MD_STATUS"
+        strip_ansi "$MD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$MD_STATUS" -ne 0 || "$MD_FAIL" -ne 0 ]]; then
+        [[ "$MD_FAIL" -eq 0 ]] && MD_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-install-claude-md-markers.sh" "$MD_PASS" "$MD_FAIL" "$MD_STATUS"
+        strip_ansi "$MD_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-install-claude-md-markers.sh" "$MD_PASS"
+    fi
+    PASS=$((PASS + MD_PASS))
+    FAIL=$((FAIL + MD_FAIL))
+    record_suite "test-install-claude-md-markers.sh" "$MD_PASS" "$MD_FAIL" "CLAUDE.md markers"
 fi
 
 # The command files under commands/repo/ are prose, not scripts, so they have no
@@ -330,5 +370,18 @@ echo "==============================="
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
 echo "==============================="
+
+# Self-check: the per-suite breakdown columns MUST sum to the headline
+# aggregate. This is what keeps the two numbers honest — every case that ran is
+# attributed to exactly one row, so the headline can never again quietly diverge
+# from the breakdown (repo#44). If a suite is ever added that folds into PASS/FAIL
+# without a matching record_suite call (or vice versa), this fails the run.
+if [[ "$SUITE_PASS_SUM" -ne "$PASS" || "$SUITE_FAIL_SUM" -ne "$FAIL" ]]; then
+    echo "FATAL: breakdown does not sum to headline (harness accounting bug)" >&2
+    echo "  breakdown: $SUITE_PASS_SUM pass, $SUITE_FAIL_SUM fail" >&2
+    echo "  headline:  $PASS pass, $FAIL fail" >&2
+    exit 1
+fi
+
 echo "PASS: $PASS   FAIL: $FAIL"
 [[ "$FAIL" -eq 0 ]]
