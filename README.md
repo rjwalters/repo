@@ -38,7 +38,7 @@ Every category is configurable per repo (`REPO_GUARD_*`/`REPO_*` env vars or `gu
 
 ## Handoff notes at session start
 
-Installing Repo Skills also wires a **SessionStart hook** (`session-start-handoff.sh`). When `/repo:handoff` has left a note at `.claude/handoff.md`, the hook surfaces it as session context on startup and resume — path, age, a section outline, and a staleness warning once the note passes seven days — so a rolled session opens already knowing what the last one left behind.
+Installing Repo Skills also wires a **SessionStart hook** (`session-start-handoff.sh`). When `/repo:handoff` has left a note at `.claude/handoff.md`, the hook surfaces it as session context on startup and resume — path, age, a staleness warning once the note passes seven days, and the note itself: the full body inlined when it is small (at or under a 10 KB cap), or a header outline plus an oversize warning when it is larger — so a rolled session opens already knowing what the last one left behind.
 
 It is strictly read-only: it never writes or deletes the note (absorbing it and removing it is `/repo:handoff`'s own one-shot contract), it stays silent when no note exists, and it fails open, so a hook error can never block session start. It deliberately does not fire on `/clear`, which is not a process relaunch.
 
