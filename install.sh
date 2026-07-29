@@ -222,6 +222,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/.install-local.json (machine-local, gitignored)"
   echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
+  echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
   echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
   while IFS= read -r cmd; do
@@ -457,6 +458,19 @@ install_file "$SOURCE_ROOT/hooks/repo/session-start-handoff.sh" \
 chmod +x "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/hooks/session-start-handoff.sh"
 merge_settings_sessionstart_hook
+
+# 3d. Headless provisioning script for /repo:remote. Same colocation + chmod
+# rationale as the hooks above: it lives inside .claude/skills/repo/ so
+# uninstall's `rm -rf` removes it for free, and render+copy drops the exec bit
+# so we re-set it. This is the non-interactive entry point the interactive
+# skill delegates to and that a caller (e.g. loom's `fleet add-worker`) invokes
+# directly — without this copy step the script would ship in the source repo
+# but never reach a consumer repo (repo#52).
+mkdir -p "$TARGET/.claude/skills/repo/scripts"
+install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
+  "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" "scripts/repo/repo-remote.sh"
+chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
+success "Installed .claude/skills/repo/scripts/repo-remote.sh"
 
 # 4. CLAUDE.md block (replace existing block in place, else append).
 # Skipped in dev mode: the symlinked install is machine-local (absolute symlinks

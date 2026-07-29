@@ -111,7 +111,7 @@ TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || error "Target directory does not 
   || { info "No Repo Skills install found in $TARGET"; exit 0; }
 
 echo "Will remove from $TARGET:"
-[[ -d "$TARGET/.claude/skills/repo" ]]   && echo "  .claude/skills/repo/ (incl. hooks/guard-destructive.sh, hooks/session-start-handoff.sh)"
+[[ -d "$TARGET/.claude/skills/repo" ]]   && echo "  .claude/skills/repo/ (incl. hooks/guard-destructive.sh, hooks/session-start-handoff.sh, scripts/repo-remote.sh)"
 [[ -d "$TARGET/.claude/commands/repo" ]] && echo "  .claude/commands/repo/"
 grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md" 2>/dev/null && echo "  CLAUDE.md REPO-SKILLS block"
 if [[ -f "$TARGET/.claude/settings.json" ]] && \
