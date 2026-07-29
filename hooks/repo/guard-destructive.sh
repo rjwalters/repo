@@ -1399,6 +1399,18 @@ ALWAYS_BLOCK_PATTERNS=(
     # (root followed by a closing quote) still matches (#3553). The trailing
     # class matches anything that is not a path-continuation character (so `/`,
     # `/ `, `/*`, `/;`, `/'` all count as "root itself" but `/tmp` does not).
+    # NOTE (#72): these three patterns require `rm` to be immediately followed by
+    # whitespace, so a command-word substitution like `$(which rm) -rf /` (where
+    # `rm` is followed by `)`) does NOT match here. That shape is instead caught
+    # by the extract_rm_targets() -> rm-protected-path path below, whose deny
+    # covers root, $HOME, AND every top-level dir — a superset of these three.
+    # For that superset claim to actually hold for the substitution shape, the
+    # extract path must recognize the SAME home/root targets these literal
+    # patterns do: extract_rm_targets() strips a leading `env` (and VAR=val
+    # assignments) as well as `sudo`, and the protected-path loop expands a bare
+    # `~`/`$HOME` target before the check — so `env $(which rm) -rf /`,
+    # `$(which rm) -rf ~`, and `$(which rm) -rf $HOME` all deny just like their
+    # literal counterparts. No parallel regex is needed for the substitution case.
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+/([^[:alnum:]._~/-]|$)'
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+~([^[:alnum:]._~/-]|$)'
     'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+\$HOME([^[:alnum:]._~/-]|$)'
@@ -1654,8 +1666,10 @@ fi
 #
 # Only *actual local* `rm` command words are inspected. `extract_rm_targets`
 # splits the command on ; | & && || and, for each simple-command segment whose
-# command word is `rm` (optionally sudo-prefixed) AND which carries a
-# recursive/force flag, emits the non-flag argument tokens. Consequences (#3553):
+# command word is `rm` (optionally sudo-prefixed) — OR a command-word
+# *substitution* `$(...)`/backtick in executable position (#72) — AND which
+# carries a recursive/force flag, emits the non-flag argument tokens.
+# Consequences (#3553):
 #   - A token from an earlier command in the same line (e.g. the `host-ip.txt`
 #     in `HOST=$(cat host-ip.txt); ssh $HOST rm -rf …`) is never mis-read as an
 #     rm target — only tokens of a real `rm` segment are considered.
@@ -1706,15 +1720,73 @@ extract_rm_targets() {
         for (si = 1; si <= segc; si++) {
             seg = segs[si]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading run of VAR=val assignments and sudo/env wrappers
+            # (in any order/repetition) so the REAL command word — a literal `rm`
+            # OR a command-word substitution — is what we classify. `env` is
+            # stripped alongside `sudo` (#72): `env $(which rm) -rf /` and
+            # `env rm -rf /` must be seen as an rm command word, not shielded
+            # behind the wrapper. The required trailing [ \t]+ in each sub()
+            # guarantees the while loop makes progress and terminates.
+            while (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg) || \
+                   sub(/^sudo[ \t]+/, "", seg) || \
+                   sub(/^env[ \t]+/, "", seg)) { }
             sub(/^[ \t]+/, "", seg)
-            if (seg !~ /^rm([ \t]|$)/) continue
-            m = split(seg, toks, /[ \t]+/)
+            # Determine the argument tail and the token index to start scanning
+            # from. Two command-word shapes emit targets:
+            #   (a) a literal `rm` command word — scan from toks[2] (skip "rm").
+            #   (b) a command-word *substitution* — `$(...)` or a backtick pair —
+            #       in executable position (#72). The substitution result becomes
+            #       the command word at run time, so `$(which rm) -rf /` never
+            #       presents a literal `rm` token yet is exactly as dangerous. We
+            #       deliberately do NOT try to resolve what the substitution names
+            #       (`which rm`, `command -v rm`, an alias, a PATH-relative rm, … —
+            #       unbounded and trivially bypassable); we key on the SHAPE
+            #       (substitution in command-word position + a recursive/force
+            #       flag + a protected-path target) and let the downstream
+            #       protected-path check decide. A benign `$(which ls) -la /tmp`
+            #       carries no recursive/force flag, so it emits no target and
+            #       stays allowed — no blanket deny on command-word substitutions.
+            tail = ""
+            start = 0
+            if (seg ~ /^rm([ \t]|$)/) {
+                tail = seg
+                start = 2
+            } else if (substr(seg, 1, 2) == "$(") {
+                # Balanced-paren skip past the substitution so an internal space
+                # (e.g. `$(command -v rm)`) is NOT mis-split into a bogus
+                # flag/target token. Start depth at 1 for the opening `(`.
+                depth = 1
+                p = 3
+                L = length(seg)
+                while (p <= L && depth > 0) {
+                    ch = substr(seg, p, 1)
+                    if (ch == "(") depth++
+                    else if (ch == ")") depth--
+                    p++
+                }
+                if (depth != 0) continue   # unterminated: emit nothing (conservative)
+                tail = substr(seg, p)
+                sub(/^[ \t]+/, "", tail)
+                start = 1
+            } else if (substr(seg, 1, 1) == "`") {
+                # Backtick command word: skip to the closing backtick.
+                p = 2
+                L = length(seg)
+                while (p <= L && substr(seg, p, 1) != "`") p++
+                if (p > L) continue        # unterminated: emit nothing
+                p++                         # step past the closing backtick
+                tail = substr(seg, p)
+                sub(/^[ \t]+/, "", tail)
+                start = 1
+            } else {
+                continue
+            }
+            m = split(tail, toks, /[ \t]+/)
             has_rf = 0
-            for (j = 2; j <= m; j++)
+            for (j = start; j <= m; j++)
                 if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
             if (!has_rf) continue
-            for (j = 2; j <= m; j++) {
+            for (j = start; j <= m; j++) {
                 if (toks[j] == "") continue
                 if (toks[j] ~ /^-/) continue
                 print toks[j]
@@ -1762,8 +1834,14 @@ normalize_abs_path() {
 }
 
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
-# no recursive/force rm at all.
-if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
+# no recursive/force rm at all. The first alternative matches a literal `rm`
+# command word; the second admits a command-word *substitution* (#72) — a
+# closing `)` or backtick immediately followed by a recursive/force flag, as in
+# `$(which rm) -rf /` or `` `which rm` -rf / `` — so extract_rm_targets() is
+# invoked for that shape too. This gate is only an optimization: a false match
+# here is harmless because extract_rm_targets() emits a target only for a real
+# rm-flavored (substitution/rm command word + recursive-force flag) segment.
+if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-zA-Z]*[rf]'; then
     RM_TARGETS=$(extract_rm_targets "$COMMAND" | head -20)
 
     for target in $RM_TARGETS; do
@@ -1791,6 +1869,31 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
             *.pyc)
                 continue ;;
         esac
+
+        # Expand a leading `~` or `$HOME` token so home-directory targets are
+        # recognized the same way the literal-rm ALWAYS_BLOCK `$HOME`/`~`
+        # patterns handle them (#72). extract_rm_targets() emits the raw token,
+        # so a substitution-path target of `~` or `$HOME` (as in
+        # `$(which rm) -rf ~`) would otherwise be treated as a CWD-relative path
+        # and never flagged, an asymmetry vs. literal `rm -rf ~`/`rm -rf $HOME`.
+        # Only bare-home and home-subpath forms are expanded — this mirrors the
+        # literal floor exactly: bare `$HOME`/`~` deny (whole-home wipe) while a
+        # home *subpath* expands to a deeper path and stays allowed.
+        if [[ -n "$HOME" ]]; then
+            # The `~` in the case globs below is a LITERAL match against the
+            # emitted target token, not a path we want the shell to expand —
+            # SC2088 (tilde-does-not-expand-in-quotes) is exactly the intended
+            # behaviour here, so it is suppressed.
+            # shellcheck disable=SC2088
+            case "$target" in
+                '~')          target="$HOME" ;;
+                '~/'*)        target="$HOME/${target#\~/}" ;;
+                '$HOME')      target="$HOME" ;;
+                '$HOME/'*)    target="$HOME/${target#\$HOME/}" ;;
+                '${HOME}')    target="$HOME" ;;
+                '${HOME}/'*)  target="$HOME/${target#\$\{HOME\}/}" ;;
+            esac
+        fi
 
         # Resolve path to absolute (raw — normalization happens next).
         ABS_PATH=""
