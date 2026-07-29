@@ -61,7 +61,7 @@ stashes, untracked files) always need an explicit opt-in.
 | /repo:tidy  | Working tree cluttered with build artifacts and temp files |
 | /repo:remote | Need a cloud dev box (GCP/AWS) with this repo ready to go |
 | /repo:sudo | One-time machine setup — grant passwordless sudo (validated drop-in) so an agent over SSH isn't blocked on password prompts |
-| /repo:release | Cut a release — pre-flight, semver, CHANGELOG, version bump, tag, GitHub Release. Supports per-project release policy via `.repo/release-policy.md` seams |
+| /repo:release | Cut a release — pre-flight, semver, CHANGELOG, version bump, tag, GitHub Release. Supports per-project release policy via named phase-boundary seams in `.repo/release-policy.md` |
 
 ### Periodic maintenance
 | /repo:audit | Monthly sweep, or after a big refactor/import |

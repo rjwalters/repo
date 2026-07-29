@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **`/repo:remote` idle-shutdown guard gains an idle-exit marker contract and daemon-host guidance (#78, PR #79).** `scripts/repo/repo-remote.sh`'s on-host guard now honors `REPO_REMOTE_IDLE_MARKER` — a file whose mtime is an authoritative "idle since" timestamp that replaces the local countdown when present — with an active-SSH/CPU-load veto still winning first, and clock-skew / stale-marker safety. The contract is self-contained (works standalone before any daemon writes the marker) so this repo's half doesn't block on upstream `loom#4467`.
+- **`scripts/version.sh` makes `VERSION` the authoritative version source (build tooling).** `/repo:release` detects it ahead of npm, so a vestigial `package.json` can no longer make the release mis-detect `npm` and bump the wrong file; the script mirrors `package.json`'s version to `VERSION` on every bump. `package.json` was aligned to `0.7.0`.
+- **Docs: `/repo:release` per-project-seam description synced across README, SKILL.md, and help.md; redundant `.gitignore` carve-out removed** (now covered by the Loom-managed block).
+
 ## 0.7.0 (2026-07-29)
 
 New commands and installer features:
