@@ -258,6 +258,43 @@ If `CHANGELOG.md` exists, study its format and draft a new entry matching it
 **absent**, offer to bootstrap a "Keep a Changelog" template. Present the draft
 and iterate until approved. Omit empty sections.
 
+### Fold an existing `## Unreleased` section into the draft
+
+A CHANGELOG may already carry a `## Unreleased` section — a convention where
+merged-but-unshipped changes accumulate under a placeholder heading at the top of
+the file (directly under the `# Changelog` title, above the newest version entry)
+until the next release names them. If one exists, this release **is** that
+version, so its entries must be folded into the new entry rather than left
+stranded below the freshly-inserted version heading. Do this **at draft time**,
+as part of matching the file's format above — not as a separate Phase 5 step:
+
+1. Check for an existing `^## Unreleased` heading in `CHANGELOG.md`. If none
+   exists, skip the rest of this sub-section entirely and behave exactly as
+   before — the fold path is strictly opt-in on the heading's presence and makes
+   **no** change to the draft-from-git-log path when absent.
+2. If present, capture its body — every line between that heading and the next
+   `^## ` heading (the newest existing version entry).
+3. Merge those captured items into the git-log-derived draft, **de-duplicating**
+   against items this release already derived from its git-log range. Entries in
+   this repo cite issue/PR numbers in their lead-ins (e.g. `(#38, PR #42)`,
+   `(#43)`), so a simple `grep -oE '#[0-9]+'` per bullet and a set-intersection
+   against the range's issue/PR references is a sufficient dedup key for v1 (fall
+   back to a fuzzy text match only for bullets that cite no number). Keep a
+   captured `## Unreleased` bullet only if none of its numbers already appear in
+   the git-log-derived draft.
+4. Produce **one** combined entry headed with the new version + today's date,
+   positioned **where `## Unreleased` was** — since that heading conventionally
+   sits at the very top, this is a rename-in-place (`## Unreleased` →
+   `## X.Y.Z (date)`), not an append elsewhere and no reordering. The
+   `## Unreleased` heading itself is removed as part of drafting.
+
+> Seam interaction: under a `pre-changelog-style (replace)` policy the default
+> draft heuristic — including this fold — is skipped per the seam's
+> "policy steps produce the entry; skip the default draft heuristic" semantics
+> (see the seam table below), so folding any `## Unreleased` section becomes the
+> policy's responsibility. Under `augment` (the default), the seam's steps run
+> first and then this fold runs, so there is no conflict.
+
 ## Phase 5 — Apply
 
 > Seam `pre-apply` fires before this phase — run any bound policy steps (e.g.
@@ -265,7 +302,12 @@ and iterate until approved. Omit empty sections.
 
 Once approved:
 
-1. Insert the new entry into `CHANGELOG.md`.
+1. Insert the new entry into `CHANGELOG.md`. Phase 4 has already produced the
+   fully-merged entry (folding any `## Unreleased` section into it at draft
+   time), so this is a straight "write this string" — no fold/merge happens here.
+   The `pre-apply` seam therefore needs **no** change for the fold: it fires
+   before this insert, after drafting is complete, so it never observes an
+   un-folded entry regardless of how the string was assembled.
 2. **Show the version-bearing files** the tool will touch, then bump. Dispatch on
    the detected tool; each branch must produce a version commit **and** tag:
 
@@ -289,6 +331,18 @@ Once approved:
    commit/tag convention (check `git log` and `git tag`).
 3. **Verify**: re-read the version and confirm the tag exists
    (`git tag --sort=-v:refname | head -1`). For cargo, `cargo check --workspace`.
+   Also confirm the `## Unreleased` fold (Phase 4) actually landed: grep the
+   freshly-written `CHANGELOG.md` for any surviving `## Unreleased` heading and
+   **fail loudly** if one remains — a stray heading means the fold silently
+   didn't happen (e.g. both headings were left in place, or dedup dropped the
+   merge), which would strand this release's entries below the new version.
+
+   ```bash
+   if grep -Eq '^##[[:space:]]+Unreleased([[:space:]]|$)' CHANGELOG.md; then
+     echo "ERROR: a '## Unreleased' heading survived — Phase 4 fold did not complete" >&2
+     exit 1
+   fi
+   ```
 
 Show the result and get final confirmation.
 
@@ -380,7 +434,7 @@ meaningful where the boundary has a default action to replace:
 | Seam | Fires | Augment (default) | `(replace)` |
 |------|-------|-------------------|-------------|
 | `pre-flight` | start of Phase 1 | run policy steps, then the standard pre-flight checks | policy steps become the pre-flight gate; skip the built-in CI/clean-tree checks |
-| `pre-changelog-style` | before Phase 4 drafts the entry | run policy steps (e.g. enforce a house changelog style), then draft | policy steps produce the entry; skip the default draft heuristic |
+| `pre-changelog-style` | before Phase 4 drafts the entry | run policy steps (e.g. enforce a house changelog style), then draft — the default draft still folds any existing `## Unreleased` section into the new entry | policy steps produce the entry; skip the default draft heuristic — **including** the `## Unreleased` fold, so a `(replace)` policy owns folding any `## Unreleased` section itself or it will be left stranded |
 | `pre-apply` | before Phase 5 applies | run policy steps (e.g. edit extra manifests), then bump + commit + tag | policy steps perform the bump/commit/tag; skip the default apply dispatch |
 | `pre-push` | before the `git push` in Phase 6 | run policy steps (a final gate), then push | policy steps perform the push; skip the default `git push` |
 | `post-push` | immediately after the push succeeds | run policy steps | **augment-only** — no default action; a `(replace)` marker is ignored with a warning |
