@@ -33,10 +33,12 @@ RESET_MD="$REPO_ROOT/commands/repo/reset.md"
 
 PASS=0
 FAIL=0
+SKIP=0
 TOTAL=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 if [[ ! -f "$BRANCHES_MD" ]]; then
@@ -58,6 +60,17 @@ ok() {   # <label>
 no() {   # <label> <detail>
     TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
     printf "  ${RED}FAIL${NC}: %s\n" "$1"
+    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
+    return 0
+}
+# A skipped assertion is neither pass nor fail: the environment cannot exercise
+# it (e.g. this git predates `merge-tree --write-tree`). It is counted separately
+# and surfaced in the summary so a silently-skipped suite is never mistaken for a
+# full pass (repo#46). SKIP does NOT feed TOTAL/PASS/FAIL — run.sh folds only the
+# pass/fail counts, and reports the skip count as a breakdown annotation.
+skip() {  # <label> <reason>
+    SKIP=$((SKIP + 1))
+    printf "  ${YELLOW}SKIP${NC}: %s\n" "$1"
     [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
     return 0
 }
@@ -213,6 +226,17 @@ build_fixtures() {
     echo mainonly > "$REPO/m.txt"
     git -C "$REPO" add -A && git -C "$REPO" commit -qm "MAINONLY: committed only to main"
     MAINONLY_SHA=$(git -C "$REPO" rev-parse --short HEAD)
+
+    # (6) IDENTICAL-TREE branch: same content as main's current tip but a
+    #     distinct SHA (an amended commit, same tree + same parent). Its tree
+    #     equals main's, so even the degraded `git diff --quiet` fallback can
+    #     prove containment — this is the legitimate "old git still classifies
+    #     SAFE" path exercised by the degraded-mode section below (repo#46).
+    #     Built last so main's tree is fixed from here on; leaving main checked
+    #     out keeps every later assertion operating from main.
+    git -C "$REPO" checkout -q -b feature/identical
+    git -C "$REPO" commit -q --amend --allow-empty -m "identical: main's tree, distinct SHA"
+    git -C "$REPO" checkout -q main
 }
 
 echo "branches.md permanent-loss check test suite"
@@ -220,6 +244,46 @@ echo "==========================================="
 echo ""
 
 build_fixtures
+
+# ---------------------------------------------------------------------------
+# Capability probe + merge-tree shim (repo#46)
+# ---------------------------------------------------------------------------
+# 5b's primary containment check uses `git merge-tree --write-tree`, which only
+# exists on git >= 2.38. Probe the capability once — on the fixture repo, not by
+# parsing `git --version` (a vendor version string can distort that) — so the
+# assertions that need a REAL merge-tree result skip cleanly on older git instead
+# of failing with a confusing empty-string-vs-tree-hash mismatch. The documented
+# fallback (`git diff --quiet` -> merged-PR lookup) is then exercised explicitly
+# under a PATH shim below, on every git version.
+HAS_MERGE_TREE=0
+if git -C "$REPO" merge-tree --write-tree HEAD HEAD >/dev/null 2>&1; then
+    HAS_MERGE_TREE=1
+fi
+
+# A `git` shim that simulates git < 2.38: it fails only on `merge-tree` and execs
+# the real git for everything else. Used by mt_unsupported_loss_check to force
+# the degraded fallback chain regardless of the host git version.
+SHIM_DIR="$SCRATCH/nomergetree-bin"
+mkdir -p "$SHIM_DIR"
+REAL_GIT="$(command -v git)"
+cat > "$SHIM_DIR/git" <<SHIM
+#!/usr/bin/env bash
+for arg in "\$@"; do
+    if [ "\$arg" = "merge-tree" ]; then
+        echo "git: 'merge-tree --write-tree' unsupported (simulated git < 2.38)" >&2
+        exit 129
+    fi
+done
+exec "$REAL_GIT" "\$@"
+SHIM
+chmod +x "$SHIM_DIR/git"
+
+# loss_check run against a git that lacks `merge-tree --write-tree`. The PATH
+# override lives in a subshell, so the real merge-tree is untouched afterward —
+# later real-git assertions must not see the shim (guards the "shim leak" case).
+mt_unsupported_loss_check() {  # <branch>
+    ( PATH="$SHIM_DIR:$PATH"; loss_check "$1" )
+}
 
 # ---------------------------------------------------------------------------
 echo "-- the bug: \`--not\` is a toggle (repo#39) --"
@@ -248,17 +312,31 @@ if [[ -n "$SQ_5A" ]]; then
 else
     no "5a alone reports the squash-merged branch as having unique SHAs" "5a was empty"
 fi
-# ...but its content IS contained in main, which is what 5b measures.
-MT=$(git -C "$REPO" merge-tree --write-tree main feature/squashed 2>/dev/null)
-assert_eq "5b: merging the squash-merged branch changes nothing" \
-    "$(git -C "$REPO" rev-parse 'main^{tree}')" "$MT"
+# ...but its content IS contained in main, which is what 5b measures. This direct
+# probe needs a real merge-tree result, so it skips (not fails) on git < 2.38.
+if [[ "$HAS_MERGE_TREE" == 1 ]]; then
+    MT=$(git -C "$REPO" merge-tree --write-tree main feature/squashed 2>/dev/null)
+    assert_eq "5b: merging the squash-merged branch changes nothing" \
+        "$(git -C "$REPO" rev-parse 'main^{tree}')" "$MT"
+else
+    skip "5b: merging the squash-merged branch changes nothing" \
+        "git merge-tree --write-tree unsupported (git < 2.38)"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- fixture 1: squash-merged branch classifies SAFE --"
 # ---------------------------------------------------------------------------
 PR_LOOKUP_MODE="none"   # no forge help at all — content containment must carry it
-assert_eq "squash-merged -> SAFE (without any PR lookup)" "SAFE" "$(loss_check feature/squashed)"
+# main has advanced past the squash-merge (later fixtures added files), so only
+# merge-tree can prove containment here; without it the degraded path correctly
+# refuses SAFE. That degraded direction is pinned in the fallback section below.
+if [[ "$HAS_MERGE_TREE" == 1 ]]; then
+    assert_eq "squash-merged -> SAFE (without any PR lookup)" "SAFE" "$(loss_check feature/squashed)"
+else
+    skip "squash-merged -> SAFE (without any PR lookup)" \
+        "content containment needs merge-tree; degraded path covered by the fallback section"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -269,7 +347,12 @@ assert_eq "unpushed work -> UNSAFE" "UNSAFE" "$(loss_check feature/unpushed)"
 # Not rescued by a bogus merged-PR answer being absent, and not by --prune.
 SAFE_SET="$(safe_to_delete_set | tr '\n' ' ')"
 assert_not_contains "unpushed branch is never offered for deletion" "$SAFE_SET" "feature/unpushed"
-assert_contains "squash-merged branch IS offered for deletion" "$SAFE_SET" "feature/squashed"
+if [[ "$HAS_MERGE_TREE" == 1 ]]; then
+    assert_contains "squash-merged branch IS offered for deletion" "$SAFE_SET" "feature/squashed"
+else
+    skip "squash-merged branch IS offered for deletion" \
+        "needs merge-tree to prove containment after main advanced (git < 2.38)"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -297,8 +380,13 @@ assert_eq "no merged PR found -> UNSAFE" "UNSAFE" "$(loss_check feature/pr-merge
 
 # A failing forge lookup must never rescue, nor condemn-to-SAFE, anything.
 PR_LOOKUP_MODE="fail"
-assert_eq "forge failure leaves squash-merged branch SAFE on content alone" \
-    "SAFE" "$(loss_check feature/squashed)"
+if [[ "$HAS_MERGE_TREE" == 1 ]]; then
+    assert_eq "forge failure leaves squash-merged branch SAFE on content alone" \
+        "SAFE" "$(loss_check feature/squashed)"
+else
+    skip "forge failure leaves squash-merged branch SAFE on content alone" \
+        "content containment needs merge-tree (git < 2.38)"
+fi
 assert_not_safe "forge failure keeps unpushed branch out of SAFE" \
     "$(loss_check feature/unpushed)"
 SAFE_SET="$(safe_to_delete_set | tr '\n' ' ')"
@@ -312,6 +400,57 @@ PR_LOOKUP_MODE="merged"
 assert_eq "unknown ref -> KEEP even with a merged-PR answer available" \
     "KEEP" "$(loss_check no/such/branch)"
 PR_LOOKUP_MODE="none"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- degraded path: git < 2.38 has no \`merge-tree --write-tree\` (repo#46) --"
+# ---------------------------------------------------------------------------
+# The documented fallback chain (branches.md:161) is `merge-tree` -> `git diff
+# --quiet` -> merged-PR lookup. On a modern git the merge-tree arm always wins, so
+# the fallback arms have zero natural coverage. Force them by running loss_check
+# under a git that fails on merge-tree, and pin the failure DIRECTION: the
+# degraded path must never classify SAFE unless containment is otherwise proven
+# (identical trees or a merged PR). "Degrades to SAFE" is precisely the
+# silent-data-loss failure repo#39 was filed to prevent — this is the coverage it
+# left untested. Runs on every git version; the shim forces the fallback.
+
+# (a) Identical trees: `git diff --quiet` exits 0 — the legitimate degraded
+#     success path (exit 0 is documented proof of containment).
+PR_LOOKUP_MODE="none"
+assert_eq "fallback: identical-tree branch -> SAFE via \`git diff --quiet\`" \
+    "SAFE" "$(mt_unsupported_loss_check feature/identical)"
+
+# (b) main advanced past a squash-merge, no forge help: diff differs, PR lookup
+#     finds nothing -> UNSAFE. The primary (merge-tree) path calls this SAFE;
+#     degraded correctly will not, because it cannot prove containment.
+PR_LOOKUP_MODE="none"
+assert_eq "fallback: squash-merged (main advanced), no PR -> UNSAFE" \
+    "UNSAFE" "$(mt_unsupported_loss_check feature/squashed)"
+assert_not_safe "fallback: squash-merged branch never degrades to SAFE" \
+    "$(mt_unsupported_loss_check feature/squashed)"
+
+# (c) Same, but the forge lookup itself fails (5c) -> KEEP, never SAFE.
+PR_LOOKUP_MODE="fail"
+assert_eq "fallback: squash-merged (main advanced), forge down -> KEEP" \
+    "KEEP" "$(mt_unsupported_loss_check feature/squashed)"
+
+# (d) A merged PR still rescues a branch without merge-tree — the forge arm is
+#     independent of the containment probe.
+PR_LOOKUP_MODE="merged"
+assert_eq "fallback: merged-PR lookup clears the branch without merge-tree" \
+    "SAFE" "$(mt_unsupported_loss_check feature/pr-merged)"
+PR_LOOKUP_MODE="none"
+
+# Shim hygiene: the PATH override was confined to subshells, so a REAL merge-tree
+# (when the host has one) must still resolve here — no leak into later cases.
+if [[ "$HAS_MERGE_TREE" == 1 ]]; then
+    if git -C "$REPO" merge-tree --write-tree main feature/squashed >/dev/null 2>&1; then
+        ok "merge-tree shim did not leak into the real environment"
+    else
+        no "merge-tree shim did not leak into the real environment" \
+            "real merge-tree unavailable after the shim subshells"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -365,6 +504,7 @@ echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"
 printf "  ${RED}Failed${NC}: %s\n" "$FAIL"
+printf "  ${YELLOW}Skipped${NC}: %s\n" "$SKIP"
 echo "========================================="
 
 if [[ $FAIL -gt 0 ]]; then
