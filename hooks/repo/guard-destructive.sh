@@ -1089,6 +1089,142 @@ strip_literal_text() {
     }'
 }
 
+# Redact the quoted argument(s) of a non-executing "data sink" command word
+# (echo, printf) so a dangerous-looking string that appears ONLY as quoted DATA
+# handed to echo/printf no longer trips the raw ALWAYS_BLOCK_PATTERNS scan
+# (catastrophic tier) or the ASK_PATTERNS scan (ask tier) (#53). echo/printf
+# print their arguments verbatim; they never EXECUTE them, so a quoted argument
+# is inert text — exactly like a --body/-m value — yet strip_literal_text()'s
+# flag allowlist never covered it. This is the meta false-positive that blocked
+# a guard self-test (`echo '{"…":"<dangerous cmd>"}' | guard-destructive.sh`)
+# and blocked filing this very issue's heredoc body.
+#
+# Command-word anchored (mirrors fastpath_builtin_admits() and the segment
+# parsers): the quoted args are redacted ONLY for a simple command whose FIRST
+# token is exactly `echo` or `printf` (optionally behind a bare `sudo`/`env`
+# wrapper). A wrapper that actually EXECUTES its argument — `bash -c '<payload>'`,
+# `sh -c`, `eval`, `xargs` — is never a data sink and is never redacted here.
+#
+# Safety floor, identical to strip_literal_text()/qsplit():
+#   - A quoted span is redacted ONLY when it carries no command substitution /
+#     backtick opener (`$(` or a backtick), so a smuggled `echo "$(<payload>)"`
+#     keeps its payload intact and still hard-denies.
+#   - The `echo '<payload>' | sh` shape (data PIPED into a shell that WOULD
+#     execute it) is handled by the command_has_shell_segment() gate at the call
+#     site, which skips this redaction entirely whenever any pipeline segment's
+#     command word is a shell — so the raw scan still sees and blocks the payload.
+#
+# Single-pass quote-aware lexer. It deliberately does NOT reuse qsplit(), whose
+# `\n`-per-separator contract would conflate a real newline inside a multi-line
+# quoted span with a shell separator; here a multi-line span is redacted as one
+# inert unit (`.` never matches a newline, so each line stays SAME-LENGTH and the
+# surrounding byte offsets are preserved). Best-effort like strip_literal_text():
+# an unterminated quote copies the remainder verbatim (never redacts), and the
+# result feeds only the NARROWING scans, so the worst case is a raw substring
+# surviving (a false block) — never a catastrophic block being skipped.
+strip_datasink_literals() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)   # single quote
+        DQ = sprintf("%c", 34)   # double quote
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        n = length(s)
+        out = ""
+        i = 1
+        atcmd = 1     # at the start of a simple command (command-word position)
+        sink = 0      # inside an echo/printf data-sink command
+        while (i <= n) {
+            c = substr(s, i, 1)
+            # A shell separator resets to command-word position.
+            if (c == ";" || c == "&" || c == "|" || c == "\n") {
+                out = out c; i++; atcmd = 1; sink = 0; continue
+            }
+            # Leading whitespace is copied without leaving command-word position.
+            if (c == " " || c == "\t") { out = out c; i++; continue }
+            # Command-word position: read the first token and classify it.
+            if (atcmd) {
+                atcmd = 0
+                tok = ""
+                j = i
+                while (j <= n) {
+                    cc = substr(s, j, 1)
+                    if (cc == " " || cc == "\t" || cc == ";" || cc == "&" || cc == "|" || cc == "\n") break
+                    tok = tok cc
+                    j++
+                }
+                # A bare sudo/env wrapper: emit it and stay in command-word
+                # position so the NEXT token is classified as the command word.
+                if (tok == "sudo" || tok == "env") {
+                    out = out tok; i = j; atcmd = 1; continue
+                }
+                if (tok == "echo" || tok == "printf") { sink = 1 }
+                out = out tok; i = j; continue
+            }
+            # Mid-command: a quoted span is redacted only inside a data sink.
+            if (c == DQ || c == SQ) {
+                qc = c
+                ci = 0
+                for (j = i + 1; j <= n; j++) {
+                    if (substr(s, j, 1) == qc) { ci = j; break }
+                }
+                if (ci == 0) {
+                    # Unterminated quote: copy the rest verbatim, never redact.
+                    out = out substr(s, i); i = n + 1; continue
+                }
+                inner = substr(s, i + 1, ci - i - 1)
+                if (sink && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    gsub(/./, "X", inner)   # . never matches \n: multi-line stays same-length
+                }
+                out = out qc inner qc; i = ci + 1; continue
+            }
+            out = out c; i++
+        }
+        printf "%s", out
+    }'
+}
+
+# Return 0 (success) if ANY quote-aware segment's command word is a shell binary
+# (sh/bash/dash/zsh/ksh/csh/tcsh/fish/pwsh, with or without a leading path).
+# GATES strip_datasink_literals(): when a shell could consume the command's data
+# (e.g. `echo '<payload>' | sh`), the data-sink redaction is skipped so the raw
+# catastrophic scan still sees — and blocks — the payload. Conservative by
+# construction: a shell ANYWHERE in the command disables the (narrowing)
+# redaction, so the worst case is a preserved false BLOCK, never a skipped one.
+# `guard-destructive.sh` (basename is not a bare shell word) is deliberately NOT
+# matched, so the guard's own `echo '<json>' | guard-destructive.sh` self-test
+# still redacts and no longer false-blocks (#53). Emits "yes"/"no".
+command_has_shell_segment() {
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        found = 0
+        s = qsplit(buf)   # quote-aware segmentation (#3755); separators -> \n
+        n = split(s, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            # Strip any run of leading VAR=val assignments, then a sudo/env wrapper,
+            # so the REAL command word is classified. The required trailing [ \t]+
+            # in the assignment pattern guarantees the loop makes progress.
+            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/)) { seg = substr(seg, RLENGTH + 1) }
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^env[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            w = toks[1]
+            sub(/.*\//, "", w)   # basename only
+            if (w == "sh" || w == "bash" || w == "dash" || w == "zsh" || \
+                w == "ksh" || w == "csh" || w == "tcsh" || w == "fish" || w == "pwsh") { found = 1 }
+        }
+        print (found ? "yes" : "no")
+    }'
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -1239,6 +1375,19 @@ if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
 fi
+# ALSO redact the quoted args of a data-sink command word (echo/printf), so a
+# dangerous string handed to echo/printf as inert DATA no longer trips the raw
+# scan (#53) — the meta false-positive that blocked guard self-tests and filing
+# this issue's heredoc body. Gated on echo/printf being present (off the hot
+# path otherwise) AND on NO shell segment existing: when data is piped into a
+# shell that would execute it (`echo '<payload>' | sh`), the redaction is skipped
+# so the raw scan still blocks the payload. `-c` wrappers (bash -c/sh -c) are
+# never data sinks, and `$(`/backtick spans are never redacted, so smuggling
+# still hard-denies.
+if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]] && \
+   [[ "$(command_has_shell_segment "$COMMAND")" == "no" ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT")
+fi
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
@@ -1285,6 +1434,15 @@ if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--messag
       "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
       "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
     COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_NO_COMMENT")
+fi
+# Mirror the catastrophic tier's data-sink redaction (#53): an ask-phrase quoted
+# as inert echo/printf data (e.g. `echo 'run gh issue close 5 to clean up'`)
+# should not false-ask. Same shell-segment gate keeps `echo '<phrase>' | sh`
+# reaching the raw ask scan. Never feeds the catastrophic scan, so it can only
+# NARROW an ask, never miss a hard deny.
+if [[ "$COMMAND_NO_COMMENT" == *"echo"* || "$COMMAND_NO_COMMENT" == *"printf"* ]] && \
+   [[ "$(command_has_shell_segment "$COMMAND_NO_COMMENT")" == "no" ]]; then
+    COMMAND_ASK_SCAN=$(strip_datasink_literals "$COMMAND_ASK_SCAN")
 fi
 
 # =============================================================================
