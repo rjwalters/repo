@@ -2284,6 +2284,44 @@ assert_allow "#84: a markdown # heading in a heredoc body does not disturb the s
 assert_allow "#84: a benign backslash-continued opener line still allows the body" \
     "$(printf 'cat <<EOF \\\n  --flag\n%s\nEOF' "$_HD84_SHUTDOWN")"
 
+# --- #108: a backslash-ESCAPED leading `<` is not an operator -----------------
+#
+# `\<` is a literal `<` inside a word, so `\<<WORD` opens no heredoc at all.
+# Probing it anyway manufactured a phantom opener whose terminator never appears,
+# and the unterminated-heredoc rule then skipped the REST OF THE BUFFER — hiding
+# every later real command from all three parsers. Real bash runs the command on
+# the following line in each of these (verified with a marker binary shadowing
+# the lifecycle word on PATH), and the pre-#84 guard denied them all.
+
+assert_deny "#108 safety: escaped \\<< is not an opener and cannot hide the next line" \
+    "$(printf 'cat \\<<EOF\n%s' "$_HD84_HALT")"
+
+assert_deny "#108 safety: escaped \\<< with a quoted delimiter still denies" \
+    "$(printf 'true \\<<%sEOF%s\n%s' "$_HD84_SQ" "$_HD84_SQ" "$_HD84_HALT")"
+
+assert_deny "#108 safety: escaped \\<<- plus a line continuation still denies" \
+    "$(printf 'cat \\<<-EOF \\\nbody text\n%s' "$_HD84_HALT")"
+
+assert_deny "#108 safety: escaped \\<< does not hide an outside-repo rm" \
+    "$(printf 'cat \\<<EOF\n%s' "$_HD84_RM")"
+
+assert_ask "#108 safety: escaped \\<< does not hide a force op" \
+    "$(printf 'cat \\<<EOF\n%s' "$_HD84_RESET")"
+
+# The check applies to the LEADING `<` only. An escaped DELIMITER (`<<\EOF`) is a
+# genuine opener that merely suppresses body expansion, and an escaped SECOND `<`
+# (`<\<`) is not a `<<` sequence at all — neither may regress.
+assert_allow "#108: an escaped DELIMITER <<\\EOF is still a real opener" \
+    "$(printf 'cat <<\\EOF\n%s\nEOF' "$_HD84_HALT")"
+
+assert_deny "#108 safety: <\\< is not a heredoc operator and hides nothing" \
+    "$(printf 'cat <\\<EOF\n%s' "$_HD84_HALT")"
+
+# An EVEN number of backslashes leaves the `<` unescaped, so this IS a real
+# opener and its body stays inert.
+assert_allow "#108: an escaped backslash before << leaves a real opener" \
+    "$(printf 'cat \\\\<<EOF\n%s\nEOF' "$_HD84_HALT")"
+
 echo ""
 
 # =========================================================================
