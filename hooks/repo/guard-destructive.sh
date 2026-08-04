@@ -1020,6 +1020,12 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 #     newline falls through to the legacy separator handling, so the continued
 #     line is segmented as the real commands it is; the bodies then start at the
 #     first NON-continued newline, matching the shell.
+#   - A `<<` whose leading `<` is itself preceded by an ODD number of backslashes
+#     (`\<<WORD`) is NOT an operator — `\<` is a literal `<` inside a word — so it
+#     is not probed at all (#108). Without this the phantom opener's terminator
+#     never appeared and the unterminated-heredoc rule skipped the rest of the
+#     buffer, hiding every later real command. The ESCAPED-DELIMITER form
+#     `<<\WORD` is a different (and legitimate) thing and is unaffected.
 # Safety floor unchanged: the raw ALWAYS_BLOCK_PATTERNS catastrophic scan reads
 # the command string directly (never through ml_segment), so a `$(...)`-smuggled
 # payload inside a heredoc body still denies, and a GENUINE multi-line command
@@ -1074,11 +1080,18 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
     out["delim"] = w
     return j
 }
-# A newline at position i is a LINE CONTINUATION when it is preceded by an ODD
-# number of backslashes (`\` + newline is removed by the shell; `\\` + newline is
-# a literal backslash followed by a REAL newline). A continued newline does not
-# end the logical line, so heredoc bodies must NOT start there.
-function cont_nl(s, i,   bs, p) {
+# The character at position i is BACKSLASH-ESCAPED when it is preceded by an ODD
+# number of backslashes (`\x` is an escape; `\\x` is a literal backslash followed
+# by an unescaped `x`). Two call sites depend on this parity:
+#   - a NEWLINE: an escaped newline is a LINE CONTINUATION — the shell removes it
+#     and the logical line continues, so pending heredoc BODIES must not start
+#     there;
+#   - the leading `<` of a `<<`: an escaped `\<` is a literal `<` inside a word,
+#     NOT a redirection operator, so `\<<WORD` never opens a heredoc and must not
+#     be probed as one (#108).
+# Both uses are strictly NARROWING: treating something as escaped only falls back
+# to the legacy separator-active segmentation, which cannot widen a deny.
+function bs_escaped(s, i,   bs, p) {
     bs = 0
     for (p = i - 1; p >= 1 && substr(s, p, 1) == "\\"; p--) bs++
     return (bs % 2)
@@ -1147,7 +1160,17 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 pc == "&" || pc == "|" || pc == "(" || pc == ")" ||
                 pc == "<" || pc == ">") incmt = 1
         }
-        if (c == "<" && i < n && substr(s, i + 1, 1) == "<" && !incmt) {
+        # A BACKSLASH-ESCAPED leading `<` (`\<<WORD`) is a literal `<` inside a
+        # word, not a redirection operator, so the shell opens no heredoc there
+        # (#108). Probing it anyway manufactured a phantom opener whose
+        # terminator never appears, and the unterminated-heredoc rule then
+        # skipped the REST OF THE BUFFER — hiding every later real command from
+        # all three parsers. Note this checks only the FIRST `<`: when the SECOND
+        # one is escaped (`<\<`) the `substr()` guard below already fails, and an
+        # escaped DELIMITER (`<<\EOF`) is a legitimate opener that hd_opener()
+        # handles by marking the body unexpanded.
+        if (c == "<" && i < n && substr(s, i + 1, 1) == "<" && !incmt &&
+            !bs_escaped(s, i)) {
             if (substr(s, i + 2, 1) == "<") {
                 # `<<<` is a here-STRING: consume the whole operator so its third
                 # `<` cannot be re-probed as the start of a `<< WORD` heredoc.
@@ -1174,7 +1197,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 continue
             }
         }
-        if (c == "\n" && hdc > 0 && !cont_nl(s, i)) {
+        if (c == "\n" && hdc > 0 && !bs_escaped(s, i)) {
             # End of the opener line: the pending heredoc BODIES follow. Look
             # ahead across every pending body, in opener order, to find where the
             # last one ends — and whether any EXPANSION-CAPABLE body (bare
