@@ -45,25 +45,38 @@ For every local branch, classify it into one of these buckets:
 #### PROTECTED (never delete)
 - The default branch (`main`/`master`) and the currently checked-out branch
 - Any branch currently checked out by a worktree
-- Any branch with an **open** PR (`gh pr list --head <branch> --state open`)
+- Any branch with an **open** PR:
+  `gh api "repos/{owner}/{repo}/pulls?state=open&head={owner}:<branch>" --jq length`
 - Long-lived branches the repo's own docs (CLAUDE.md, CONTRIBUTING.md) name as
   release/project branches — if such a list exists, honor it
 
 #### MERGED PR BRANCHES
 - Branches matching common PR patterns: `feature/*`, `fix/*`, `feat/*`, `pr-*`
-- Check if a PR exists and is merged:
-  `gh pr list --head <branch> --state merged --json number --jq length`
-- If the PR is merged, the branch is safe to delete
+- Check whether a PR exists for the branch's head and is merged (the REST form
+  below) — a count `>= 1` means the branch is safe to delete
 - Also safe: any branch fully merged into the default branch
   (`git branch --merged <default>`). Reachability is **sufficient but not
   necessary** — a squash-merged branch is never `--merged`, so its absence from
   that list means nothing. Step 5 decides.
 
+```bash
+gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>" \
+  --jq '[.[] | select(.merged_at != null)] | length'
+```
+
+REST's `pulls` endpoint has no `state=merged` value — only `open`, `closed`, and
+`all` — so merged-ness is a **client-side** filter on `.merged_at != null` over
+`state=all`. An older closed-but-unmerged PR on the same head is correctly
+excluded by it. Step 5b arm 4 runs the same call for the final verdict.
+
 #### CLOSED ISSUE BRANCHES
 - Branches whose names embed an issue number (e.g. `feature/issue-123`,
   `loom/issue-123`)
-- Check the linked issue: `gh issue view <number> --json state --jq .state`
-- If the issue is CLOSED and no open PR exists for the branch, it's safe to delete
+- Check the linked issue:
+  `gh api repos/{owner}/{repo}/issues/<number> --jq .state`
+- REST returns a **lowercase** state (`open`/`closed`); GraphQL's enum form was
+  uppercase (`OPEN`/`CLOSED`), so compare against the lowercase string
+- If the issue is `closed` and no open PR exists for the branch, it's safe to delete
 
 #### ORPHANED AUTOMATION BRANCHES
 - Ephemeral branches created by tooling and abandoned — e.g. `worktree-agent-*`,
@@ -81,7 +94,10 @@ linked issue for active labels before treating it as stale:
 
 ```bash
 issue=$(echo "$branch" | grep -oE 'issue-[0-9]+' | grep -oE '[0-9]+')
-gh issue view "$issue" --json state,labels --jq '[.state, (.labels[].name)] | join(",")'
+# REST, not a `gh issue`/`gh pr` subcommand with --json — see step 5b arm 4 for
+# why. The state field is lowercase here (`open`/`closed`), not GraphQL's
+# `OPEN`/`CLOSED`; the label names are unaffected.
+gh api "repos/{owner}/{repo}/issues/$issue" --jq '[.state, (.labels[].name)] | join(",")'
 ```
 
 Active labels (`loom:building`, `loom:review-requested`,
@@ -228,19 +244,9 @@ is never a reason to delete on its own.
 **Arm 4 — forge merge state** → `landed (squash), merged PR #N (<date>)`
 
 Ask the forge whether the branch's head had a merged PR. This is the only arm
-that can clear a branch whose content `<default>` has moved past entirely.
-
-```bash
-gh pr list --head <branch> --state merged --json number --jq length
-```
-
-A count `>= 1` means the work landed through that PR; safe to delete.
-
-The report tag also needs the PR number and merge date. Get both from the REST
-endpoint — prefer it for this and for any **new** forge call added here, because
-`gh pr list` is GraphQL-backed and spends the much smaller GraphQL rate-limit
-budget (converting the remaining GraphQL-backed read paths is tracked separately
-in repo#103; do not do it here):
+that can clear a branch whose content `<default>` has moved past entirely. **One**
+REST call answers the containment question and supplies the number and merge date
+the report tag needs — do not put a separate count query in front of it:
 
 ```bash
 gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>" \
@@ -248,8 +254,19 @@ gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>" \
 ```
 
 `gh` substitutes `{owner}` and `{repo}` from the current repository; `<branch>`
-is the branch name. A leading count `>= 1` is the same signal as above, and
-carries the number and date the tag needs.
+is the branch name. A leading count `>= 1` means the work landed through that
+PR — safe to delete — and the same line carries the number and date the tag
+needs. Empty output or a non-zero exit is 5c, not "no merged PR".
+
+Use `gh api` for this and for any **new** forge call added here. Every `gh
+pr`/`gh issue` subcommand invoked with `--json` is GraphQL-backed and spends the
+much smaller GraphQL rate-limit budget, which on a busy multi-agent host is
+routinely exhausted while the REST `core` bucket sits nearly unused — and a
+rate-limited forge lookup here costs a branch its verdict (5c: KEEP), so the
+cheaper bucket is the one to spend. REST's `pulls` endpoint has no
+`state=merged` value — only `open`, `closed`, and `all` — so merged-ness is the
+client-side `.merged_at != null` filter above, which correctly ignores an older
+closed-but-unmerged PR on the same head.
 
 If no arm establishes containment, the 5a commits would be **permanently
 lost**. Do NOT auto-delete even under `--prune`. Reclassify the branch as

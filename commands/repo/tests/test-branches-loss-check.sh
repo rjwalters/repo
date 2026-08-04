@@ -31,10 +31,12 @@
 # exists nowhere else. The doc-drift block at the end pins the tag vocabulary in
 # branches.md and reset.md against the tags this file emits.
 #
-# NOTE on the forge arm: branches.md keeps `gh pr list --head ... --state merged`
-# as the containment probe and adds the REST `gh api .../pulls?state=all&head=...`
-# form for the number/date the tag needs. Converting the remaining GraphQL-backed
-# `gh pr list` read paths is repo#103's scope, deliberately NOT duplicated here.
+# NOTE on the forge arm: since repo#103 branches.md reaches the forge over REST
+# only — one `gh api .../pulls?state=all&head=...` call answers containment AND
+# carries the number/date the tag needs. Merged-ness is a client-side
+# `.merged_at != null` filter because REST's pulls endpoint has no `state=merged`.
+# The doc-drift block at the end asserts no GraphQL-backed `gh pr`/`gh issue`
+# `--json` form comes back.
 
 set -uo pipefail
 
@@ -109,9 +111,10 @@ assert_not_safe() {  # <label> <actual>
 DEFAULT="main"
 REPO=""
 
-# Stands in for the forge lookup — `gh pr list --head <branch> --state merged`
-# for the count, plus the REST `gh api .../pulls?state=all&head=...` form for the
-# number and merge date the report tag needs. Echoes "<count> <number> <date>".
+# Stands in for the forge lookup — the single REST call
+# `gh api .../pulls?state=all&head=...` filtered client-side on
+# `.merged_at != null`, which yields the count AND the number and merge date the
+# report tag needs. Echoes "<count> <number> <date>".
 # PR_LOOKUP_MODE: none -> no merged PR | merged -> one merged PR | fail ->
 # non-zero exit (gh missing / unauthenticated / rate-limited / offline).
 PR_LOOKUP_MODE="none"
@@ -612,8 +615,16 @@ assert_contains "branches.md documents the corrected 5a idiom" \
     "$MD" 'git log --oneline <branch> --not <default> --remotes'
 assert_contains "branches.md documents a content-containment check" \
     "$MD" 'git merge-tree --write-tree <default> <branch>'
-assert_contains "branches.md documents the merged-PR fallback" \
-    "$MD" 'gh pr list --head <branch> --state merged'
+# repo#103: the merged-PR arm is REST-backed. It is pinned by the jq that makes
+# it correct, not by a command name — REST's pulls endpoint has no
+# `state=merged`, so dropping the client-side filter would silently count
+# closed-but-unmerged PRs as landed and clear a branch that never merged.
+assert_contains "branches.md documents the merged-PR fallback over REST" \
+    "$MD" 'state=all&head={owner}:<branch>'
+assert_contains "branches.md filters merged-ness client-side" \
+    "$MD" 'select(.merged_at != null)'
+assert_contains "branches.md explains why state=merged is unavailable" \
+    "$MD" 'endpoint has no `state=merged` value'
 assert_contains "branches.md warns against --merged alone" \
     "$MD" 'Do NOT "simplify" 5b to `git branch --merged <default>`'
 assert_contains "branches.md explains why --not must not be doubled" \
@@ -638,6 +649,23 @@ assert_contains "branches.md restricts -D to branches step 5 tagged landed" \
     "$MD" 'Escalate to `-D` only for a branch step 5 tagged `landed (...)`'
 assert_contains "branches.md refuses the git branch --merged offline fallback" \
     "$MD" 'Do **not** fall back to'
+
+# repo#103: every forge read in this file goes through REST. `gh pr list` and
+# `gh issue view --json` are GraphQL-backed, and a rate-limited lookup here costs
+# a branch its verdict (5c: KEEP) — so a reintroduced GraphQL form is a
+# regression, not a style preference. Pin their absence rather than trusting
+# prose. (Prose that must *name* the GraphQL path says "gh pr"/"gh issue" with
+# --json, deliberately avoiding these literals.)
+assert_not_contains "branches.md has no GraphQL-backed gh pr list call" \
+    "$MD" 'gh pr list'
+assert_not_contains "branches.md has no GraphQL-backed gh issue view call" \
+    "$MD" 'gh issue view'
+assert_contains "branches.md reaches issues over REST" \
+    "$MD" 'gh api repos/{owner}/{repo}/issues/<number> --jq .state'
+assert_contains "branches.md flags REST's lowercase issue state" \
+    "$MD" 'lowercase'
+assert_contains "branches.md reaches open PRs over REST" \
+    "$MD" 'gh api "repos/{owner}/{repo}/pulls?state=open&head={owner}:<branch>"'
 
 # The tag vocabulary this suite emits must be published in branches.md, or the
 # report and the check have drifted apart.

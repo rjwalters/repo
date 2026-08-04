@@ -248,7 +248,10 @@ gh pr list --author "app/dependabot" --state open \
 
 # REST fallback when GraphQL's rate-limit bucket is exhausted. Note the author
 # spelling differs: gh's --author filter wants "app/dependabot", the REST
-# payload carries login "dependabot[bot]".
+# payload carries login "dependabot[bot]". This jq deliberately emits only
+# number/title — if a later step starts consuming headRefName/createdAt/
+# statusCheckRollup/labels, widen it, or the fallback path silently loses them
+# (statusCheckRollup has no REST field: use `gh pr checks <N>` per PR instead).
 gh api repos/OWNER/REPO/pulls --paginate \
   --jq '.[] | select(.user.login == "dependabot[bot]") | "#\(.number) \(.title)"'
 ```
@@ -266,7 +269,11 @@ compare the leading version components) — confirm against the diff rather than
 trusting the title alone:
 
 ```bash
-gh pr view <N> --json title,body,files
+# REST rather than `gh pr view --json` — same reason as the label lookup above:
+# any `--json` flag on `gh pr`/`gh issue` forces a GraphQL query. `gh pr diff`
+# and `gh pr checks` take no `--json` and are already REST-backed.
+gh api repos/OWNER/REPO/pulls/<N> --jq '{title, body}'
+gh api repos/OWNER/REPO/pulls/<N>/files --paginate --jq '[.[].filename]'
 gh pr diff <N>
 gh pr checks <N>
 ```
