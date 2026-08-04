@@ -128,7 +128,11 @@ if [ -d ".github/workflows" ] && [ -n "$(find .github/workflows -maxdepth 1 -typ
 else
   echo "No CI workflows — using clean tree + zero blocking PRs as the gate"
 fi
-gh pr list --state open --json number,title --jq '.[] | "#\(.number) \(.title)"'
+# Open PRs, over REST. Any `gh pr`/`gh issue` subcommand invoked with --json is
+# GraphQL-backed and spends the much smaller GraphQL rate-limit budget, which on
+# a busy multi-agent host is routinely exhausted while the REST `core` bucket
+# sits nearly unused.
+gh api "repos/{owner}/{repo}/pulls?state=open" --paginate --jq '.[] | "#\(.number) \(.title)"'
 git status --porcelain
 ```
 
