@@ -46,12 +46,12 @@ git clean -ndX
 git clean -nd
 
 # Empty directories
-find . \( -path './.git' -o -name node_modules -o -name target \
+find . \( -name .git -o -name node_modules -o -name target \
           -o -name dist -o -name .venv \) -prune \
      -o -type d -empty -print
 
 # Large files in the working tree (>10 MB, tracked or not)
-find . \( -path './.git' -o -name node_modules -o -name target \
+find . \( -name .git -o -name node_modules -o -name target \
           -o -name dist -o -name .venv \) -prune \
      -o -type f -size +10M -print
 
@@ -93,10 +93,10 @@ git does its own traversal. When editing the prune list:
 - **Draw entries from the denylist and CACHE categories already named in step 2**
   (`node_modules/`, `.venv/`, `dist/`, plus `target/` for Rust builds) instead
   of growing a second, inconsistent list.
-- **Match by `-name`, not `-path`** (except `./.git`, which is unambiguously at
-  the root). `-name` prunes at any depth, so nested copies like
-  `packages/foo/node_modules/` are covered — the old
-  `-not -path './node_modules/*'` only ever matched the top-level one.
+- **Match by `-name`, not `-path`.** `-name` prunes at any depth, so nested
+  copies like `packages/foo/node_modules/` and a vendored `vendor/foo/.git/`
+  are covered — the old `-not -path './node_modules/*'` only ever matched the
+  top-level one.
 - **Coordination roots (`.loom/`, `.anvil/`, `.wrangler/`) are deliberately not
   pruned.** They are small, and step 2 needs to see their empty directories in
   order to route them to ASK.
