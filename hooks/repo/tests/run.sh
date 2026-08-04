@@ -17,8 +17,9 @@
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
 # test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
-# commands/repo/tests/test-repo-remote.sh, and
-# commands/repo/tests/test-verify-fix-persistence.sh.
+# commands/repo/tests/test-repo-remote.sh,
+# commands/repo/tests/test-verify-fix-persistence.sh, and
+# commands/repo/tests/test-early-sync-switch.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -486,6 +487,45 @@ else
     PASS=$((PASS + VP_PASS))
     FAIL=$((FAIL + VP_FAIL))
     record_suite "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_NOTE"
+fi
+
+# /repo:all's conditional early sync-and-switch: the eligibility conjunction
+# ("fully pushed and behind the default branch", clean tree, has an upstream)
+# and the stage ordering it guarantees (repo#82). Same delegation shape as the
+# suites above.
+echo
+echo "-- early sync-and-switch eligibility (delegated suite) --"
+ES_TEST="$TESTS_DIR/../../../commands/repo/tests/test-early-sync-switch.sh"
+if [[ ! -f "$ES_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-early-sync-switch.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-early-sync-switch.sh" "$ES_TEST"
+else
+    ES_OUT="$(bash "$ES_TEST" 2>&1)"
+    ES_STATUS=$?
+    ES_PASS="$(suite_count Passed "$ES_OUT")"
+    ES_FAIL="$(suite_count Failed "$ES_OUT")"
+    # Skips are neither pass nor fail — surfaced as a note only, same as above.
+    ES_SKIP="$(suite_count Skipped "$ES_OUT")"
+    ES_NOTE="early sync-and-switch gate"
+    [[ "$ES_SKIP" =~ ^[0-9]+$ && "$ES_SKIP" -gt 0 ]] && ES_NOTE+=" — $ES_SKIP skipped"
+    if ! [[ "$ES_PASS" =~ ^[0-9]+$ && "$ES_FAIL" =~ ^[0-9]+$ ]]; then
+        ES_PASS=0
+        ES_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-early-sync-switch.sh" "$ES_STATUS"
+        strip_ansi "$ES_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$ES_STATUS" -ne 0 || "$ES_FAIL" -ne 0 ]]; then
+        [[ "$ES_FAIL" -eq 0 ]] && ES_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-early-sync-switch.sh" "$ES_PASS" "$ES_FAIL" "$ES_STATUS"
+        strip_ansi "$ES_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-early-sync-switch.sh" "$ES_PASS"
+    fi
+    PASS=$((PASS + ES_PASS))
+    FAIL=$((FAIL + ES_FAIL))
+    record_suite "test-early-sync-switch.sh" "$ES_PASS" "$ES_FAIL" "$ES_NOTE"
 fi
 
 echo
