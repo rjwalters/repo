@@ -426,7 +426,7 @@ Once approved:
      pyproject)         python3 -c 'import re,sys;p="pyproject.toml";t=open(p).read();n=re.subn(r"(?ms)(^\[project\][^\n]*\n(?:(?!^\[)[^\n]*\n)*?version[ \t]*=[ \t]*)\"[^\"]*\"",lambda m:m.group(1)+f"\"{sys.argv[1]}\"",t,count=1);sys.exit("ERROR: no [project].version found in pyproject.toml") if n[1]==0 else open(p,"w").write(n[0])' "$NEW" && { [ -f uv.lock ] && command -v uv >/dev/null 2>&1 && uv lock || : ; } ;;  # then commit (with CHANGELOG) + tag v$NEW
      npm)               npm version <level> -m "chore: bump version to %s" ;;
      version-file)      printf '%s\n' "$NEW" > VERSION ;;  # then commit (with CHANGELOG) + tag v$NEW
-     declared-policy)   sh -c "$VS_BUMP" _ "$NEW" ;;  # declared bump: command, $NEW passed as $1; then commit (with CHANGELOG) + tag v$NEW
+     declared-policy)   sh -c "$VS_BUMP" _ "$NEW"; GOT="$(sh -c "$VS_READ")"; [ "$GOT" = "$NEW" ] || { echo "ERROR: declared bump: ran but the source still reads '$GOT', not '$NEW' — the bump: command did not take (regex/path mismatch?). Refusing to commit/tag." >&2; exit 1; } ;;  # declared bump: command, $NEW passed as $1, then post-verified against declared read:; then commit (with CHANGELOG) + tag v$NEW
    esac
    ```
 
@@ -460,6 +460,18 @@ Once approved:
    as the other non-self-committing tools. The declaration owns **only** the
    in-file edit; this command still owns the commit and the tag, so a repo
    declares just the one-line `sed`/edit, never the git plumbing.
+
+   - **The bump is post-verified against the declared `read:`**, mirroring the
+     `pyproject` branch's zero-substitution guard: after running `bump:`, the
+     branch re-reads the version with `sh -c "$VS_READ"` and **fails loud**
+     (`exit 1`, no commit, no tag) unless it now equals `$NEW`. This closes the
+     one silent-mis-tag footgun unique to this branch — `bump:` runs an arbitrary
+     repo-declared `sed`/edit, so a stale constant name, wrong path, or drifted
+     regex leaves the file untouched while `sh -c` still exits 0. Without the
+     re-read assertion the apply would commit and tag `v$NEW` over a source that
+     still holds the old version; with it, a `bump:` that doesn't take fails the
+     release instead of shipping a stale tag — the same guarantee `pyproject`
+     gives on a zero-substitution rewrite.
 3. **Verify**: re-read the version and confirm the tag exists
    (`git tag --sort=-v:refname | head -1`). For cargo, `cargo check --workspace`.
    Also confirm the `## Unreleased` fold (Phase 4) actually landed: grep the
