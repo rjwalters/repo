@@ -126,11 +126,12 @@ verify_applied() {
 }
 
 # verify_dirty <path> -> DIRTY | CLEAN
-#   The documented secondary form (`git status --porcelain -- <path>`). Cheaper,
-#   but weaker: it only proves the path differs from HEAD, not that it differs
-#   in the way this command intended. Pinned here so the docs' "or" arm is
-#   covered, and so the tracked-edit case can be shown to agree with the
-#   content check.
+#   The documented cheap pre-filter (`git status --porcelain -- <path>`).
+#   Cheaper, but weaker: it only proves the path differs from HEAD, not that it
+#   differs in the way this command intended. Pinned here so the docs' pre-filter
+#   arm is covered, so the tracked-edit case can be shown to agree with the
+#   content check, and so the partial-revert case below can show where it does
+#   NOT agree (repo#95).
 verify_dirty() {
     local path="$1" out
     out="$(git -C "$REPO" status --porcelain -- "$path" 2>/dev/null)"
@@ -263,6 +264,44 @@ assert_contains "unaffected stage still counts its fix" "$README_LINE" "1 fixed"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- two edits, one file, partial revert: why \`git status\` alone lies --"
+# ---------------------------------------------------------------------------
+# repo#95: `git status --porcelain -- <path>` answers "does this path differ from
+# HEAD?", not "is MY edit still there". When one command applies two fixes to the
+# same file and a concurrent writer reverts only one region, the path is STILL
+# dirty — so a git-status-only check would report both fixes as applied while one
+# is gone on disk. Only the content re-read separates them. This is the scenario
+# the caveat in each command file's "Verify after write" block warns about.
+git -C "$REPO" checkout -q -- .
+git -C "$REPO" clean -qfd
+apply_fix README.md "Fix A: adapters are alpha, beta, gamma."
+apply_fix README.md "Fix B: the daemon is started with loom start."
+assert_eq "both edits verify APPLIED before the revert" "APPLIED/APPLIED" \
+    "$(verify_applied README.md "Fix A:")/$(verify_applied README.md "Fix B:")"
+
+# The concurrent writer reverts ONE region and leaves the other in place.
+grep -vF -- "Fix A:" "$REPO/README.md" > "$SCRATCH/README.partial"
+mv "$SCRATCH/README.partial" "$REPO/README.md"
+
+# The weak form cannot tell the difference: the path is still dirty, so a
+# git-status-only check concludes "still applied" for BOTH fixes.
+assert_eq "partially-reverted path is still DIRTY vs HEAD" "DIRTY" \
+    "$(verify_dirty README.md)"
+# The primary form does tell the difference, per edit.
+assert_eq "the reverted edit is caught by the content re-read" "REVERTED" \
+    "$(verify_applied README.md "Fix A:")"
+assert_eq "the surviving edit still verifies APPLIED" "APPLIED" \
+    "$(verify_applied README.md "Fix B:")"
+
+# The consequence: a git-status-only check would have counted 2 fixed.
+PARTIAL_LINE="$(stage_report Docs "README.md fix B" "README.md fix A")"
+assert_contains "only the surviving edit counts as fixed" \
+    "$PARTIAL_LINE" "1 fixed"
+assert_contains "the reverted edit reports needs-re-run" \
+    "$PARTIAL_LINE" "reverted after apply — needs re-run"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- no concurrent writer: the check is invisible --"
 # ---------------------------------------------------------------------------
 # Criterion: in a repo with nothing else writing, verify-after-write always
@@ -292,6 +331,14 @@ for c in "${APPLYING_COMMANDS[@]}"; do
         "$MD" 'before counting it as applied'
     assert_contains "$c.md names a concrete re-check" \
         "$MD" 'git status --porcelain -- <path>'
+    # repo#95: the content re-read is the authoritative form, and the git arms
+    # are a pre-filter with a stated caveat — not an equivalent alternative.
+    assert_contains "$c.md makes the content re-read the primary check" \
+        "$MD" 're-read the changed region of the file and confirm your specific edit is present'
+    assert_contains "$c.md caveats the git arm as HEAD-comparison only" \
+        "$MD" 'only proves the path differs from HEAD'
+    assert_contains "$c.md forbids the git arm as the sole check" \
+        "$MD" 'must not be the sole check when the file may carry other uncommitted changes'
     assert_contains "$c.md makes the check unconditional (detection is racy)" \
         "$MD" 'This check is **unconditional**'
     assert_contains "$c.md explains why detect-then-skip is not the fix" \
