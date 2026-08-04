@@ -166,9 +166,17 @@ git checkout "$default"
 git pull --ff-only
 ```
 
-If `--ff-only` fails, the local default branch has diverged from the remote —
-report the divergence (`git log --oneline @{u}..HEAD` and `HEAD..@{u}`) and
-ask how to proceed. Do not rebase or force anything on your own.
+If `git checkout` fails with `fatal: '<default>' is already used by worktree at
+'<path>'`, the default branch is checked out in another worktree (exit 128, HEAD
+unchanged) — the ordinary case in a Loom-managed repo, which keeps a worktree
+per issue. Nothing moved and nothing is at risk: name that cause and the
+worktree holding the branch, and finish the run from where you are rather than
+reporting a generic failure.
+
+If `--ff-only` fails, the checkout already landed, so the run is now *on* the
+local default branch and it has diverged from the remote — say so, report the
+divergence (`git log --oneline @{u}..HEAD` and `HEAD..@{u}`) and ask how to
+proceed. Do not rebase or force anything on your own.
 
 ### 5. Final state report
 

@@ -73,8 +73,11 @@ performs at the end. So check the branch state here, before Docs runs:
 
 ```bash
 current=$(git symbolic-ref --short HEAD 2>/dev/null) || current=""
-default=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+# Fetch BEFORE resolving origin/HEAD: `default` comes from a local ref, so
+# resolving it first would read a stale (or, on a fresh or --single-branch
+# clone, missing) value and no-op on the run's first opportunity to be eligible.
 git fetch origin --quiet
+default=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
 
 eligible=no
 if [ -n "$current" ] && [ -n "$default" ] && [ "$current" != "$default" ] \
@@ -98,7 +101,7 @@ switch could lose work or fail:
 | Condition | Why it is required |
 |---|---|
 | On a branch (not detached), and it isn't already the default | Nothing to switch to; a detached HEAD has no upstream to reason about |
-| `origin/HEAD` resolves to a default branch | Without it there is no defensible switch target — leave the order alone |
+| `origin/HEAD` resolves to a default branch | Without it there is no defensible switch target — leave the order alone. The fetch above runs first so a stale copy is refreshed in time; a repo that has never had `origin/HEAD` set locally at all (some `--single-branch` clones) needs a one-off `git remote set-head origin --auto`, and stays a no-op until then |
 | Working tree clean (`git status --porcelain` empty) | A dirty tree would have to be stashed to switch, and this run ends on the default branch, so there is no natural point to pop it back |
 | Branch **has an upstream** and is **0 commits ahead of it** | This is the literal "no unpushed commits". A branch that was **never pushed** has no upstream and is **not** eligible — treat it exactly like unpushed commits |
 | Branch is behind `origin/<default>` by at least one commit | If it isn't behind, the checkout is already current and switching buys nothing |
@@ -119,9 +122,23 @@ Reset: synced early — feature/x was fully pushed and 6 commits behind main; sw
 ```
 
 Under `--ask`, report the finding and get a yes before switching, like every
-other stage. If the checkout or the `--ff-only` pull fails (a diverged local
-default branch, say), change nothing, report why, and continue with the stage
-order unchanged — stage 6 will surface it again with [[reset]]'s own handling.
+other stage. The checkout and the pull fail differently, and only one of them
+leaves the run where it started — report them as the distinct outcomes they are:
+
+- **The checkout fails.** HEAD never moved, so change nothing, report why, and
+  continue with the stage order unchanged — stage 6 will surface it again with
+  [[reset]]'s own handling. The common case in a Loom-managed repo lands here:
+  the default branch is already checked out in another worktree (Loom keeps one
+  per issue), so git refuses with `fatal: '<default>' is already used by
+  worktree at '<path>'` — exit 128, HEAD unchanged. Name that cause when it is
+  the reason; it is an expected, recognized no-op, not a generic failure.
+- **The checkout succeeds and the `--ff-only` pull then fails** (a diverged
+  local default branch, say). The switch already happened, so "nothing changed"
+  would be false: the run is now sitting on that diverged local default branch,
+  and Docs, Tidy, and Update tools will read that copy for the rest of the run.
+  Say exactly that — which branch you are on and that it is diverged from its
+  upstream — rather than reporting a clean no-op. Stage 6 still surfaces it
+  again with [[reset]]'s own divergence handling.
 
 **If `eligible=no`**, this stage is a no-op: say nothing, and run the remaining
 stages exactly as before, with Reset in full at the end. Unpushed work on the

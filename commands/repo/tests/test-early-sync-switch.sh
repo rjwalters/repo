@@ -32,6 +32,10 @@
 #   4  when eligible, the sync-and-switch loses nothing: the branch ref and its
 #      commits survive untouched
 #   5  the pruning half (stash/branch/worktree review) still runs last
+#   6  the two ways the switch can fail are NOT the same outcome: a refused
+#      checkout (typically the default branch held by another worktree) leaves
+#      HEAD where it was, while a failed `--ff-only` pull happens after the
+#      checkout already landed and strands the run on a diverged default branch
 #
 # Two sections: a fixture section that exercises early_sync_eligible() (a
 # faithful transcription of the documented check) against real git repositories
@@ -111,8 +115,11 @@ assert_not_contains() {  # <label> <haystack> <needle>
 early_sync_eligible() {
     local r="$1" current default ahead_of_upstream behind_default
     current=$(git -C "$r" symbolic-ref --short HEAD 2>/dev/null) || current=""
-    default=$(git -C "$r" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    # Fetch first, then resolve origin/HEAD from the refreshed local ref — the
+    # documented order (repo#115). Resolving `default` first reads a stale or
+    # missing ref that this very fetch could have supplied.
     git -C "$r" fetch origin --quiet 2>/dev/null
+    default=$(git -C "$r" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
 
     [ -n "$current" ] || { echo INELIGIBLE; return; }        # detached HEAD
     [ -n "$default" ] || { echo INELIGIBLE; return; }        # no origin/HEAD
@@ -259,6 +266,39 @@ assert_not_contains "stale branch-only content is gone from the checkout" "$FRES
 # Nothing was pruned: the pruning half has not run.
 assert_eq "no branch was deleted by the sync half" "1" \
     "$(git -C "$C" for-each-ref --format='%(refname:short)' refs/heads/feature | grep -c .)"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- worktree collision: the default branch is checked out elsewhere --"
+# ---------------------------------------------------------------------------
+# The ordinary shape of a Loom-managed repo (repo#115): a worktree per issue,
+# with the default branch checked out in one of them. `git checkout <default>`
+# then refuses with exit 128 and HEAD does not move — a safe no-op, but the one
+# environment this feature was built for, so it must be named rather than
+# reported as a generic failure.
+C="$(new_clone worktree-collision)"
+git_quiet "$C" checkout -b feature/z
+git_quiet "$C" push -u origin feature/z
+advance_default 2
+git_quiet "$C" fetch origin
+assert_eq "the collision case is otherwise ELIGIBLE" "ELIGIBLE" "$(early_sync_eligible "$C")"
+
+COLLIDE_WT="$SCRATCH/collide-main"
+git_quiet "$C" worktree add "$COLLIDE_WT" main
+HEAD_BEFORE="$(git -C "$C" rev-parse HEAD)"
+COLLIDE_ERR="$(git -C "$C" checkout main 2>&1 >/dev/null)"
+COLLIDE_RC=$?
+assert_eq "checkout refuses while another worktree holds the branch" "128" "$COLLIDE_RC"
+assert_contains "git names the colliding worktree in its error" \
+    "$COLLIDE_ERR" "already used by worktree at"
+assert_eq "the refused checkout leaves HEAD exactly where it was" \
+    "$HEAD_BEFORE" "$(git -C "$C" rev-parse HEAD)"
+assert_eq "still on the working branch" "feature/z" "$(git -C "$C" symbolic-ref --short HEAD)"
+assert_eq "the sync half reports failure, not a silent success" "FAILED" "$(sync_and_switch "$C")"
+assert_eq "and the failed sync half still moved nothing" \
+    "$HEAD_BEFORE" "$(git -C "$C" rev-parse HEAD)"
+assert_eq "the tree is still clean after the refused switch" "" "$(git -C "$C" status --porcelain)"
+git_quiet "$C" worktree remove --force "$COLLIDE_WT"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -418,8 +458,20 @@ assert_contains "all.md reports the early switch on its own line" \
     "$ALL" 'switched before Docs'
 assert_contains "all.md honours --ask before switching" \
     "$ALL" 'report the finding and get a yes before switching'
-assert_contains "all.md falls back safely when the switch fails" \
+# The two failure modes are NOT interchangeable (repo#115): a failed checkout
+# leaves HEAD where it was, a failed --ff-only pull happens after the switch
+# already landed. Each claim gets its own assertion so neither can be quietly
+# collapsed back into the other.
+assert_contains "all.md falls back safely when the CHECKOUT fails" \
     "$ALL" 'change nothing, report why, and continue with the stage order unchanged'
+assert_contains "all.md names the worktree-collision cause of that failed checkout" \
+    "$ALL" "already used by worktree at"
+assert_contains "all.md says a failed PULL leaves the run on the diverged default" \
+    "$ALL" 'the run is now sitting on that diverged local default branch'
+assert_contains "all.md warns the later stages read that diverged copy" \
+    "$ALL" 'Docs, Tidy, and Update tools will read that copy'
+assert_not_contains "all.md no longer folds the pull failure into 'change nothing'" \
+    "$ALL" 'If the checkout or the `--ff-only` pull fails'
 assert_contains "all.md makes the ineligible path a silent no-op" \
     "$ALL" 'this stage is a no-op'
 assert_contains "all.md keeps pruning in the last stage" \
@@ -462,6 +514,26 @@ fi
 assert_contains "all.md still documents re-verify-before-print" \
     "$ALL" '### Re-verify before printing'
 
+# Fetch ordering (repo#115): `default` is resolved from the LOCAL
+# refs/remotes/origin/HEAD, so the eligibility block's own fetch has to run
+# first or a stale/unset origin/HEAD cannot be refreshed in time and the stage
+# no-ops on its first opportunity to run. Asserted by line position, since the
+# bug is purely the order of two adjacent lines.
+line_of() {  # <file> <literal>
+    grep -n -F -m1 -- "$2" "$1" | cut -d: -f1
+}
+FETCH_LN="$(line_of "$ALL_MD" 'git fetch origin --quiet')"
+DEFAULT_LN="$(line_of "$ALL_MD" 'default=$(git symbolic-ref --short refs/remotes/origin/HEAD')"
+if [[ -n "$FETCH_LN" && -n "$DEFAULT_LN" ]]; then
+    assert_eq "all.md fetches before resolving origin/HEAD" "yes" \
+        "$([[ "$FETCH_LN" -lt "$DEFAULT_LN" ]] && echo yes || echo no)"
+else
+    no "all.md's eligibility block still fetches and resolves origin/HEAD" \
+        "fetch=$FETCH_LN default=$DEFAULT_LN"
+fi
+assert_contains "all.md documents the unset-origin/HEAD escape hatch" \
+    "$ALL" 'git remote set-head origin --auto'
+
 RESET="$(flatten "$RESET_MD")"
 assert_contains "reset.md names the two halves" \
     "$RESET" '## Two halves'
@@ -473,6 +545,10 @@ assert_contains "reset.md keeps standalone behaviour unchanged" \
     "$RESET" 'Run standalone, `/repo:reset` always runs all four steps in order'
 assert_contains "reset.md points at /repo:all's early use of the first half" \
     "$RESET" 'may run the **sync-and-switch half early**'
+assert_contains "reset.md names the worktree-collision checkout refusal" \
+    "$RESET" "already used by worktree at"
+assert_contains "reset.md says a failed --ff-only leaves the run on the default branch" \
+    "$RESET" 'the checkout already landed'
 
 # ---------------------------------------------------------------------------
 echo ""
