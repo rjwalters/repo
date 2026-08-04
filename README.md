@@ -125,6 +125,7 @@ hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regre
 hooks/repo/tests/test-shell-wrapper.sh  claude shell wrapper suite (run.sh delegates to it)
 commands/repo/tests/test-branches-loss-check.sh  branches.md permanent-loss check suite (run.sh delegates)
 commands/repo/tests/test-repo-remote.sh  repo-remote.sh provisioning-contract suite (run.sh delegates)
+commands/repo/tests/test-verify-fix-persistence.sh  verify-after-write contract suite (run.sh delegates)
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
