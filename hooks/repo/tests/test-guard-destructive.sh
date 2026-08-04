@@ -1366,6 +1366,124 @@ assert_deny "#3755: real 'foo | rm -rf /' (rm after real pipe) still denied" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #113: a quoted \$( ) span must not swallow the rest of the command ---${NC}"
+# =========================================================================
+#
+# A quoted span carrying a command substitution keeps its separators ACTIVE (the
+# #3679/#3755 floor above), so both lexers walk INTO it character-by-character —
+# and eventually reach that span's own closing quote. Neither lexer remembered
+# that this position was the already-computed CLOSE, so the top-of-loop quote
+# detector re-read it as the OPENER of a brand-new span:
+#   - ml_segment(): with no later quote in the buffer the unterminated-quote
+#     fallback swallowed the ENTIRE remainder into the current segment, so a real
+#     `; <destructive command>` after the span never became its own segment and
+#     parse_force_ops() / lifecycle_or_cloud_reason() / extract_rm_targets() all
+#     fell through to ALLOW.
+#   - qsplit(): its fallback only advances one character, so the plain repro
+#     happened to split by luck — but a LATER unrelated quote pair anywhere in the
+#     command paired with the re-opened quote and swallowed every real separator
+#     between them as bogus inert text, silently disabling the
+#     command_has_shell_segment() gate on strip_datasink_literals().
+#
+# This was a fixable FALSE NEGATIVE, not an intentional redaction/expansion
+# safety floor: the "keep separators active inside the span" rule is about not
+# MASKING smuggled content INSIDE a substitution, never about disabling matching
+# for the text AFTER it. Both lexers now record the real close index (a stack, so
+# nested active spans each pop their own) and resume segmentation right after it.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84).
+_Q113_RM="rm -r""f /opt/some-vendor/important"
+_Q113_HALT="ha""lt"
+_Q113_FORCE="git push --fo""rce origin feature-x"
+_Q113_DANGER="rm -r""f /"
+_Q113_SUB='"$(id)"'          # double-quoted command substitution
+_Q113_BT='"`id`"'            # backtick substitution nested in double quotes
+_Q113_SQSUB="'"'$(id)'"'"    # single-quoted lookalike (shell does NOT expand it)
+_Q113_CMT='"# x $(id)"'      # a `#` inside the substitution-bearing span
+
+# Control: the SAME command with an inert quoted prefix has always denied. Every
+# assertion below must match this baseline — the only difference is the `$(...)`.
+assert_deny "#113 control: inert quoted prefix then an outside-repo rm denies" \
+    "echo \"y\" ; $_Q113_RM"
+
+# The exact repro from the issue body (extract_rm_targets / rm-scope tier).
+assert_deny "#113: quoted \$( ) prefix then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_SUB ; $_Q113_RM"
+
+# The same shape on the lifecycle tier (lifecycle_or_cloud_reason).
+assert_deny "#113: quoted \$( ) prefix then a ;-separated lifecycle command denies" \
+    "echo $_Q113_SUB ; $_Q113_HALT"
+
+# Backtick nested inside double quotes (backticks are only in scope for the lexer
+# when they sit inside a quoted span — a bare backtick pair is not a quote char).
+assert_deny "#113: double-quoted backtick prefix then an outside-repo rm denies" \
+    "echo $_Q113_BT ; $_Q113_RM"
+
+# Single-quoted lookalike: the shell does NOT expand `$(id)` here, but the
+# lexer's naive substring probe still marks the span ACTIVE — so it hits the
+# identical close-quote mis-detection and must be fixed by the same change.
+assert_deny "#113: single-quoted \$( ) lookalike prefix then an outside-repo rm denies" \
+    "echo $_Q113_SQSUB ; $_Q113_RM"
+
+# The `# x`-in-quote variant from the issue body: the `#` is walked as ordinary
+# text inside the active span (probe suppression only, #84), so it is irrelevant
+# to the defect — but it must not regress.
+assert_deny "#113: '# x' inside the quoted \$( ) span then an outside-repo rm denies" \
+    "echo $_Q113_CMT ; $_Q113_RM"
+
+# Every real separator, not just `;` — && and | and a raw newline all split.
+assert_deny "#113: quoted \$( ) prefix then an &&-separated lifecycle command denies" \
+    "echo $_Q113_SUB && $_Q113_HALT"
+
+assert_deny "#113: quoted \$( ) prefix then a |-separated lifecycle command denies" \
+    "echo $_Q113_SUB | $_Q113_HALT"
+
+assert_deny "#113: quoted \$( ) prefix then a NEWLINE-separated outside-repo rm denies" \
+    "$(printf 'echo %s\n%s' "$_Q113_SUB" "$_Q113_RM")"
+
+# parse_force_ops() is the third consumer of the shared lexer and was equally
+# affected: the ask-tier force-push confirmation was silently skipped. Pin the
+# mode explicitly (#3913) so an ambient LOOM_FORCE_SCOPE cannot decide this.
+assert_ask_env "#113: quoted \$( ) prefix then a force-push still ASKS (parse_force_ops)" \
+    "LOOM_FORCE_SCOPE=all" "echo $_Q113_SUB ; $_Q113_FORCE"
+
+# NESTED active spans: an inner substitution-bearing span inside an outer one.
+# A single scalar "last close" would be overwritten by the inner span and the
+# OUTER close would still be mis-read, so the fix tracks a stack.
+assert_deny "#113: NESTED quoted \$( ) spans then an outside-repo rm denies" \
+    "echo \"\$(a '\$(b)')\" ; $_Q113_RM"
+
+# qsplit()/command_has_shell_segment() exposure: a LATER unrelated quote pair
+# lets the re-opened quote pair with it and swallow the real separators between
+# them, so the pipe-to-shell is not seen, strip_datasink_literals() redacts the
+# single-quoted payload, and the catastrophic scan never sees it.
+assert_deny "#113: quoted \$( ) prefix, piped-to-shell payload, then a trailing quoted string denies" \
+    "echo $_Q113_SUB ; echo '$_Q113_DANGER' | sh ; echo \"done\""
+
+# --- The fix must NOT disable matching INSIDE an active span (#3755 floor) ----
+
+assert_deny "#113: smuggled \$(x|halt ) inside the span still denies with a trailing tail" \
+    "grep -E \"\$(x|$_Q113_HALT )\" file ; echo \"done\""
+
+# --- ...and must NOT widen any existing allow -------------------------------
+
+assert_allow "#113: legitimate gh api -f body=\"\$(cat file)\" with no destructive tail is allowed" \
+    'gh api -f body="$(cat file)"'
+
+assert_allow "#113: a bare quoted \$( ) span with no tail at all is allowed" \
+    "echo $_Q113_SUB"
+
+assert_allow "#113: quoted \$( ) prefix then a benign command is allowed" \
+    "echo $_Q113_SUB ; echo done"
+
+assert_allow "#113: inert quoted alternation followed by a later quoted string is allowed" \
+    "grep -E \"lifecycle|$_Q113_HALT|poweroff|init 0\" file && echo \"done\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 regression guard: catastrophic commands STILL deny ---${NC}"
 # =========================================================================
 

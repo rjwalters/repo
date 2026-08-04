@@ -866,6 +866,11 @@ resolve_default_branch() {
 # text) ONLY when it carries no command substitution — no `$(` and no backtick —
 # mirroring strip_literal_text()'s #3679 safety floor: a smuggled
 # `"$(a|halt)"` keeps its separators ACTIVE so the genuine protection is intact.
+# Such an ACTIVE span still records where it really ENDS, so the character walk
+# does not mistake its own closing quote for the opener of a new span (#113) —
+# without that, a later unrelated quote paired with the re-opened one and every
+# real separator between them (a genuine `; <destructive cmd>` after the span)
+# was swallowed as bogus inert text.
 # The token VALUES are preserved verbatim (unlike a redaction approach), so
 # extract_rm_targets still sees the real `rm` targets. Best-effort like
 # strip_literal_text(): backslash-escaped quotes and an unterminated quote fall
@@ -874,14 +879,28 @@ resolve_default_branch() {
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK='
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
+function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, acs, acn) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
     n = length(s)
+    split("", acs)           # stack of pending active-span CLOSING quote indexes
+    acn = 0
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
+        # A quote character at a position ALREADY KNOWN to be the closing quote of
+        # an open active (command-substitution-bearing) span TERMINATES that span —
+        # it is not the opener of a new one (#113). See the ml_segment() copy of
+        # this guard for the full rationale; both lexers share the defect and
+        # therefore share the fix so they cannot drift.
+        while (acn > 0 && acs[acn] < i) acn--   # spans a jump already skipped past
+        if (acn > 0 && i == acs[acn]) {
+            out = out c
+            acn--
+            i++
+            continue
+        }
         if (c == DQ || c == SQ) {
             qc = c
             ci = 0
@@ -904,7 +923,11 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
             }
             # Span carries command substitution: keep separators ACTIVE (copy the
             # opening quote and keep walking char-by-char so a `|` inside splits).
+            # REMEMBER the already-computed close index (#113) so the char-walk
+            # does not re-read that same quote as a NEW opener — which used to
+            # swallow everything after the span.
             out = out c
+            acs[++acn] = ci
             i++
             continue
         }
@@ -962,7 +985,11 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 #     segment out of quoted documentation prose (the false positive).
 #   - A quoted span carrying command substitution (`$(` or a backtick) keeps its
 #     separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
-#     smuggled payload is never hidden behind an opening quote.
+#     smuggled payload is never hidden behind an opening quote. Its
+#     already-computed CLOSING quote index is remembered (#113) so the walk that
+#     reaches it recognises the span TERMINATOR instead of re-opening a phantom
+#     span there — the mis-read that used to swallow the whole rest of the
+#     command (and with it any `; <destructive cmd>` following the span).
 #   - An unterminated quote copies the remainder verbatim (best-effort; never
 #     widens a deny into an allow).
 #
@@ -1098,10 +1125,12 @@ function bs_escaped(s, i,   bs, p) {
 }
 function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
-                    arO, arC, eol, nexti, line, t, incmt, pc) {
+                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     split("", segs)          # clear the caller-supplied out-array
+    split("", acs)           # stack of pending active-span CLOSING quote indexes
+    acn = 0
     s = buf
     n = length(s)
     seg = ""
@@ -1111,6 +1140,36 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
+        # ACTIVE-SPAN CLOSE (#113). When the span below carries a command
+        # substitution its separators stay ACTIVE, so the walk continues
+        # character-by-character INTO the span — and eventually reaches the REAL
+        # closing quote of that same span. Without this guard the top-of-loop quote
+        # detector below re-read that closing quote as the OPENER of a brand-new
+        # span and re-scanned forward for a partner: with no later quote the
+        # unterminated-quote fallback swallowed the ENTIRE remainder of the buffer
+        # into the current segment, and with a later quote everything up to it
+        # (including real `;` `|` `&` separators) was copied as a bogus inert span.
+        # Either way a genuinely destructive command AFTER a quoted `$(...)` span
+        # never became its own segment, so parse_force_ops(),
+        # lifecycle_or_cloud_reason() and extract_rm_targets() never saw its
+        # command word and fell through to ALLOW.
+        #
+        # This was a fixable FALSE NEGATIVE, not an intentional safety floor: the
+        # #3679/#3755 "keep separators active inside a substitution-bearing span"
+        # rule exists so smuggled content INSIDE the span is not masked — it never
+        # implied disabling matching for the text AFTER the span. Remembering the
+        # already-computed close index (a stack, so NESTED active spans each pop
+        # their own close) resumes correct segmentation right after the real close
+        # while leaving in-span matching exactly as it was. Strictly widening for
+        # segmentation (it can only produce MORE segment boundaries than before),
+        # so it can never turn an existing deny into an allow.
+        while (acn > 0 && acs[acn] < i) acn--   # spans a jump already skipped past
+        if (acn > 0 && i == acs[acn]) {
+            seg = seg c
+            acn--
+            i++
+            continue
+        }
         if (c == DQ || c == SQ) {
             qc = c
             ci = 0
@@ -1133,7 +1192,8 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 i = ci + 1
                 continue
             }
-            seg = seg c   # command substitution present: keep separators ACTIVE
+            seg = seg c        # command substitution present: keep separators ACTIVE
+            acs[++acn] = ci    # ...but remember where the span really ends (#113)
             i++
             continue
         }
