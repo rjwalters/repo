@@ -81,6 +81,16 @@ overrides everything below, regardless of gitignore status):**
   `node_modules/` — reinstalling them costs time and network, so they are never
   auto-deleted and `--caches` does **not** reach them (they are environments, not
   caches). Surface them under ASK for an explicit human call.
+- Tool scaffolding / coordination roots: runtime-state directories a tool
+  expects to exist and manages itself — anything under `.loom/` (`locks/`,
+  `worktrees/`, `sweep-run/`, `sweep-checkpoint/`, …), `.anvil/`, `.wrangler/`
+  (e.g. `.wrangler/tmp/`), and the equivalent runtime dirs under any other
+  tool's dot-directory. **Match by parent tool-directory prefix, not by an
+  enumerated leaf list**, so coordination subdirectories added later are covered
+  without editing this file. For these, **empty is the normal, healthy state** —
+  an empty `.loom/locks/` means no lock is currently held, not that the
+  directory is abandoned — so emptiness is never evidence of junk here (see the
+  empty-directory rule under SAFE).
 - Anything else that looks credential-like or holds unique local state
   (local SQLite DBs, local-only config, sample-data caches)
 
@@ -93,7 +103,15 @@ reserved for tracked files.
   it does **not** match the denylist above **and** matches one of:
   - OS/editor droppings: `.DS_Store`, `Thumbs.db`, `*~`, `*.swp`, `.#*`
   - Merge/patch leftovers: `*.orig`, `*.rej`, `*.BACKUP.*`
-  - Empty directories
+  - Empty directories — **but only after checking the path against the
+    never-delete denylist above**, exactly as for the file patterns. Emptiness
+    is not itself a junk signal and never promotes a path into SAFE: an empty
+    directory under a tool-scaffolding / coordination root (`.loom/`, `.anvil/`,
+    `.wrangler/`, …) routes to **ASK**, not SAFE, and an empty gitignored
+    directory matching no allowlist still falls through to ASK. The
+    `find . -type d -empty` inventory in step 1 is a raw path scan — it consults
+    neither gitignore nor the denylist — so this check must be applied to its
+    output before anything is deleted.
 
   Nothing in this category may be tracked by git or match a source-code
   extension.
@@ -114,7 +132,10 @@ reserved for tracked files.
   - Untracked files that aren't gitignored (could be unsaved work!), large
     files, stale-looking logs, old `tmp/` contents.
   - **Any gitignored file that matches the never-delete denylist** (secrets,
-    virtualenvs) — surfaced here, never auto-deleted.
+    virtualenvs, tool-scaffolding roots) — surfaced here, never auto-deleted.
+  - **Any empty directory whose path matches the denylist** (a `.loom/`,
+    `.anvil/`, or `.wrangler/` coordination or runtime-state dir) — emptiness
+    is that tool's normal state, so it lands here rather than in SAFE.
   - **Any gitignored file that does not match the SAFE or CACHE allowlist** (a
     novel/unrecognized cache dir, unrecognized local state) — when in doubt, it
     lands here, not in SAFE or CACHE.
@@ -143,6 +164,8 @@ ASK:
   .env                     gitignored, 1 KB  ← credentials, never auto-deleted
   .venv/                   gitignored, 240 MB  ← virtualenv, expensive to rebuild
   node_modules/            gitignored, 310 MB  ← environment, reinstall via npm; not a --caches target
+  .loom/locks/             gitignored, empty  ← coordination root, empty is normal state
+  .wrangler/tmp/           gitignored, empty  ← tool runtime dir, empty between builds
   notes-scratch.md         untracked, 3 KB, modified today  ← might be real work
   sim-output-old/          untracked, 1.2 GB, untouched 60 days
   worktree: ../repo-wt-fix123 (branch merged)
@@ -167,7 +190,8 @@ KEEP (informational):
 
 The default auto-delete is scoped to **SAFE-allowlisted paths only** (plus the
 CACHE allowlist when `--caches` is passed). Never pass a denylisted path
-(secrets, virtualenvs, `node_modules/`) or an unrecognized gitignored path to
+(secrets, virtualenvs, `node_modules/`, tool-scaffolding roots — **including
+when it is empty**) or an unrecognized gitignored path to
 `git clean -fdX` — those are ASK items and require an explicit human call. Build
 the explicit `<paths>` list from the SAFE category (and CACHE under `--caches`)
 and nothing else; do **not** run a blanket `git clean -fdX` that would sweep
@@ -186,8 +210,9 @@ inventory to confirm and report bytes freed.
 4. **Everything deleted must have appeared in the report first**
 5. When scoped to a subtree, do not delete anything outside it
 6. **Gitignored ≠ safe to delete** — the never-delete denylist (secrets like
-   `.env`/`*.pem`/`*.key`, and environments like `.venv/`/`venv/`/`env/` and
-   `node_modules/`) always overrides SAFE and CACHE and routes to ASK, regardless
+   `.env`/`*.pem`/`*.key`, environments like `.venv/`/`venv/`/`env/` and
+   `node_modules/`, and tool-scaffolding roots like `.loom/`/`.anvil/`/
+   `.wrangler/`) always overrides SAFE and CACHE and routes to ASK, regardless
    of what `git clean -ndX` lists. Unrecognized gitignored files fall through to
    ASK, never SAFE or CACHE.
 7. **Caches are opt-in** — the CACHE tier (`__pycache__/`, `dist/`, `.mypy_cache/`,
@@ -195,3 +220,12 @@ inventory to confirm and report bytes freed.
    default; it is cleared only when `--caches` is passed (or approved item-by-item
    under `--ask`). Deleting a cache is safe but forces a rebuild, so the default
    keeps it.
+8. **Empty ≠ abandoned** — for lock, coordination, and runtime-state
+   directories, empty is the *normal operating state*, not clutter: an empty
+   `.loom/locks/` means nothing is currently held, and `.loom/worktrees/`,
+   `.loom/sweep-run/`, `.loom/sweep-checkpoint/`, or `.wrangler/tmp/` are empty
+   whenever no run is in flight. Deleting them reads a tool working correctly as
+   evidence of junk. So the ordering in rule 6 applies to **directories exactly
+   as it does to files**: check the denylist before the empty-directory rule in
+   SAFE. Emptiness never promotes a denylisted path into SAFE, and never
+   bypasses the fall-through to ASK for unrecognized gitignored paths.
