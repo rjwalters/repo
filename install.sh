@@ -10,13 +10,16 @@
 #   --list            List available commands and exit
 #   --dry-run         Show what would be written without writing
 #   -y, --yes         Non-interactive mode (skip confirmation prompts)
-#   --shell-wrapper   Opt into a shell `claude` wrapper (edits ~/.zshrc or
-#                     ~/.bashrc — the only thing this installer writes outside
-#                     the target repo) that surfaces a pending /repo:handoff
-#                     note before Claude starts. Default: off. Even without
-#                     this flag, an interactive install still offers it via a
-#                     confirm (default N, diff shown first); under --yes it is
-#                     always a strict no-op unless this flag is also passed.
+#   --shell-wrapper   Opt into shell `claude` + `codex`/`codex-safe` wrappers
+#                     (edits ~/.zshrc or ~/.bashrc — the only thing this
+#                     installer writes outside the target repo). The claude
+#                     wrapper surfaces a pending /repo:handoff note before Claude
+#                     starts; the codex wrapper gives an interactive operator a
+#                     bypass-approvals default plus a read-only codex-safe entry
+#                     point. Default: off. Even without this flag, an
+#                     interactive install still offers it via a confirm (default
+#                     N, diff shown first); under --yes it is always a strict
+#                     no-op unless this flag is also passed.
 #   -h, --help        Show this help
 #
 # Examples:
@@ -67,9 +70,10 @@ MARKER_END='<!-- END REPO-SKILLS -->'
 # shellcheck source=lib/claude-md-block.sh
 source "$SOURCE_ROOT/lib/claude-md-block.sh"
 
-# Shell `claude` wrapper (opt-in via --shell-wrapper) — the one thing this
-# installer can write outside the target repo. See lib/shell-wrapper.sh
-# (repo#35) for the detection/parsing/rewrite logic and its safety contract.
+# Shell `claude` + `codex` wrappers (opt-in via --shell-wrapper) — the one thing
+# this installer can write outside the target repo. See lib/shell-wrapper.sh
+# (repo#35 claude, repo#80 codex) for the detection/parsing/rewrite logic and
+# its safety contract.
 # shellcheck source=lib/shell-wrapper.sh
 source "$SOURCE_ROOT/lib/shell-wrapper.sh"
 
@@ -263,12 +267,12 @@ if [[ "$DRY_RUN" == true ]]; then
   if [[ "$SHELL_WRAPPER" == true ]]; then
     _dry_run_sw_shell="$(shell_wrapper_detect_shell)" || _dry_run_sw_shell="unsupported"
     if [[ "$_dry_run_sw_shell" == zsh || "$_dry_run_sw_shell" == bash ]]; then
-      echo "  $(shell_wrapper_rc_path "$_dry_run_sw_shell") (outside $TARGET — marker-bounded claude shell wrapper; --shell-wrapper)"
+      echo "  $(shell_wrapper_rc_path "$_dry_run_sw_shell") (outside $TARGET — marker-bounded claude + codex shell wrappers; --shell-wrapper)"
     else
       echo "  (--shell-wrapper given, but no supported shell detected — would skip: $_dry_run_sw_shell)"
     fi
   else
-    echo "  (pass --shell-wrapper to also preview the optional claude shell wrapper, outside $TARGET)"
+    echo "  (pass --shell-wrapper to also preview the optional claude + codex shell wrappers, outside $TARGET)"
   fi
   exit 0
 fi
@@ -524,12 +528,13 @@ else
       [[ -f "$SW_RC" ]] && cp "$SW_RC" "$SW_PREVIEW_BEFORE" || : >"$SW_PREVIEW_BEFORE"
       SW_PREVIEW_AFTER="$(mktemp)"
       cp "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER"
-      if ! shell_wrapper_install "$SW_PREVIEW_AFTER" "$SHELL_WRAPPER_FLAGS"; then
-        warning "claude shell wrapper: could not prepare a preview: $SHELL_WRAPPER_ERROR"
+      if ! shell_wrapper_install "$SW_PREVIEW_AFTER" "$SHELL_WRAPPER_FLAGS" \
+        || ! shell_wrapper_install_codex "$SW_PREVIEW_AFTER"; then
+        warning "shell wrapper: could not prepare a preview: $SHELL_WRAPPER_ERROR"
         rm -f "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER"
       else
         echo ""
-        info "claude shell wrapper ($SW_SHELL) would change $SW_RC:"
+        info "claude + codex shell wrappers ($SW_SHELL) would change $SW_RC:"
         diff -u "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER" | tail -n +3 || true
         rm -f "$SW_PREVIEW_BEFORE" "$SW_PREVIEW_AFTER" "$SHELL_WRAPPER_BACKUP"
 
@@ -546,8 +551,13 @@ else
           else
             warning "claude shell wrapper: could not install it: $SHELL_WRAPPER_ERROR"
           fi
+          if shell_wrapper_install_codex "$SW_RC"; then
+            success "Installed codex shell wrapper into $SW_RC (backed up to $SHELL_WRAPPER_BACKUP)"
+          else
+            warning "codex shell wrapper: could not install it: $SHELL_WRAPPER_ERROR"
+          fi
         else
-          info "Skipped the claude shell wrapper"
+          info "Skipped the claude + codex shell wrappers"
         fi
       fi
     fi

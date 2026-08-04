@@ -63,6 +63,17 @@ This is the **one thing the installer writes outside the target repo** — it ed
 
 `uninstall.sh` removes the block (from both `~/.zshrc` and `~/.bashrc`, whichever has it) automatically, with the same backup discipline, and is a no-op if it was never installed.
 
+### Optional: Codex operator wrapper (`--shell-wrapper`)
+
+The same `--shell-wrapper` opt-in installs a **second**, independent marker-bounded block (`# BEGIN REPO-SKILLS CODEX WRAPPER` / `# END …`) that defines two Codex entry points, mirroring the hand-rolled convention many operators already keep in their rc:
+
+- **`codex`** — the interactive-operator default. It injects `--dangerously-bypass-approvals-and-sandbox` so a human driving a full session isn't stopped by repeated approval prompts. It adds that flag **exactly once, and only when you haven't already chosen a posture**: if your argv already carries `--sandbox`/`-s`, `--ask-for-approval`/`-a`, or the bypass flag itself (in either `--flag value` or `--flag=value` form), your choice is respected and nothing is injected. Non-session utility subcommands (`codex doctor`, `codex update`, `codex mcp …`) pass straight through, unmodified.
+- **`codex-safe`** — runs `command codex` with your argv byte-for-byte, no injection. Use it for read-only / review work.
+
+> **Security boundary — read before opting in.** The `codex` default is an **explicit, interactive operator opt-in for a human at a keyboard**. It is deliberately dangerous (it bypasses Codex's approval prompts *and* its sandbox), and it is **not** the sandbox policy for unattended or daemon-dispatched workers. Automated/worker contexts must set their own posture explicitly (or use `codex-safe`) — never rely on this convenience default in a headless pipeline. The wrapper's argv scan errs on the safe side: if it can't tell whether you passed an explicit posture flag, it declines to inject the dangerous default rather than risk overriding a safer choice you made.
+
+Both blocks are installed, previewed, backed up, and removed together under the single `--shell-wrapper` opt-in — same idempotency and backup discipline as the `claude` wrapper above. `uninstall.sh` removes the Codex block too.
+
 ## Installation
 
 The installer copies the skill files into a target repository's `.claude/` directory, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
@@ -108,7 +119,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 
 Nothing else in the target repository is read or modified.
 
-Opt-in only, and outside the target repository: with `--shell-wrapper`, your shell rc (`~/.zshrc` or `~/.bashrc`) gains one marker-bounded block (`# BEGIN REPO-SKILLS CLAUDE WRAPPER` / `# END …`), backed up first — see "Optional: surface the note to the human too" above.
+Opt-in only, and outside the target repository: with `--shell-wrapper`, your shell rc (`~/.zshrc` or `~/.bashrc`) gains two marker-bounded blocks (`# BEGIN REPO-SKILLS CLAUDE WRAPPER` / `# END …` and `# BEGIN REPO-SKILLS CODEX WRAPPER` / `# END …`), backed up first — see "Optional: surface the note to the human too" and "Optional: Codex operator wrapper" above.
 
 ## Repository layout
 
@@ -122,14 +133,14 @@ hooks/repo/tests/run.sh      Smoke suite covering both hooks (bash, no framework
 hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
 hooks/repo/tests/test-session-start-handoff.sh  Handoff-hook suite (run.sh delegates to it)
 hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regression suite
-hooks/repo/tests/test-shell-wrapper.sh  claude shell wrapper suite (run.sh delegates to it)
+hooks/repo/tests/test-shell-wrapper.sh  claude + codex shell wrapper suite (run.sh delegates to it)
 commands/repo/tests/test-branches-loss-check.sh  branches.md permanent-loss check suite (run.sh delegates)
 commands/repo/tests/test-repo-remote.sh  repo-remote.sh provisioning-contract suite (run.sh delegates)
 commands/repo/tests/test-verify-fix-persistence.sh  verify-after-write contract suite (run.sh delegates)
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
-lib/shell-wrapper.sh         Opt-in claude shell wrapper (--shell-wrapper): detection, alias parsing, marker-bounded rc surgery
+lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 ```
 
 ## Adding a skill

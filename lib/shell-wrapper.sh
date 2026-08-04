@@ -64,6 +64,13 @@
 SHELL_WRAPPER_MARKER_BEGIN='# BEGIN REPO-SKILLS CLAUDE WRAPPER'
 SHELL_WRAPPER_MARKER_END='# END REPO-SKILLS CLAUDE WRAPPER'
 
+# Codex wrapper markers (repo#80). Deliberately a SEPARATE, self-contained
+# marker pair and function set from the Claude wrapper above — see the "Codex
+# wrapper" section near the bottom of this file for why this is implemented in
+# parallel rather than by generalizing the already-shipped Claude code path.
+SHELL_WRAPPER_CODEX_MARKER_BEGIN='# BEGIN REPO-SKILLS CODEX WRAPPER'
+SHELL_WRAPPER_CODEX_MARKER_END='# END REPO-SKILLS CODEX WRAPPER'
+
 # Public output channels — set by the functions above, read by callers after a
 # non-zero return (or after a successful install/uninstall, for the backup
 # path). shellcheck: this file is only ever sourced, so "unused" is expected.
@@ -369,4 +376,232 @@ shell_wrapper_uninstall() {  # <rcfile>
     return 1
   fi
   return 0
+}
+
+# ===========================================================================
+# Codex wrapper (repo#80)
+# ===========================================================================
+#
+# WHAT THIS SHIPS: a second, independent marker-bounded block that defines
+# `codex` and `codex-safe` shell functions — the operator's approval/sandbox
+# posture for interactive Codex sessions, analogous to (but deliberately NOT
+# unified with) the Claude wrapper above.
+#
+#   codex()       — the operator default. Injects
+#                   `--dangerously-bypass-approvals-and-sandbox` for a
+#                   session-starting invocation UNLESS the caller already
+#                   selected an explicit posture (`--sandbox`/`-s`,
+#                   `--ask-for-approval`/`-a`, or the bypass flag itself), in
+#                   which case the caller's choice is respected untouched.
+#   codex-safe()  — passes argv to the real binary byte-for-byte, no injection.
+#                   Read-only / review work.
+#
+# WHY PARALLEL, NOT GENERALIZED (repo#80): the Claude wrapper above is
+# load-bearing (it runs in every shell the user opens) and already shipped and
+# well-tested. Its purpose (surfacing a handoff banner, folding install-time
+# alias flags) has nothing in common with Codex's purpose (a *runtime*
+# approval/sandbox posture decision). Forcing both under one generalized engine
+# now would risk regressing the released Claude path for no real DRY win, so
+# this is implemented as a self-contained parallel set. The only pieces shared
+# with the Claude path are the genuinely marker-agnostic `_shell_wrapper_backup`
+# and `_shell_wrapper_append_block` helpers; the block surgery itself is a new
+# marker-parameterized engine (`_shell_wrapper_install_generic` /
+# `_shell_wrapper_uninstall_generic`) that the Claude functions do NOT call, so
+# their behavior is provably unchanged by this addition.
+#
+# THE SECURITY-RELEVANT PART — argv-time posture detection. Unlike Claude's
+# alias flags (folded in once at install time), the Codex bypass flag is gated
+# at *runtime* on every invocation. If `_repo_codex_has_posture_flag` fails to
+# recognize an explicit `--sandbox read-only` a user typed, `codex()` would
+# silently append `--dangerously-bypass-approvals-and-sandbox` on top of it —
+# quietly downgrading the user's safety posture with no error. The detector is
+# therefore intentionally GENEROUS (it errs toward "a posture is present, do
+# not inject"): a false positive merely declines to add the dangerous default
+# (fail-safe), while a false negative would be the dangerous, hard-to-notice
+# failure. See hooks/repo/tests/test-shell-wrapper.sh for the fixture matrix.
+
+# The Codex wrapper body — static (no install-time substitution; the posture
+# decision is entirely runtime). zsh+bash compatible. Every helper it calls is
+# defined in THIS SAME BLOCK, so a shell that sources the rc gets all of it or
+# none of it. If the helpers are somehow missing (a user's partial edit inside
+# the markers), `codex()` falls through to a plain `command codex "$@"` — argv
+# is never altered and the dangerous flag is never injected on the fail path.
+read -r -d '' _SHELL_WRAPPER_CODEX_BODY_TEMPLATE <<'REPOSKILLSCODEXBLOCK' || true
+# Installed by Repo Skills (https://github.com/rjwalters/repo) install.sh
+# --shell-wrapper. Defines codex() (the interactive-operator default: bypass
+# approvals + sandbox) and codex-safe() (the real binary, unchanged, for
+# read-only/review work). This is an explicit OPERATOR opt-in for an
+# interactive session at a human keyboard — it is NOT, and must not be confused
+# with, the unattended daemon-dispatched worker sandbox policy. Edit outside
+# these markers only; re-running install.sh --shell-wrapper replaces this block
+# in place. To remove: ./uninstall.sh (from the repo-skills source, or a target
+# repo with repo-skills installed) — it detects and removes this block
+# automatically.
+unalias codex 2>/dev/null
+unalias codex-safe 2>/dev/null
+
+# Non-session utility subcommands never execute model-generated shell commands,
+# so the approval/sandbox posture is irrelevant to them — they must pass
+# through untouched (mirrors _repo_claude_is_session next door). Return 1 =
+# "not a session start", 0 = "session start".
+_repo_codex_is_session() {
+  case "$1" in
+    doctor|update|mcp|login|logout|completion|help) return 1 ;;
+    -v|--version|-h|--help) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# True (0) if argv already carries an explicit approval/sandbox posture, in
+# which case codex() must NOT inject its dangerous default. Recognizes, in both
+# `--flag value` and `--flag=value` forms: --sandbox/-s, --ask-for-approval/-a,
+# and --dangerously-bypass-approvals-and-sandbox. Deliberately generous (a
+# false positive only declines the dangerous default — the safe direction).
+_repo_codex_has_posture_flag() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -s|--sandbox|-a|--ask-for-approval|--dangerously-bypass-approvals-and-sandbox) return 0 ;;
+      --sandbox=*|--ask-for-approval=*|-s=*|-a=*) return 0 ;;
+      -s?*|-a?*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+codex() {
+  if type _repo_codex_is_session >/dev/null 2>&1 && type _repo_codex_has_posture_flag >/dev/null 2>&1; then
+    if _repo_codex_is_session "${1:-}" && ! _repo_codex_has_posture_flag "$@"; then
+      command codex --dangerously-bypass-approvals-and-sandbox "$@"
+      return
+    fi
+  fi
+  command codex "$@"
+}
+
+codex-safe() {
+  command codex "$@"
+}
+REPOSKILLSCODEXBLOCK
+
+shell_wrapper_render_codex_block() {  # -> prints the marker-bounded block to stdout
+  printf '%s\n' "$SHELL_WRAPPER_CODEX_MARKER_BEGIN"
+  printf '%s\n' "$_SHELL_WRAPPER_CODEX_BODY_TEMPLATE"
+  printf '%s\n' "$SHELL_WRAPPER_CODEX_MARKER_END"
+}
+
+shell_wrapper_codex_block_present() {  # <rcfile>
+  [[ -f "$1" ]] && grep -qF "$SHELL_WRAPPER_CODEX_MARKER_BEGIN" "$1" 2>/dev/null
+}
+
+# Marker-parameterized block surgery — the additive engine the Codex wrapper
+# installs/uninstalls through. Structurally identical to shell_wrapper_install's
+# inline logic, but takes the marker pair (and a pre-rendered block file) as
+# arguments so the Claude path's own copy above is never touched. Same
+# ambiguous-layout guard, same mktemp-backup discipline, same append-vs-replace
+# behavior.
+_shell_wrapper_install_generic() {  # <rcfile> <begin> <end> <blockfile>
+  local rcfile="$1" begin="$2" end="$3" blockfile="$4" n_begin n_end tmp backup
+  SHELL_WRAPPER_ERROR=""
+  SHELL_WRAPPER_BACKUP=""
+
+  [[ -f "$rcfile" ]] || : >"$rcfile" 2>/dev/null || {
+    SHELL_WRAPPER_ERROR="could not create $rcfile"
+    return 1
+  }
+
+  n_begin=$(grep -cxF "$begin" "$rcfile" 2>/dev/null || true); n_begin=${n_begin:-0}
+  n_end=$(grep -cxF "$end" "$rcfile" 2>/dev/null || true); n_end=${n_end:-0}
+  if [[ "$n_begin" -gt 1 || "$n_end" -gt 1 || "$n_begin" -ne "$n_end" ]]; then
+    SHELL_WRAPPER_ERROR="ambiguous ${begin#\# BEGIN } marker layout in $rcfile ($n_begin begin / $n_end end) — refusing to touch it; remove the stale block by hand, then re-run"
+    return 1
+  fi
+
+  backup="$(_shell_wrapper_backup "$rcfile")" || {
+    SHELL_WRAPPER_ERROR="could not back up $rcfile before editing it"
+    return 1
+  }
+  # shellcheck disable=SC2034 # public output var, read by callers after return
+  SHELL_WRAPPER_BACKUP="$backup"
+
+  tmp="$(mktemp)" || { SHELL_WRAPPER_ERROR="could not create a temp file"; return 1; }
+  if [[ "$n_begin" -eq 1 ]]; then
+    awk -v begin="$begin" -v end="$end" -v blockfile="$blockfile" '
+      $0 == begin {
+        while ((getline line < blockfile) > 0) print line
+        close(blockfile)
+        skip = 1
+        next
+      }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$rcfile" >"$tmp"
+  else
+    _shell_wrapper_append_block "$rcfile" "$blockfile" >"$tmp"
+  fi
+
+  if ! mv "$tmp" "$rcfile"; then
+    rm -f "$tmp"
+    SHELL_WRAPPER_ERROR="could not move the rewritten file into place (backup: $backup)"
+    return 1
+  fi
+  return 0
+}
+
+_shell_wrapper_uninstall_generic() {  # <rcfile> <begin> <end>
+  local rcfile="$1" begin="$2" end="$3" n_begin n_end backup tmp
+  SHELL_WRAPPER_ERROR=""
+  SHELL_WRAPPER_BACKUP=""
+  [[ -f "$rcfile" ]] || return 0
+
+  n_begin=$(grep -cxF "$begin" "$rcfile" 2>/dev/null || true); n_begin=${n_begin:-0}
+  n_end=$(grep -cxF "$end" "$rcfile" 2>/dev/null || true); n_end=${n_end:-0}
+  [[ "$n_begin" -eq 0 && "$n_end" -eq 0 ]] && return 0
+
+  if [[ "$n_begin" -ne 1 || "$n_end" -ne 1 ]]; then
+    SHELL_WRAPPER_ERROR="ambiguous ${begin#\# BEGIN } marker layout in $rcfile ($n_begin begin / $n_end end) — leaving it untouched; remove the block by hand"
+    return 1
+  fi
+
+  backup="$(_shell_wrapper_backup "$rcfile")" || {
+    SHELL_WRAPPER_ERROR="could not back up $rcfile before editing it"
+    return 1
+  }
+  # shellcheck disable=SC2034 # public output var, read by callers after return
+  SHELL_WRAPPER_BACKUP="$backup"
+
+  tmp="$(mktemp)" || { SHELL_WRAPPER_ERROR="could not create a temp file"; return 1; }
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { skip = 1; next }
+    $0 == end   { skip = 0; next }
+    !skip { print }
+  ' "$rcfile" >"$tmp"
+
+  if ! mv "$tmp" "$rcfile"; then
+    rm -f "$tmp"
+    SHELL_WRAPPER_ERROR="could not move the rewritten file into place (backup: $backup)"
+    return 1
+  fi
+  return 0
+}
+
+# Install the Codex wrapper block into <rcfile> (create it if absent). No
+# alias-flag folding — the Codex wrapper takes no install-time flags. Returns 1
+# with SHELL_WRAPPER_ERROR set on ambiguous layout / backup failure, same
+# contract as shell_wrapper_install.
+shell_wrapper_install_codex() {  # <rcfile>
+  local rcfile="$1" blockfile rc
+  # shellcheck disable=SC2034 # public output var, read by callers after return
+  blockfile="$(mktemp)" || { SHELL_WRAPPER_ERROR="could not create a temp file"; return 1; }
+  shell_wrapper_render_codex_block >"$blockfile"
+  _shell_wrapper_install_generic "$rcfile" \
+    "$SHELL_WRAPPER_CODEX_MARKER_BEGIN" "$SHELL_WRAPPER_CODEX_MARKER_END" "$blockfile"
+  rc=$?
+  rm -f "$blockfile"
+  return $rc
+}
+
+shell_wrapper_uninstall_codex() {  # <rcfile>
+  _shell_wrapper_uninstall_generic "$1" \
+    "$SHELL_WRAPPER_CODEX_MARKER_BEGIN" "$SHELL_WRAPPER_CODEX_MARKER_END"
 }

@@ -46,6 +46,7 @@ sw_any_present() {
   local f
   for f in "${SW_CANDIDATES[@]}"; do
     shell_wrapper_block_present "$f" && return 0
+    shell_wrapper_codex_block_present "$f" && return 0
   done
   return 1
 }
@@ -152,6 +153,7 @@ if sw_any_present; then
   echo "Will also remove (outside $TARGET — your shell rc, from an earlier --shell-wrapper opt-in):"
   for f in "${SW_CANDIDATES[@]}"; do
     shell_wrapper_block_present "$f" && echo "  $f REPO-SKILLS CLAUDE WRAPPER block"
+    shell_wrapper_codex_block_present "$f" && echo "  $f REPO-SKILLS CODEX WRAPPER block"
   done
 fi
 
@@ -172,15 +174,22 @@ fi
 
 rmdir "$TARGET/.claude/skills" "$TARGET/.claude/commands" "$TARGET/.claude" 2>/dev/null || true
 
-# claude shell wrapper block, if a previous install opted in via
+# claude + codex shell wrapper blocks, if a previous install opted in via
 # --shell-wrapper. Backed up before every edit, same as the CLAUDE.md surgery
-# above; no-op per candidate rc when our block isn't present there.
+# above; no-op per candidate rc when a given block isn't present there.
 for f in "${SW_CANDIDATES[@]}"; do
   if shell_wrapper_block_present "$f"; then
     if shell_wrapper_uninstall "$f"; then
       success "Removed claude shell wrapper from $f (backed up to $SHELL_WRAPPER_BACKUP)"
     else
       warning "Could not remove the claude shell wrapper from $f: $SHELL_WRAPPER_ERROR"
+    fi
+  fi
+  if shell_wrapper_codex_block_present "$f"; then
+    if shell_wrapper_uninstall_codex "$f"; then
+      success "Removed codex shell wrapper from $f (backed up to $SHELL_WRAPPER_BACKUP)"
+    else
+      warning "Could not remove the codex shell wrapper from $f: $SHELL_WRAPPER_ERROR"
     fi
   fi
 done
