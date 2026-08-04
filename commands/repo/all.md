@@ -109,9 +109,10 @@ upstream, which is a different axis; a branch that has diverged from the
 default branch is still eligible as long as everything on it is pushed.
 
 **If `eligible=yes`**, run only the sync-and-switch half now — [[reset]]'s
-step 4: `git fetch --all --prune`, then `git checkout "$default"` and `git pull
---ff-only` — so Docs, Tidy, and Update tools all operate on a fresh
-default-branch checkout. Report it on one line as it happens:
+step-1 refresh (`git fetch --all --prune`) followed by its step 4 (`git
+checkout "$default"` and `git pull --ff-only`) — so Docs, Tidy, and Update
+tools all operate on a fresh default-branch checkout. Report it on one line as
+it happens:
 
 ```
 Reset: synced early — feature/x was fully pushed and 6 commits behind main; switched before Docs

@@ -45,15 +45,79 @@ gates intact.
 
 ### 1. Working tree safety check
 
+Refresh the remote-tracking refs **before** looking at the tree, so the one
+judgment call this command asks for is made against the current remote rather
+than a picture up to three steps stale:
+
 ```bash
+git fetch --all --prune
 git status --porcelain
 ```
 
+The fetch is read-only: it updates remote-tracking refs and drops the ones that
+no longer exist on the remote. It moves no local branch, touches no index, and
+rewrites no working-tree file, so it is safe ahead of the safety check and
+changes none of this command's ordering guarantees. `--prune` now runs once,
+here, instead of at step 4 — which also means the branch & worktree review in
+step 3 sees already-pruned remote-tracking refs rather than pruning them
+afterwards.
+
+If the tree is clean, this step is a no-op — go on to step 2.
+
 If the tree is dirty, stop and resolve it **first** — everything after this
-step assumes no work can be lost. Show the changes and ask:
+step assumes no work can be lost. Before presenting the choice, gather what the
+remote already knows about the dirty paths:
+
+```bash
+# The full dirty set — unstaged, staged, and untracked. `git diff --name-only`
+# alone would miss the staged and untracked files that `git status --porcelain`
+# reports as dirty, so an overlap check built on it under-reports silently.
+dirty=$( { git diff --name-only
+           git diff --cached --name-only
+           git ls-files --others --exclude-standard; } | sort -u )
+
+# Upstream context — only if the branch has one. A branch that was never
+# pushed has no @{u}; skip these lines rather than erroring on it.
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+  ahead=$(git rev-list --count '@{u}..HEAD')
+  behind=$(git rev-list --count 'HEAD..@{u}')
+  # Incoming commits that touch one of those paths. Feed the pathspecs via
+  # NUL-delimited xargs rather than an unquoted `-- $dirty`: bare word
+  # splitting doesn't happen at all in zsh (the whole list becomes one
+  # pathspec, matching nothing — a silent "no overlap") and breaks on any
+  # path containing a space in every shell.
+  overlap=""
+  [ -n "$dirty" ] && overlap=$(printf '%s\n' "$dirty" | tr '\n' '\0' \
+    | xargs -0 git log --oneline 'HEAD..@{u}' --)
+fi
+```
+
+Show the changes **and** that upstream context, then ask:
 - **Commit** them (offer to draft the commit)
 - **Stash** them with a descriptive message (`git stash push -m "..."`)
 - **Abort** the reset and leave everything as is
+
+Report it like this, so the state that should drive the choice is on screen
+when the choice is made:
+
+```
+Dirty tree: 1 file (mcp-loom/package-lock.json)
+Upstream:   ahead 0, behind 7 (origin/main)
+Incoming commits touching your dirty paths:
+  880a4de  fix(version): sync mcp-loom/package-lock.json in version.sh bump/check
+```
+
+- **If `overlap` is non-empty**, say so explicitly and **steer to abort or
+  inspect, not commit** — the remote may already carry this change, and
+  committing it locally lands a redundant commit that then blocks the
+  `--ff-only` pull at step 4. Offer to show the incoming commit
+  (`git show <sha>`) so the two can be compared before deciding.
+- **If `behind` is 0 or `overlap` is empty**, say that too — "no incoming
+  commit touches your dirty paths" is exactly what makes commit or stash the
+  safe answer.
+- **If the branch has no upstream**, report that the fetch and prune ran but
+  that there is nothing to compare against, and omit the ahead/behind and
+  overlap lines entirely.
 
 NEVER discard changes. `git checkout --`, `git reset --hard`, and `git clean`
 on tracked modifications are off the table unless the user explicitly asks.
@@ -81,11 +145,9 @@ automatically, so nothing here can permanently destroy work.
 
 ### 4. Sync with remote
 
-```bash
-git fetch --all --prune
-```
-
-Then return to the default branch and fast-forward it:
+Remote-tracking refs were already refreshed and pruned in step 1, and `git pull
+--ff-only` fetches again on its own, so no standalone `git fetch --all --prune`
+runs here. Return to the default branch and fast-forward it:
 
 ```bash
 default=$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's|origin/||')
