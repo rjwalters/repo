@@ -10,13 +10,17 @@ user-invocable: true
 
 Run the full sequence of sensible repo work in one go: scan for problems, bring
 the docs back in line with reality, tidy filesystem clutter, refresh installed
-tool packages, and land back on a clean baseline. This is the umbrella command
+tool packages, report on third-party dependency currency, and land back on a
+clean baseline. This is the umbrella command
 — it orchestrates the other `/repo:*`
 commands in a deliberate order, applying each one's safe fixes by default and
 keeping the same safety gates on destructive steps that each uses on its own.
 
 It deliberately does **not** launch cloud dev sessions ([[remote]]) — that
-provisions paid infrastructure and is never part of a routine hygiene pass.
+provisions paid infrastructure and is never part of a routine hygiene pass. And
+it only ever runs [[deps]]' read-only half (`--check`): scaffolding Dependabot
+config, flipping repository flags, and merging bot PRs all stay behind
+`/repo:deps`' own confirmations.
 
 ## Usage
 
@@ -140,10 +144,42 @@ hygiene pass — deleting them just forces a costly rebuild — so this stage do
 Environments (`node_modules/`, virtualenvs) and other ASK items are never
 auto-removed here regardless.
 
-### 5. Update tools (see [[update-tools]])
+### 5. Update tools, and check dependency currency (see [[update-tools]], [[deps]])
 
-Check installed tool packages (Loom, Anvil, Repo itself, …) against their
-sources. Report what's behind and offer to update.
+Two currency checks run here, both report-first.
+
+**Installed tool packages** (see [[update-tools]]): check Loom, Anvil, Repo
+itself, … against their sources. Report what's behind and offer to update.
+
+**Third-party dependencies** (see [[deps]]): run the report-only form,
+`[[deps]] --check`. Report three independent items — never collapsed into one
+"Dependabot: on":
+
+- whether `.github/dependabot.yml` is present (that file governs **version**
+  updates only),
+- the repo-level **security-updates** flag — report it **UNKNOWN (needs
+  admin)**, not `disabled`, when the token can't read the setting, exactly as
+  [[deps]] does; "can't see it" and "it's off" are different answers,
+- the **count of open Dependabot PRs**, noting how many are majors.
+
+That count is all `/repo:all` needs — leave [[deps]]' per-PR classification
+table (ecosystem, update type, CI status, diff notes) to `/repo:deps --review`,
+which is a separate, confirm-gated activity.
+
+Only `--check` runs from here. `/repo:all` **never** scaffolds
+`.github/dependabot.yml`, **never** flips a repository flag, and **never**
+merges a Dependabot PR. Those are [[deps]]' always-confirm-first actions and
+stay out of the sweep entirely — if any of them is warranted, say so and let
+the user run `/repo:deps` themselves. Under `--ask` this half is unchanged;
+it is already report-only, so there is nothing to confirm.
+
+Dependabot is a GitHub feature, and [[deps]] refuses to run against another
+forge. So if `origin` is not a GitHub remote, skip this half, report it on its
+own line, and continue — it never fails the stage or the run:
+
+```
+Deps: check skipped (not a GitHub remote)
+```
 
 ### 6. Reset (see [[reset]])
 
@@ -178,8 +214,9 @@ Audit:        3 findings surfaced (gitignore rule fixed)
 Docs:         2 fixed (README table, CHANGELOG entry), 1 deferred: docs/analysis/ missing README
 Tidy:         freed 240 MB (build/, .cache/, 3 empty dirs)
 Tools:        Anvil updated 1.4.0 → 1.5.1; Loom current
+Deps:         dependabot.yml present, security updates OFF, 2 open PRs (1 major)
 Reset:        on main (up to date), tree clean, 4 branches deleted, 1 stash kept
-Skipped:      remote (never part of /repo:all)
+Skipped:      remote (never part of /repo:all); deps install/review (confirm-first — run /repo:deps)
 ```
 
 List anything intentionally left behind — deferred findings, kept stashes,
