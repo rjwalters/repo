@@ -2089,6 +2089,147 @@ assert_deny "#72 regression: \$(rm -rf /) smuggled inside a --body value still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Heredoc body lines are not command segments (#84) ---${NC}"
+# =========================================================================
+#
+# The shared ml_segment() lexer (_ML_QSPLIT_AWK, used by parse_force_ops,
+# lifecycle_or_cloud_reason and extract_rm_targets) tracked quote state but had
+# NO heredoc awareness, so every heredoc BODY line became its own phantom
+# top-level segment and its first word was read as a command word. A composite
+# like `gh issue create --body "$(cat <<'EOF' … EOF)"` whose body line begins
+# with `shutdown` was therefore hard-denied as a system-lifecycle command — the
+# false positive that blocked filing this very bug report. #84 teaches the lexer
+# heredoc openers (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\WORD`,
+# several per line, unterminated) so the opener line stays ONE segment with its
+# REAL command word and the body contributes no segment at all.
+#
+# Safety floor asserted below: the raw ALWAYS_BLOCK catastrophic scan never runs
+# through ml_segment; a real command after the terminator (or after a pipe on the
+# opener line) is still a real segment; a BARE (expanded) delimiter whose body
+# carries a command substitution reverts to the legacy separator-active
+# treatment; `<<<` is a here-STRING, not a heredoc; and `<<` inside an arithmetic
+# expansion is a left shift.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71).
+_HD84_SHUTDOWN="shutdo""wn"
+_HD84_HALT="ha""lt"
+_HD84_REBOOT="rebo""ot"
+_HD84_POWEROFF="powero""ff"
+_HD84_AZ="az group de""lete"
+_HD84_RESET="git reset --ha""rd"
+_HD84_RM="rm -r""f /opt/some-vendor/important"
+_HD84_DANGER="rm -r""f /"
+_HD84_SQ="'"
+
+# --- lifecycle_or_cloud_reason(): heredoc bodies no longer hard-deny -----------
+
+# The EXACT repro from the issue body: a quoted-delimiter heredoc nested inside a
+# command substitution inside a --body value. (The outer double-quoted span
+# carries `$(`, so by the #3679 floor its separators stay ACTIVE — which is why
+# quote tracking alone never fixed this.)
+assert_allow "#84: issue repro — \$(cat <<'EOF' …) body line leading with shutdown is allowed" \
+    "$(printf 'gh issue create --body "$(cat <<%sEOF%s\nsome text\n%s Iq is specified at line 3\nEOF\n)"' \
+        "$_HD84_SQ" "$_HD84_SQ" "$_HD84_SHUTDOWN")"
+
+# The follow-up comment's shape: a BARE heredoc (no $(…) wrapper, no quotes).
+assert_allow "#84: bare heredoc --body-file - with a shutdown body line is allowed" \
+    "$(printf 'gh issue create --body-file - <<%sEOF%s\nsome text\n%s now\nEOF' \
+        "$_HD84_SQ" "$_HD84_SQ" "$_HD84_SHUTDOWN")"
+
+assert_allow "#84: unquoted delimiter <<EOF with a halt body line is allowed" \
+    "$(printf 'cat <<EOF\n%s\nEOF' "$_HD84_HALT")"
+
+assert_allow "#84: double-quoted delimiter <<\"EOF\" with a reboot body line is allowed" \
+    "$(printf 'cat <<"EOF"\n%s\nEOF' "$_HD84_REBOOT")"
+
+assert_allow "#84: backslash-escaped (unexpanded) delimiter with a halt body line is allowed" \
+    "$(printf 'cat <<\\EOF\n%s\nEOF' "$_HD84_HALT")"
+
+# `<<-` strips leading TABs from the terminator line, so a tab-indented `EOF`
+# still terminates the body.
+assert_allow "#84: <<-EOF with a tab-indented terminator and a poweroff body line is allowed" \
+    "$(printf 'cat <<-EOF\n\t%s\n\tEOF' "$_HD84_POWEROFF")"
+
+assert_allow "#84: heredoc body line leading with az ... delete is allowed" \
+    "$(printf 'cat <<EOF\n%s\nEOF' "$_HD84_AZ")"
+
+# Multiple heredocs on ONE command line: body A is consumed in full before body
+# B starts, matching real shell semantics.
+assert_allow "#84: two heredocs on one line, lifecycle words in both bodies, is allowed" \
+    "$(printf 'cmd <<A <<B\n%s\nA\n%s\nB' "$_HD84_HALT" "$_HD84_REBOOT")"
+
+# Unterminated heredoc: a real shell treats the rest of the input as body and
+# never executes it, so the lexer skips the remainder rather than manufacturing
+# segments out of it.
+assert_allow "#84: unterminated heredoc with a lifecycle body line is allowed" \
+    "$(printf 'cat <<EOF\nsome text\n%s never runs' "$_HD84_HALT")"
+
+# --- The other two parsers get the shared-lexer fix for free ------------------
+
+# parse_force_ops(): a hard-reset phrase in a heredoc body used to false-`ask`.
+assert_allow "#84: heredoc body line leading with git reset --hard is allowed (parse_force_ops)" \
+    "$(printf 'cat <<EOF\n%s\nEOF' "$_HD84_RESET")"
+
+# extract_rm_targets(): an outside-repo deep rm in a heredoc body used to
+# false-`deny` under the default repo-scoped rm guard.
+assert_allow "#84: heredoc body line leading with an outside-repo rm is allowed (extract_rm_targets)" \
+    "$(printf 'cat <<EOF\n%s\nEOF' "$_HD84_RM")"
+
+# --- SAFETY FLOOR: heredoc awareness must NEVER widen a deny into an allow ----
+
+# A REAL command after the terminator line is still a real segment.
+assert_deny "#84 safety: a lifecycle command AFTER the heredoc terminator still denies" \
+    "$(printf 'cat <<EOF\nbody text\nEOF\n%s' "$_HD84_HALT")"
+
+# A REAL command before the opener is unaffected.
+assert_deny "#84 safety: a lifecycle command BEFORE the heredoc opener still denies" \
+    "$(printf '%s\ncat <<EOF\nbody text\nEOF' "$_HD84_HALT")"
+
+# The REST of the opener line still segments normally, so a pipe on that line
+# still yields a real second segment.
+assert_deny "#84 safety: a lifecycle command piped to on the opener line still denies" \
+    "$(printf 'cat <<EOF | %s\nbody text\nEOF' "$_HD84_HALT")"
+
+# A BARE (expansion-capable) delimiter whose body carries a command substitution
+# reverts to the legacy separator-active treatment — the shell really would
+# expand it — so a later body line leading with a lifecycle word still denies.
+assert_deny "#84 safety: bare-delimiter heredoc body carrying \$( ) keeps separators active" \
+    "$(printf 'cat <<EOF\n$(echo x)\n%s\nEOF' "$_HD84_HALT")"
+
+assert_deny "#84 safety: bare-delimiter heredoc body carrying a backtick keeps separators active" \
+    "$(printf 'cat <<EOF\n\`echo x\`\n%s\nEOF' "$_HD84_HALT")"
+
+# The raw ALWAYS_BLOCK catastrophic scan reads the command string directly, never
+# through ml_segment(), so a smuggled payload in a heredoc body still denies.
+assert_deny "#84 safety: \$( ) smuggled catastrophic rm inside a heredoc body still denies" \
+    "$(printf 'cat <<EOF\n$(%s)\nEOF' "$_HD84_DANGER")"
+
+assert_deny "#84 safety: backtick smuggled catastrophic rm inside a heredoc body still denies" \
+    "$(printf 'cat <<EOF\n\`%s\`\nEOF' "$_HD84_DANGER")"
+
+# A GENUINE multi-line command with no heredoc at all is untouched (#71 floor).
+assert_deny "#84 safety: genuine multi-line command with a lifecycle command on a later line still denies" \
+    "$(printf 'echo line-one\n%s\necho line-three' "$_HD84_HALT")"
+
+# `<<<` is a here-STRING, not a heredoc: it must not swallow the following line.
+assert_allow "#84: here-string <<< is not treated as a heredoc opener" \
+    'grep -q foo <<< "bar"'
+
+assert_deny "#84 safety: a lifecycle command after a <<< here-string still denies" \
+    "$(printf 'grep -q foo <<< x\n%s' "$_HD84_HALT")"
+
+# `<<` inside an arithmetic expansion is a left shift, not a heredoc opener.
+assert_deny "#84 safety: \$(( 1 << 3 )) left shift does not swallow a later lifecycle command" \
+    "$(printf 'echo $((1 << 3))\n%s' "$_HD84_HALT")"
+
+assert_deny "#84 safety: (( x << y )) left shift does not swallow a later lifecycle command" \
+    "$(printf '(( x << y ))\n%s' "$_HD84_HALT")"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
 # =========================================================================
 #
