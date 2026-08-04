@@ -1004,6 +1004,22 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 #     applies. A quoted/escaped delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`)
 #     suppresses expansion, so its body is unconditionally inert.
 #   - `<<<` is a here-STRING, not a heredoc, and is deliberately not matched.
+#   - A `<<` inside a shell COMMENT (`echo hi # <<EOF`) is not an operator at
+#     all, so the opener probe is SUPPRESSED from a word-initial unquoted `#`
+#     through the end of that physical line. Without this, the phantom opener's
+#     terminator never appears and the unterminated-heredoc rule would skip the
+#     rest of the buffer — hiding a real command on the NEXT line from
+#     extract_rm_targets(), which parses raw $COMMAND rather than
+#     $COMMAND_NO_COMMENT. Only the probe is suppressed (the characters still
+#     flow through normal separator handling), because skipping to the newline
+#     would in turn hide a trailing `; <cmd>` after a `#` that sits inside a
+#     command-substitution-bearing quoted span.
+#   - A newline preceded by an ODD number of backslashes is a LINE CONTINUATION,
+#     not the end of the logical line, so the pending bodies do NOT start there
+#     (`cat <<EOF \` + newline + `&& <cmd>` really does run `<cmd>`). Such a
+#     newline falls through to the legacy separator handling, so the continued
+#     line is segmented as the real commands it is; the bodies then start at the
+#     first NON-continued newline, matching the shell.
 # Safety floor unchanged: the raw ALWAYS_BLOCK_PATTERNS catastrophic scan reads
 # the command string directly (never through ml_segment), so a `$(...)`-smuggled
 # payload inside a heredoc body still denies, and a GENUINE multi-line command
@@ -1058,9 +1074,18 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
     out["delim"] = w
     return j
 }
+# A newline at position i is a LINE CONTINUATION when it is preceded by an ODD
+# number of backslashes (`\` + newline is removed by the shell; `\\` + newline is
+# a literal backslash followed by a REAL newline). A continued newline does not
+# end the logical line, so heredoc bodies must NOT start there.
+function cont_nl(s, i,   bs, p) {
+    bs = 0
+    for (p = i - 1; p >= 1 && substr(s, p, 1) == "\\"; p--) bs++
+    return (bs % 2)
+}
 function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
-                    arO, arC, eol, nexti, line, t) {
+                    arO, arC, eol, nexti, line, t, incmt, pc) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     split("", segs)          # clear the caller-supplied out-array
@@ -1069,6 +1094,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
     seg = ""
     segc = 0
     hdc = 0                  # heredoc openers pending a body on the next line
+    incmt = 0                # a shell COMMENT is open on the current line
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
@@ -1084,6 +1110,13 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
             inner = substr(s, i + 1, ci - i - 1)
             if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
+                # NOTE: `incmt` is deliberately NOT cleared here even when the
+                # span carries a newline. A real comment ends at that newline, so
+                # leaving the flag set can only suppress the opener probe for
+                # LONGER than the shell would — and over-suppression is strictly
+                # narrowing (it just restores the legacy pre-#84 treatment).
+                # Clearing it here would re-enable the probe on text the shell may
+                # still regard as commented, which is the widening direction.
                 i = ci + 1
                 continue
             }
@@ -1091,7 +1124,30 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
             i++
             continue
         }
-        if (c == "<" && i < n && substr(s, i + 1, 1) == "<") {
+        # A `#` that STARTS a word opens a shell COMMENT that runs to the end of
+        # the physical line, so any `<<WORD` after it is TEXT, not an operator.
+        # A word starts at the beginning of the buffer or right after an unquoted
+        # blank or shell METACHARACTER (` ` \t \n ; & | ( ) < >) — the full set
+        # bash uses to delimit words, so `;#`, `&&#`, `|#` and `(cmd)#` are all
+        # comment starts. A `#` in any OTHER position is part of a word
+        # (`http://x#y`, `${#arr}`, `ab#cd`) and is correctly NOT a comment.
+        #
+        # Only the heredoc-opener PROBE is suppressed while the flag is set — the
+        # characters still flow through the normal separator handling below,
+        # because skipping to the newline here would hide a trailing `; <cmd>` in
+        # a shape like `echo "$(id) # x" ; <cmd>` (a `#` inside a
+        # command-substitution-bearing quoted span is walked by this loop, and
+        # bash really does run that command). Probe suppression is strictly
+        # NARROWING: it can only restore the legacy pre-#84 treatment, never
+        # widen a deny into an allow — which is why the metacharacter set is
+        # chosen as a SUPERSET of the shapes bash actually treats as comments.
+        if (c == "#" && !incmt) {
+            pc = (i == 1) ? "" : substr(s, i - 1, 1)
+            if (i == 1 || pc == " " || pc == "\t" || pc == "\n" || pc == ";" ||
+                pc == "&" || pc == "|" || pc == "(" || pc == ")" ||
+                pc == "<" || pc == ">") incmt = 1
+        }
+        if (c == "<" && i < n && substr(s, i + 1, 1) == "<" && !incmt) {
             if (substr(s, i + 2, 1) == "<") {
                 # `<<<` is a here-STRING: consume the whole operator so its third
                 # `<` cannot be re-probed as the start of a `<< WORD` heredoc.
@@ -1118,7 +1174,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 continue
             }
         }
-        if (c == "\n" && hdc > 0) {
+        if (c == "\n" && hdc > 0 && !cont_nl(s, i)) {
             # End of the opener line: the pending heredoc BODIES follow. Look
             # ahead across every pending body, in opener order, to find where the
             # last one ends — and whether any EXPANSION-CAPABLE body (bare
@@ -1148,12 +1204,14 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 # inert DATA and contributes no segment at all.
                 segs[++segc] = seg
                 seg = ""
+                incmt = 0
                 i = k
                 continue
             }
             # else: fall through to the ordinary separator handling below.
         }
         if (c == ";" || c == "&" || c == "|" || c == "\n") {
+            if (c == "\n") incmt = 0   # a comment ends at the physical newline
             segs[++segc] = seg; seg = ""; i++; continue
         }
         seg = seg c

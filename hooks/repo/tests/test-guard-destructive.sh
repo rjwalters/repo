@@ -2107,8 +2107,11 @@ echo -e "${YELLOW}--- Heredoc body lines are not command segments (#84) ---${NC}
 # through ml_segment; a real command after the terminator (or after a pipe on the
 # opener line) is still a real segment; a BARE (expanded) delimiter whose body
 # carries a command substitution reverts to the legacy separator-active
-# treatment; `<<<` is a here-STRING, not a heredoc; and `<<` inside an arithmetic
-# expansion is a left shift.
+# treatment; `<<<` is a here-STRING, not a heredoc; `<<` inside an arithmetic
+# expansion is a left shift; a `<<` inside a shell COMMENT is not an operator at
+# all (so the probe is suppressed and the next line is not swallowed); and a
+# backslash-CONTINUED newline does not start the bodies, because the logical
+# opener line has not ended yet.
 #
 # Danger phrases assembled at runtime so this test file never contains the
 # literal string a naive scan of the harness's own Bash call would flag
@@ -2226,6 +2229,60 @@ assert_deny "#84 safety: \$(( 1 << 3 )) left shift does not swallow a later life
 
 assert_deny "#84 safety: (( x << y )) left shift does not swallow a later lifecycle command" \
     "$(printf '(( x << y ))\n%s' "$_HD84_HALT")"
+
+# A `<<` inside a shell COMMENT is not an operator: without the probe
+# suppression the phantom opener's terminator never appears and the
+# unterminated-heredoc rule swallows the REST OF THE BUFFER, hiding the real
+# command on the next line. Real bash runs `echo hi` and then the removal, and
+# only extract_rm_targets is exposed (the other two parsers read
+# COMMAND_NO_COMMENT, which strips the comment before segmentation).
+assert_deny "#84 safety: a <<WORD inside a shell comment does not hide the next line's rm" \
+    "$(printf 'echo hi # <<EOF\n%s' "$_HD84_RM")"
+
+assert_deny "#84 safety: comment fake-opener at line start does not hide the next line's rm" \
+    "$(printf '# <<EOF\n%s' "$_HD84_RM")"
+
+assert_deny "#84 safety: comment fake-opener with no space after # still denies" \
+    "$(printf 'echo hi #<<EOF\n%s' "$_HD84_RM")"
+
+assert_deny "#84 safety: comment fake-opener with a later EOF line still denies" \
+    "$(printf 'echo hi # <<EOF\n%s\nEOF\necho done' "$_HD84_RM")"
+
+# A newline preceded by an ODD number of backslashes is a LINE CONTINUATION, so
+# the logical opener line continues and the body starts only at the NEXT real
+# newline. Real bash prints the body and then runs the continued command.
+assert_deny "#84 safety: backslash-continued opener line does not hide a lifecycle command" \
+    "$(printf 'cat <<EOF \\\n&& %s\nbody text\nEOF' "$_HD84_HALT")"
+
+assert_deny "#84 safety: backslash-continued opener line does not hide an outside-repo rm" \
+    "$(printf 'cat <<EOF \\\n&& %s\nbody text\nEOF' "$_HD84_RM")"
+
+assert_ask "#84 safety: backslash-continued opener line does not hide a force op" \
+    "$(printf 'cat <<EOF \\\n&& %s\nbody text\nEOF' "$_HD84_RESET")"
+
+# An EVEN number of backslashes is a literal backslash followed by a REAL
+# newline, so the body genuinely starts there and stays inert.
+assert_allow "#84: an escaped backslash before the newline still opens the body" \
+    "$(printf 'cat <<EOF \\\\\nbody %s\nEOF' "$_HD84_HALT")"
+
+# The suppression must not cost the intended fix: a comment AFTER a real opener
+# on the same line, and a comment-only line before one, both still allow.
+assert_allow "#84: a comment after a real opener on the same line still allows the body" \
+    "$(printf 'cat <<EOF # note\n%s\nEOF' "$_HD84_SHUTDOWN")"
+
+assert_allow "#84: a comment-only line before a heredoc opener still allows the body" \
+    "$(printf '# just a note\ncat <<EOF\n%s\nEOF' "$_HD84_SHUTDOWN")"
+
+# A markdown `#` heading inside a heredoc body is body DATA — the body is
+# skipped wholesale, so it never reaches the comment tracker.
+assert_allow "#84: a markdown # heading in a heredoc body does not disturb the skip" \
+    "$(printf 'gh issue create --body-file - <<%sEOF%s\n## Heading\n%s now\nEOF' \
+        "$_HD84_SQ" "$_HD84_SQ" "$_HD84_SHUTDOWN")"
+
+# A continued opener line whose continuation is benign still opens the body at
+# the first NON-continued newline.
+assert_allow "#84: a benign backslash-continued opener line still allows the body" \
+    "$(printf 'cat <<EOF \\\n  --flag\n%s\nEOF' "$_HD84_SHUTDOWN")"
 
 echo ""
 
