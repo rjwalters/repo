@@ -16,8 +16,9 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
-# test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh, and
-# commands/repo/tests/test-repo-remote.sh.
+# test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
+# commands/repo/tests/test-repo-remote.sh, and
+# commands/repo/tests/test-verify-fix-persistence.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -444,6 +445,47 @@ else
     PASS=$((PASS + RR_PASS))
     FAIL=$((FAIL + RR_FAIL))
     record_suite "test-repo-remote.sh" "$RR_PASS" "$RR_FAIL" "remote.md provisioning contract"
+fi
+
+# The verify-after-write contract shared by docs.md / readme.md / gitignore.md /
+# links.md, plus all.md's re-verify-before-print + distinct "reverted" line
+# (repo#89). Same delegation shape as the two suites above: it lives outside
+# hooks/repo/tests/ but `pnpm test` stays the one entry point, so fold its real
+# PASS/FAIL counts into the totals here.
+echo
+echo "-- verify-after-write fix persistence (delegated suite) --"
+VP_TEST="$TESTS_DIR/../../../commands/repo/tests/test-verify-fix-persistence.sh"
+if [[ ! -f "$VP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-verify-fix-persistence.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-verify-fix-persistence.sh" "$VP_TEST"
+else
+    VP_OUT="$(bash "$VP_TEST" 2>&1)"
+    VP_STATUS=$?
+    VP_PASS="$(suite_count Passed "$VP_OUT")"
+    VP_FAIL="$(suite_count Failed "$VP_OUT")"
+    # Skips are neither pass nor fail, so they do NOT feed the PASS/FAIL folding
+    # or the breakdown-sums-to-headline self-check — surface them as a note only.
+    VP_SKIP="$(suite_count Skipped "$VP_OUT")"
+    VP_NOTE="verify-after-write contract"
+    [[ "$VP_SKIP" =~ ^[0-9]+$ && "$VP_SKIP" -gt 0 ]] && VP_NOTE+=" — $VP_SKIP skipped"
+    if ! [[ "$VP_PASS" =~ ^[0-9]+$ && "$VP_FAIL" =~ ^[0-9]+$ ]]; then
+        VP_PASS=0
+        VP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-verify-fix-persistence.sh" "$VP_STATUS"
+        strip_ansi "$VP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$VP_STATUS" -ne 0 || "$VP_FAIL" -ne 0 ]]; then
+        [[ "$VP_FAIL" -eq 0 ]] && VP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_STATUS"
+        strip_ansi "$VP_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-verify-fix-persistence.sh" "$VP_PASS"
+    fi
+    PASS=$((PASS + VP_PASS))
+    FAIL=$((FAIL + VP_FAIL))
+    record_suite "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_NOTE"
 fi
 
 echo
