@@ -445,6 +445,244 @@ claude mcp list
 assert_eq "runtime: missing helpers -> transparent passthrough, argv unchanged" \
     "passthrough:mcp list" "$NOHELPERS"
 
+# ===========================================================================
+# Codex wrapper (repo#80)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- codex install.sh --shell-wrapper: both wrapper blocks land together --"
+
+read -r HCX TCX <<<"$(new_home_target codex-install)"
+cat > "$HCX/.zshrc" <<'EOF'
+# my zshrc
+export FOO=bar
+EOF
+
+OUTCX="$(HOME="$HCX" SHELL=/bin/zsh bash "$INSTALL_SH" -y --shell-wrapper "$TCX" 2>&1)"; RCCX=$?
+BODYCX="$(cat "$HCX/.zshrc")"
+
+assert_eq "codex-install: install exits 0" "0" "$RCCX"
+assert_contains "codex-install: reports codex wrapper installed" "$OUTCX" "Installed codex shell wrapper"
+assert_contains "codex-install: claude marker present"  "$BODYCX" "# BEGIN REPO-SKILLS CLAUDE WRAPPER"
+assert_contains "codex-install: codex marker present"   "$BODYCX" "# BEGIN REPO-SKILLS CODEX WRAPPER"
+assert_contains "codex-install: defines codex()"        "$BODYCX" "codex() {"
+assert_contains "codex-install: defines codex-safe()"   "$BODYCX" "codex-safe() {"
+assert_contains "codex-install: unalias codex precedes"      "$BODYCX" "unalias codex 2>/dev/null"
+assert_contains "codex-install: unalias codex-safe present"  "$BODYCX" "unalias codex-safe 2>/dev/null"
+assert_contains "codex-install: original content untouched"  "$BODYCX" "export FOO=bar"
+
+# Idempotency: re-running is byte-identical with exactly one codex marker pair.
+BEFORE_CX="$(cat "$HCX/.zshrc")"
+HOME="$HCX" SHELL=/bin/zsh bash "$INSTALL_SH" -y --shell-wrapper "$TCX" >/dev/null 2>&1
+AFTER_CX="$(cat "$HCX/.zshrc")"
+assert_eq "codex-install: idempotent re-install (byte-identical)" "$BEFORE_CX" "$AFTER_CX"
+N_CX_BEGIN="$(grep -cxF '# BEGIN REPO-SKILLS CODEX WRAPPER' "$HCX/.zshrc")"
+assert_eq "codex-install: exactly one codex marker pair after re-install" "1" "$N_CX_BEGIN"
+
+# Uninstall removes BOTH blocks and restores the file byte-for-byte.
+printf '# my zshrc\nexport FOO=bar\n' > "$SCRATCH/codex-install-expected.zshrc"
+OUTCXU="$(HOME="$HCX" SHELL=/bin/zsh bash "$UNINSTALL_SH" -y "$TCX" 2>&1)"
+assert_contains "codex-uninstall: reports codex wrapper removed" "$OUTCXU" "Removed codex shell wrapper from"
+assert_file_bytes_eq "codex-uninstall: rc restored byte-for-byte (both blocks gone)" \
+    "$SCRATCH/codex-install-expected.zshrc" "$HCX/.zshrc"
+assert_not_contains "codex-uninstall: no codex marker remains" "$(cat "$HCX/.zshrc")" "REPO-SKILLS CODEX WRAPPER"
+assert_not_contains "codex-uninstall: no claude marker remains" "$(cat "$HCX/.zshrc")" "REPO-SKILLS CLAUDE WRAPPER"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- codex uninstall: unrelated rc content is preserved --"
+
+read -r HCXP TCXP <<<"$(new_home_target codex-preserve)"
+cat > "$HCXP/.zshrc" <<'EOF'
+export BEFORE=1
+alias ll='ls -la'
+export AFTER=2
+EOF
+cp "$HCXP/.zshrc" "$SCRATCH/codex-preserve-expected.zshrc"
+HOME="$HCXP" SHELL=/bin/zsh bash "$INSTALL_SH" -y --shell-wrapper "$TCXP" >/dev/null 2>&1
+HOME="$HCXP" SHELL=/bin/zsh bash "$UNINSTALL_SH" -y "$TCXP" >/dev/null 2>&1
+assert_file_bytes_eq "codex-preserve: unrelated lines survive install+uninstall roundtrip" \
+    "$SCRATCH/codex-preserve-expected.zshrc" "$HCXP/.zshrc"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- codex runtime: argv forwarding, dangerous-flag injection, and posture dedup --"
+
+# Render just the codex block body (markers stripped) and source it into a
+# throwaway bash with a `command` shim that reports exactly what argv the real
+# `codex` binary WOULD receive. This is the security-relevant surface: the
+# runtime posture-flag scan that decides whether the dangerous bypass flag is
+# appended. We assert against real argv shapes, not just flag presence/absence.
+render_codex_body() {  # -> the codex block's body (markers stripped), to stdout
+    (
+        source "$LIB"
+        shell_wrapper_render_codex_block
+    ) | sed '1d;$d'
+}
+
+CODEX_BLOCK_FILE="$SCRATCH/runtime-codex-block.sh"
+render_codex_body > "$CODEX_BLOCK_FILE"
+
+# Runner: `bash CODEX_RUNNER <blockfile> <fn> <args...>` prints
+# "codex-called:<argv the real binary would receive>" on one line.
+CODEX_RUNNER="$SCRATCH/codex-runner.sh"
+cat > "$CODEX_RUNNER" <<'RUNNER'
+# shellcheck disable=SC1090
+source "$1"; shift
+command() {
+  if [ "$1" = codex ]; then
+    shift
+    printf 'codex-called:%s\n' "$*"
+  else
+    builtin command "$@"
+  fi
+}
+"$@"
+RUNNER
+
+run_codex() {  # <fn> <args...> -> "codex-called:<argv>"
+    bash "$CODEX_RUNNER" "$CODEX_BLOCK_FILE" "$@" 2>&1
+}
+
+# Count non-overlapping occurrences of <needle> in <haystack>.
+count_occurrences() {  # <haystack> <needle> -> prints integer
+    local rest="$1" needle="$2" n=0
+    while [[ "$rest" == *"$needle"* ]]; do
+        n=$((n + 1)); rest="${rest#*"$needle"}"
+    done
+    echo "$n"
+}
+
+BYPASS='--dangerously-bypass-approvals-and-sandbox'
+
+# (1) Session start, no posture -> dangerous flag injected exactly once, ahead
+#     of the user's argv, which is otherwise forwarded intact.
+OUT_SESS="$(run_codex codex 'write a haiku')"
+assert_eq "codex-runtime: session start injects bypass once, argv preserved" \
+    "codex-called:$BYPASS write a haiku" "$OUT_SESS"
+assert_eq "codex-runtime: bypass appears exactly once (no duplication)" \
+    "1" "$(count_occurrences "$OUT_SESS" "$BYPASS")"
+
+# (2) codex-safe forwards argv byte-for-byte, never injecting the dangerous flag
+#     — even for a session-shaped invocation.
+OUT_SAFE="$(run_codex codex-safe 'write a haiku')"
+assert_eq "codex-runtime: codex-safe forwards argv unchanged" \
+    "codex-called:write a haiku" "$OUT_SAFE"
+assert_not_contains "codex-runtime: codex-safe never adds the bypass flag" "$OUT_SAFE" "$BYPASS"
+
+# (3) Non-session utility subcommands pass straight through, no injection
+#     (mirrors _repo_claude_is_session). AC#4.
+for sub in "doctor" "update" "mcp list" "login" "--version"; do
+    OUT_SUB="$(run_codex codex $sub)"
+    assert_eq "codex-runtime: non-session '$sub' passes through unmodified" \
+        "codex-called:$sub" "$OUT_SUB"
+    assert_not_contains "codex-runtime: non-session '$sub' gets no bypass flag" "$OUT_SUB" "$BYPASS"
+done
+
+# (4) SECURITY: an explicit posture flag must NOT be silently overridden with
+#     the dangerous default. Every form below must forward the user's choice
+#     WITHOUT the wrapper appending --dangerously-bypass-approvals-and-sandbox.
+#     A miss here would quietly downgrade the user's safety posture (no error),
+#     which is exactly the failure mode this fixture exists to catch.
+declare -a POSTURE_CASES=(
+    "--sandbox=workspace-write prompt"
+    "--sandbox workspace-write prompt"
+    "-s workspace-write prompt"
+    "-s=read-only prompt"
+    "--ask-for-approval never prompt"
+    "--ask-for-approval=never prompt"
+    "-a never prompt"
+    "--sandbox read-only --ask-for-approval never prompt"
+)
+for argv in "${POSTURE_CASES[@]}"; do
+    OUT_P="$(run_codex codex $argv)"
+    assert_eq "codex-runtime: explicit posture '$argv' forwarded verbatim" \
+        "codex-called:$argv" "$OUT_P"
+    assert_not_contains "codex-runtime: explicit posture '$argv' is NOT downgraded to bypass default" \
+        "$OUT_P" "$BYPASS"
+done
+
+# (5) SECURITY: when the caller ALREADY passes the bypass flag, it must pass
+#     through exactly once — never swallowed, never duplicated into a
+#     contradictory double posture.
+OUT_EXPLICIT_BYPASS="$(run_codex codex "$BYPASS" prompt)"
+assert_eq "codex-runtime: caller-supplied bypass forwarded verbatim" \
+    "codex-called:$BYPASS prompt" "$OUT_EXPLICIT_BYPASS"
+assert_eq "codex-runtime: caller-supplied bypass appears exactly once (not swallowed, not doubled)" \
+    "1" "$(count_occurrences "$OUT_EXPLICIT_BYPASS" "$BYPASS")"
+
+# (6) A posture flag AFTER a leading prompt is still detected (the scan covers
+#     the whole argv, not just $1) — session start, but posture present.
+OUT_MIXED="$(run_codex codex prompt --sandbox read-only)"
+assert_not_contains "codex-runtime: posture flag anywhere in argv suppresses the bypass default" \
+    "$OUT_MIXED" "$BYPASS"
+
+# (6b) SECURITY: codex's config-override route to a posture — `-c sandbox_mode=…`
+#      / `--config approval_policy=…` — sets the SAME sandbox/approval posture as
+#      the first-class flags. Injecting --dangerously-bypass-approvals-and-sandbox
+#      on top of a user's `-c sandbox_mode=read-only` silently ESCALATES it to
+#      full bypass (codex-cli 0.146.0 parses the pair exit 0, bypass wins). These
+#      forms must suppress injection and forward argv verbatim.
+declare -a CONFIG_POSTURE_CASES=(
+    "-c sandbox_mode=read-only prompt"
+    "-c sandbox_mode=\"read-only\" prompt"
+    "--config approval_policy=untrusted prompt"
+    "--config=sandbox_mode=workspace-write prompt"
+    "-c approval_policy=untrusted prompt"
+)
+for argv in "${CONFIG_POSTURE_CASES[@]}"; do
+    OUT_CP="$(run_codex codex $argv)"
+    assert_eq "codex-runtime: config-set posture '$argv' forwarded verbatim" \
+        "codex-called:$argv" "$OUT_CP"
+    assert_not_contains "codex-runtime: config-set posture '$argv' is NOT escalated to bypass default" \
+        "$OUT_CP" "$BYPASS"
+done
+
+# (6c) Escalation repro from the Judge's review (PR #111): the exact invocation
+#      that previously injected the bypass flag on top of a read-only posture.
+#      It must now forward argv unchanged with NO bypass flag.
+OUT_ESCALATION="$(run_codex codex -c sandbox_mode=read-only p)"
+assert_eq "codex-runtime: escalation repro '-c sandbox_mode=read-only p' forwarded verbatim" \
+    "codex-called:-c sandbox_mode=read-only p" "$OUT_ESCALATION"
+assert_not_contains "codex-runtime: escalation repro no longer injects bypass" \
+    "$OUT_ESCALATION" "$BYPASS"
+
+# (6d) An UNRELATED `-c`/`--config` key (not sandbox_mode/approval_policy) is a
+#      normal session start with no posture set — injection MUST still happen.
+OUT_UNREL_C="$(run_codex codex -c model=o3 prompt)"
+assert_eq "codex-runtime: unrelated '-c model=o3' still injects bypass (no posture set)" \
+    "codex-called:$BYPASS -c model=o3 prompt" "$OUT_UNREL_C"
+OUT_UNREL_GLUED="$(run_codex codex --config=model=o3 prompt)"
+assert_eq "codex-runtime: unrelated glued '--config=model=o3' still injects bypass" \
+    "codex-called:$BYPASS --config=model=o3 prompt" "$OUT_UNREL_GLUED"
+
+# (6e) A posture-looking string inside a QUOTED PROMPT is not a real option arg —
+#      the scan must not be fooled into suppressing injection. (Mirrors the
+#      false-suppression guard for `--sandbox`, now for the config route.)
+OUT_QUOTED="$(run_codex codex 'explain -c sandbox_mode=read-only in codex')"
+assert_eq "codex-runtime: config posture inside a quoted prompt is not a flag (bypass still injected)" \
+    "codex-called:$BYPASS explain -c sandbox_mode=read-only in codex" "$OUT_QUOTED"
+
+# (7) Fail-transparent: if the helper functions are somehow absent (a user's
+#     partial edit inside the markers), codex() must fall through to a plain
+#     `command codex "$@"` — argv unchanged, and crucially NOT injecting the
+#     dangerous flag on the degraded path.
+OUT_NOHELP="$(bash -c '
+  command() { if [ "$1" = codex ]; then shift; printf "codex-called:%s\n" "$*"; else builtin command "$@"; fi; }
+  codex() {
+    if type _repo_codex_is_session >/dev/null 2>&1 && type _repo_codex_has_posture_flag >/dev/null 2>&1; then
+      if _repo_codex_is_session "${1:-}" && ! _repo_codex_has_posture_flag "$@"; then
+        command codex --dangerously-bypass-approvals-and-sandbox "$@"; return
+      fi
+    fi
+    command codex "$@"
+  }
+  codex chat now
+' 2>&1)"
+assert_eq "codex-runtime: missing helpers -> transparent passthrough, no injection" \
+    "codex-called:chat now" "$OUT_NOHELP"
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================="
