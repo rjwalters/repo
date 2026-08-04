@@ -73,6 +73,27 @@ step failing as "source clone unknown" rather than an error:
    is simply unknown; skip to the GitHub check in step 2. This is normal (fresh
    clone on a different machine), not a failure.
 
+**Signature check: distinguish "never installed here" from "sidecar was deleted
+by a pull."** Step 3 collapses two different situations into one "unknown"
+outcome, so before reporting it, check for this signature: `install-metadata.json`
+exists (proof a successful install previously ran in *this* checkout) but no
+sidecar is present **and** no legacy inline `source` / `installed_at` fields
+exist in `install-metadata.json` either. That combination is also what you get
+when a previously-tracked `.install-local.json` was untracked upstream and this
+checkout later pulled that commit — git deletes the untracked file's
+working-tree copy in every checkout except the one that ran `git rm --cached`
+(repo#96). Still report "source unknown" for the version-comparison purpose
+(there is no path to read), but append a distinct one-line suggestion instead of
+treating it identically to a fresh clone:
+
+```
+sidecar missing but install-metadata.json present — if this was previously
+installed, re-run <tool>'s installer to regenerate the sidecar.
+```
+
+A genuinely fresh clone (no `install-metadata.json` at all) gets no such
+suggestion — it was simply never installed here.
+
 Known family members: Loom (`.loom/`), Anvil (`.anvil/`), Repo Skills
 (`.claude/skills/repo/`), kicad-tools, and anything else that follows the same
 metadata pattern. Report any metadata file found even if the tool is
@@ -104,7 +125,14 @@ TOOL PACKAGES
 | anvil       | 0.9.0 (Jul 1)    | 0.9.0   | current     |
 | repo-skills | 0.1.0 (Jul 14)   | 0.1.0   | current     |
 | kicad-tools | 2.3.0 (May 20)   | ?       | source repo missing — clone it? |
+| some-tool   | 1.2.0 (Jun 30)   | ?       | sidecar missing — re-run installer? |
 ```
+
+The last two rows are **different** failure modes, so report them distinctly:
+`source repo missing` means the recorded source clone path no longer exists on
+disk, while `sidecar missing` is the signature check above (installed here once,
+but the machine-local pointer is gone — typically deleted by pulling an
+untracking commit, repo#96).
 
 Where a changelog exists in the source repo, summarize what changed between
 the installed and latest versions.

@@ -16,6 +16,7 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
+# test-install-sidecar-untracking.sh,
 # test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh, and
@@ -327,6 +328,44 @@ else
     PASS=$((PASS + MD_PASS))
     FAIL=$((FAIL + MD_FAIL))
     record_suite "test-install-claude-md-markers.sh" "$MD_PASS" "$MD_FAIL" "CLAUDE.md markers"
+fi
+
+# install.sh's tracked-`.install-local.json` detection + `git rm --cached`
+# staging (repo#96). Same delegation shape as the marker suite above: it drives
+# install.sh against scratch git repos and asserts on index state and captured
+# output, so it shares nothing with expect(). Fold its real PASS/FAIL counts in
+# and record a breakdown row.
+echo
+echo "-- install.sh tracked-sidecar untracking (delegated suite) --"
+SC_TEST="$TESTS_DIR/test-install-sidecar-untracking.sh"
+if [[ ! -f "$SC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-install-sidecar-untracking.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-install-sidecar-untracking.sh" "$SC_TEST"
+else
+    SC_OUT="$(bash "$SC_TEST" 2>&1)"
+    SC_STATUS=$?
+    SC_PASS="$(suite_count Passed "$SC_OUT")"
+    SC_FAIL="$(suite_count Failed "$SC_OUT")"
+    if ! [[ "$SC_PASS" =~ ^[0-9]+$ && "$SC_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        SC_PASS=0
+        SC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-install-sidecar-untracking.sh" "$SC_STATUS"
+        strip_ansi "$SC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SC_STATUS" -ne 0 || "$SC_FAIL" -ne 0 ]]; then
+        [[ "$SC_FAIL" -eq 0 ]] && SC_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-install-sidecar-untracking.sh" "$SC_PASS" "$SC_FAIL" "$SC_STATUS"
+        strip_ansi "$SC_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-install-sidecar-untracking.sh" "$SC_PASS"
+    fi
+    PASS=$((PASS + SC_PASS))
+    FAIL=$((FAIL + SC_FAIL))
+    record_suite "test-install-sidecar-untracking.sh" "$SC_PASS" "$SC_FAIL" "sidecar untracking"
 fi
 
 # install.sh --shell-wrapper / uninstall.sh's shell `claude` wrapper (repo#35).
