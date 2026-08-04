@@ -139,9 +139,20 @@ or **keep**. Never auto-drop, regardless of flags.
 Run the full [[branches]] classification (PROTECTED / merged-PR / closed-issue
 / orphaned-automation / UNKNOWN, plus stale worktrees). With `--prune`, delete
 the SAFE TO DELETE category after presenting it; otherwise ask. Either way,
-[[branches]]' **permanent-loss check** applies — a branch with commits found
-nowhere else, or a worktree with uncommitted changes, is never removed
+[[branches]]' **permanent-loss check** applies — a branch whose *content* is
+found nowhere else, or a worktree with uncommitted changes, is never removed
 automatically, so nothing here can permanently destroy work.
+
+Carry [[branches]]' per-branch **tag** through into the report below: it names
+which check cleared each branch, so "landed (squash)" stays visibly distinct
+from "no unique commits" and from work kept because it exists nowhere else. Two
+consequences worth stating plainly, both from [[branches]] step 5:
+
+- On a squash-merging repo `git branch -d` refuses every landed branch, so the
+  deletion of a `landed (...)` branch legitimately uses `-D`.
+- Never reach for `-D` to work around a refusal that step 5 did **not** already
+  clear — `-D` deletes unmerged work just as readily, and a `unique work` or
+  `unverifiable` tag means the refusal was right.
 
 ### 4. Sync with remote
 
@@ -167,11 +178,20 @@ RESET COMPLETE
 Branch:    main (up to date with origin/main)
 Tree:      clean
 Stashes:   1 kept (stash@{0}: "wip: quantizer experiment", 3 days old)
-Branches:  4 deleted, 2 UNKNOWN kept (experiment-a, spike/cache)
+Branches:  4 deleted, 2 UNKNOWN kept
+             fix/123-parser-crash — landed (squash), merged PR #150 (2026-06-28)
+             fix/88-null-deref — landed (squash), content-verified (merge-tree)
+             feature/issue-77 — landed (squash), patch-id equivalent (git cherry)
+             wt/agent-3 — no unique commits
+             experiment-a — KEPT: unique work: 3 commits found nowhere else
+             spike/cache — KEPT: unverifiable: forge lookup failed (rate limited)
 Worktrees: 1 removed (../repo-wt-fix123)
 ```
 
-List anything intentionally left behind so nothing is silently forgotten.
+List anything intentionally left behind so nothing is silently forgotten. A
+deleted branch with no tag, or a bare `N deleted` count, is a reporting bug: the
+tag is how an operator confirms after the fact that squash-landed work — not
+unique work — is what went away.
 
 ## Related
 
