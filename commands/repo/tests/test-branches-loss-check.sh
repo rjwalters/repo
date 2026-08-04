@@ -21,8 +21,20 @@
 #
 # The contract under test:
 #   5a  git log --oneline <branch> --not <default> --remotes   (ONE --not)
-#   5b  content containment (merge-tree / diff / merged-PR), NOT SHA ancestry
+#   5b  content containment + forge merge state, NOT SHA ancestry. Four arms,
+#       tried in order: merge-tree / diff --quiet / git cherry / merged-PR
 #   5c  any error or ambiguity classifies KEEP, never SAFE
+#
+# Every verdict also carries the TAG naming the arm that produced it (repo#97),
+# because a report that says only "SAFE TO DELETE" cannot distinguish "landed as
+# a squash commit" from "had no unique commits at all" from work kept because it
+# exists nowhere else. The doc-drift block at the end pins the tag vocabulary in
+# branches.md and reset.md against the tags this file emits.
+#
+# NOTE on the forge arm: branches.md keeps `gh pr list --head ... --state merged`
+# as the containment probe and adds the REST `gh api .../pulls?state=all&head=...`
+# form for the number/date the tag needs. Converting the remaining GraphQL-backed
+# `gh pr list` read paths is repo#103's scope, deliberately NOT duplicated here.
 
 set -uo pipefail
 
@@ -97,55 +109,79 @@ assert_not_safe() {  # <label> <actual>
 DEFAULT="main"
 REPO=""
 
-# Stands in for `gh pr list --head <branch> --state merged --json number --jq length`.
-# PR_LOOKUP_MODE: none -> "0" | merged -> "1" | fail -> non-zero exit (gh
-# missing / unauthenticated / rate-limited / offline).
+# Stands in for the forge lookup — `gh pr list --head <branch> --state merged`
+# for the count, plus the REST `gh api .../pulls?state=all&head=...` form for the
+# number and merge date the report tag needs. Echoes "<count> <number> <date>".
+# PR_LOOKUP_MODE: none -> no merged PR | merged -> one merged PR | fail ->
+# non-zero exit (gh missing / unauthenticated / rate-limited / offline).
 PR_LOOKUP_MODE="none"
-pr_merged_count() {  # <branch>
+pr_merged_lookup() {  # <branch>
     case "$PR_LOOKUP_MODE" in
-        merged) echo 1 ;;
+        merged) echo "1 150 2026-06-28" ;;
         fail)   return 7 ;;
-        *)      echo 0 ;;
+        *)      echo "0  " ;;
     esac
 }
 
-# loss_check <branch> -> SAFE | UNSAFE | KEEP
+# classify <branch> -> "<verdict>|<tag>"
 #   SAFE   : work is preserved elsewhere; branch may be deleted under --prune
 #   UNSAFE : branch holds commits whose content exists nowhere else
 #   KEEP   : ambiguous or errored (5c) — must be treated exactly like UNSAFE
-loss_check() {
-    local branch="$1" unique mt tree n
+# The tag is the branches.md step-4 report label naming the check that fired.
+classify() {
+    local branch="$1" unique mt tree lookup n num date cherry
+    local n_commits
 
     # -- 5a: ancestry. ONE --not, both exclusions after it.
     if ! unique=$(git -C "$REPO" log --oneline "$branch" --not "$DEFAULT" --remotes 2>/dev/null); then
-        echo KEEP; return          # 5c: errored -> KEEP, never SAFE
+        echo "KEEP|unverifiable: 5a ancestry lookup failed"; return   # 5c
     fi
     if [[ -z "$unique" ]]; then
-        echo SAFE; return
+        echo "SAFE|no unique commits"; return
     fi
+    n_commits=$(printf '%s\n' "$unique" | grep -c .)
 
-    # -- 5b: content containment, not SHA ancestry.
+    # -- 5b arm 1: tree containment (merge-tree), not SHA ancestry.
     if mt=$(git -C "$REPO" merge-tree --write-tree "$DEFAULT" "$branch" 2>/dev/null); then
         if ! tree=$(git -C "$REPO" rev-parse "$DEFAULT^{tree}" 2>/dev/null); then
-            echo KEEP; return      # 5c
+            echo "KEEP|unverifiable: cannot resolve $DEFAULT^{tree}"; return   # 5c
         fi
         if [[ "$mt" == "$tree" ]]; then
-            echo SAFE; return      # merging the branch would change nothing
+            # merging the branch would change nothing
+            echo "SAFE|landed (squash), content-verified (merge-tree)"; return
         fi
+    # -- 5b arm 2: exact tree match (the git < 2.38 / conflicted-merge fallback).
     elif git -C "$REPO" diff --quiet "$DEFAULT" "$branch" 2>/dev/null; then
-        echo SAFE; return          # fallback: identical trees
+        echo "SAFE|landed, identical tree"; return
     fi
 
-    if n=$(pr_merged_count "$branch" 2>/dev/null); then
+    # -- 5b arm 3: patch-id equivalence. Proven only when the output is non-empty
+    #    and EVERY line is '-'. One '+' means a patch that is not in <default>.
+    if cherry=$(git -C "$REPO" cherry "$DEFAULT" "$branch" 2>/dev/null); then
+        if [[ -n "$cherry" ]] && ! printf '%s\n' "$cherry" | grep -q '^+'; then
+            echo "SAFE|landed (squash), patch-id equivalent (git cherry)"; return
+        fi
+    fi
+
+    # -- 5b arm 4: forge merge state.
+    if lookup=$(pr_merged_lookup "$branch" 2>/dev/null); then
+        read -r n num date <<<"$lookup"
         if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )); then
-            echo SAFE; return
+            echo "SAFE|landed (squash), merged PR #${num} (${date})"; return
         fi
     else
-        echo KEEP; return          # 5c: forge lookup unavailable -> KEEP
+        # 5c: forge lookup unavailable -> KEEP
+        echo "KEEP|unverifiable: forge lookup failed"; return
     fi
 
-    echo UNSAFE
+    echo "UNSAFE|unique work: ${n_commits} commits found nowhere else"
 }
+
+# loss_check <branch> -> SAFE | UNSAFE | KEEP   (verdict only)
+loss_check() { classify "$1" | cut -d'|' -f1; }
+
+# loss_tag <branch> -> the report tag classify assigned
+loss_tag() { classify "$1" | cut -d'|' -f2-; }
 
 # safe_to_delete_set -> newline-separated branches loss_check calls SAFE
 safe_to_delete_set() {
@@ -204,9 +240,16 @@ build_fixtures() {
     #     main edited the same file. merge-tree conflicts and diff differs, so
     #     only the forge lookup can establish containment — the case that proves
     #     the 5c failure direction.
+    #     It is deliberately MULTI-commit: a squash collapses its two patches into
+    #     one, so no individual patch-id survives into main and `git cherry`
+    #     (5b arm 3) correctly reports '+' and falls through to the forge arm.
+    #     A single-commit version would be cleared by patch-id and would stop
+    #     exercising the forge-only path — fixture 5 covers that case instead.
     git -C "$REPO" checkout -q -b feature/pr-merged main
     echo v1 > "$REPO/c.txt"
     git -C "$REPO" add -A && git -C "$REPO" commit -qm "C1: add c=v1"
+    echo v1b > "$REPO/c.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "C2: c=v1b"
     git -C "$REPO" checkout -q main
     git -C "$REPO" merge --squash -q feature/pr-merged >/dev/null
     git -C "$REPO" commit -qm "squash: add c (#2)"
@@ -215,7 +258,24 @@ build_fixtures() {
     git -C "$REPO" push -q origin main
     git -C "$REPO" checkout -q main
 
-    # (5) Finally, a commit made to main and NOT pushed — the `abae8dc` analogue
+    # (5) SINGLE-commit squash-merge that main has since moved past (repo#97).
+    #     The live failure this issue was filed from: every branch in it carried
+    #     one commit, was squash-landed, and main had advanced. merge-tree
+    #     conflicts (add/add on s.txt) and diff differs, so arms 1-2 cannot clear
+    #     it — but the squash commit's patch IS the branch commit's patch, so
+    #     `git cherry` clears it with no forge access at all.
+    git -C "$REPO" checkout -q -b feature/cherry-landed main
+    echo s1 > "$REPO/s.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "S1: add s=s1"
+    git -C "$REPO" checkout -q main
+    git -C "$REPO" merge --squash -q feature/cherry-landed >/dev/null
+    git -C "$REPO" commit -qm "squash: add s (#3)"
+    echo s2 > "$REPO/s.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "main: s=s2"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q main
+
+    # (6) Finally, a commit made to main and NOT pushed — the `abae8dc` analogue
     #     from repo#39. Local main is now one commit ahead of origin/main, which
     #     is the ordinary state right after any local merge. The malformed idiom
     #     leaks THIS commit into every branch's output; the fixed one does not.
@@ -227,7 +287,7 @@ build_fixtures() {
     git -C "$REPO" add -A && git -C "$REPO" commit -qm "MAINONLY: committed only to main"
     MAINONLY_SHA=$(git -C "$REPO" rev-parse --short HEAD)
 
-    # (6) IDENTICAL-TREE branch: same content as main's current tip but a
+    # (7) IDENTICAL-TREE branch: same content as main's current tip but a
     #     distinct SHA (an amended commit, same tree + same parent). Its tree
     #     equals main's, so even the degraded `git diff --quiet` fallback can
     #     prove containment — this is the legitimate "old git still classifies
@@ -333,9 +393,12 @@ PR_LOOKUP_MODE="none"   # no forge help at all — content containment must carr
 # refuses SAFE. That degraded direction is pinned in the fallback section below.
 if [[ "$HAS_MERGE_TREE" == 1 ]]; then
     assert_eq "squash-merged -> SAFE (without any PR lookup)" "SAFE" "$(loss_check feature/squashed)"
+    assert_eq "squash-merged tag names the merge-tree arm" \
+        "landed (squash), content-verified (merge-tree)" "$(loss_tag feature/squashed)"
 else
     skip "squash-merged -> SAFE (without any PR lookup)" \
         "content containment needs merge-tree; degraded path covered by the fallback section"
+    skip "squash-merged tag names the merge-tree arm" "needs merge-tree (git < 2.38)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -367,16 +430,49 @@ assert_eq "pushed branch -> UNSAFE once the remote copy is gone" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- fixture 5: single-commit squash landed, main advanced (repo#97) --"
+# ---------------------------------------------------------------------------
+# The exact shape of the live failure: one commit, squash-merged, main since
+# advanced past the file. `git branch -d` refuses it, `git branch --merged`
+# omits it, merge-tree conflicts, `git diff` differs — yet the work is fully
+# landed. Only patch-id equivalence (5b arm 3) can say so without the forge.
+PR_LOOKUP_MODE="none"
+CHERRY_OUT=$(git -C "$REPO" cherry main feature/cherry-landed)
+assert_contains "git cherry marks the squash-landed commit as '-'" "$CHERRY_OUT" "-"
+assert_not_contains "git cherry finds no unmatched patch on that branch" "$CHERRY_OUT" "+"
+MERGED_LIST=$(git -C "$REPO" branch --merged main --format='%(refname:short)' | tr '\n' ' ')
+assert_not_contains "git branch --merged still omits it (reachability is wrong here)" \
+    "$MERGED_LIST" "feature/cherry-landed"
+assert_eq "single-commit squash-landed -> SAFE with no forge access" \
+    "SAFE" "$(loss_check feature/cherry-landed)"
+assert_eq "its tag names the patch-id arm, not merge-tree" \
+    "landed (squash), patch-id equivalent (git cherry)" "$(loss_tag feature/cherry-landed)"
+# A branch of several commits squashed into one does NOT patch-id match, and the
+# check must not pretend otherwise: this is the documented limit of arm 3.
+MULTI_CHERRY=$(git -C "$REPO" cherry main feature/pr-merged)
+assert_contains "multi-commit squash is NOT cleared by patch-id" "$MULTI_CHERRY" "+"
+# And genuinely unique work is never cleared by patch-id either.
+UNIQ_CHERRY=$(git -C "$REPO" cherry main feature/unpushed)
+assert_contains "unpushed work is NOT cleared by patch-id" "$UNIQ_CHERRY" "+"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- 5c: ambiguity and errors classify KEEP, never SAFE --"
 # ---------------------------------------------------------------------------
 # feature/pr-merged: content NOT contained (main moved past it), so only the
 # forge lookup can clear it.
 PR_LOOKUP_MODE="merged"
 assert_eq "merged PR clears a branch main has moved past" "SAFE" "$(loss_check feature/pr-merged)"
+assert_eq "its tag carries the PR number and merge date" \
+    "landed (squash), merged PR #150 (2026-06-28)" "$(loss_tag feature/pr-merged)"
 PR_LOOKUP_MODE="fail"
 assert_eq "forge lookup unavailable -> KEEP (not SAFE)" "KEEP" "$(loss_check feature/pr-merged)"
+assert_eq "its tag says unverifiable, not landed" \
+    "unverifiable: forge lookup failed" "$(loss_tag feature/pr-merged)"
 PR_LOOKUP_MODE="none"
 assert_eq "no merged PR found -> UNSAFE" "UNSAFE" "$(loss_check feature/pr-merged)"
+assert_contains "its tag says unique work, distinct from any landed tag" \
+    "$(loss_tag feature/pr-merged)" "unique work:"
 
 # A failing forge lookup must never rescue, nor condemn-to-SAFE, anything.
 PR_LOOKUP_MODE="fail"
@@ -419,6 +515,18 @@ echo "-- degraded path: git < 2.38 has no \`merge-tree --write-tree\` (repo#46) 
 PR_LOOKUP_MODE="none"
 assert_eq "fallback: identical-tree branch -> SAFE via \`git diff --quiet\`" \
     "SAFE" "$(mt_unsupported_loss_check feature/identical)"
+assert_eq "fallback: identical-tree tag names the tree arm, not a squash arm" \
+    "landed, identical tree" \
+    "$( PATH="$SHIM_DIR:$PATH"; loss_tag feature/identical )"
+
+# (a2) Patch-id equivalence needs no merge-tree at all, so the single-commit
+#      squash-landed branch is still cleared — and still labelled as landed —
+#      on a git that predates `merge-tree --write-tree` (repo#97).
+assert_eq "fallback: single-commit squash-landed -> SAFE via patch-id" \
+    "SAFE" "$(mt_unsupported_loss_check feature/cherry-landed)"
+assert_eq "fallback: patch-id tag survives the degraded path" \
+    "landed (squash), patch-id equivalent (git cherry)" \
+    "$( PATH="$SHIM_DIR:$PATH"; loss_tag feature/cherry-landed )"
 
 # (b) main advanced past a squash-merge, no forge help: diff differs, PR lookup
 #     finds nothing -> UNSAFE. The primary (merge-tree) path calls this SAFE;
@@ -454,6 +562,36 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- report tags: every verdict names the check that fired (repo#97) --"
+# ---------------------------------------------------------------------------
+# The operator-facing half of the fix: a bare "SAFE TO DELETE" cannot be audited
+# after the fact. Each verdict must carry a tag, "landed" tags must be visibly
+# distinct from "unique work", and every tag this suite emits must appear in the
+# vocabulary table branches.md publishes (asserted in the doc-drift block below).
+PR_LOOKUP_MODE="merged"
+UNTAGGED=""
+for b in feature/squashed feature/unpushed feature/pushed feature/pr-merged \
+         feature/cherry-landed feature/identical; do
+    t="$(loss_tag "$b")"
+    [[ -z "$t" ]] && UNTAGGED+="$b "
+done
+if [[ -z "$UNTAGGED" ]]; then
+    ok "every classified branch carries a report tag"
+else
+    no "every classified branch carries a report tag" "untagged: $UNTAGGED"
+fi
+
+# A landed branch and a unique-work branch must not read the same.
+LANDED_TAG="$(loss_tag feature/cherry-landed)"
+PR_LOOKUP_MODE="none"
+UNIQUE_TAG="$(loss_tag feature/unpushed)"
+assert_contains "landed branches are tagged 'landed'" "$LANDED_TAG" "landed"
+assert_not_contains "a landed tag never reads as unique work" "$LANDED_TAG" "unique work"
+assert_contains "unique work is tagged 'unique work'" "$UNIQUE_TAG" "unique work"
+assert_not_contains "a unique-work tag never reads as landed" "$UNIQUE_TAG" "landed"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: branches.md still specifies what this suite implements --"
 # ---------------------------------------------------------------------------
 # Every `git log` invocation in the file must use EXACTLY ONE `--not`. A second
@@ -485,6 +623,34 @@ assert_contains "branches.md fixes the failure direction to KEEP" \
 assert_contains "branches.md states errors are never SAFE" \
     "$MD" '**Never SAFE.**'
 
+# repo#97: patch-id arm, the REST form for new forge calls, and the -d/-D warning.
+assert_contains "branches.md documents the patch-id (git cherry) arm" \
+    "$MD" 'git cherry <default> <branch>'
+assert_contains "branches.md documents the patch-id limit for multi-commit squashes" \
+    "$MD" 'matches none of them individually'
+assert_contains "branches.md gives the REST form for new forge calls" \
+    "$MD" 'gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>"'
+assert_contains "branches.md warns that -d is not the classifier" \
+    "$MD" '`git branch -d` is not the classifier'
+assert_contains "branches.md warns that -D is not the fix for a -d refusal" \
+    "$MD" '`-D` is not the fix'
+assert_contains "branches.md restricts -D to branches step 5 tagged landed" \
+    "$MD" 'Escalate to `-D` only for a branch step 5 tagged `landed (...)`'
+assert_contains "branches.md refuses the git branch --merged offline fallback" \
+    "$MD" 'Do **not** fall back to'
+
+# The tag vocabulary this suite emits must be published in branches.md, or the
+# report and the check have drifted apart.
+for tag in 'no unique commits' \
+           'landed (squash), content-verified (merge-tree)' \
+           'landed, identical tree' \
+           'landed (squash), patch-id equivalent (git cherry)' \
+           'landed (squash), merged PR #N (<date>)' \
+           'unique work: N commits found nowhere else' \
+           'unverifiable: <reason>'; do
+    assert_contains "branches.md publishes the tag: $tag" "$MD" "$tag"
+done
+
 # reset.md delegates to branches.md rather than duplicating the idiom; if it
 # ever grows its own copy, this suite must be extended to cover it too.
 if [[ -f "$RESET_MD" ]]; then
@@ -496,6 +662,14 @@ if [[ -f "$RESET_MD" ]]; then
     else
         ok "reset.md does not duplicate the loss-check idiom"
     fi
+    # repo#97: reset.md's final report must carry the tag through, so its branch
+    # summary is not a bare "N deleted" that hides which rule applied.
+    assert_contains "reset.md carries the per-branch tag into its report" \
+        "$RESET" "landed (squash)"
+    assert_contains "reset.md's report distinguishes kept unique work" \
+        "$RESET" "unique work:"
+    assert_contains "reset.md warns against reaching for -D" \
+        "$RESET" 'Never reach for `-D`'
 fi
 
 # ---------------------------------------------------------------------------
