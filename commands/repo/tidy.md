@@ -90,7 +90,12 @@ overrides everything below, regardless of gitignore status):**
   without editing this file. For these, **empty is the normal, healthy state** —
   an empty `.loom/locks/` means no lock is currently held, not that the
   directory is abandoned — so emptiness is never evidence of junk here (see the
-  empty-directory rule under SAFE).
+  empty-directory rule under SAFE). (The cache dot-directories already named
+  under CACHE — `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.turbo/`,
+  `.astro/` — are **not** coordination roots: they are regenerable output and
+  stay in CACHE, so `--caches` still clears them. The discriminator is that a
+  coordination root is one where *empty is the normal state*; a cache directory
+  is one whose entire contents can be rebuilt by re-running the tool.)
 - Anything else that looks credential-like or holds unique local state
   (local SQLite DBs, local-only config, sample-data caches)
 
@@ -103,12 +108,12 @@ reserved for tracked files.
   it does **not** match the denylist above **and** matches one of:
   - OS/editor droppings: `.DS_Store`, `Thumbs.db`, `*~`, `*.swp`, `.#*`
   - Merge/patch leftovers: `*.orig`, `*.rej`, `*.BACKUP.*`
-  - Empty directories — **but only after checking the path against the
-    never-delete denylist above**, exactly as for the file patterns. Emptiness
-    is not itself a junk signal and never promotes a path into SAFE: an empty
-    directory under a tool-scaffolding / coordination root (`.loom/`, `.anvil/`,
-    `.wrangler/`, …) routes to **ASK**, not SAFE, and an empty gitignored
-    directory matching no allowlist still falls through to ASK. The
+  - Empty directories **whose path matches no never-delete denylist entry** —
+    the denylist is checked first here exactly as it is for the file patterns
+    above. An empty directory under a tool-scaffolding / coordination root
+    (`.loom/`, `.anvil/`, `.wrangler/`, …) routes to **ASK**, not SAFE:
+    emptiness is that tool's normal operating state, not evidence of junk. Every
+    other empty directory (an empty `build/`, say) is SAFE. Note that the
     `find . -type d -empty` inventory in step 1 is a raw path scan — it consults
     neither gitignore nor the denylist — so this check must be applied to its
     output before anything is deleted.
