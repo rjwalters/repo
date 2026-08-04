@@ -52,8 +52,17 @@ find . \( -path './.git' -o -name node_modules -o -name target \
           -o -name dist -o -name .venv \) -prune \
      -o -type f -size +10M -print
 
-# Stale worktrees
-git worktree list
+# Git worktree roots — authoritative and tool-agnostic. RETAIN this output as a
+# path set for step 2's denylist; do not just print it. `--porcelain` gives one
+# `worktree <path>` line per entry, including worktrees that live outside this
+# repo root (`../repo-wt-fix123`, `/private/tmp/…`, `/private/var/folders/…`),
+# which `git clean` never sees.
+git worktree list --porcelain
+
+# Size of each worktree root, for the inventory line in step 3. Bounded by the
+# number of worktrees (typically a handful), so one `du -sh` per root is cheap
+# enough — unlike a `du` over the whole tree, which is not.
+git worktree list --porcelain | awk '/^worktree /{print $2}' | xargs -I{} du -sh {}
 ```
 
 Both `find` walks `-prune` the heavy trees rather than filtering them out with
@@ -77,6 +86,17 @@ git does its own traversal. When editing the prune list:
 - **Coordination roots (`.loom/`, `.anvil/`, `.wrangler/`) are deliberately not
   pruned.** They are small, and step 2 needs to see their empty directories in
   order to route them to ASK.
+
+The **first** `worktree` entry is the main working tree — the repo being tidied
+(`git rev-parse --show-toplevel`). Drop it; the rest are the linked worktrees
+this command cares about.
+
+`git worktree list --porcelain` is **authoritative**. A directory whose `.git`
+is a **file** (not a directory) containing `gitdir: …/.git/worktrees/…` is also
+a worktree root, and that check catches worktrees belonging to *other*
+checkouts of the same project; but where the two disagree — e.g. a stale `.git`
+pointer whose target is gone — trust `git worktree list --porcelain` and do not
+let a speculative `.git`-file scan fail the step.
 
 Also look for junk by pattern, wherever it lives:
 - OS/editor droppings: `.DS_Store`, `Thumbs.db`, `*~`, `*.swp`, `.#*`
@@ -122,6 +142,26 @@ overrides everything below, regardless of gitignore status):**
   stay in CACHE, so `--caches` still clears them. The discriminator is that a
   coordination root is one where *empty is the normal state*; a cache directory
   is one whose entire contents can be rebuilt by re-running the tool.)
+- Git worktree roots — **any** path listed by `git worktree list --porcelain`
+  in step 1, **or** any directory whose `.git` is a **file** (not a directory)
+  whose contents match `gitdir: .*/\.git/worktrees/.*`. A worktree root is a
+  live checkout that can hold uncommitted, unpushed, one-of-a-kind work; it is
+  never SAFE and never CACHE, regardless of gitignore status. This test is
+  **tool-agnostic and independent of the tool-scaffolding prefixes above** — it
+  is what covers `.claude/worktrees/`, `.codex/worktrees/`, and any other
+  tool's worktree cache dir that is not named in the `.loom/` / `.anvil/` /
+  `.wrangler/` list, as well as ad hoc worktrees under no dot-directory at all
+  (`git worktree add ../repo-wt-fix123`, `/private/tmp/…`,
+  `/private/var/folders/…`). Do not rely on the prefix match to reach these.
+  Emptiness never promotes a worktree root to SAFE either (safety rule 8) — a
+  checked-out worktree is not legitimately empty, and a parent directory that
+  *contains* worktrees still routes through the existing empty-directory rule.
+  A nested worktree shows up in `git clean -ndX` as `Would skip repository
+  <path>` — plain `git clean -fdX` leaves it alone, but `-ffdX` (double force)
+  deletes it outright, so never widen the force flag to make a listing "go
+  away". Report these with their size (below); deciding which worktrees are
+  *reclaimable* needs merge state and agent liveness that `/repo:tidy` does not
+  have, so it stays a report, never a deletion.
 - Anything else that looks credential-like or holds unique local state
   (local SQLite DBs, local-only config, sample-data caches)
 
@@ -167,12 +207,18 @@ reserved for tracked files.
   - **Any empty directory whose path matches the denylist** (a `.loom/`,
     `.anvil/`, or `.wrangler/` coordination or runtime-state dir) — emptiness
     is that tool's normal state, so it lands here rather than in SAFE.
+  - **Any git worktree root** detected in step 1 — surfaced on its own
+    `worktree:` inventory line with its size (see Report), never auto-deleted,
+    whether or not it is gitignored and whether or not it sits under a
+    recognized tool dot-directory.
   - **Any gitignored file that does not match the SAFE or CACHE allowlist** (a
     novel/unrecognized cache dir, unrecognized local state) — when in doubt, it
     lands here, not in SAFE or CACHE.
 
-  Stale worktrees, branches, and stashes are [[reset]]'s job — point there
-  instead of handling them here.
+  Deciding which worktrees, branches, and stashes are *stale* remains
+  [[reset]]'s job — point there instead of pruning them here. `/repo:tidy`'s
+  job with worktrees is only **visibility and protection**: report each root
+  and its size so the operator can see the footprint, and never delete one.
 - **KEEP** — flagged only as information: tracked files that look like they
   don't belong (build output that got committed — point to [[gitignore]]).
 
@@ -199,11 +245,33 @@ ASK:
   .wrangler/tmp/           gitignored, empty  ← tool runtime dir, empty between builds
   notes-scratch.md         untracked, 3 KB, modified today  ← might be real work
   sim-output-old/          untracked, 1.2 GB, untouched 60 days
-  worktree: ../repo-wt-fix123 (branch merged)
+
+WORKTREES (66 GB across 4 roots — never auto-deleted, listed for visibility):
+  worktree: .loom/worktrees/issue-42        32 GB  ← live git worktree
+  worktree: .claude/worktrees/scratch-wt     3.1 GB  ← live git worktree
+  worktree: ../repo-wt-fix123                12 GB  ← live git worktree (outside repo root)
+  worktree: /private/tmp/wt-bisect            19 GB  ← live git worktree (outside repo root)
+  Pruning stale worktrees is /repo:reset's call, not tidy's.
 
 KEEP (informational):
   assets/build.min.js      tracked but looks generated — see /repo:gitignore
 ```
+
+The `WORKTREES` block is a **distinct inventory section**, not folded into the
+generic denylist ASK lines, and its bytes are summed **separately** from the
+SAFE/CACHE/ASK totals (a worktree's contents are neither freed nor freeable by
+this command). Print it whenever at least one worktree root exists — including
+on an otherwise-clean run, so `/repo:tidy` never reports "nothing to tidy" on a
+tree where tens of gigabytes are sitting in worktrees with no hint of where the
+space went.
+
+If the repo documents its **own** worktree-management tooling — a script,
+`package.json` command, `Makefile` target, or binary the repo's own docs point
+at for this purpose — mention it after the block as a soft pointer (e.g.
+`Reclaimable worktrees: try 'loom-daemon clean --safe --dry-run'.`). Only
+whichever the repo actually documents; `/repo:tidy` has no reliable way to
+discover arbitrary third-party tooling, so **omit the line entirely rather than
+guessing** at a command that may not exist.
 
 ### 4. Apply
 
@@ -221,8 +289,8 @@ KEEP (informational):
 
 The default auto-delete is scoped to **SAFE-allowlisted paths only** (plus the
 CACHE allowlist when `--caches` is passed). Never pass a denylisted path
-(secrets, virtualenvs, `node_modules/`, tool-scaffolding roots — **including
-when it is empty**) or an unrecognized gitignored path to
+(secrets, virtualenvs, `node_modules/`, tool-scaffolding roots, git worktree
+roots — **including when it is empty**) or an unrecognized gitignored path to
 `git clean -fdX` — those are ASK items and require an explicit human call. Build
 the explicit `<paths>` list from the SAFE category (and CACHE under `--caches`)
 and nothing else; do **not** run a blanket `git clean -fdX` that would sweep
@@ -242,10 +310,10 @@ inventory to confirm and report bytes freed.
 5. When scoped to a subtree, do not delete anything outside it
 6. **Gitignored ≠ safe to delete** — the never-delete denylist (secrets like
    `.env`/`*.pem`/`*.key`, environments like `.venv/`/`venv/`/`env/` and
-   `node_modules/`, and tool-scaffolding roots like `.loom/`/`.anvil/`/
-   `.wrangler/`) always overrides SAFE and CACHE and routes to ASK, regardless
-   of what `git clean -ndX` lists. Unrecognized gitignored files fall through to
-   ASK, never SAFE or CACHE.
+   `node_modules/`, tool-scaffolding roots like `.loom/`/`.anvil/`/
+   `.wrangler/`, and git worktree roots) always overrides SAFE and CACHE and
+   routes to ASK, regardless of what `git clean -ndX` lists. Unrecognized
+   gitignored files fall through to ASK, never SAFE or CACHE.
 7. **Caches are opt-in** — the CACHE tier (`__pycache__/`, `dist/`, `.mypy_cache/`,
    and the other compilation/tool/build patterns) is never auto-deleted by
    default; it is cleared only when `--caches` is passed (or approved item-by-item
@@ -260,3 +328,13 @@ inventory to confirm and report bytes freed.
    as it does to files**: check the denylist before the empty-directory rule in
    SAFE. Emptiness never promotes a denylisted path into SAFE, and never
    bypasses the fall-through to ASK for unrecognized gitignored paths.
+9. **Never delete a git worktree root** — a worktree is a live checkout that
+   may hold uncommitted, unpushed work, and it is denylisted on the strength of
+   `git worktree list --porcelain` (or a `.git` **file** pointing at
+   `…/.git/worktrees/…`), *not* on where it happens to live. Do not infer
+   protection from a dot-directory prefix: `.claude/worktrees/`, a sibling
+   `../repo-wt-fix123`, and a worktree under `/private/tmp/` are all protected
+   by this rule and none of them are matched by rule 6's prefix list. Report
+   each root and its size (see Report) even when nothing is deleted — the one
+   thing worse than deleting a worktree is telling the operator their 94 GB
+   tree is clean.
