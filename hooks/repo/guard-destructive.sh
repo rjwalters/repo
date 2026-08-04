@@ -849,6 +849,56 @@ resolve_default_branch() {
 }
 
 # =============================================================================
+# BACKSLASH-ESCAPE HELPERS (shared by BOTH lexers)
+#
+# The character at position i is BACKSLASH-ESCAPED when it is preceded by an ODD
+# number of backslashes (`\x` is an escape; `\\x` is a literal backslash followed
+# by an unescaped `x`). Call sites depend on this parity:
+#   - a NEWLINE: an escaped newline is a LINE CONTINUATION — the shell removes it
+#     and the logical line continues, so pending heredoc BODIES must not start
+#     there;
+#   - the leading `<` of a `<<`: an escaped `\<` is a literal `<` inside a word,
+#     NOT a redirection operator, so `\<<WORD` never opens a heredoc and must not
+#     be probed as one (#108);
+#   - a QUOTE character: `\"` is literal text, so it never OPENS a quoted span
+#     and is never accepted as the authoritative CLOSE of an active one (#113).
+#
+# `trusted_close()` resolves that last case for the ACTIVE-span bookkeeping the
+# two lexers share. Starting from the naive "next quote of the same kind" index
+# it:
+#   - SKIPS backslash-escaped quotes (`\"` is literal text, never a real close);
+#   - returns 0 — meaning "do not record a close, walk the span the legacy way" —
+#     when no unescaped candidate exists, or when the candidate directly follows
+#     a backslash run (`\\"`). There the escaped BACKSLASH makes the pairing
+#     genuinely ambiguous (the quote is real, but the shell re-parses quoting
+#     inside `$( )`), and recording it would end the span at a position the
+#     legacy walk pairs differently — the one direction that can lose a segment
+#     boundary. Returning 0 reproduces the pre-#113 walk for that span exactly.
+# Every use is strictly NARROWING: treating something as escaped/ambiguous only
+# falls back to (or stays in) separator-ACTIVE segmentation, never widening a
+# deny into an allow.
+#
+# Lives in its own awk source string, prepended to BOTH lexer sources, so
+# qsplit() and ml_segment() share ONE definition and cannot drift (#113).
+# =============================================================================
+_ESCAPE_AWK='
+function bs_escaped(s, i,   bs, p) {
+    bs = 0
+    for (p = i - 1; p >= 1 && substr(s, p, 1) == "\\"; p--) bs++
+    return (bs % 2)
+}
+function trusted_close(s, n, ci, qc,   j) {
+    while (ci > 0 && bs_escaped(s, ci)) {
+        j = ci + 1
+        ci = 0
+        for (; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
+    }
+    if (ci > 1 && substr(s, ci - 1, 1) == "\\") return 0
+    return ci
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE COMMAND SEGMENTATION (#3755)
 #
 # The three segment parsers below (parse_force_ops, lifecycle_or_cloud_reason,
@@ -873,13 +923,23 @@ resolve_default_branch() {
 # was swallowed as bogus inert text.
 # The token VALUES are preserved verbatim (unlike a redaction approach), so
 # extract_rm_targets still sees the real `rm` targets. Best-effort like
-# strip_literal_text(): backslash-escaped quotes and an unterminated quote fall
-# back to the old separator-active behaviour, never widening a deny into an allow.
+# strip_literal_text(): where a BACKSLASH makes the quote pairing ambiguous both
+# lexers resolve it in the one direction that keeps separators ACTIVE, so the
+# result can only gain segment boundaries, never lose them (#113):
+#   - a backslash-escaped quote (`\"`) never OPENS a span — it is literal text —
+#     so it can no longer start a bogus inert run that swallows real separators;
+#   - the close index an ACTIVE span records is resolved by trusted_close():
+#     escaped candidates are skipped, and an ambiguous one (`\\"`) records
+#     nothing at all so that span is walked exactly the legacy way;
+#   - an unterminated quote advances ONE character with separators still active
+#     (both lexers) instead of swallowing the remainder of the buffer.
+# None of these can widen a deny into an allow; the escaped-quote cases in the
+# #113 test block pin the shapes that did.
 #
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK='
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, acs, acn) {
+function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -901,7 +961,12 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, acs, acn) {
             i++
             continue
         }
-        if (c == DQ || c == SQ) {
+        # A BACKSLASH-ESCAPED quote (`\"`) is literal text, not a span opener
+        # (#113). Opening a span there let an escaped quote AFTER an active span
+        # pair with a much later quote and copy every real separator between
+        # them as bogus inert text. Refusing to open is strictly NARROWING (the
+        # separators stay ACTIVE), so it can only add segment boundaries.
+        if ((c == DQ || c == SQ) && !bs_escaped(s, i)) {
             qc = c
             ci = 0
             for (j = i + 1; j <= n; j++) {
@@ -923,11 +988,16 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, acs, acn) {
             }
             # Span carries command substitution: keep separators ACTIVE (copy the
             # opening quote and keep walking char-by-char so a `|` inside splits).
-            # REMEMBER the already-computed close index (#113) so the char-walk
-            # does not re-read that same quote as a NEW opener — which used to
-            # swallow everything after the span.
+            # REMEMBER where the span really ENDS (#113) so the char-walk does not
+            # re-read that quote as a NEW opener — which used to swallow
+            # everything after the span. `trusted_close()` resolves the real close
+            # (skipping backslash-escaped quotes, refusing an ambiguous one); see
+            # the ml_segment() copy of this guard for the full rationale — both
+            # lexers share the defect and therefore share the fix so they cannot
+            # drift.
             out = out c
-            acs[++acn] = ci
+            tc = trusted_close(s, n, ci, qc)
+            if (tc > 0) acs[++acn] = tc
             i++
             continue
         }
@@ -1107,23 +1177,10 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
     out["delim"] = w
     return j
 }
-# The character at position i is BACKSLASH-ESCAPED when it is preceded by an ODD
-# number of backslashes (`\x` is an escape; `\\x` is a literal backslash followed
-# by an unescaped `x`). Two call sites depend on this parity:
-#   - a NEWLINE: an escaped newline is a LINE CONTINUATION — the shell removes it
-#     and the logical line continues, so pending heredoc BODIES must not start
-#     there;
-#   - the leading `<` of a `<<`: an escaped `\<` is a literal `<` inside a word,
-#     NOT a redirection operator, so `\<<WORD` never opens a heredoc and must not
-#     be probed as one (#108).
-# Both uses are strictly NARROWING: treating something as escaped only falls back
-# to the legacy separator-active segmentation, which cannot widen a deny.
-function bs_escaped(s, i,   bs, p) {
-    bs = 0
-    for (p = i - 1; p >= 1 && substr(s, p, 1) == "\\"; p--) bs++
-    return (bs % 2)
-}
-function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner,
+# bs_escaped() (the backslash-parity helper every escape-sensitive branch below
+# calls) lives in the shared _ESCAPE_AWK source string, which is prepended to
+# BOTH this lexer and qsplit() so the two cannot drift (#113).
+function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
                     arO, arC, eol, nexti, line, t, incmt, pc, acs, acn) {
     SQ = sprintf("%c", 39)   # single quote
@@ -1160,9 +1217,14 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
         # implied disabling matching for the text AFTER the span. Remembering the
         # already-computed close index (a stack, so NESTED active spans each pop
         # their own close) resumes correct segmentation right after the real close
-        # while leaving in-span matching exactly as it was. Strictly widening for
-        # segmentation (it can only produce MORE segment boundaries than before),
-        # so it can never turn an existing deny into an allow.
+        # while leaving in-span matching exactly as it was.
+        #
+        # The close index is only authoritative when a BACKSLASH did not make the
+        # pairing ambiguous — see the escaped-quote rules in the shared header
+        # above and the three escape-aware branches below. With those in place
+        # this is strictly widening for segmentation (it can only produce MORE
+        # segment boundaries than before), so it can never turn an existing deny
+        # into an allow.
         while (acn > 0 && acs[acn] < i) acn--   # spans a jump already skipped past
         if (acn > 0 && i == acs[acn]) {
             seg = seg c
@@ -1170,13 +1232,28 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
             i++
             continue
         }
-        if (c == DQ || c == SQ) {
+        # A BACKSLASH-ESCAPED quote (`\"`) is literal text and never OPENS a span
+        # (#113): opening one there let an escaped quote sitting AFTER an active
+        # span pair with a much later quote and copy every real separator between
+        # them as bogus inert text (`echo "$(id)" \" ; <destructive>`). Refusing
+        # to open keeps the separators ACTIVE, which is the narrowing direction.
+        # The forward close scan below still ACCEPTS an escaped quote as the
+        # INERT-span boundary (ending a literal span earlier is also the active
+        # direction, and it is what the pre-#113 walk did), but the ACTIVE-span
+        # bookkeeping resolves a real close through trusted_close() (see below).
+        if ((c == DQ || c == SQ) && !bs_escaped(s, i)) {
             qc = c
             ci = 0
             for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
             if (ci == 0) {
-                seg = seg substr(s, i)   # unterminated quote: copy rest verbatim
-                i = n + 1
+                # Unterminated quote: advance ONE character with separators still
+                # ACTIVE, exactly like qsplit() (#113). Copying the whole rest of
+                # the buffer verbatim — the pre-#113 behaviour here — swallowed
+                # every remaining separator, so a stray or escaped quote anywhere
+                # ahead of a real `; <destructive>` hid it from all three parsers.
+                # One-character advance can only ADD segment boundaries.
+                seg = seg c
+                i++
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
@@ -1193,7 +1270,16 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
                 continue
             }
             seg = seg c        # command substitution present: keep separators ACTIVE
-            acs[++acn] = ci    # ...but remember where the span really ends (#113)
+            # ...but remember where the span really ENDS (#113). The naive "next
+            # quote of the same kind" index is NOT usable here: a backslash-escaped
+            # `\"` inside the span is literal text, so ending the span there would
+            # leave the REAL close to open a bogus span (`echo "$(a \" b)" ;
+            # <destructive>` — a shape the pre-#113 walk denied). trusted_close()
+            # skips escaped candidates and returns 0 when the pairing is ambiguous,
+            # in which case NO close is recorded and this span is walked exactly
+            # the legacy way.
+            tc = trusted_close(s, n, ci, qc)
+            if (tc > 0) acs[++acn] = tc
             i++
             continue
         }
@@ -1324,7 +1410,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, j, inner
 #   - reset --hard: always emitted with <target> = "@HEAD@".
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
 parse_force_ops() {
-    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
                                  # read does not trim an empty cpath.
@@ -1587,7 +1673,7 @@ strip_datasink_literals() {
 # matched, so the guard's own `echo '<json>' | guard-destructive.sh` self-test
 # still redacts and no longer false-blocks (#53). Emits "yes"/"no".
 command_has_shell_segment() {
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_QSPLIT_AWK"'
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         found = 0
@@ -1871,7 +1957,7 @@ fi
 lifecycle_or_cloud_reason() {
     # Emit a deny reason (one per line) for every segment whose command word is a
     # system-lifecycle command or an az/gcloud delete. Portable awk only.
-    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
     BEGIN { buf = "" }
     # Slurp the whole (possibly multi-line) command, then segment ONCE with the
     # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
@@ -2009,7 +2095,7 @@ extract_rm_targets() {
     # so parse_force_ops()/lifecycle_or_cloud_reason() reuse the SAME algorithm
     # instead of duplicating it (see the _ML_QSPLIT_AWK header for the full
     # segmentation contract).
-    printf '%s' "$1" | awk "$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
     BEGIN { buf = "" }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {

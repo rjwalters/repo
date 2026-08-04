@@ -1481,6 +1481,83 @@ assert_allow "#113: quoted \$( ) prefix then a benign command is allowed" \
 assert_allow "#113: inert quoted alternation followed by a later quoted string is allowed" \
     "grep -E \"lifecycle|$_Q113_HALT|poweroff|init 0\" file && echo \"done\""
 
+# --- BACKSLASH-ESCAPED quotes around an active span -------------------------
+#
+# Recording the span's close index is only safe when a BACKSLASH did not make the
+# quote pairing ambiguous. The forward scan finds the NEXT quote of the same
+# kind, which for `"$(a \" b)"` is the ESCAPED one — literal text, not the close.
+# Trusting it ended the span early, so the REAL close was re-read as the opener
+# of a brand-new span, and the swallow this whole block exists to remove came
+# straight back on shapes that denied BEFORE #113 (deny -> allow, the one
+# direction a guard change must never take). The mirror shape is an escaped quote
+# sitting AFTER the span (`echo "$(id)" \" ; …`), which must not OPEN a span at
+# all. Both lexers resolve the close through trusted_close() and treat `\"` as
+# literal text; an unterminated quote now advances one character with separators
+# still ACTIVE instead of swallowing the remainder.
+#
+# Every case below denies on the pre-#113 guard, so they are no-regression pins,
+# not new behaviour.
+_Q113_ESCDQ='"$(a \" b)"'      # escaped double quote INSIDE the span
+_Q113_ESCSQ="'\$(a \\' b)'"    # escaped single quote inside a single-quoted span
+_Q113_ESCEND='"$(a b) \""'     # escaped quote at the very END of the span
+_Q113_ESCBS='"$(a \\" b)"'     # escaped BACKSLASH, then a genuinely real close
+_Q113_TRAILESC='"$(id)" \"'    # escaped quote AFTER the span closes
+
+assert_deny "#113: escaped quote inside the span then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_ESCDQ ; $_Q113_RM"
+
+assert_deny "#113: escaped quote inside the span then an &&-separated lifecycle command denies" \
+    "echo $_Q113_ESCDQ && $_Q113_HALT"
+
+assert_deny "#113: escaped quote inside a SINGLE-quoted span then a ;-separated rm denies" \
+    "echo $_Q113_ESCSQ ; $_Q113_RM"
+
+assert_deny "#113: escaped quote inside a SINGLE-quoted span then an && lifecycle command denies" \
+    "echo $_Q113_ESCSQ && $_Q113_HALT"
+
+assert_deny "#113: escaped quote at the END of the span then an outside-repo rm denies" \
+    "echo $_Q113_ESCEND ; $_Q113_RM"
+
+# An escaped BACKSLASH before the close (`\\"`) leaves a REAL close quote, so the
+# parity helper correctly reports "not escaped" — but the shell re-parses quoting
+# inside `$( )`, so the pairing is ambiguous and trusted_close() records nothing.
+assert_deny "#113: escaped backslash before the real close then an outside-repo rm denies" \
+    "echo $_Q113_ESCBS ; $_Q113_RM"
+
+# ...including with a TRAILING quoted string, the shape that turns a mis-paired
+# close into a bogus inert span swallowing the separators between them.
+assert_deny "#113: escaped backslash before the close, rm, then a trailing quoted string denies" \
+    "echo $_Q113_ESCBS ; $_Q113_RM ; echo \"done\""
+
+assert_deny "#113: escaped quote AFTER the span then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_TRAILESC ; $_Q113_RM"
+
+assert_deny "#113: escaped quote AFTER the span, rm, then a trailing quoted string denies" \
+    "echo $_Q113_TRAILESC ; $_Q113_RM ; echo \"done\""
+
+# qsplit()/command_has_shell_segment() exposure of the same family.
+assert_deny "#113: escaped-quote span, piped-to-shell payload, then a trailing quoted string denies" \
+    "echo $_Q113_ESCDQ ; echo '$_Q113_DANGER' | sh ; echo \"done\""
+
+assert_deny "#113: escaped-quote span then a NEWLINE-separated outside-repo rm denies" \
+    "$(printf 'echo %s\n%s' "$_Q113_ESCDQ" "$_Q113_RM")"
+
+assert_ask_env "#113: escaped-quote span then a force-push still ASKS (parse_force_ops)" \
+    "LOOM_FORCE_SCOPE=all" "echo $_Q113_ESCDQ ; $_Q113_FORCE"
+
+# ...and the escaped-quote handling must not widen the allow side either.
+assert_allow "#113: escaped quote inside the span then a benign command is allowed" \
+    "echo $_Q113_ESCDQ ; echo done"
+
+assert_allow "#113: escaped quote in an INERT quoted span with a benign tail is allowed" \
+    'echo "a \" b" ; echo done'
+
+assert_allow "#113: escaped quote AFTER the span with a benign tail is allowed" \
+    "echo $_Q113_TRAILESC ; echo done"
+
+assert_allow "#113: gh api body carrying an escaped quote is allowed" \
+    'gh api -f body="$(cat file) \" x"'
+
 echo ""
 
 # =========================================================================
