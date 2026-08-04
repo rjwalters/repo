@@ -618,6 +618,52 @@ OUT_MIXED="$(run_codex codex prompt --sandbox read-only)"
 assert_not_contains "codex-runtime: posture flag anywhere in argv suppresses the bypass default" \
     "$OUT_MIXED" "$BYPASS"
 
+# (6b) SECURITY: codex's config-override route to a posture — `-c sandbox_mode=…`
+#      / `--config approval_policy=…` — sets the SAME sandbox/approval posture as
+#      the first-class flags. Injecting --dangerously-bypass-approvals-and-sandbox
+#      on top of a user's `-c sandbox_mode=read-only` silently ESCALATES it to
+#      full bypass (codex-cli 0.146.0 parses the pair exit 0, bypass wins). These
+#      forms must suppress injection and forward argv verbatim.
+declare -a CONFIG_POSTURE_CASES=(
+    "-c sandbox_mode=read-only prompt"
+    "-c sandbox_mode=\"read-only\" prompt"
+    "--config approval_policy=untrusted prompt"
+    "--config=sandbox_mode=workspace-write prompt"
+    "-c approval_policy=untrusted prompt"
+)
+for argv in "${CONFIG_POSTURE_CASES[@]}"; do
+    OUT_CP="$(run_codex codex $argv)"
+    assert_eq "codex-runtime: config-set posture '$argv' forwarded verbatim" \
+        "codex-called:$argv" "$OUT_CP"
+    assert_not_contains "codex-runtime: config-set posture '$argv' is NOT escalated to bypass default" \
+        "$OUT_CP" "$BYPASS"
+done
+
+# (6c) Escalation repro from the Judge's review (PR #111): the exact invocation
+#      that previously injected the bypass flag on top of a read-only posture.
+#      It must now forward argv unchanged with NO bypass flag.
+OUT_ESCALATION="$(run_codex codex -c sandbox_mode=read-only p)"
+assert_eq "codex-runtime: escalation repro '-c sandbox_mode=read-only p' forwarded verbatim" \
+    "codex-called:-c sandbox_mode=read-only p" "$OUT_ESCALATION"
+assert_not_contains "codex-runtime: escalation repro no longer injects bypass" \
+    "$OUT_ESCALATION" "$BYPASS"
+
+# (6d) An UNRELATED `-c`/`--config` key (not sandbox_mode/approval_policy) is a
+#      normal session start with no posture set — injection MUST still happen.
+OUT_UNREL_C="$(run_codex codex -c model=o3 prompt)"
+assert_eq "codex-runtime: unrelated '-c model=o3' still injects bypass (no posture set)" \
+    "codex-called:$BYPASS -c model=o3 prompt" "$OUT_UNREL_C"
+OUT_UNREL_GLUED="$(run_codex codex --config=model=o3 prompt)"
+assert_eq "codex-runtime: unrelated glued '--config=model=o3' still injects bypass" \
+    "codex-called:$BYPASS --config=model=o3 prompt" "$OUT_UNREL_GLUED"
+
+# (6e) A posture-looking string inside a QUOTED PROMPT is not a real option arg —
+#      the scan must not be fooled into suppressing injection. (Mirrors the
+#      false-suppression guard for `--sandbox`, now for the config route.)
+OUT_QUOTED="$(run_codex codex 'explain -c sandbox_mode=read-only in codex')"
+assert_eq "codex-runtime: config posture inside a quoted prompt is not a flag (bypass still injected)" \
+    "codex-called:$BYPASS explain -c sandbox_mode=read-only in codex" "$OUT_QUOTED"
+
 # (7) Fail-transparent: if the helper functions are somehow absent (a user's
 #     partial edit inside the markers), codex() must fall through to a plain
 #     `command codex "$@"` — argv unchanged, and crucially NOT injecting the

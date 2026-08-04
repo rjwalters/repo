@@ -455,15 +455,43 @@ _repo_codex_is_session() {
 # True (0) if argv already carries an explicit approval/sandbox posture, in
 # which case codex() must NOT inject its dangerous default. Recognizes, in both
 # `--flag value` and `--flag=value` forms: --sandbox/-s, --ask-for-approval/-a,
-# and --dangerously-bypass-approvals-and-sandbox. Deliberately generous (a
-# false positive only declines the dangerous default — the safe direction).
+# and --dangerously-bypass-approvals-and-sandbox.
+#
+# ALSO recognizes codex's first-class config-override route to the SAME posture:
+# `-c sandbox_mode=…` / `-c approval_policy=…` and the `--config …` long form
+# (both the split `-c key=value` / `--config key=value` and the glued
+# `--config=key=value` / `-c=key=value` shapes). Codex (verified against
+# codex-cli 0.146.0) applies these `~/.codex/config.toml` keys as overrides, so
+# `codex -c sandbox_mode=read-only` sets a real posture — and injecting the
+# bypass flag on top silently ESCALATES it. We therefore treat ANY `-c`/`--config`
+# that mentions `sandbox_mode` or `approval_policy` (any value, quoted or not) as
+# posture-present and decline to inject. Only a *real* `-c`/`--config` option arg
+# counts — a posture-looking substring inside a quoted prompt is not matched, and
+# an unrelated key (e.g. `-c model=o3`) does not suppress. Deliberately generous
+# (a false positive only declines the dangerous default — the safe direction).
 _repo_codex_has_posture_flag() {
-  local arg
+  local arg prev=""
   for arg in "$@"; do
     case "$arg" in
       -s|--sandbox|-a|--ask-for-approval|--dangerously-bypass-approvals-and-sandbox) return 0 ;;
       --sandbox=*|--ask-for-approval=*|-s=*|-a=*) return 0 ;;
       -s?*|-a?*) return 0 ;;
+    esac
+    # Config-override posture (glued forms): --config=key=value / -c=key=value.
+    case "$arg" in
+      --config=*sandbox_mode*|--config=*approval_policy*|-c=*sandbox_mode*|-c=*approval_policy*) return 0 ;;
+    esac
+    # Config-override posture (split form): a bare `-c`/`--config` seen on the
+    # previous arg means THIS arg is its value — match the posture keys anywhere
+    # inside it (covers `-c sandbox_mode=…` and quoted `-c 'sandbox_mode=…'`).
+    if [ "$prev" = "-c" ] || [ "$prev" = "--config" ]; then
+      case "$arg" in
+        *sandbox_mode*|*approval_policy*) return 0 ;;
+      esac
+    fi
+    case "$arg" in
+      -c|--config) prev="$arg" ;;
+      *) prev="" ;;
     esac
   done
   return 1
