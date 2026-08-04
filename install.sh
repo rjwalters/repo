@@ -448,6 +448,39 @@ success "Wrote install-metadata.json"
 } >"$TARGET/.claude/skills/repo/.install-local.json"
 success "Wrote .install-local.json (machine-local, gitignored)"
 
+# A previously-tracked sidecar (pre-split installs, or a repo that accidentally
+# committed it) is a trap: gitignoring it below does not untrack it, and whoever
+# later `git rm --cached`s it produces a commit that DELETES the working-tree
+# copy in every other checkout on pull (that is how git represents "no longer
+# tracked" — see repo#96). Stage the untracking ourselves, in this same install
+# run, with an explicit warning, instead of leaving it to be discovered
+# downstream as an unexplained deletion. Not gated on $DEV: a tracked sidecar is
+# a problem to fix regardless of install mode, and the sidecar write above is
+# itself unconditional. `git rm --cached` only touches the index, so the
+# freshly-written working-tree file here is preserved. Uses `ls-files
+# --error-unmatch` rather than `check-ignore` because tracked-ness and
+# ignored-ness are orthogonal — a tracked file can also match a .gitignore
+# pattern, and check-ignore says nothing about the index.
+SIDECAR_PATH=".claude/skills/repo/.install-local.json"
+if git -C "$TARGET" ls-files --error-unmatch "$SIDECAR_PATH" >/dev/null 2>&1; then
+  # --force only overrides git's staged-content safety check; with --cached the
+  # working-tree file is never removed either way. Report a failed untracking
+  # instead of claiming one that did not happen.
+  if git -C "$TARGET" rm --cached --quiet --force "$SIDECAR_PATH" 2>/dev/null; then
+    warning "$SIDECAR_PATH was already tracked in git — staged for untracking"
+    warning "(git rm --cached). Once you commit and push this, git will DELETE the"
+    warning "working-tree copy of this file in every OTHER checkout that pulls the"
+    warning "commit (standard git behavior for untracking a file, not a bug here)."
+    warning "Fix on those checkouts: just re-run this installer — it regenerates"
+    warning "the sidecar in seconds and is fully idempotent."
+  else
+    warning "$SIDECAR_PATH is tracked in git but could not be staged for untracking."
+    warning "Run 'git rm --cached $SIDECAR_PATH' by hand, and note that committing it"
+    warning "will DELETE the working-tree copy in every OTHER checkout that pulls the"
+    warning "commit — re-run this installer there to regenerate the sidecar."
+  fi
+fi
+
 # Ensure the sidecar is gitignored on every install. Dev mode ignores the whole
 # .claude/ tree in step 4 below (which already covers the sidecar), so only the
 # copy install needs an explicit entry here. Guard with check-ignore so we skip

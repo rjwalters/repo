@@ -106,6 +106,21 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   Likewise, if a candidate doesn't clearly belong to any discovered repo,
   surface it for a target decision rather than dropping it or guessing.
 
+  **Signature check: distinguish "never installed here" from "sidecar was
+  deleted by a pull"** (kept consistent with `/repo:update-tools`, whose
+  discovery this reuses). If `install-metadata.json` exists — proof a successful
+  install previously ran in *this* checkout — but no sidecar is present **and**
+  no legacy inline `source` / `installed_at` fields exist in
+  `install-metadata.json` either, that combination is also what a previously
+  *tracked* `.install-local.json` produces once it is untracked upstream and this
+  checkout pulls that commit: git deletes the untracked file's working-tree copy
+  in every checkout except the one that ran `git rm --cached` (repo#96). Still
+  mark the target UNKNOWN (there is no path to read), but append the distinct
+  suggestion `"sidecar missing but install-metadata.json present — if this was
+  previously installed, re-run <tool>'s installer to regenerate the sidecar."`
+  rather than treating it identically to a fresh clone. A genuinely fresh clone
+  (no `install-metadata.json` at all) gets no such suggestion.
+
 Honor scope flags: `--here` keeps only this-repo targets; `--repo <tool>`
 restricts to a single discovered tool.
 
