@@ -22,12 +22,15 @@ call, never auto-deleted.
 /repo:tidy                    # Inventory, delete SAFE junk (caches kept), report; ASK items presented
 /repo:tidy --caches           # Also clear regenerable caches (__pycache__/, dist/, .mypy_cache/, …)
 /repo:tidy --ask              # Walk every category interactively before deleting anything
+/repo:tidy --sizes            # Also measure worktree root sizes (slow: du has no prune)
 /repo:tidy packages/core      # Scope to one subtree
 ```
 
 (`--apply` is accepted as a synonym for the default, for muscle memory. `--caches`
 composes with `--ask`: `--ask` still walks every category, `--caches` just moves
-the cache tier into the auto-delete set for the non-interactive default.)
+the cache tier into the auto-delete set for the non-interactive default.
+`--sizes` only adds the per-worktree size column described in step 1 — it never
+changes what is deleted.)
 
 ## Steps
 
@@ -59,10 +62,21 @@ find . \( -path './.git' -o -name node_modules -o -name target \
 # which `git clean` never sees.
 git worktree list --porcelain
 
-# Size of each worktree root, for the inventory line in step 3. Bounded by the
-# number of worktrees (typically a handful), so one `du -sh` per root is cheap
-# enough — unlike a `du` over the whole tree, which is not.
-git worktree list --porcelain | awk '/^worktree /{print $2}' | xargs -I{} du -sh {}
+# The worktree paths alone, for step 3's WORKTREES block. Extract them with
+# `sed`, not `awk '{print $2}'`: awk splits on whitespace and would truncate
+# `/repos/my checkout/wt` to `/repos/my`. The `worktree ` prefix is fixed, so
+# stripping it with sed and reading whole lines keeps paths with spaces intact
+# (paths containing newlines need `git worktree list --porcelain -z`).
+git worktree list --porcelain | sed -n 's/^worktree //p'
+
+# Worktree SIZES ARE NOT COLLECTED BY DEFAULT — only when `--sizes` is passed.
+# See below for why. When it is passed, bound each root so a slow one degrades
+# the size column instead of stalling the step:
+git worktree list --porcelain | sed -n 's/^worktree //p' \
+  | while IFS= read -r wt; do
+      timeout 20 du -sh "$wt" 2>/dev/null \
+        || printf '%s\t%s\n' 'size unavailable' "$wt"
+    done
 ```
 
 Both `find` walks `-prune` the heavy trees rather than filtering them out with
@@ -87,9 +101,46 @@ git does its own traversal. When editing the prune list:
   pruned.** They are small, and step 2 needs to see their empty directories in
   order to route them to ASK.
 
-The **first** `worktree` entry is the main working tree — the repo being tidied
-(`git rev-parse --show-toplevel`). Drop it; the rest are the linked worktrees
-this command cares about.
+**Worktree sizes are opt-in (`--sizes`); the default inventory reports count and
+paths only.** `du` has no `-prune`: sizing a worktree root re-enters the very
+`node_modules/`, `target/`, `dist/`, and `.venv/` trees the two `find` walks
+above were rewritten to skip, once per root — and the reported case that
+motivated all of this is 66 GB of worktrees inside a 94 GB tree, so sizing the
+roots is most of a `du` over the whole repo. The cost is bounded by inode count
+under those roots, not by the number of worktrees, so "there are only a handful
+of them" is not a bound at all. That makes an eager `du` the same unbounded walk
+that blew a 120-second timeout and stalled this step before.
+
+Making it a flag is the same call the command already makes for `--caches`:
+work whose *result* is useful but whose *cost* is high is presented, not
+performed, until asked for. It also keeps the fix for the failure this block
+exists to prevent — a report of "nothing to tidy" on a tree with tens of
+gigabytes in worktrees — because the count and the paths are what carry that
+signal, and they are free (`git worktree list` reads
+`.git/worktrees/`, it does not walk the trees). The size column is the
+refinement, not the point.
+
+When `--sizes` is passed, the sizes are **best-effort**: wrap each root in
+`timeout 20` and print `size unavailable` for any root that exceeds it rather
+than letting one enormous worktree hang the inventory. (`timeout` is GNU
+coreutils — on macOS it is `gtimeout` from `brew install coreutils`. If neither
+is available, report sizes as unavailable rather than running the walk
+unbounded.) Do not prune inside the `du`: an "excluding regenerable trees"
+number would understate exactly the footprint the operator is looking for. The
+honest choices are a bounded full number or none.
+
+The **first** `worktree` entry is the **main** working tree — always, regardless
+of where the command runs from. It is *not* necessarily
+`git rev-parse --show-toplevel`: from inside a linked worktree (which is where
+Loom agents run, e.g. `.loom/worktrees/issue-42`), `--show-toplevel` reports the
+linked worktree's own root while the first porcelain entry is still the main
+repo. Do not treat the two as the same path.
+
+What to drop from the list is **the tree being tidied** — the entry whose path
+equals `git rev-parse --show-toplevel` — since that is the repo this run is
+sweeping, not a worktree it is protecting from itself. Every remaining entry,
+including the main working tree when tidy is invoked from a linked worktree, is
+a live checkout to report and protect.
 
 `git worktree list --porcelain` is **authoritative**. A directory whose `.git`
 is a **file** (not a directory) containing `gitdir: …/.git/worktrees/…` is also
@@ -159,9 +210,10 @@ overrides everything below, regardless of gitignore status):**
   A nested worktree shows up in `git clean -ndX` as `Would skip repository
   <path>` — plain `git clean -fdX` leaves it alone, but `-ffdX` (double force)
   deletes it outright, so never widen the force flag to make a listing "go
-  away". Report these with their size (below); deciding which worktrees are
-  *reclaimable* needs merge state and agent liveness that `/repo:tidy` does not
-  have, so it stays a report, never a deletion.
+  away". Report these (with their size when `--sizes` is passed — see below);
+  deciding which worktrees are *reclaimable* needs merge state and agent
+  liveness that `/repo:tidy` does not have, so it stays a report, never a
+  deletion.
 - Anything else that looks credential-like or holds unique local state
   (local SQLite DBs, local-only config, sample-data caches)
 
@@ -208,17 +260,18 @@ reserved for tracked files.
     `.anvil/`, or `.wrangler/` coordination or runtime-state dir) — emptiness
     is that tool's normal state, so it lands here rather than in SAFE.
   - **Any git worktree root** detected in step 1 — surfaced on its own
-    `worktree:` inventory line with its size (see Report), never auto-deleted,
-    whether or not it is gitignored and whether or not it sits under a
-    recognized tool dot-directory.
+    `worktree:` inventory line (see Report), never auto-deleted, whether or not
+    it is gitignored and whether or not it sits under a recognized tool
+    dot-directory.
   - **Any gitignored file that does not match the SAFE or CACHE allowlist** (a
     novel/unrecognized cache dir, unrecognized local state) — when in doubt, it
     lands here, not in SAFE or CACHE.
 
   Deciding which worktrees, branches, and stashes are *stale* remains
   [[reset]]'s job — point there instead of pruning them here. `/repo:tidy`'s
-  job with worktrees is only **visibility and protection**: report each root
-  and its size so the operator can see the footprint, and never delete one.
+  job with worktrees is only **visibility and protection**: report every root
+  (and its size under `--sizes`) so the operator can see the footprint, and
+  never delete one.
 - **KEEP** — flagged only as information: tracked files that look like they
   don't belong (build output that got committed — point to [[gitignore]]).
 
@@ -246,24 +299,39 @@ ASK:
   notes-scratch.md         untracked, 3 KB, modified today  ← might be real work
   sim-output-old/          untracked, 1.2 GB, untouched 60 days
 
-WORKTREES (66 GB across 4 roots — never auto-deleted, listed for visibility):
-  worktree: .loom/worktrees/issue-42        32 GB  ← live git worktree
-  worktree: .claude/worktrees/scratch-wt     3.1 GB  ← live git worktree
-  worktree: ../repo-wt-fix123                12 GB  ← live git worktree (outside repo root)
-  worktree: /private/tmp/wt-bisect            19 GB  ← live git worktree (outside repo root)
+WORKTREES (4 roots — never auto-deleted, listed for visibility; --sizes to measure):
+  worktree: .loom/worktrees/issue-42      ← live git worktree
+  worktree: .claude/worktrees/scratch-wt  ← live git worktree
+  worktree: ../repo-wt-fix123             ← live git worktree (outside repo root)
+  worktree: /private/tmp/wt-bisect        ← live git worktree (outside repo root)
   Pruning stale worktrees is /repo:reset's call, not tidy's.
 
 KEEP (informational):
   assets/build.min.js      tracked but looks generated — see /repo:gitignore
 ```
 
+With `--sizes`, the same block gains a right-aligned size column and a total
+(`size unavailable` for any root that hit the `timeout`):
+
+```
+WORKTREES (66 GB across 4 roots — never auto-deleted, listed for visibility):
+  worktree: .loom/worktrees/issue-42       32 GB  ← live git worktree
+  worktree: .claude/worktrees/scratch-wt  3.1 GB  ← live git worktree
+  worktree: ../repo-wt-fix123              12 GB  ← live git worktree (outside repo root)
+  worktree: /private/tmp/wt-bisect         19 GB  ← live git worktree (outside repo root)
+  Pruning stale worktrees is /repo:reset's call, not tidy's.
+```
+
 The `WORKTREES` block is a **distinct inventory section**, not folded into the
-generic denylist ASK lines, and its bytes are summed **separately** from the
-SAFE/CACHE/ASK totals (a worktree's contents are neither freed nor freeable by
-this command). Print it whenever at least one worktree root exists — including
-on an otherwise-clean run, so `/repo:tidy` never reports "nothing to tidy" on a
-tree where tens of gigabytes are sitting in worktrees with no hint of where the
-space went.
+generic denylist ASK lines, and under `--sizes` its bytes are summed
+**separately** from the SAFE/CACHE/ASK totals (a worktree's contents are neither
+freed nor freeable by this command); roots whose size is unavailable are
+excluded from the total and the total is marked as a lower bound. Print the
+block whenever at least one worktree root exists — including on an
+otherwise-clean run and including without `--sizes`, so `/repo:tidy` never
+reports "nothing to tidy" on a tree where tens of gigabytes are sitting in
+worktrees with no hint of where the space went. The count and the paths are what
+carry that signal; the sizes only quantify it.
 
 If the repo documents its **own** worktree-management tooling — a script,
 `package.json` command, `Makefile` target, or binary the repo's own docs point
@@ -335,6 +403,7 @@ inventory to confirm and report bytes freed.
    protection from a dot-directory prefix: `.claude/worktrees/`, a sibling
    `../repo-wt-fix123`, and a worktree under `/private/tmp/` are all protected
    by this rule and none of them are matched by rule 6's prefix list. Report
-   each root and its size (see Report) even when nothing is deleted — the one
-   thing worse than deleting a worktree is telling the operator their 94 GB
-   tree is clean.
+   every root (see Report) even when nothing is deleted — the one thing worse
+   than deleting a worktree is telling the operator their 94 GB tree is clean.
+   Sizing those roots is a `du` with no `-prune`, so it is opt-in behind
+   `--sizes` and bounded per root; the report itself never is.
