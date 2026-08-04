@@ -43,14 +43,40 @@ git clean -ndX
 git clean -nd
 
 # Empty directories
-find . -type d -empty -not -path './.git/*'
+find . \( -path './.git' -o -name node_modules -o -name target \
+          -o -name dist -o -name .venv \) -prune \
+     -o -type d -empty -print
 
 # Large files in the working tree (>10 MB, tracked or not)
-find . -type f -size +10M -not -path './.git/*' -not -path './node_modules/*'
+find . \( -path './.git' -o -name node_modules -o -name target \
+          -o -name dist -o -name .venv \) -prune \
+     -o -type f -size +10M -print
 
 # Stale worktrees
 git worktree list
 ```
+
+Both `find` walks `-prune` the heavy trees rather than filtering them out with
+`-not -path`. `-not -path` only suppresses *printing* — `find` still descends
+into `.git/`, `node_modules/`, and every other excluded directory, which is why
+the inventory stalls on a repo with a multi-GB build tree. Pruning is a
+**traversal optimization only and must never change what is reported**: junk
+outside the pruned trees (an empty `build/`, an 11 MB file under `src/`) is
+still listed exactly as before, and `git clean -ndX`/`-nd` are unaffected since
+git does its own traversal. When editing the prune list:
+
+- **Keep both invocations' lists identical.** If they drift, one command
+  silently reintroduces the stall.
+- **Draw entries from the denylist and CACHE categories already named in step 2**
+  (`node_modules/`, `.venv/`, `dist/`, plus `target/` for Rust builds) instead
+  of growing a second, inconsistent list.
+- **Match by `-name`, not `-path`** (except `./.git`, which is unambiguously at
+  the root). `-name` prunes at any depth, so nested copies like
+  `packages/foo/node_modules/` are covered — the old
+  `-not -path './node_modules/*'` only ever matched the top-level one.
+- **Coordination roots (`.loom/`, `.anvil/`, `.wrangler/`) are deliberately not
+  pruned.** They are small, and step 2 needs to see their empty directories in
+  order to route them to ASK.
 
 Also look for junk by pattern, wherever it lives:
 - OS/editor droppings: `.DS_Store`, `Thumbs.db`, `*~`, `*.swp`, `.#*`
