@@ -23,6 +23,48 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 GUARD="$REPO_ROOT/hooks/repo/guard-destructive.sh"
 
+# --- Ambient guard-env neutralization (#134) --------------------------------
+# Loom's sweep dispatcher exports vars like LOOM_FORCE_SCOPE=protected and
+# LOOM_GUARD_DECISION_LOG=1 into every spawned agent's shell. Those are exactly
+# the toggles this file's no-env assertion family (assert_deny/assert_ask/
+# assert_allow — see run_guard above, which invokes "$GUARD" with whatever
+# environment the test *process* inherited) exercises the DEFAULT for. An
+# ambient value therefore silently changes what "default" means for ~10 cases,
+# without a single line of this file changing: the identical suite reports
+# 1421 pass / 0 fail in a clean shell and 10 (unrelated-looking) case failures
+# inside a dispatched-agent environment. This is the *general* form of the
+# #3913 lesson already pinned once below as a narrow, local fix (the #113 /
+# #130 force-push cases that pin LOOM_FORCE_SCOPE=all explicitly so an ambient
+# value can't decide them) — #134 is a second, costlier occurrence of the same
+# hazard: a dispatched agent saw the 10 failures, concluded they were
+# pre-existing flakiness, and closed an unrelated issue (#130) without doing
+# the required work. Do not strip this block as "redundant" with the #113 pin
+# below — that pin covers one case; this covers the other ~580 in this file.
+#
+# Fix: neutralize every guard-related toggle env var — BOTH the REPO_* name
+# and its legacy LOOM_* alias, since guard-destructive.sh's own precedence
+# contract has REPO_* win over LOOM_* (an ambient REPO_FORCE_SCOPE alone can
+# still outrank a case's explicit local LOOM_FORCE_SCOPE=... override) — before
+# any assert_* case runs, so this suite's own results never depend on what the
+# calling shell happened to export. Cases that genuinely need a non-default
+# scope keep setting it explicitly and locally via assert_*_env / an inline
+# `env VAR=val`, unaffected by this: `env VAR=val "$GUARD"` sets VAR in the
+# guard's child process regardless of what this preamble did up here.
+for _guard_env_var in \
+    REPO_GUARD_READONLY_FASTPATH LOOM_GUARD_READONLY_FASTPATH \
+    REPO_GUARD_SQL LOOM_GUARD_SQL \
+    REPO_GUARD_CLOUD LOOM_GUARD_CLOUD \
+    REPO_GUARD_REVERSIBLE_GH LOOM_GUARD_REVERSIBLE_GH \
+    REPO_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG \
+    REPO_GUARD_DECISION_LOG_FILE LOOM_GUARD_DECISION_LOG_FILE \
+    REPO_RM_SCOPE LOOM_RM_SCOPE \
+    REPO_FORCE_SCOPE LOOM_FORCE_SCOPE \
+    REPO_DEFAULT_BRANCH LOOM_DEFAULT_BRANCH \
+    LOOM_WORKTREE_ROOT; do
+    unset "$_guard_env_var"
+done
+unset _guard_env_var
+
 PASS=0
 FAIL=0
 TOTAL=0
