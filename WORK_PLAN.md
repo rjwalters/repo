@@ -15,7 +15,7 @@ _No issues currently marked `loom:issue` (human/Champion-approved, awaiting a Bu
 
 ## Proposed
 
-_No issues currently marked `loom:architect`, `loom:hermit`, or `loom:curated`._
+- **#145**: tidy: offer package-manager-native pruning of orphaned node_modules content (pnpm prune / npm prune) *(curated)*
 
 ## Epics
 
@@ -23,5 +23,5 @@ _No open `loom:epic` issues._
 
 ## Needs triage
 
-- **#145**: tidy: offer package-manager-native pruning of orphaned node_modules content (pnpm prune / npm prune) *(unlabeled, awaiting Curator)*
+_No open issues awaiting Curator._
 <!-- guide:plan-body:end -->
