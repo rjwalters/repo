@@ -273,7 +273,72 @@ reserved for tracked files.
   (and its size under `--sizes`) so the operator can see the footprint, and
   never delete one.
 - **KEEP** — flagged only as information: tracked files that look like they
-  don't belong (build output that got committed — point to [[gitignore]]).
+  don't belong. Nothing here is ever deleted — safety rule 1 is absolute — but
+  "looks like it doesn't belong" covers two shapes whose remedies are
+  **opposite**, so KEEP is reported as two named sub-cases and never as one
+  collapsed list:
+  - **KEEP (generated)** — a tracked file that looks like build output or some
+    other regenerable artifact that got committed by accident
+    (`assets/build.min.js`). It is inert: nothing reads it as source, it is
+    just noise in the history and the diff. The remedy is to stop tracking it
+    and ignore it going forward, which is [[gitignore]]'s job — point there.
+    This is what KEEP has always meant, and this sub-case is unchanged.
+  - **KEEP (name collision)** — a tracked file whose **trailing extension is a
+    live source extension in this repo**, so every tool that walks the project
+    by extension (compilers, EDA tools, linters, IDEs) opens it as real source.
+    This one is not inert, and [[gitignore]] is the **wrong** pointer for it:
+    the file is already tracked, already on disk, and already being parsed, so
+    adding an ignore rule changes nothing about the harm. The only remedy is a
+    deliberate `git rm` — see **The printed recipe** below.
+
+    Detection is a **naming heuristic, not a content check**: no file is opened
+    or parsed to make this call. It runs over **tracked files only**, since an
+    untracked or gitignored file is another tier's problem:
+
+    ```bash
+    # The candidate set and the sibling set are both drawn from here.
+    git ls-files
+    ```
+
+    A tracked file is a name collision when **both** conditions hold:
+
+    1. Its basename carries a backup/copy marker **in the stem — before the
+       final `.`**: `*backup*`, `*copy*`, or `*.orig.`, matched
+       **case-insensitively** (`Connectors_BACKUP_20260427.kicad_sch`,
+       `schematic copy.kicad_sch`, `parser.orig.rs`).
+    2. Its trailing extension has **real siblings**: at least one *other*
+       tracked file ends in the same `.<ext>` and carries **no** such marker.
+       That sibling test is what makes `<ext>` a live source extension *for
+       this repo*. Never match against a hardcoded global extension list — a
+       `.kicad_sch` collision matters only in a repo that has real `.kicad_sch`
+       files, and in a repo with no such siblings the same filename is just a
+       file with an unusual name.
+
+    Condition 1 is deliberately about the **stem**, and that is what keeps the
+    inert shape out. `connectors_backup_20260427_163100.kicad_sch` collides:
+    its trailing extension really is `.kicad_sch`, so KiCad loads it as a
+    schematic sheet and its contents are counted a second time.
+    `connectors.kicad_sch.backup-20260427_163100` does **not** collide: its
+    trailing extension is `.backup-20260427_163100`, the marker *is* the
+    extension rather than part of the stem, no other tracked file shares that
+    extension, and no extension-walking tool will ever open it. Flagging the
+    second shape alongside the first would bury the signal, which is the whole
+    point of the sub-case: separate the backups that are actively being parsed
+    from the ones that are harmlessly sitting there.
+
+    **The printed recipe.** For each collision, print a literal,
+    copy-pasteable `git rm <path>` line plus a one-line reason naming the tool
+    class that parses the file and what that costs. `/repo:tidy` **prints this
+    string and nothing else** — it never runs `git rm`, never stages it, and
+    never offers to run it, not under `--ask`, `--apply`, or any other flag.
+    Removing a tracked file is a commit the user makes deliberately (safety
+    rule 1); the recipe exists so that decision is one paste away instead of a
+    research task, exactly as the [[gitignore]] pointer is for the generated
+    sub-case.
+
+  Print each sub-header **only when it has entries**. A repo with nothing
+  colliding must not grow an empty `name collision` heading — an empty tier
+  reads as a finding, and this one is meant to read as an alarm.
 
 ### 3. Report
 
@@ -306,9 +371,27 @@ WORKTREES (4 roots — never auto-deleted, listed for visibility; --sizes to mea
   worktree: /private/tmp/wt-bisect        ← live git worktree (outside repo root)
   Pruning stale worktrees is /repo:reset's call, not tidy's.
 
-KEEP (informational):
-  assets/build.min.js      tracked but looks generated — see /repo:gitignore
+KEEP (informational) — tracked files, never deleted by tidy (safety rule 1):
+
+  generated — committed build output; stop tracking it going forward:
+    assets/build.min.js      tracked but looks generated — see /repo:gitignore
+
+  name collision — tracked AND parsed as real source; gitignoring fixes nothing:
+    connectors_backup_20260427_163100.kicad_sch
+      why: 14 real .kicad_sch files in this tree, so KiCad opens this backup as
+           a schematic sheet and its contents are counted twice
+      run deliberately (tidy will not run this for you):
+        git rm connectors_backup_20260427_163100.kicad_sch
 ```
+
+The two KEEP sub-blocks are formatted differently on purpose: the generated
+sub-case is a one-line pointer at another command, while the name-collision
+sub-case gets its own indented `why:` line and a `git rm` recipe on a line of
+its own, because the operator has to read the reason before running it. Print
+whichever sub-blocks have entries and omit the others entirely — on the common
+repo where nothing collides, the output is the single `generated` block and is
+byte-for-byte what it has always been. The `git rm` line above is **report
+text**: it is printed for the operator to run, never executed by `/repo:tidy`.
 
 With `--sizes`, the same block gains a right-aligned size column and a total
 (`size unavailable` for any root that hit the `timeout`):
@@ -354,6 +437,14 @@ guessing** at a command that may not exist.
   CACHE; delete only what they approve. (`--ask` already surfaces caches for a
   decision, so `--caches` is redundant with it — the flag only affects the
   non-interactive default.)
+- **KEEP is never part of the apply step, under any flag.** Both sub-cases are
+  tracked files, so both are report-only: `/repo:tidy` never runs `git rm`,
+  never stages a tracked-file deletion, and never prompts to do either — not
+  even for a name collision, and not even under `--ask`. The `git rm <path>`
+  line in the report is a string printed for the operator, in exactly the same
+  sense as the `see /repo:gitignore` pointer beside it. If a future change ever
+  needs tidy to *perform* it, that is a different command with a different
+  safety story, not a flag on this one.
 
 The default auto-delete is scoped to **SAFE-allowlisted paths only** (plus the
 CACHE allowlist when `--caches` is passed). Never pass a denylisted path

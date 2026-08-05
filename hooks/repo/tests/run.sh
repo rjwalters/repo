@@ -19,8 +19,9 @@
 # test-install-sidecar-untracking.sh,
 # test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
-# commands/repo/tests/test-verify-fix-persistence.sh, and
-# commands/repo/tests/test-early-sync-switch.sh.
+# commands/repo/tests/test-verify-fix-persistence.sh,
+# commands/repo/tests/test-early-sync-switch.sh, and
+# commands/repo/tests/test-tidy-keep-tiers.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -565,6 +566,46 @@ else
     PASS=$((PASS + ES_PASS))
     FAIL=$((FAIL + ES_FAIL))
     record_suite "test-early-sync-switch.sh" "$ES_PASS" "$ES_FAIL" "$ES_NOTE"
+fi
+
+# /repo:tidy's two KEEP sub-cases: the name-collision naming heuristic (marker in
+# the stem + an extension with real tracked siblings), the inert shape it must
+# not flag, empty sub-header suppression, and the fence-level guard that the
+# printed `git rm` recipe never becomes an executed one (repo#120). Same
+# delegation shape as the suites above.
+echo
+echo "-- tidy KEEP generated/name-collision split (delegated suite) --"
+TK_TEST="$TESTS_DIR/../../../commands/repo/tests/test-tidy-keep-tiers.sh"
+if [[ ! -f "$TK_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-tidy-keep-tiers.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-tidy-keep-tiers.sh" "$TK_TEST"
+else
+    TK_OUT="$(bash "$TK_TEST" 2>&1)"
+    TK_STATUS=$?
+    TK_PASS="$(suite_count Passed "$TK_OUT")"
+    TK_FAIL="$(suite_count Failed "$TK_OUT")"
+    # Skips are neither pass nor fail — surfaced as a note only, same as above.
+    TK_SKIP="$(suite_count Skipped "$TK_OUT")"
+    TK_NOTE="tidy KEEP sub-cases"
+    [[ "$TK_SKIP" =~ ^[0-9]+$ && "$TK_SKIP" -gt 0 ]] && TK_NOTE+=" — $TK_SKIP skipped"
+    if ! [[ "$TK_PASS" =~ ^[0-9]+$ && "$TK_FAIL" =~ ^[0-9]+$ ]]; then
+        TK_PASS=0
+        TK_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-tidy-keep-tiers.sh" "$TK_STATUS"
+        strip_ansi "$TK_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$TK_STATUS" -ne 0 || "$TK_FAIL" -ne 0 ]]; then
+        [[ "$TK_FAIL" -eq 0 ]] && TK_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-tidy-keep-tiers.sh" "$TK_PASS" "$TK_FAIL" "$TK_STATUS"
+        strip_ansi "$TK_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-tidy-keep-tiers.sh" "$TK_PASS"
+    fi
+    PASS=$((PASS + TK_PASS))
+    FAIL=$((FAIL + TK_FAIL))
+    record_suite "test-tidy-keep-tiers.sh" "$TK_PASS" "$TK_FAIL" "$TK_NOTE"
 fi
 
 echo
