@@ -1109,9 +1109,13 @@ update_work_log() {
   local last_pr=$(work_log_max_pr)
   local last_issue=$(work_log_max_issue)
 
-  # Get newly merged PRs (after high-water mark)
-  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt \
-    --jq "[.[] | select(.number > $last_pr)] | sort_by(.mergedAt) | reverse")
+  # Get newly merged PRs (after high-water mark). Excludes the Guide's own
+  # docs-maintenance PRs (branch prefix `docs/guide-update-`) — otherwise each
+  # merged docs PR is logged as "new work" on the very next tick, which
+  # mutates WORK_LOG.md and re-triggers create_docs_pr(), producing an
+  # infinite self-referential loop of docs PRs (#151).
+  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select(.number > $last_pr) | select(.headRefName | startswith(\"docs/guide-update-\") | not)] | sort_by(.mergedAt) | reverse")
 
   # Get newly closed issues (after high-water mark)
   local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
