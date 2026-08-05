@@ -106,26 +106,57 @@ assert_not_contains() {  # <label> <haystack> <needle>
 # keep_collision <repo> -> the tracked paths that classify as KEEP (name
 #   collision), newline-separated, in `git ls-files` order.
 #
-#   Mirrors the two conditions in tidy.md step 2's "KEEP (name collision)"
-#   sub-case. Both are pure name arithmetic: no file is opened, and the whole
-#   candidate AND sibling set come from `git ls-files`, so untracked and
+#   Mirrors the three conditions in tidy.md step 2's "KEEP (name collision)"
+#   sub-case. All three are pure name arithmetic: no file is opened, and the
+#   whole candidate AND sibling set come from `git ls-files`, so untracked and
 #   gitignored files are structurally out of scope.
 #
-#     1. the basename carries `backup` / `copy` / a `.orig` component in the
+#     1. the basename carries the substring `backup` / `copy` / `orig` in the
 #        STEM (everything before the final `.`), case-insensitively
 #     2. the trailing extension has "real" siblings: some OTHER tracked file
-#        ends in the same extension and carries no such marker
+#        ends in the same extension and carries no such marker — and the
+#        extension does not itself carry a marker (`.orig`, `.backup-<ts>`)
+#     3. stripping the trailing MARKER RUN off the stem leaves a non-empty
+#        base that is itself tracked, in the same directory, with the same
+#        extension — the file this one is a backup *of*
 #
 #   Condition 2 is what makes the extension list per-repo. A marker-shaped file
 #   never counts as its own sibling, so a lone `notes_backup.kicad_sch` in a
 #   repo with no real schematics is not a collision.
+#
+#   Condition 3 is what separates a provenance STAMP from a mere TOPIC. Without
+#   it, conditions 1+2 flag any ordinary source file whose name contains the
+#   word — `copyright.py`, `BackupManager.ts`, `copy_utils.ts`, `backup.py` —
+#   and print a `git rm` recipe for each. See the "ordinary repo" fixture.
 keep_collision() {
     local r="$1"
     git -C "$r" ls-files | awk '
+        # A stem or an extension is "marked" when it carries one of the three
+        # markers as a substring. Inputs are already lowercased, so this is the
+        # case-insensitive match condition 1 documents.
+        function marked(s) {
+            return (index(s, "backup") || index(s, "copy") || index(s, "orig"))
+        }
+        # base_of(stem) -> the stem with a TRAILING marker run removed, or ""
+        # when there is no such run. The run is the separator(s) in front of
+        # the marker word, the marker word itself, and any timestamp or copy
+        # index (digits and separators) behind it. A marker glued into a longer
+        # word (copyright, backupmanager, deepcopy_helpers) is not a run; a
+        # marker with nothing in front of it (backup.py, copy_utils.ts) leaves
+        # no base. Both cases return "" and are therefore not collisions.
+        function base_of(stem,   t) {
+            t = stem
+            if (sub(/[ ._-]+(backup|copy|orig)[0-9 ._-]*$/, "", t) && t != "")
+                return t
+            return ""
+        }
         {
             path[NR] = $0
             n = split($0, seg, "/")
             base = tolower(seg[n])
+            # Everything up to and including the final "/" — condition 3s base
+            # sibling must live in the SAME directory.
+            dir = tolower(substr($0, 1, length($0) - length(seg[n])))
             # Trailing extension = text after the LAST dot in the basename.
             dot = 0
             for (i = length(base); i > 0; i--)
@@ -134,14 +165,20 @@ keep_collision() {
             else { ext[NR] = substr(base, dot + 1); stem = substr(base, 1, dot - 1) }
             # Marker must live in the STEM, never in the trailing extension —
             # that is the whole inert-case discriminator.
-            marker[NR] = (index(stem, "backup") || index(stem, "copy") \
-                          || stem ~ /(^|\.)orig$/) ? 1 : 0
+            marker[NR] = marked(stem) ? 1 : 0
+            # Condition 3s lookup key: <dir><base-stem>.<ext>.
+            b = base_of(stem)
+            sib[NR] = (b == "" || ext[NR] == "") ? "" : dir b "." ext[NR]
+            tracked[dir base] = 1
             if (ext[NR] != "" && !marker[NR]) real[ext[NR]] = 1
             total = NR
         }
         END {
             for (i = 1; i <= total; i++)
-                if (marker[i] && ext[i] != "" && (ext[i] in real)) print path[i]
+                if (marker[i] && ext[i] != "" && !marked(ext[i]) \
+                    && (ext[i] in real) \
+                    && sib[i] != "" && (sib[i] in tracked))
+                    print path[i]
         }
     '
 }
@@ -280,8 +317,12 @@ assert_eq "an arbitrary repo-local extension is derived correctly" \
 echo ""
 echo "-- condition 1: markers, case-insensitively, in the STEM only --"
 # ---------------------------------------------------------------------------
+# Every marked file here has its base sibling tracked alongside it
+# (Connectors/SHEET/schematic/parser), which is condition 3 — the marker reads
+# as a stamp on a file that exists.
 MARK="$(mkrepo markers \
     schematic.kicad_sch parser.rs lib.rs notes.md \
+    Connectors.kicad_sch SHEET.kicad_sch \
     Connectors_BACKUP_20260427.kicad_sch \
     'schematic copy.kicad_sch' \
     SHEET_Copy.kicad_sch \
@@ -303,6 +344,16 @@ assert_eq "an unmarked source file is untouched" "0" \
 ORIG="$(mkrepo origonly README.md src/parser.rs src/parser.rs.orig src/lib.rs.orig)"
 assert_eq "a bare *.orig leftover is not a name collision" "" "$(keep_collision "$ORIG")"
 
+# ...and that stays true even when `.orig` acquires "real" siblings of its own.
+# Unmarked `*.rs.orig` leftovers would otherwise make `orig` look like a live
+# source extension, handing `sheet_backup_<ts>.orig` to this rule while the SAFE
+# tier's leftover rule already owns that shape. A marker-carrying extension is
+# never live, which resolves the overlap in the SAFE tier's favour.
+ORIGLIVE="$(mkrepo origlive README.md src/a.rs src/a.rs.orig src/b.rs.orig \
+    src/sheet.orig src/sheet_backup_20260101.orig)"
+assert_eq "a marker extension (.orig) never becomes a live source extension" "" \
+    "$(keep_collision "$ORIGLIVE")"
+
 # The marker must be in the stem of the file's OWN basename, not in a parent
 # directory name — a directory called `backups/` does not make its contents
 # collisions.
@@ -310,6 +361,75 @@ DIRMARK="$(mkrepo dirmark \
     src/sheet.kicad_sch backups/sheet.kicad_sch backups/other.kicad_sch)"
 assert_eq "a 'backup' parent directory does not mark its contents" "" \
     "$(keep_collision "$DIRMARK")"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- condition 3: the marker must be a provenance STAMP, not a topic --"
+# ---------------------------------------------------------------------------
+# The failure mode conditions 1+2 alone cannot see (judge review, PR #132):
+# `backup` and `copy` name a *subject* at least as often as they stamp a copy.
+# In this entirely ordinary repo — no backups anywhere in it — conditions 1+2
+# flag 8 of 12 files and print a `git rm` recipe for each. Condition 3 requires
+# the stem to strip to a tracked base sibling, and none of these do.
+#
+# The unmarked companions are adversarial on purpose: `utils.ts`, `Manager.ts`,
+# `helpers.py` and `strategy.md` are exactly the base siblings a *naive* strip
+# (delete the marker word, keep the rest) would find for `copy_utils.ts`,
+# `BackupManager.ts`, `deepcopy_helpers.py` and `backup-strategy.md`.
+ORD="$(mkrepo ordinary \
+    src/main.py src/index.ts docs/readme.md \
+    src/utils.ts src/Manager.ts src/helpers.py docs/strategy.md \
+    src/backup.py src/copy.py src/copyright.py src/copy_utils.ts \
+    src/BackupManager.ts src/useCopyToClipboard.ts src/deepcopy_helpers.py \
+    docs/backup-strategy.md)"
+ORD_HITS="$(keep_collision "$ORD")"
+assert_eq "an ordinary repo with no backups flags nothing at all" "" "$ORD_HITS"
+for f in src/backup.py src/copy.py src/copyright.py src/copy_utils.ts \
+         src/BackupManager.ts src/useCopyToClipboard.ts \
+         src/deepcopy_helpers.py docs/backup-strategy.md; do
+    assert_not_contains "$f is a topic, not a stamp — not a collision" \
+        "$ORD_HITS" "$f"
+done
+
+# The same repo, one real stamp added: it is the ONLY hit. The rule discriminates
+# within a single tree rather than by refusing to fire.
+printf 'content\n' > "$ORD/src/main_backup_20260101.py"
+git -C "$ORD" add -A >/dev/null 2>&1
+git -C "$ORD" commit -qm stamp >/dev/null 2>&1
+assert_eq "a real stamp in the same repo is still flagged, and alone" \
+    "src/main_backup_20260101.py" "$(keep_collision "$ORD")"
+
+# Stamp shapes that DO strip to a base sibling, one per separator style.
+STAMPS="$(mkrepo stamps \
+    'sheet.kicad_sch' 'sheet - Copy 2.kicad_sch' \
+    'board.kicad_sch' 'board.copy.kicad_sch' \
+    'panel.kicad_sch' 'panel-backup-20260101.kicad_sch')"
+assert_eq "space/hyphen/dot separators and a copy index all strip correctly" "3" \
+    "$(keep_collision "$STAMPS" | grep -c . )"
+
+# The base sibling must be in the SAME directory: a same-named file somewhere
+# else in the tree is a coincidence, which is what condition 3 exists to reject.
+CROSS="$(mkrepo crossdir \
+    hw/sheet.kicad_sch hw/other.kicad_sch src/sheet_backup_20260101.kicad_sch)"
+assert_eq "a base sibling in another directory does not count" "" \
+    "$(keep_collision "$CROSS")"
+printf 'content\n' > "$CROSS/src/sheet.kicad_sch"
+git -C "$CROSS" add -A >/dev/null 2>&1
+git -C "$CROSS" commit -qm sib >/dev/null 2>&1
+assert_eq "the base sibling next to it does count" \
+    "src/sheet_backup_20260101.kicad_sch" "$(keep_collision "$CROSS")"
+
+# The documented false negative, pinned so it stays a deliberate trade rather
+# than a surprise: delete the base file and the backup drops out of this
+# sub-case (it stays reportable as `generated`, which needs no base sibling).
+GONE="$(mkrepo basegone \
+    src/sheet.kicad_sch src/other.kicad_sch src/sheet_backup_20260101.kicad_sch)"
+assert_eq "with the base file present, the backup is a collision" \
+    "src/sheet_backup_20260101.kicad_sch" "$(keep_collision "$GONE")"
+git -C "$GONE" rm -q src/sheet.kicad_sch >/dev/null 2>&1
+git -C "$GONE" commit -qm "drop base" >/dev/null 2>&1
+assert_eq "with the base file gone, precision wins over recall" "" \
+    "$(keep_collision "$GONE")"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -416,10 +536,12 @@ assert_contains "detection is a naming heuristic, not a content check" \
 assert_contains "detection is scoped to tracked files" \
     "$TIDY" 'It runs over **tracked files only**'
 assert_contains "detection draws its sets from git ls-files" "$TIDY" 'git ls-files'
+assert_contains "detection requires all three conditions" \
+    "$TIDY" 'A tracked file is a name collision when **all three** conditions hold'
 assert_contains "condition 1 requires the marker in the stem" \
     "$TIDY" 'backup/copy marker **in the stem — before the final `.`**'
 assert_contains "condition 1 names the three markers" \
-    "$TIDY" '`*backup*`, `*copy*`, or `*.orig.`'
+    "$TIDY" 'the substring `backup`, `copy`, or `orig`'
 assert_contains "condition 1 is case-insensitive" "$TIDY" '**case-insensitively**'
 assert_contains "condition 2 requires real siblings" \
     "$TIDY" 'Its trailing extension has **real siblings**'
@@ -427,6 +549,37 @@ assert_contains "condition 2 requires the sibling to be a DIFFERENT file" \
     "$TIDY" 'at least one *other* tracked file ends in the same'
 assert_contains "the extension list is per-repo, never hardcoded" \
     "$TIDY" 'Never match against a hardcoded global extension list'
+# A marker-carrying extension is never live — the tie-break that keeps this rule
+# from claiming the SAFE tier's `*.orig` merge leftovers.
+assert_contains "condition 2 excludes marker-carrying extensions" \
+    "$TIDY" '**An extension that itself carries a marker is never live**'
+assert_contains "the *.orig overlap is resolved in SAFE's favour" \
+    "$TIDY" 'a `*.orig` merge leftover is the SAFE tier'"'"'s leftover rule, not this one'
+# Condition 3: the stamp-vs-topic test.
+assert_contains "condition 3 demands a provenance stamp on an existing file" \
+    "$TIDY" 'The marker reads as a **provenance stamp on an existing file**'
+assert_contains "condition 3 strips a marker run off the end of the stem" \
+    "$TIDY" 'Strip the **marker run** off the *end* of the stem'
+assert_contains "the marker run includes the separator and any timestamp" \
+    "$TIDY" 'the separator run (space, `_`, `-`, `.`) in front of it, and any timestamp or copy index (digits and separators) behind it'
+assert_contains "condition 3 requires a tracked base sibling in the same dir" \
+    "$TIDY" 'another tracked file `<base>.<ext>`, same extension, **same directory**'
+assert_contains "the base sibling is the file this one is a copy of" \
+    "$TIDY" 'the file this one is a copy *of*; if it cannot be named, this is not a collision'
+assert_contains "condition 3 is framed as stamp vs topic" \
+    "$TIDY" 'Condition 3 is what tells a **stamp** from a **topic**'
+assert_contains "tidy.md names backup.py / copy.py as non-collisions" \
+    "$TIDY" '`src/backup.py` and `src/copy.py` strip to nothing'
+assert_contains "tidy.md names the glued-word false positives" \
+    "$TIDY" '`copyright.py`, `BackupManager.ts`, `useCopyToClipboard.ts` and `deepcopy_helpers.py` have no marker *run* at all'
+assert_contains "tidy.md names the leading-marker false positive" \
+    "$TIDY" '`copy_utils.ts` carries the marker at the **front**'
+assert_contains "tidy.md states what a wrong git rm costs" \
+    "$TIDY" 'the one recipe in `/repo:tidy` that costs a source file'
+assert_contains "the recall trade is documented, not accidental" \
+    "$TIDY" 'The trade is deliberate — precision bought with recall'
+assert_contains "a stamp with no base sibling is not lost, only demoted" \
+    "$TIDY" 'it stays in the **generated** sub-case with the [[gitignore]] pointer'
 assert_contains "tidy.md names the inert shape as a non-collision" \
     "$TIDY" '`connectors.kicad_sch.backup-20260427_163100` does **not** collide'
 assert_contains "tidy.md explains why the inert shape is inert" \
@@ -436,6 +589,17 @@ assert_contains "the recipe is copy-pasteable and literal" \
     "$TIDY" 'copy-pasteable `git rm <path>` line'
 assert_contains "the recipe carries a one-line reason" \
     "$TIDY" 'plus a one-line reason naming the tool'
+# The reason may only restate what conditions 2 and 3 established — the guard
+# against a templated `why:` line asserting something false about a file that
+# is not a backup of anything.
+assert_contains "the reason is written from conditions 2 and 3 only" \
+    "$TIDY" 'The reason is only ever written from what conditions 2 and 3 established'
+assert_contains "an unwritable reason means the file is not reported" \
+    "$TIDY" 'the file is not a collision and must not be reported here**'
+assert_contains "tidy may never claim an unnamed base file" \
+    "$TIDY" 'never assert that a file is a backup of something tidy could not name'
+assert_contains "the sample why: line names the base sibling" \
+    "$TIDY" 'why: backup of connectors.kicad_sch'
 assert_contains "tidy.md forbids running the recipe" \
     "$TIDY" 'it never runs `git rm`, never stages it, and never offers to run it'
 assert_contains "the ban on running it covers every flag" \

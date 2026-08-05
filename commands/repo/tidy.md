@@ -300,10 +300,10 @@ reserved for tracked files.
     git ls-files
     ```
 
-    A tracked file is a name collision when **both** conditions hold:
+    A tracked file is a name collision when **all three** conditions hold:
 
     1. Its basename carries a backup/copy marker **in the stem — before the
-       final `.`**: `*backup*`, `*copy*`, or `*.orig.`, matched
+       final `.`**: the substring `backup`, `copy`, or `orig`, matched
        **case-insensitively** (`Connectors_BACKUP_20260427.kicad_sch`,
        `schematic copy.kicad_sch`, `parser.orig.rs`).
     2. Its trailing extension has **real siblings**: at least one *other*
@@ -312,7 +312,23 @@ reserved for tracked files.
        this repo*. Never match against a hardcoded global extension list — a
        `.kicad_sch` collision matters only in a repo that has real `.kicad_sch`
        files, and in a repo with no such siblings the same filename is just a
-       file with an unusual name.
+       file with an unusual name. **An extension that itself carries a marker
+       is never live**, however many files share it: `.backup-20260427_163100`
+       and `.orig` are provenance suffixes, nothing parses them as source, and
+       a `*.orig` merge leftover is the SAFE tier's leftover rule, not this
+       one — that exclusion is what keeps the two rules from overlapping in a
+       repo whose `*.rs.orig` leftovers would otherwise make `orig` look live.
+    3. The marker reads as a **provenance stamp on an existing file**, not as
+       the file's subject. Strip the **marker run** off the *end* of the stem
+       — the marker word, the separator run (space, `_`, `-`, `.`) in front of
+       it, and any timestamp or copy index (digits and separators) behind it —
+       and what remains must be a non-empty stem that names a **base sibling**:
+       another tracked file `<base>.<ext>`, same extension, **same directory**.
+       `connectors_backup_20260427_163100.kicad_sch` → `connectors.kicad_sch`,
+       `schematic copy.kicad_sch` → `schematic.kicad_sch`, `sheet - Copy
+       2.kicad_sch` → `sheet.kicad_sch`, `parser.orig.rs` → `parser.rs`. The
+       base sibling is the file this one is a copy *of*; if it cannot be
+       named, this is not a collision.
 
     Condition 1 is deliberately about the **stem**, and that is what keeps the
     inert shape out. `connectors_backup_20260427_163100.kicad_sch` collides:
@@ -326,11 +342,39 @@ reserved for tracked files.
     point of the sub-case: separate the backups that are actively being parsed
     from the ones that are harmlessly sitting there.
 
+    Condition 3 is what tells a **stamp** from a **topic**, and without it
+    conditions 1 and 2 flag ordinary source in any repo that merely discusses
+    backups or copying. `src/backup.py` and `src/copy.py` strip to nothing.
+    `copyright.py`, `BackupManager.ts`, `useCopyToClipboard.ts` and
+    `deepcopy_helpers.py` have no marker *run* at all — the marker is glued
+    into a longer word, with no separator in front of it and no
+    separator-or-digits behind it. `copy_utils.ts` carries the marker at the
+    **front**, with no base in front of it to be a copy of.
+    `docs/backup-strategy.md` has both problems. None of these are backups of
+    anything and none may appear in this sub-case: it prints `git rm`, and a
+    pasted false positive here is the one recipe in `/repo:tidy` that costs a
+    source file.
+
+    The trade is deliberate — precision bought with recall. A genuine backup
+    whose base file was since renamed or deleted, or that was moved into a
+    `backups/` directory away from its original, has no base sibling and is
+    **not** reported here even though a tool would still parse it. It is not
+    lost: like the inert shapes, it stays in the **generated** sub-case with
+    the [[gitignore]] pointer. Only the alarm and the `git rm` recipe are
+    withheld, and they are withheld exactly when tidy cannot say truthfully
+    what the file is a backup of — which is the same circumstance in which the
+    `why:` line below could not be written honestly.
+
     **The printed recipe.** For each collision, print a literal,
     copy-pasteable `git rm <path>` line plus a one-line reason naming the tool
-    class that parses the file and what that costs. `/repo:tidy` **prints this
-    string and nothing else** — it never runs `git rm`, never stages it, and
-    never offers to run it, not under `--ask`, `--apply`, or any other flag.
+    class that parses the file and what that costs. The reason is only ever
+    written from what conditions 2 and 3 established — the sibling count that
+    made the extension live, and the base sibling the file is a copy of. **If
+    that sentence cannot be written truthfully, the file is not a collision
+    and must not be reported here**; never assert that a file is a backup of
+    something tidy could not name. `/repo:tidy` **prints this string and
+    nothing else** — it never runs `git rm`, never stages it, and never
+    offers to run it, not under `--ask`, `--apply`, or any other flag.
     Removing a tracked file is a commit the user makes deliberately (safety
     rule 1); the recipe exists so that decision is one paste away instead of a
     research task, exactly as the [[gitignore]] pointer is for the generated
@@ -378,8 +422,9 @@ KEEP (informational) — tracked files, never deleted by tidy (safety rule 1):
 
   name collision — tracked AND parsed as real source; gitignoring fixes nothing:
     connectors_backup_20260427_163100.kicad_sch
-      why: 14 real .kicad_sch files in this tree, so KiCad opens this backup as
-           a schematic sheet and its contents are counted twice
+      why: backup of connectors.kicad_sch, and 14 real .kicad_sch files make
+           that a live extension here — KiCad opens this backup as a schematic
+           sheet too, so its contents are counted twice
       run deliberately (tidy will not run this for you):
         git rm connectors_backup_20260427_163100.kicad_sch
 ```
