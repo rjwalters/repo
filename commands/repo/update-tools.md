@@ -161,10 +161,10 @@ consumes — the asymmetry with the sibling rows is deliberate. In every other r
 the trailing `<this-repo>` is a positional argument that **selects** the repo the
 installer acts on; `resync-installed.sh` takes **no positional target** and
 rejects one with exit `1` (its arg loop matches only `--dry-run`/`-n`,
-`--quiet`/`-q`, `--help`/`-h`). It resolves its target from the **current working
-directory** via `git rev-parse --git-common-dir` (worktree-safe — this points at
-the primary checkout even from a linked worktree), never from its own path on
-disk. So do **not** "fix" the Loom row to look like its siblings by appending a
+`--quiet`/`-q`, `--allow-worktree`, `--help`/`-h`). It resolves its target from
+the **current working directory** via `git rev-parse --git-common-dir`
+(worktree-safe — this points at the primary checkout even from a linked
+worktree), never from its own path on disk. So do **not** "fix" the Loom row to look like its siblings by appending a
 target path: the script would reject the command with an error that does not
 obviously point back to the cause. What guarantees cwd is the target repo at this
 point is that `/repo:update-tools` runs in the target repo's working directory
