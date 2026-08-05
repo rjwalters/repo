@@ -1626,6 +1626,84 @@ assert_deny "#130 control: balanced quotes after the span still deny (quoted wor
 assert_deny "#130 control: stray-quote shape WITHOUT a later quote pair still denies" \
     "echo $_Q113_SUB $_Q113_STRAY ; $_Q113_RM"
 
+# --- KNOWN LIMIT, second route: opener INSIDE the active span (#130) --------
+#
+# The cases above reach the inert branch with an opener sitting AFTER the active
+# span has already closed. #130's own reproduction reaches the SAME branch by a
+# different route, so those pins do not constrain it:
+#
+#   opener position                              example
+#   -------------------------------------------  --------------------------------
+#   AFTER the span, once it has closed            echo "$(id)" " ; <rm> ; echo "t"
+#   INSIDE the span, partner PAST its close       echo "$( ' )" ; <rm> '
+#
+# Walk of the second shape:
+#   1. `"$( ' )"` is ACTIVE (its inner text holds `$(`), so separators stay live
+#      and the lexer walks it character by character rather than skipping it.
+#   2. Inside it the walk reaches `'`. It is unescaped and is not the recorded
+#      close of the enclosing span, so it OPENS a span of its own.
+#   3. The forward scan pairs it with the NEXT `'` — the trailing one at the very
+#      end of the command, past the enclosing span's close.
+#   4. That inner text carries no `$(` and no backtick, so the INERT branch
+#      copies it verbatim and jumps to `ci + 1`.
+#   5. Every real separator in between is consumed as literal text. One segment
+#      survives, its command word is `echo`, and the destructive tail is never
+#      matched by parse_force_ops() / lifecycle_or_cloud_reason() /
+#      extract_rm_targets().
+#
+# Accepted for the same mechanical reason as the sibling family, and pinned the
+# same way: the shape needs an ODD quote count, so the shell REJECTS it and the
+# swallowed text is text the shell also treats as quoted. `assert_shell_rejects`
+# carries that half of the argument — if a future lexer or normalization change
+# ever makes one of these parseable, it fails and the paired allow must be
+# revisited rather than silently becoming a live bypass.
+_Q130_SPANSQ="\"\$( ' )\""    # active "$( ) " span holding a lone single quote
+_Q130_PARTSQ="'"              # the trailing partner the inner quote reaches
+_Q130_SPANDQ="'\$( \" )'"     # quote kinds mirrored: '$( " )' lookalike span
+_Q130_PARTDQ='"'
+_Q130_TRAILSQ="'trailing'"    # a later quote PAIR, for the qsplit() exposure
+
+# The exact repro from the issue body (extract_rm_targets / rm-scope tier).
+assert_shell_rejects "#130 KNOWN LIMIT: inner-quote repro is unparseable, so the allow cannot execute" \
+    "echo $_Q130_SPANSQ ; $_Q113_RM $_Q130_PARTSQ"
+assert_allow "#130 KNOWN LIMIT: inner quote paired past the span close swallows the rm tail" \
+    "echo $_Q130_SPANSQ ; $_Q113_RM $_Q130_PARTSQ"
+
+# The same shape on the lifecycle tier (lifecycle_or_cloud_reason).
+assert_shell_rejects "#130 KNOWN LIMIT: inner-quote lifecycle shape is unparseable" \
+    "echo $_Q130_SPANSQ ; $_Q113_HALT $_Q130_PARTSQ"
+assert_allow "#130 KNOWN LIMIT: inner quote paired past the span close swallows the lifecycle tail" \
+    "echo $_Q130_SPANSQ ; $_Q113_HALT $_Q130_PARTSQ"
+
+# Quote kinds mirrored: a double quote inside a single-quoted lookalike span.
+assert_shell_rejects "#130 KNOWN LIMIT: mirrored inner-quote shape is unparseable" \
+    "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
+assert_allow "#130 KNOWN LIMIT: inner double quote in a single-quoted span swallows the rm tail" \
+    "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
+
+# qsplit()/command_has_shell_segment() exposure: here the inner quote's partner
+# is the opener of a later quote PAIR, so the pipe-to-shell is never seen.
+assert_shell_rejects "#130 KNOWN LIMIT: inner-quote piped-to-shell shape is unparseable" \
+    "echo $_Q130_SPANSQ ; echo '$_Q113_DANGER' | sh ; echo $_Q130_TRAILSQ"
+assert_allow "#130 KNOWN LIMIT: inner quote swallows a piped-to-shell payload" \
+    "echo $_Q130_SPANSQ ; echo '$_Q113_DANGER' | sh ; echo $_Q130_TRAILSQ"
+
+# parse_force_ops() is the third consumer and loses its ask tier the same way.
+# Pin the mode explicitly (#3913) so an ambient LOOM_FORCE_SCOPE cannot decide it.
+assert_shell_rejects "#130 KNOWN LIMIT: inner-quote force-push shape is unparseable" \
+    "echo $_Q130_SPANSQ ; $_Q113_FORCE $_Q130_PARTSQ"
+assert_allow_env "#130 KNOWN LIMIT: inner quote swallows a force-push that would otherwise ASK" \
+    "LOOM_FORCE_SCOPE=all" "echo $_Q130_SPANSQ ; $_Q113_FORCE $_Q130_PARTSQ"
+
+# Controls: the limit needs BOTH an inner opener and a later partner, and it
+# never touches input the shell can parse.
+assert_deny "#130 control: inner-quote span WITHOUT a trailing partner still denies" \
+    "echo $_Q130_SPANSQ ; $_Q113_RM"
+assert_deny "#130 control: inner quote paired INSIDE the span still denies (parseable)" \
+    "echo \"\$( ' ' )\" ; $_Q113_RM"
+assert_deny "#130 control: balanced inner quotes with a balanced trailing pair still deny" \
+    "echo \"\$( '' )\" ; $_Q113_RM ''"
+
 echo ""
 
 # =========================================================================
