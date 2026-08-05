@@ -26,10 +26,10 @@ clone to diff against, so it needs a different comparison model.
 /repo:update-tools --no-commit   # Update the working tree but leave it uncommitted for review
 ```
 
-An update runs the tool's own installer (executing code from its source repo
-and rewriting `.claude/`), so unlike the safe-fix hygiene commands this one is
-**not** auto-applied — it reports and confirms before updating. `--check` is
-the report-only form.
+An update runs the tool's own installer or updater (executing code from its
+source repo and rewriting `.claude/`), so unlike the safe-fix hygiene commands
+this one is **not** auto-applied — it reports and confirms before updating.
+`--check` is the report-only form.
 
 Once an update is confirmed, it is committed and landed on the default branch
 (`main`) by default — it does **not** push, and it never folds a pre-existing
@@ -139,17 +139,52 @@ the installed and latest versions.
 
 ### 4. Update (with confirmation)
 
-For each stale tool the user approves, update the source clone first, then
-re-run that tool's own installer — never hand-copy files:
+For each stale tool the user approves, update the source clone first, then run
+that tool's own update mechanism — its dedicated updater where it ships one,
+otherwise its installer. Never hand-copy files:
 
 ```bash
 git -C <source> pull --ff-only
-# Loom:        <source>/install.sh --quick -y <this-repo>
+# Loom:        <this-repo>/.loom/scripts/resync-installed.sh --dry-run   # preview drift
+#              <this-repo>/.loom/scripts/resync-installed.sh             # apply once confirmed
 # Anvil:       <source>/scripts/install-anvil.sh <this-repo>
 # Repo Skills: <source>/install.sh -y <this-repo>
 # kicad-tools: <source>/scripts/install-kct.sh <this-repo>
 # Unknown tools: look for install.sh / scripts/install-*.sh in the source repo
 ```
+
+**Loom updates go through `resync-installed.sh`, not `install.sh`.** Note the
+path: the resync script lives in the **target** repo's `.loom/scripts/`, not in
+the source clone, unlike every other row above. It is the non-destructive,
+idempotent update path — it reports per-file updated/created/unchanged/skipped,
+never clobbers a symlinked install target, and re-stamps `loom_version` /
+`loom_commit` / `last_resync` into `.loom/install-metadata.json` on a successful
+non-dry-run. Run `--dry-run` first (exit `2` means drift was found and would be
+synced, `0` means already in sync, `1` is an error), report it, then apply.
+`<source>/install.sh --quick -y <this-repo>` is **not** an update command: Loom's
+installer refuses a non-interactive reinstall over an existing `.loom/` and exits
+with an error, which is the only situation this step ever runs in.
+
+Reinstall is the **destructive fallback**, used only when resync cannot resolve
+the drift:
+
+```bash
+# Destructive — uninstalls the existing Loom payload before writing the new version.
+# Inventory and back up project-owned Loom hooks, scripts, and agent configuration first.
+<source>/install.sh --quick -y --confirm-reinstall <this-repo>
+```
+
+Confirm that separately with the user; do not escalate to it just because a
+resync pass exited non-zero — see the re-run caveat first.
+
+**Re-run caveat: `resync-installed.sh` syncs itself.** The script is part of the
+`.loom/scripts/` payload it updates, so the copy that starts the run is the
+*old* one. A stale copy carrying a bug can die partway through (observed going
+0.16.0 → 0.18.0: `line 509: verb_past: unbound variable`) after it has already
+written the newer script to disk. Re-running it once is expected to pick up the
+freshly-synced copy and complete cleanly (in that case, 70 further files
+updated). Treat a single failed pass as "retry once", not as a broken update or
+a reason to reach for `--confirm-reinstall`.
 
 If the source clone has local modifications or `--ff-only` fails, report it
 and skip that tool rather than resolving on your own.
@@ -160,9 +195,9 @@ a summary of what changed (`git status --short`).
 ### 5. Land the update (default)
 
 A confirmed tool bump is a safe, reversible, version-controlled change (the
-installer is idempotent and re-runnable), so by default `update-tools` **commits
-it and lands it on the default branch** rather than stopping at an uncommitted
-diff. It **never** pushes — pushing is outward-facing and stays a separate,
+installer/updater is idempotent and re-runnable), so by default `update-tools`
+**commits it and lands it on the default branch** rather than stopping at an
+uncommitted diff. It **never** pushes — pushing is outward-facing and stays a separate,
 explicit action (Safety Rule 5). Pass `--no-commit` (alias `--stage-only`) to
 skip this step and leave the working-tree changes uncommitted for manual review
 instead (the old behavior).
@@ -218,8 +253,13 @@ Land each tool's bump as its own commit:
 ## Safety Rules
 
 1. **Never update without confirmation** — show installed → latest per tool first
-2. **Always use the tool's own installer** — it owns its write footprint and
-   marker blocks; hand-copying breaks reinstall idempotency
+2. **Always use the tool's own installer or update mechanism** — where a tool
+   ships a dedicated non-destructive updater (e.g. Loom's
+   `.loom/scripts/resync-installed.sh`), prefer it over re-running the
+   installer; installer reinstall is the destructive fallback, not the default
+   update path. Either way, never hand-copy files — the installer/updater owns
+   the write footprint and marker blocks, and hand-copying breaks reinstall
+   idempotency
 3. **Never resolve source-repo git problems silently** (diverged clone, dirty
    tree) — report and skip
 4. **Land the update, don't just stage it** — by default commit the installer's
