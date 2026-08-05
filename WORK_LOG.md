@@ -5,6 +5,7 @@ by the Guide triage agent. Newest entries first.
 
 ### 2026-08-05
 
+- **PR #148**: docs: Guide document maintenance update
 - **PR #147**: docs: Guide document maintenance update
 - **PR #146**: docs: Guide document maintenance update
 - **Issue #138** (closed): Loom resync wants to strip package.json's version field that scripts/version.sh deliberately mirrors — decide before resyncing
