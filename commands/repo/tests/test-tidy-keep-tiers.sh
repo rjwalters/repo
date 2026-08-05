@@ -320,6 +320,14 @@ echo "-- condition 1: markers, case-insensitively, in the STEM only --"
 # Every marked file here has its base sibling tracked alongside it
 # (Connectors/SHEET/schematic/parser), which is condition 3 — the marker reads
 # as a stamp on a file that exists.
+#
+# This fixture also depends on condition 3's base-sibling lookup being
+# case-insensitive (tidy.md documents this explicitly; see keep_collision()
+# above, which lowercases both the lookup key and the tracked[] set it is
+# checked against): it pairs `Connectors.kicad_sch` / `SHEET.kicad_sch`
+# against differently-cased marked files (`Connectors_BACKUP_20260427.kicad_sch`,
+# `SHEET_Copy.kicad_sch`). A case-sensitive lookup would silently stop
+# matching these pairs — this comment exists so that isn't a surprise later.
 MARK="$(mkrepo markers \
     schematic.kicad_sch parser.rs lib.rs notes.md \
     Connectors.kicad_sch SHEET.kicad_sch \
@@ -369,7 +377,7 @@ echo "-- condition 3: the marker must be a provenance STAMP, not a topic --"
 # The failure mode conditions 1+2 alone cannot see (judge review, PR #132):
 # `backup` and `copy` name a *subject* at least as often as they stamp a copy.
 # In this entirely ordinary repo — no backups anywhere in it — conditions 1+2
-# flag 8 of 12 files and print a `git rm` recipe for each. Condition 3 requires
+# flag 8 of 15 files and print a `git rm` recipe for each. Condition 3 requires
 # the stem to strip to a tracked base sibling, and none of these do.
 #
 # The unmarked companions are adversarial on purpose: `utils.ts`, `Manager.ts`,
