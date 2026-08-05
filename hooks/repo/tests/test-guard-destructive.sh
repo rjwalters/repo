@@ -1366,6 +1366,269 @@ assert_deny "#3755: real 'foo | rm -rf /' (rm after real pipe) still denied" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #113: a quoted \$( ) span must not swallow the rest of the command ---${NC}"
+# =========================================================================
+#
+# A quoted span carrying a command substitution keeps its separators ACTIVE (the
+# #3679/#3755 floor above), so both lexers walk INTO it character-by-character —
+# and eventually reach that span's own closing quote. Neither lexer remembered
+# that this position was the already-computed CLOSE, so the top-of-loop quote
+# detector re-read it as the OPENER of a brand-new span:
+#   - ml_segment(): with no later quote in the buffer the unterminated-quote
+#     fallback swallowed the ENTIRE remainder into the current segment, so a real
+#     `; <destructive command>` after the span never became its own segment and
+#     parse_force_ops() / lifecycle_or_cloud_reason() / extract_rm_targets() all
+#     fell through to ALLOW.
+#   - qsplit(): its fallback only advances one character, so the plain repro
+#     happened to split by luck — but a LATER unrelated quote pair anywhere in the
+#     command paired with the re-opened quote and swallowed every real separator
+#     between them as bogus inert text, silently disabling the
+#     command_has_shell_segment() gate on strip_datasink_literals().
+#
+# This was a fixable FALSE NEGATIVE, not an intentional redaction/expansion
+# safety floor: the "keep separators active inside the span" rule is about not
+# MASKING smuggled content INSIDE a substitution, never about disabling matching
+# for the text AFTER it. Both lexers now record the real close index (a stack, so
+# nested active spans each pop their own) and resume segmentation right after it.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84).
+_Q113_RM="rm -r""f /opt/some-vendor/important"
+_Q113_HALT="ha""lt"
+_Q113_FORCE="git push --fo""rce origin feature-x"
+_Q113_DANGER="rm -r""f /"
+_Q113_SUB='"$(id)"'          # double-quoted command substitution
+_Q113_BT='"`id`"'            # backtick substitution nested in double quotes
+_Q113_SQSUB="'"'$(id)'"'"    # single-quoted lookalike (shell does NOT expand it)
+_Q113_CMT='"# x $(id)"'      # a `#` inside the substitution-bearing span
+
+# Control: the SAME command with an inert quoted prefix has always denied. Every
+# assertion below must match this baseline — the only difference is the `$(...)`.
+assert_deny "#113 control: inert quoted prefix then an outside-repo rm denies" \
+    "echo \"y\" ; $_Q113_RM"
+
+# The exact repro from the issue body (extract_rm_targets / rm-scope tier).
+assert_deny "#113: quoted \$( ) prefix then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_SUB ; $_Q113_RM"
+
+# The same shape on the lifecycle tier (lifecycle_or_cloud_reason).
+assert_deny "#113: quoted \$( ) prefix then a ;-separated lifecycle command denies" \
+    "echo $_Q113_SUB ; $_Q113_HALT"
+
+# Backtick nested inside double quotes (backticks are only in scope for the lexer
+# when they sit inside a quoted span — a bare backtick pair is not a quote char).
+assert_deny "#113: double-quoted backtick prefix then an outside-repo rm denies" \
+    "echo $_Q113_BT ; $_Q113_RM"
+
+# Single-quoted lookalike: the shell does NOT expand `$(id)` here, but the
+# lexer's naive substring probe still marks the span ACTIVE — so it hits the
+# identical close-quote mis-detection and must be fixed by the same change.
+assert_deny "#113: single-quoted \$( ) lookalike prefix then an outside-repo rm denies" \
+    "echo $_Q113_SQSUB ; $_Q113_RM"
+
+# The `# x`-in-quote variant from the issue body: the `#` is walked as ordinary
+# text inside the active span (probe suppression only, #84), so it is irrelevant
+# to the defect — but it must not regress.
+assert_deny "#113: '# x' inside the quoted \$( ) span then an outside-repo rm denies" \
+    "echo $_Q113_CMT ; $_Q113_RM"
+
+# Every real separator, not just `;` — && and | and a raw newline all split.
+assert_deny "#113: quoted \$( ) prefix then an &&-separated lifecycle command denies" \
+    "echo $_Q113_SUB && $_Q113_HALT"
+
+assert_deny "#113: quoted \$( ) prefix then a |-separated lifecycle command denies" \
+    "echo $_Q113_SUB | $_Q113_HALT"
+
+assert_deny "#113: quoted \$( ) prefix then a NEWLINE-separated outside-repo rm denies" \
+    "$(printf 'echo %s\n%s' "$_Q113_SUB" "$_Q113_RM")"
+
+# parse_force_ops() is the third consumer of the shared lexer and was equally
+# affected: the ask-tier force-push confirmation was silently skipped. Pin the
+# mode explicitly (#3913) so an ambient LOOM_FORCE_SCOPE cannot decide this.
+assert_ask_env "#113: quoted \$( ) prefix then a force-push still ASKS (parse_force_ops)" \
+    "LOOM_FORCE_SCOPE=all" "echo $_Q113_SUB ; $_Q113_FORCE"
+
+# NESTED active spans: an inner substitution-bearing span inside an outer one.
+# A single scalar "last close" would be overwritten by the inner span and the
+# OUTER close would still be mis-read, so the fix tracks a stack.
+assert_deny "#113: NESTED quoted \$( ) spans then an outside-repo rm denies" \
+    "echo \"\$(a '\$(b)')\" ; $_Q113_RM"
+
+# qsplit()/command_has_shell_segment() exposure: a LATER unrelated quote pair
+# lets the re-opened quote pair with it and swallow the real separators between
+# them, so the pipe-to-shell is not seen, strip_datasink_literals() redacts the
+# single-quoted payload, and the catastrophic scan never sees it.
+assert_deny "#113: quoted \$( ) prefix, piped-to-shell payload, then a trailing quoted string denies" \
+    "echo $_Q113_SUB ; echo '$_Q113_DANGER' | sh ; echo \"done\""
+
+# --- The fix must NOT disable matching INSIDE an active span (#3755 floor) ----
+
+assert_deny "#113: smuggled \$(x|halt ) inside the span still denies with a trailing tail" \
+    "grep -E \"\$(x|$_Q113_HALT )\" file ; echo \"done\""
+
+# --- ...and must NOT widen any existing allow -------------------------------
+
+assert_allow "#113: legitimate gh api -f body=\"\$(cat file)\" with no destructive tail is allowed" \
+    'gh api -f body="$(cat file)"'
+
+assert_allow "#113: a bare quoted \$( ) span with no tail at all is allowed" \
+    "echo $_Q113_SUB"
+
+assert_allow "#113: quoted \$( ) prefix then a benign command is allowed" \
+    "echo $_Q113_SUB ; echo done"
+
+assert_allow "#113: inert quoted alternation followed by a later quoted string is allowed" \
+    "grep -E \"lifecycle|$_Q113_HALT|poweroff|init 0\" file && echo \"done\""
+
+# --- BACKSLASH-ESCAPED quotes around an active span -------------------------
+#
+# Recording the span's close index is only safe when a BACKSLASH did not make the
+# quote pairing ambiguous. The forward scan finds the NEXT quote of the same
+# kind, which for `"$(a \" b)"` is the ESCAPED one — literal text, not the close.
+# Trusting it ended the span early, so the REAL close was re-read as the opener
+# of a brand-new span, and the swallow this whole block exists to remove came
+# straight back on shapes that denied BEFORE #113 (deny -> allow, the one
+# direction a guard change must never take). The mirror shape is an escaped quote
+# sitting AFTER the span (`echo "$(id)" \" ; …`), which must not OPEN a span at
+# all. Both lexers resolve the close through trusted_close() and treat `\"` as
+# literal text; an unterminated quote now advances one character with separators
+# still ACTIVE instead of swallowing the remainder.
+#
+# Every case in THIS sub-block denies on the pre-#113 guard, so they are
+# no-regression pins, not new behaviour. (The "unbalanced stray quote" sub-block
+# further down is the documented exception — see its KNOWN LIMIT header.)
+_Q113_ESCDQ='"$(a \" b)"'      # escaped double quote INSIDE the span
+_Q113_ESCSQ="'\$(a \\' b)'"    # escaped single quote inside a single-quoted span
+_Q113_ESCEND='"$(a b) \""'     # escaped quote at the very END of the span
+_Q113_ESCBS='"$(a \\" b)"'     # escaped BACKSLASH, then a genuinely real close
+_Q113_TRAILESC='"$(id)" \"'    # escaped quote AFTER the span closes
+
+assert_deny "#113: escaped quote inside the span then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_ESCDQ ; $_Q113_RM"
+
+assert_deny "#113: escaped quote inside the span then an &&-separated lifecycle command denies" \
+    "echo $_Q113_ESCDQ && $_Q113_HALT"
+
+assert_deny "#113: escaped quote inside a SINGLE-quoted span then a ;-separated rm denies" \
+    "echo $_Q113_ESCSQ ; $_Q113_RM"
+
+assert_deny "#113: escaped quote inside a SINGLE-quoted span then an && lifecycle command denies" \
+    "echo $_Q113_ESCSQ && $_Q113_HALT"
+
+assert_deny "#113: escaped quote at the END of the span then an outside-repo rm denies" \
+    "echo $_Q113_ESCEND ; $_Q113_RM"
+
+# An escaped BACKSLASH before the close (`\\"`) leaves a REAL close quote, so the
+# parity helper correctly reports "not escaped" — but the shell re-parses quoting
+# inside `$( )`, so the pairing is ambiguous and trusted_close() records nothing.
+assert_deny "#113: escaped backslash before the real close then an outside-repo rm denies" \
+    "echo $_Q113_ESCBS ; $_Q113_RM"
+
+# ...including with a TRAILING quoted string, the shape that turns a mis-paired
+# close into a bogus inert span swallowing the separators between them.
+assert_deny "#113: escaped backslash before the close, rm, then a trailing quoted string denies" \
+    "echo $_Q113_ESCBS ; $_Q113_RM ; echo \"done\""
+
+assert_deny "#113: escaped quote AFTER the span then a ;-separated outside-repo rm denies" \
+    "echo $_Q113_TRAILESC ; $_Q113_RM"
+
+assert_deny "#113: escaped quote AFTER the span, rm, then a trailing quoted string denies" \
+    "echo $_Q113_TRAILESC ; $_Q113_RM ; echo \"done\""
+
+# qsplit()/command_has_shell_segment() exposure of the same family.
+assert_deny "#113: escaped-quote span, piped-to-shell payload, then a trailing quoted string denies" \
+    "echo $_Q113_ESCDQ ; echo '$_Q113_DANGER' | sh ; echo \"done\""
+
+assert_deny "#113: escaped-quote span then a NEWLINE-separated outside-repo rm denies" \
+    "$(printf 'echo %s\n%s' "$_Q113_ESCDQ" "$_Q113_RM")"
+
+assert_ask_env "#113: escaped-quote span then a force-push still ASKS (parse_force_ops)" \
+    "LOOM_FORCE_SCOPE=all" "echo $_Q113_ESCDQ ; $_Q113_FORCE"
+
+# ...and the escaped-quote handling must not widen the allow side either.
+assert_allow "#113: escaped quote inside the span then a benign command is allowed" \
+    "echo $_Q113_ESCDQ ; echo done"
+
+assert_allow "#113: escaped quote in an INERT quoted span with a benign tail is allowed" \
+    'echo "a \" b" ; echo done'
+
+assert_allow "#113: escaped quote AFTER the span with a benign tail is allowed" \
+    "echo $_Q113_TRAILESC ; echo done"
+
+assert_allow "#113: gh api body carrying an escaped quote is allowed" \
+    'gh api -f body="$(cat file) \" x"'
+
+# --- KNOWN LIMIT: an UNBALANCED stray quote after the span (#130) -----------
+#
+# The one family where #113 moves a decision from deny to ALLOW, pinned here so
+# a future lexer change cannot move it again silently.
+#
+# Correcting the active-span pairing (the whole point of #113) also frees a
+# STRAY unmatched quote sitting after the span to pair with a LATER quote
+# instead of with this span's close. The text between them carries no
+# substitution, so the INERT branch copies it verbatim and swallows the real
+# separators inside it — separators the pre-#113 mis-pairing happened to leave
+# ACTIVE. Before #113 the phantom re-opened span consumed the stray quote and
+# the tail split; now the stray quote reaches the later one first.
+#
+# Why this is documented rather than fixed here: every member of the family
+# needs an ODD quote count, so the shell REJECTS the command and nothing
+# executes — the text the lexer swallows is text the shell also treats as
+# quoted. `assert_shell_rejects` below pins exactly that, so the safety argument
+# is mechanical rather than a claim in a comment: if a future change ever makes
+# one of these shapes parseable, that assertion fails and the allow must be
+# revisited. The underlying weakness is the inert branch itself (it consumes
+# whatever the forward scan paired with), tracked in #130 — not the #113
+# close-index bookkeeping, which is what makes the balanced cases above work.
+
+# Assert the shell itself refuses to parse a command — the load-bearing half of
+# the KNOWN LIMIT argument (an allow cannot matter if nothing can execute).
+assert_shell_rejects() {
+    local description="$1"
+    local cmd="$2"
+    TOTAL=$((TOTAL + 1))
+    if bash -n <<<"$cmd" 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: bash rejects it (syntax error)"
+        echo -e "       Got: bash PARSED it — the allow below is now executable"
+    else
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    fi
+}
+
+_Q113_STRAY='"'           # a STRAY unmatched double quote after the span
+_Q113_STRAYBS='\\\\"'     # an escaped-backslash run, then a stray quote
+_Q113_TRAILQ='"trailing"' # the later quote pair the stray one reaches first
+
+for _q113_stray in "$_Q113_STRAY" "$_Q113_STRAYBS"; do
+    for _q113_span in "$_Q113_SUB" "$_Q113_BT"; do
+        _q113_cmd="echo $_q113_span $_q113_stray ; $_Q113_RM ; echo $_Q113_TRAILQ"
+        assert_shell_rejects \
+            "#130 KNOWN LIMIT: stray quote shape is unparseable, so the allow cannot execute (${_q113_stray} after ${_q113_span})" \
+            "$_q113_cmd"
+        assert_allow \
+            "#130 KNOWN LIMIT: stray quote after the span swallows the tail (${_q113_stray} after ${_q113_span})" \
+            "$_q113_cmd"
+    done
+done
+unset _q113_stray _q113_span _q113_cmd
+
+# Controls: the SAME shapes with the quote count BALANCED still deny, so the
+# limit is confined to unparseable input and has not leaked into real commands.
+assert_deny "#130 control: balanced quotes after the span still deny (empty string arg)" \
+    "echo $_Q113_SUB \"\" ; $_Q113_RM ; echo $_Q113_TRAILQ"
+assert_deny "#130 control: balanced quotes after the span still deny (quoted word)" \
+    "echo $_Q113_SUB \"q\" ; $_Q113_RM ; echo $_Q113_TRAILQ"
+assert_deny "#130 control: stray-quote shape WITHOUT a later quote pair still denies" \
+    "echo $_Q113_SUB $_Q113_STRAY ; $_Q113_RM"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 regression guard: catastrophic commands STILL deny ---${NC}"
 # =========================================================================
 
