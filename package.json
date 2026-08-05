@@ -1,6 +1,6 @@
 {
   "name": "repo-skills",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "General-purpose repository skills for Claude Code",
   "private": true,
   "scripts": {
