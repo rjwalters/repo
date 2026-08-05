@@ -177,6 +177,23 @@ the drift:
 Confirm that separately with the user; do not escalate to it just because a
 resync pass exited non-zero — see the re-run caveat first.
 
+**Anvil and kicad-tools rows verified correct as written (issue #135) — do not
+re-investigate.** Unlike Loom, neither installer refuses a non-interactive
+reinstall over an existing install, so `<source>/scripts/install-anvil.sh
+<this-repo>` and `<source>/scripts/install-kct.sh <this-repo>` both succeed on
+a second run and need no resync-equivalent or destructive-fallback split:
+
+- **Anvil** (`rjwalters/anvil` `scripts/install-anvil.sh`, checked at `8302890`):
+  Stage 3's "active-install guard" only sets `UPGRADE=true` when `.anvil/`
+  already exists and proceeds — no exit, no confirmation gate bypassed by
+  `-y`. The installer's own `--help` text tells consumers to "re-run
+  `install-anvil.sh .` from the anvil checkout" to upgrade.
+- **kicad-tools** (`rjwalters/kicad-tools` `scripts/install-kct.sh`, checked at
+  `87561cf`): the header comment states outright "Re-running the installer is
+  the upgrade/idempotency path: a second run with the same args adds no
+  duplicate CLAUDE.md block and no duplicate dependency" — Stage 5 explicitly
+  no-ops when the dependency is already present and up to date.
+
 **Re-run caveat: `resync-installed.sh` syncs itself.** The script is part of the
 `.loom/scripts/` payload it updates, so the copy that starts the run is the
 *old* one. A stale copy carrying a bug can die partway through (observed going
