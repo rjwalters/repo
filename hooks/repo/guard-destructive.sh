@@ -991,8 +991,11 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
                 # boundaries, because it consumes whatever the forward scan paired
                 # with. When the opener is a STRAY unmatched quote, that partner
                 # can be an unrelated later quote and the real separators between
-                # them are swallowed. Confined to odd-quote-count input the shell
-                # will not parse — see the KNOWN LIMIT block in ml_segment().
+                # them are swallowed. Two routes reach it: an opener sitting AFTER
+                # an active span has closed, and an opener INSIDE an active span
+                # whose partner lies past that span-s close. Both are confined to
+                # odd-quote-count input the shell will not parse — see the KNOWN
+                # LIMIT block in ml_segment().
                 out = out substr(s, i, ci - i + 1)
                 i = ci + 1
                 continue
@@ -1246,11 +1249,18 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
         # pre-#113 mis-pairing happened to leave ACTIVE, so a few shapes go
         # deny -> allow:
         #     echo "$(id)" " ; <destructive> ; echo "trailing"
+        # The same branch is reached by a second route, where the stray opener
+        # sits INSIDE an active span and its partner lies past that span-s close
+        # (the #130 reproduction; written here with S for the single quote this
+        # single-quoted awk string cannot contain):
+        #     echo "$( S )" ; <destructive> S
         # Every member of the family needs an ODD quote count, so the shell
         # rejects the command outright and nothing executes; the swallowed text is
-        # text the shell also treats as quoted. Pinned by the "unbalanced stray
-        # quote" cases in the #113 test block. The underlying weakness is the
-        # inert branch itself, tracked in #130 — not this close-index bookkeeping.
+        # text the shell also treats as quoted. Both routes are pinned by the
+        # KNOWN LIMIT cases in the #113 test block, each paired with an
+        # assert_shell_rejects so the unparseability half is mechanical rather
+        # than a claim in this comment. The underlying weakness is the inert
+        # branch itself, tracked in #130 — not this close-index bookkeeping.
         while (acn > 0 && acs[acn] < i) acn--   # spans a jump already skipped past
         if (acn > 0 && i == acs[acn]) {
             seg = seg c
@@ -1287,8 +1297,10 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
                 # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
                 # it consumes whatever the forward scan paired with, which for a
-                # STRAY unmatched opener may be an unrelated later quote. See the
-                # KNOWN LIMIT block at the active-span-close guard above.
+                # STRAY unmatched opener may be an unrelated later quote. That
+                # opener may sit after a closed active span OR inside one with its
+                # partner past the close. See the KNOWN LIMIT block at the
+                # active-span-close guard above.
                 # NOTE: `incmt` is deliberately NOT cleared here even when the
                 # span carries a newline. A real comment ends at that newline, so
                 # leaving the flag set can only suppress the opener probe for
