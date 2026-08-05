@@ -874,9 +874,12 @@ resolve_default_branch() {
 #     inside `$( )`), and recording it would end the span at a position the
 #     legacy walk pairs differently — the one direction that can lose a segment
 #     boundary. Returning 0 reproduces the pre-#113 walk for that span exactly.
-# Every use is strictly NARROWING: treating something as escaped/ambiguous only
-# falls back to (or stays in) separator-ACTIVE segmentation, never widening a
-# deny into an allow.
+# Every use of THESE HELPERS is narrowing: treating something as
+# escaped/ambiguous only falls back to (or stays in) separator-ACTIVE
+# segmentation. That is a property of the helpers, not an unconditional property
+# of the lexers — see the KNOWN LIMIT note on the inert-span branch (#130) for
+# the one shape where correcting the active-span pairing lets a STRAY unmatched
+# quote pair differently than it did before #113.
 #
 # Lives in its own awk source string, prepended to BOTH lexer sources, so
 # qsplit() and ml_segment() share ONE definition and cannot drift (#113).
@@ -933,8 +936,10 @@ function trusted_close(s, n, ci, qc,   j) {
 #     nothing at all so that span is walked exactly the legacy way;
 #   - an unterminated quote advances ONE character with separators still active
 #     (both lexers) instead of swallowing the remainder of the buffer.
-# None of these can widen a deny into an allow; the escaped-quote cases in the
-# #113 test block pin the shapes that did.
+# For every command the shell can actually PARSE, none of these widens a deny
+# into an allow; the escaped-quote cases in the #113 test block pin the shapes
+# that did. For input with an UNBALANCED quote count the guarantee is weaker —
+# see the KNOWN LIMIT note on the inert-span branch (#130).
 #
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
@@ -982,6 +987,12 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
             inner = substr(s, i + 1, ci - i - 1)
             if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
                 # Inert quoted span: copy verbatim, separators inside are literal.
+                # KNOWN LIMIT (#130): this is the one branch that can LOSE segment
+                # boundaries, because it consumes whatever the forward scan paired
+                # with. When the opener is a STRAY unmatched quote, that partner
+                # can be an unrelated later quote and the real separators between
+                # them are swallowed. Confined to odd-quote-count input the shell
+                # will not parse — see the KNOWN LIMIT block in ml_segment().
                 out = out substr(s, i, ci - i + 1)
                 i = ci + 1
                 continue
@@ -1222,9 +1233,24 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
         # The close index is only authoritative when a BACKSLASH did not make the
         # pairing ambiguous — see the escaped-quote rules in the shared header
         # above and the three escape-aware branches below. With those in place
-        # this is strictly widening for segmentation (it can only produce MORE
-        # segment boundaries than before), so it can never turn an existing deny
-        # into an allow.
+        # this produces MORE segment boundaries than before for every command the
+        # shell can PARSE, so it cannot turn an existing deny into an allow there.
+        #
+        # KNOWN LIMIT (#130) — it is NOT an unconditional guarantee. Correcting
+        # the pairing also frees a STRAY unmatched quote sitting after the span to
+        # pair with a LATER quote instead of with the close of this span. (No
+        # apostrophes in this block: it lives inside a single-quoted awk source
+        # string, where one would terminate the string.) When the text
+        # between them carries no substitution, the inert branch below copies it
+        # verbatim and swallows the real separators inside it — separators the
+        # pre-#113 mis-pairing happened to leave ACTIVE, so a few shapes go
+        # deny -> allow:
+        #     echo "$(id)" " ; <destructive> ; echo "trailing"
+        # Every member of the family needs an ODD quote count, so the shell
+        # rejects the command outright and nothing executes; the swallowed text is
+        # text the shell also treats as quoted. Pinned by the "unbalanced stray
+        # quote" cases in the #113 test block. The underlying weakness is the
+        # inert branch itself, tracked in #130 — not this close-index bookkeeping.
         while (acn > 0 && acs[acn] < i) acn--   # spans a jump already skipped past
         if (acn > 0 && i == acs[acn]) {
             seg = seg c
@@ -1259,6 +1285,10 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
             inner = substr(s, i + 1, ci - i - 1)
             if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
+                # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
+                # it consumes whatever the forward scan paired with, which for a
+                # STRAY unmatched opener may be an unrelated later quote. See the
+                # KNOWN LIMIT block at the active-span-close guard above.
                 # NOTE: `incmt` is deliberately NOT cleared here even when the
                 # span carries a newline. A real comment ends at that newline, so
                 # leaving the flag set can only suppress the opener probe for

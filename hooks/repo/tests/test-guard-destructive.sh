@@ -1495,8 +1495,9 @@ assert_allow "#113: inert quoted alternation followed by a later quoted string i
 # literal text; an unterminated quote now advances one character with separators
 # still ACTIVE instead of swallowing the remainder.
 #
-# Every case below denies on the pre-#113 guard, so they are no-regression pins,
-# not new behaviour.
+# Every case in THIS sub-block denies on the pre-#113 guard, so they are
+# no-regression pins, not new behaviour. (The "unbalanced stray quote" sub-block
+# further down is the documented exception — see its KNOWN LIMIT header.)
 _Q113_ESCDQ='"$(a \" b)"'      # escaped double quote INSIDE the span
 _Q113_ESCSQ="'\$(a \\' b)'"    # escaped single quote inside a single-quoted span
 _Q113_ESCEND='"$(a b) \""'     # escaped quote at the very END of the span
@@ -1557,6 +1558,73 @@ assert_allow "#113: escaped quote AFTER the span with a benign tail is allowed" 
 
 assert_allow "#113: gh api body carrying an escaped quote is allowed" \
     'gh api -f body="$(cat file) \" x"'
+
+# --- KNOWN LIMIT: an UNBALANCED stray quote after the span (#130) -----------
+#
+# The one family where #113 moves a decision from deny to ALLOW, pinned here so
+# a future lexer change cannot move it again silently.
+#
+# Correcting the active-span pairing (the whole point of #113) also frees a
+# STRAY unmatched quote sitting after the span to pair with a LATER quote
+# instead of with this span's close. The text between them carries no
+# substitution, so the INERT branch copies it verbatim and swallows the real
+# separators inside it — separators the pre-#113 mis-pairing happened to leave
+# ACTIVE. Before #113 the phantom re-opened span consumed the stray quote and
+# the tail split; now the stray quote reaches the later one first.
+#
+# Why this is documented rather than fixed here: every member of the family
+# needs an ODD quote count, so the shell REJECTS the command and nothing
+# executes — the text the lexer swallows is text the shell also treats as
+# quoted. `assert_shell_rejects` below pins exactly that, so the safety argument
+# is mechanical rather than a claim in a comment: if a future change ever makes
+# one of these shapes parseable, that assertion fails and the allow must be
+# revisited. The underlying weakness is the inert branch itself (it consumes
+# whatever the forward scan paired with), tracked in #130 — not the #113
+# close-index bookkeeping, which is what makes the balanced cases above work.
+
+# Assert the shell itself refuses to parse a command — the load-bearing half of
+# the KNOWN LIMIT argument (an allow cannot matter if nothing can execute).
+assert_shell_rejects() {
+    local description="$1"
+    local cmd="$2"
+    TOTAL=$((TOTAL + 1))
+    if bash -n <<<"$cmd" 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: bash rejects it (syntax error)"
+        echo -e "       Got: bash PARSED it — the allow below is now executable"
+    else
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    fi
+}
+
+_Q113_STRAY='"'           # a STRAY unmatched double quote after the span
+_Q113_STRAYBS='\\\\"'     # an escaped-backslash run, then a stray quote
+_Q113_TRAILQ='"trailing"' # the later quote pair the stray one reaches first
+
+for _q113_stray in "$_Q113_STRAY" "$_Q113_STRAYBS"; do
+    for _q113_span in "$_Q113_SUB" "$_Q113_BT"; do
+        _q113_cmd="echo $_q113_span $_q113_stray ; $_Q113_RM ; echo $_Q113_TRAILQ"
+        assert_shell_rejects \
+            "#130 KNOWN LIMIT: stray quote shape is unparseable, so the allow cannot execute (${_q113_stray} after ${_q113_span})" \
+            "$_q113_cmd"
+        assert_allow \
+            "#130 KNOWN LIMIT: stray quote after the span swallows the tail (${_q113_stray} after ${_q113_span})" \
+            "$_q113_cmd"
+    done
+done
+unset _q113_stray _q113_span _q113_cmd
+
+# Controls: the SAME shapes with the quote count BALANCED still deny, so the
+# limit is confined to unparseable input and has not leaked into real commands.
+assert_deny "#130 control: balanced quotes after the span still deny (empty string arg)" \
+    "echo $_Q113_SUB \"\" ; $_Q113_RM ; echo $_Q113_TRAILQ"
+assert_deny "#130 control: balanced quotes after the span still deny (quoted word)" \
+    "echo $_Q113_SUB \"q\" ; $_Q113_RM ; echo $_Q113_TRAILQ"
+assert_deny "#130 control: stray-quote shape WITHOUT a later quote pair still denies" \
+    "echo $_Q113_SUB $_Q113_STRAY ; $_Q113_RM"
 
 echo ""
 
