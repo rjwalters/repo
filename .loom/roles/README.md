@@ -31,7 +31,7 @@ To edit a role definition:
 | `builder` | Feature implementation | Manual |
 | `champion` | Proposal evaluation and PR auto-merge | 10min |
 | `curator` | Issue enhancement | 5min |
-| `doctor` | Bug fixes and PR feedback | Manual |
+| `doctor` | Bug fixes and PR feedback | 5min |
 | `driver` | Plain shell environment | Manual |
 | `guide` | Issue triage and prioritization | 15min |
 | `hermit` | Code simplification proposals | 15min |
@@ -69,7 +69,6 @@ Each role can have an optional JSON metadata file with default settings:
 - **`defaultIntervalPrompt`** (string): Default prompt sent at each interval
 - **`autonomousRecommended`** (boolean): Whether autonomous mode is recommended
 - **`suggestedWorkerType`** (string): "claude" or "codex"
-- **`gitIdentity`** (object): `name` / `email` used for commits made by this role
 - **`stuckThresholds`** (object): Per-role stuck-detection limits (e.g. `maxNoOutput`, `maxNeedsInput`, in milliseconds)
 
 ## Creating Custom Roles

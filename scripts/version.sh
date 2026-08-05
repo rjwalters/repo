@@ -53,9 +53,21 @@ case "$cmd" in
   check)
     v="$(read_version)"
     p="$(pkg_version)"
-    if [ -n "$p" ] && [ "$p" != "$v" ]; then
-      echo "version drift: VERSION=$v package.json=$p (run: scripts/version.sh bump ... or align package.json)" >&2
-      exit 1
+    # An ABSENT version field is drift, not agreement. Guarding the comparison
+    # with `[ -n "$p" ]` alone made the mirror unenforceable: a tool that strips
+    # the field (Loom's resync did exactly this while package.json still carried
+    # the installer stub's name — see #138) left `check` reporting ok, so the
+    # invariant this script exists to hold would lapse unnoticed until the next
+    # bump silently restored it. Report the state actually found.
+    if [ -f "$PKG_FILE" ]; then
+      if [ -z "$p" ]; then
+        echo "version drift: VERSION=$v but package.json has no version field (run: scripts/version.sh bump ... to restore the mirror)" >&2
+        exit 1
+      fi
+      if [ "$p" != "$v" ]; then
+        echo "version drift: VERSION=$v package.json=$p (run: scripts/version.sh bump ... or align package.json)" >&2
+        exit 1
+      fi
     fi
     echo "ok: $v"
     ;;

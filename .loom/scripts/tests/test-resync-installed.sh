@@ -16,10 +16,28 @@
 #   (j) local-only custom role -> survives untouched
 #   (k) resync-ignore pins a new-surface file -> reported "skipped"
 #   (l) symlinked install target -> skipped, not clobbered
+#   (l2) symlinked SOURCE file -> resolved to its content (not a copied link),
+#        appears in the per-file report (updated/unchanged), destination-side
+#        symlink protection (l) is unaffected (#5222)
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
+# Canonical-guard-defer (#4041, #4403, #4566):
+#   (o) canonical guard + git-TRACKED vendored guard -> preserved, tree clean, and
+#       reported as an informational note (NOT a WARN) that --quiet suppresses
+#   (p) canonical guard + UNTRACKED vendored guard   -> removed (unchanged behavior)
+# Worktree-isolation refusal (#4563):
+#   (q) invoked from a linked worktree -> non-zero exit, NOTHING written to main
+#   (r) --allow-worktree / LOOM_RESYNC_ALLOW_WORKTREE=1 -> permitted (warns)
+#   (s) main checkout (incl. a subdirectory of it)      -> unaffected, exit 0
+# Self-update safety (#4669):
+#   (t) the REAL script, installed as a padded "older" copy, resyncs itself from
+#       a substantially different newer source -> run completes, no mid-run
+#       syntax error, self-copy applied LAST, other surfaces fully refreshed
+#   (u) an updated file gets a new inode (staged + renamed, not truncated) with
+#       its permissions preserved, and leaves no .resync-stage.* dirt
+#   (v) an unsyncable file -> explicit PARTIAL REFRESH report + exit 1
 # Plus contract checks:
-#   - --help prints usage, exit 0
+#   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
 #   - not-a-git-repo exits 1
 #
@@ -78,9 +96,15 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 #   .loom/scripts/custom-only.sh     (repo-specific, no defaults/ counterpart)
 # Widened surfaces (#4239):
 #   defaults/roles/builder.md            -> .loom/roles/builder.md (drift)
+#   defaults/roles/symlinked-role.md     -> .loom/roles/symlinked-role.md (SOURCE
+#                                            is a symlink to a sibling file, #5222 —
+#                                            mirrors defaults/roles/*.md -> ../.claude/
+#                                            commands/loom/*.md in the real repo)
 #   defaults/docs/troubleshooting.md     -> .loom/docs/troubleshooting.md (drift)
 #   defaults/.loom/bin/loom              -> .loom/bin/loom (drift)
 #   defaults/.claude/commands/loom/x.md  -> .claude/commands/loom/x.md (drift)
+#   defaults/.claude/README.md           -> .claude/README.md (drift, #5264)
+#   defaults/.github/CONFIGURATION.md    -> .github/CONFIGURATION.md (drift, #5264)
 #   .loom/roles/custom-role.md           (repo-specific, no defaults/ counterpart)
 #   package.json ("version": "9.9.9")    (loom_version source for re-stamp)
 #   .loom/install-metadata.json          (re-stamp target; loom_source -> $repo)
@@ -90,9 +114,11 @@ make_fixture() {
     mkdir -p "$repo/defaults/hooks" "$repo/defaults/scripts/lib" \
              "$repo/defaults/roles" "$repo/defaults/docs" \
              "$repo/defaults/.loom/bin" "$repo/defaults/.claude/commands/loom" \
+             "$repo/defaults/.github" \
              "$repo/.loom/hooks" "$repo/.loom/scripts/lib" \
              "$repo/.loom/roles" "$repo/.loom/docs" \
-             "$repo/.loom/bin" "$repo/.claude/commands/loom"
+             "$repo/.loom/bin" "$repo/.claude/commands/loom" \
+             "$repo/.github"
     git -C "$repo" init -q
 
     printf 'A\n' > "$repo/defaults/hooks/guard.sh"
@@ -111,6 +137,12 @@ make_fixture() {
     printf 'ROLE-OLD\n' > "$repo/.loom/roles/builder.md"
     printf 'CUSTOM-ROLE\n' > "$repo/.loom/roles/custom-role.md"   # local-only
 
+    # #5222: a SOURCE-side symlink, mirroring the real defaults/roles/*.md ->
+    # ../.claude/commands/loom/*.md skillification layout. sync_one/resync_tree
+    # must resolve this to its target's content, never copy the link itself.
+    printf 'SYMLINK-TARGET-CONTENT\n' > "$repo/defaults/roles/_symlink-target.md"
+    ln -s "_symlink-target.md" "$repo/defaults/roles/symlinked-role.md"
+
     printf 'DOC-NEW\n' > "$repo/defaults/docs/troubleshooting.md"
     printf 'DOC-OLD\n' > "$repo/.loom/docs/troubleshooting.md"
 
@@ -120,6 +152,14 @@ make_fixture() {
 
     printf 'CMD-NEW\n' > "$repo/defaults/.claude/commands/loom/builder.md"
     printf 'CMD-OLD\n' > "$repo/.claude/commands/loom/builder.md"
+
+    # Single-file consumer-install docs (#5264): .claude/README.md and
+    # .github/CONFIGURATION.md are copied verbatim into every consumer repo at
+    # install time but, prior to #5264, were never resynced afterward.
+    printf 'CLAUDE-README-NEW\n' > "$repo/defaults/.claude/README.md"
+    printf 'CLAUDE-README-OLD\n' > "$repo/.claude/README.md"
+    printf 'CONFIGURATION-NEW\n' > "$repo/defaults/.github/CONFIGURATION.md"
+    printf 'CONFIGURATION-OLD\n' > "$repo/.github/CONFIGURATION.md"
 
     # Version source + metadata re-stamp target.
     printf '{\n  "version": "9.9.9"\n}\n' > "$repo/package.json"
@@ -232,7 +272,7 @@ if [[ $RC -eq 2 ]]; then
 else
     fail "(i) --dry-run did not exit 2 across widened surfaces (got $RC)"
 fi
-for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md"; do
+for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md" ".claude/README.md" ".github/CONFIGURATION.md"; do
     if grep -q "$surf" <<<"$OUT"; then
         pass "(i) --dry-run reports drift for $surf"
     else
@@ -262,6 +302,16 @@ if [[ "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
     pass "(i) commands/loom/builder.md resynced from defaults"
 else
     fail "(i) commands/loom/builder.md not resynced"
+fi
+if [[ "$(cat "$REPO/.claude/README.md")" == "CLAUDE-README-NEW" ]]; then
+    pass "(i) .claude/README.md resynced from defaults (#5264)"
+else
+    fail "(i) .claude/README.md not resynced (#5264)"
+fi
+if [[ "$(cat "$REPO/.github/CONFIGURATION.md")" == "CONFIGURATION-NEW" ]]; then
+    pass "(i) .github/CONFIGURATION.md resynced from defaults (#5264)"
+else
+    fail "(i) .github/CONFIGURATION.md not resynced (#5264)"
 fi
 # second run is a clean no-op across the widened surfaces too
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
@@ -298,6 +348,43 @@ else
     fail "(k) pinned roles/builder.md was overwritten despite resync-ignore"
 fi
 
+# --- (k2) .claude/README.md / .github/CONFIGURATION.md are gated on the ------
+#          destination already existing (never force-populated, #5264)
+echo "Test group 9b: single-file docs are not force-created for a consumer that never had them"
+REPO="$(make_fixture)"
+# make_fixture git-tracks both files (its `git add -A && git commit`), so a bare
+# `rm -f` would NOT simulate "a consumer that never had them" — it leaves a
+# *deleted-but-tracked* path that `git status --porcelain` reports as pending
+# dirt (` D .claude/README.md`). resync-installed.sh's dirty-tree hint
+# (suggest_commit_if_resync_only_dirt) then lists that path in its `git add`
+# suggestion, which the "not reported at all" assertion below greps for and
+# trips on. Drop the files from the index *and* the worktree and commit the
+# removal, so the fixture is genuinely a repo that never received them.
+git -C "$REPO" rm -q -- .claude/README.md .github/CONFIGURATION.md >/dev/null 2>&1
+git -C "$REPO" commit -qm "consumer install without the single-file docs" >/dev/null 2>&1
+if [[ -z "$(git -C "$REPO" status --porcelain -- .claude/README.md .github/CONFIGURATION.md)" ]]; then
+    pass "(k2) fixture precondition: both single-file docs are absent AND untracked"
+else
+    fail "(k2) fixture precondition: single-file docs still show as pending git changes"
+fi
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ ! -e "$REPO/.claude/README.md" ]]; then
+    pass "(k2) .claude/README.md not force-created when absent"
+else
+    fail "(k2) .claude/README.md was force-created despite being absent"
+fi
+if [[ ! -e "$REPO/.github/CONFIGURATION.md" ]]; then
+    pass "(k2) .github/CONFIGURATION.md not force-created when absent"
+else
+    fail "(k2) .github/CONFIGURATION.md was force-created despite being absent"
+fi
+if ! grep -q "\.claude/README\.md" <<<"$OUT" && ! grep -q "\.github/CONFIGURATION\.md" <<<"$OUT"; then
+    pass "(k2) absent single-file docs are not reported at all"
+else
+    fail "(k2) absent single-file docs were unexpectedly reported"
+fi
+
 # --- (l) symlinked install target is skipped, not clobbered ------------------
 echo "Test group 10: symlinked install target is skipped (dogfood safety)"
 REPO="$(make_fixture)"
@@ -316,6 +403,69 @@ if [[ -L "$REPO/.loom/docs/troubleshooting.md" ]]; then
     pass "(l) symlink left intact (not clobbered into a regular file)"
 else
     fail "(l) symlink was clobbered"
+fi
+
+# --- (l2) symlinked SOURCE file is resolved to content, not silently skipped -
+#
+# #5222: defaults/roles/symlinked-role.md (built by make_fixture as a symlink
+# to the sibling defaults/roles/_symlink-target.md) mirrors the real repo's
+# defaults/roles/*.md -> ../.claude/commands/loom/*.md skillification layout.
+# Before the fix, plain `find -type f` lstats each entry, a symlink never
+# matches `-type f`, so this file fell out of the walk entirely -- never
+# reported, never copied -- while the consumer's install-metadata.json still
+# got re-stamped current. The regression check: the resolved destination must
+# be a REGULAR FILE with the target's content, not a symlink, and the file
+# must show up in the per-file report.
+echo "Test group 10b: symlinked SOURCE file is resolved to content (#5222)"
+REPO="$(make_fixture)"
+DRY_OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 2 ]] && grep -q "roles/symlinked-role.md" <<<"$DRY_OUT"; then
+    pass "(l2) --dry-run reports the symlinked source file, not silently omitted"
+else
+    fail "(l2) --dry-run did not report roles/symlinked-role.md (rc=$RC)"
+fi
+if [[ ! -e "$REPO/.loom/roles/symlinked-role.md" ]]; then
+    pass "(l2) --dry-run created nothing for the symlinked source file"
+else
+    fail "(l2) --dry-run unexpectedly wrote .loom/roles/symlinked-role.md"
+fi
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(l2) apply exits 0"; else fail "(l2) apply exits 0 (got $RC)"; fi
+if grep -q "roles/symlinked-role.md" <<<"$OUT"; then
+    pass "(l2) apply reports the symlinked source file in the per-file output"
+else
+    fail "(l2) apply did not report roles/symlinked-role.md"
+fi
+if [[ -f "$REPO/.loom/roles/symlinked-role.md" && ! -L "$REPO/.loom/roles/symlinked-role.md" ]]; then
+    pass "(l2) destination is a REGULAR FILE (not a copied symlink)"
+else
+    fail "(l2) destination is missing or is itself a symlink"
+fi
+if [[ "$(cat "$REPO/.loom/roles/symlinked-role.md" 2>/dev/null)" == "SYMLINK-TARGET-CONTENT" ]]; then
+    pass "(l2) destination content matches the symlink's RESOLVED target"
+else
+    fail "(l2) destination content does not match the resolved target"
+fi
+# Idempotent rerun: no drift once the symlinked source has been resolved once.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(l2) rerun is a clean no-op (symlinked source treated as unchanged)"
+else
+    fail "(l2) rerun was not a clean no-op (rc=$RC)"
+fi
+# The destination-side symlink protection case (l) must be completely
+# unaffected by resolving SOURCE-side symlinks.
+REPO2="$(make_fixture)"
+rm -f "$REPO2/.loom/docs/troubleshooting.md"
+ln -s "../../defaults/docs/troubleshooting.md" "$REPO2/.loom/docs/troubleshooting.md"
+(cd "$REPO2" && bash "$SCRIPT" >/dev/null 2>&1)
+if [[ -L "$REPO2/.loom/docs/troubleshooting.md" ]]; then
+    pass "(l2) destination-side symlink protection (l) still holds alongside the source-side fix"
+else
+    fail "(l2) destination-side symlink protection (l) regressed"
 fi
 
 # --- (m) recorded loom_source gone -> clear error, exit 1 --------------------
@@ -369,6 +519,68 @@ if grep -q '"loom_version": *"0.0.0"' "$REPO/.loom/install-metadata.json"; then
     pass "(n) --dry-run leaves install-metadata.json unstamped"
 else
     fail "(n) --dry-run re-stamped metadata (should be preview-only)"
+fi
+
+# --- (#4528) install-metadata.json merge=ours driver wiring -----------------
+echo "Test group 12g: resync wires the install-metadata.json merge=ours driver (#4528)"
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+GA="$REPO/.gitattributes"
+if [[ -f "$GA" ]] && grep -qxF ".loom/install-metadata.json merge=ours" "$GA"; then
+    pass "(q) .gitattributes gets the install-metadata.json merge=ours rule"
+else
+    fail "(q) .gitattributes missing the merge=ours rule"
+fi
+if [[ "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" == "true" ]]; then
+    pass "(q) local git config merge.ours.driver=true is set"
+else
+    fail "(q) local git config merge.ours.driver was not set"
+fi
+# Idempotent rerun: no duplicate marker block.
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+OCCURRENCES="$(grep -cxF ".loom/install-metadata.json merge=ours" "$GA")"
+if [[ "$OCCURRENCES" -eq 1 ]]; then
+    pass "(q) rerun does not duplicate the .gitattributes rule"
+else
+    fail "(q) rerun duplicated the .gitattributes rule (found $OCCURRENCES occurrences)"
+fi
+# --dry-run must NOT write .gitattributes or local git config.
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" --dry-run >/dev/null 2>&1)
+if [[ ! -f "$REPO/.gitattributes" ]]; then
+    pass "(q) --dry-run leaves .gitattributes absent (preview-only)"
+else
+    fail "(q) --dry-run wrote .gitattributes (should be preview-only)"
+fi
+if [[ -z "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" ]]; then
+    pass "(q) --dry-run leaves merge.ours.driver unset (preview-only)"
+else
+    fail "(q) --dry-run set merge.ours.driver (should be preview-only)"
+fi
+# End-to-end: a real merge conflict on install-metadata.json between two
+# divergent branches resolves automatically to "ours" once the driver+
+# attribute are wired up, instead of stopping for manual resolution.
+MERGE_REPO="$(make_fixture)"
+(cd "$MERGE_REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+git -C "$MERGE_REPO" add -A >/dev/null 2>&1
+git -C "$MERGE_REPO" commit -qm "wire merge driver" >/dev/null 2>&1
+MERGE_REPO_DEFAULT_BRANCH="$(git -C "$MERGE_REPO" symbolic-ref --short HEAD)"
+git -C "$MERGE_REPO" checkout -qb host-a >/dev/null 2>&1
+printf '{\n  "loom_version": "1.1.1",\n  "loom_commit": "aaa1111",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-a resync stamp" >/dev/null 2>&1
+git -C "$MERGE_REPO" checkout -q "$MERGE_REPO_DEFAULT_BRANCH" >/dev/null 2>&1
+printf '{\n  "loom_version": "2.2.2",\n  "loom_commit": "bbb2222",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-b resync stamp" >/dev/null 2>&1
+if git -C "$MERGE_REPO" merge -q host-a >/dev/null 2>&1; then
+    if grep -q '"loom_version": *"2.2.2"' "$MERGE_REPO/.loom/install-metadata.json"; then
+        pass "(q) two hosts' resync stamps merge cleanly, keeping the local (ours) side"
+    else
+        fail "(q) merge succeeded but did not keep the local side's stamp"
+    fi
+else
+    fail "(q) merge of two divergent resync stamps still conflicts"
 fi
 
 # --- (#4280) .gitignore managed-block refresh + audit ------------------------
@@ -463,9 +675,16 @@ fi
 echo "Test group 12c: absent daemon binary -> loud warning, apply still exits 0 (#4280)"
 REPO="$(make_fixture)"
 # Force the resolver to find nothing: no LOOM_DAEMON_BIN, no PATH loom-daemon,
-# no build-output under the fixture's SOURCE_ROOT (the fixture repo).
-OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" bash "$SCRIPT" 2>&1)"
+# no build-output under the fixture's SOURCE_ROOT (the fixture repo), and no
+# machine-level install fallback (step 4 of loom_locate_daemon_bin) -- on a
+# host with a genuine machine-level Loom install, leaving $HOME/
+# LOOM_DAEMON_BIN_DIR untouched would let that step resolve the real binary
+# and defeat this fixture (#5183).
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
 RC=$?
+rm -rf "$NO_BIN_HOME"
 if [[ $RC -eq 0 ]]; then
     pass "(#4280) apply still exits 0 when no daemon binary resolves"
 else
@@ -475,6 +694,119 @@ if grep -qi "could not refresh the loom-managed .gitignore block\|no loom-daemon
     pass "(#4280) missing binary produces a loud warning (not a silent skip)"
 else
     fail "(#4280) missing binary did not produce the expected warning"
+fi
+
+# --- (#5294) stale-binary regression: a loom-daemon binary compiled before a
+# given EPHEMERAL_PATTERNS entry existed, resolved ahead of a fresher
+# repo-local build under default (no LOOM_PREFER_REPO_BUILD) resolver
+# precedence, must not silently drop that pattern from the regenerated
+# .gitignore -- this is the exact mechanism that reintroduced #5267's gitlink
+# hazard 34 minutes after #5280 fixed it (05cf67e8). These fixtures use fake
+# `loom-daemon` shell-script stand-ins (each emitting a canned managed block
+# from a fixed pattern list) rather than the real Rust binary, so the
+# regression is reproducible without compiling two different daemon versions.
+#
+# make_fake_daemon_bin <dest> <pattern>... -- writes an executable at <dest>
+# that supports exactly `update-gitignore --help` (prints usage, exit 0) and
+# `update-gitignore <repo>` (rewrites <repo>/.gitignore's loom-managed block
+# to contain exactly the given patterns, preserving surrounding content).
+make_fake_daemon_bin() {
+    local dest="$1"; shift
+    mkdir -p "$(dirname "$dest")"
+    printf '%s\n' "$@" > "$dest.patterns"
+    cat > "$dest" <<'FAKE_DAEMON_EOF'
+#!/usr/bin/env bash
+set -u
+PATFILE="$0.patterns"
+if [[ "${1:-}" == "update-gitignore" ]]; then
+    if [[ "${2:-}" == "--help" ]]; then
+        echo "usage: loom-daemon update-gitignore <repo>"
+        exit 0
+    fi
+    repo="$2"
+    gi="$repo/.gitignore"
+    [[ -f "$gi" ]] || : > "$gi"
+    tmp="$(mktemp)"
+    awk 'BEGIN{skip=0} /# >>> loom-managed/{skip=1;next} /# <<< loom-managed/{skip=0;next} skip==0{print}' "$gi" > "$tmp"
+    {
+        cat "$tmp"
+        echo "# >>> loom-managed (do not edit) >>>"
+        echo "# Loom runtime state (don't commit these)"
+        cat "$PATFILE"
+        echo "# <<< loom-managed <<<"
+    } > "$gi"
+    rm -f "$tmp"
+    exit 0
+fi
+exit 1
+FAKE_DAEMON_EOF
+    chmod +x "$dest"
+}
+
+# A synthetic post_init.rs declaring an "old" pattern (present in every fake
+# binary below) plus a "just-added" pattern (present ONLY in the fresh
+# repo-local build) -- mirrors #5280 adding `.claude/worktrees/` to source
+# while a stale resolved binary still lacked it.
+write_fake_post_init() {
+    local repo="$1"
+    mkdir -p "$repo/loom-daemon/src/init"
+    cat > "$repo/loom-daemon/src/init/post_init.rs" <<'RUST_EOF'
+pub const EPHEMERAL_PATTERNS: &[&str] = &[
+    ".loom-in-use",
+    ".fake-newly-added-pattern/",
+];
+RUST_EOF
+}
+
+echo "Test group 12h: gitignore refresh prefers a repo-local build over a stale PATH binary when no \$LOOM_DAEMON_BIN override is set (#5294)"
+REPO="$(make_fixture)"
+write_fake_post_init "$REPO"
+make_fake_daemon_bin "$REPO/loom-daemon/target/release/loom-daemon" ".loom-in-use" ".fake-newly-added-pattern/"
+STALE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fake-path.XXXXXX")"
+make_fake_daemon_bin "$STALE_DIR/loom-daemon" ".loom-in-use"
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="$STALE_DIR:/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
+RC=$?
+rm -rf "$NO_BIN_HOME" "$STALE_DIR"
+if [[ $RC -eq 0 ]]; then
+    pass "(#5294) apply exits 0 with a stale PATH binary and a fresh repo-local build present"
+else
+    fail "(#5294) apply exits 0 with stale PATH + fresh repo build (got $RC)"
+fi
+GI_BLOCK="$(sed -n '/# >>> loom-managed/,/# <<< loom-managed/p' "$REPO/.gitignore")"
+if grep -qxF ".fake-newly-added-pattern/" <<<"$GI_BLOCK"; then
+    pass "(#5294) the newly-added source pattern landed in .gitignore (repo-local build was preferred over stale PATH)"
+else
+    fail "(#5294) newly-added pattern missing from .gitignore -- the stale PATH binary was used instead of the repo build"
+fi
+if grep -qi "regenerated .gitignore WITHOUT" <<<"$OUT"; then
+    fail "(#5294) unexpected stale-binary warning even though the repo build covered every source pattern"
+else
+    pass "(#5294) no stale-binary warning printed when the resolved binary satisfies all source patterns"
+fi
+
+echo "Test group 12i: gitignore refresh warns loudly -- never silently -- when only a stale binary resolves (#5294)"
+REPO="$(make_fixture)"
+write_fake_post_init "$REPO"
+# No repo-local build this time: resolution falls through to the stale PATH
+# binary (the pre-#5294-fix behavior this whole issue is about).
+STALE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fake-path.XXXXXX")"
+make_fake_daemon_bin "$STALE_DIR/loom-daemon" ".loom-in-use"
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="$STALE_DIR:/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
+RC=$?
+rm -rf "$NO_BIN_HOME" "$STALE_DIR"
+if [[ $RC -eq 0 ]]; then
+    pass "(#5294) apply still exits 0 when only a stale binary resolves"
+else
+    fail "(#5294) apply exits 0 with only a stale binary resolvable (got $RC)"
+fi
+if grep -qi "regenerated .gitignore WITHOUT" <<<"$OUT" && grep -qF ".fake-newly-added-pattern/" <<<"$OUT"; then
+    pass "(#5294) the dropped pattern is named in a loud warning instead of being silently lost"
+else
+    fail "(#5294) stale-binary warning did not name the missing pattern"
 fi
 
 # --- (#4285) targeted loom-workspace package.json version field edit --------
@@ -539,6 +871,436 @@ else
     fail "(#4285) pinned package.json not reported skipped"
 fi
 
+# --- (#4403) canonical-guard-defer: git-tracked target must NOT be removed --
+echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+git -C "$REPO" add .loom/hooks/guard-destructive-generic.sh >/dev/null 2>&1
+git -C "$REPO" commit -qm "track vendored guard" >/dev/null 2>&1
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with a tracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) git-tracked hooks/guard-destructive-generic.sh preserved (not removed)"
+else
+    fail "(#4403) git-tracked hooks/guard-destructive-generic.sh was removed"
+fi
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT"; then
+    pass "(#4403) the preserved tracked file is reported explicitly"
+else
+    fail "(#4403) no report explaining the preserved tracked file"
+fi
+# #4566: a committed vendored guard is a deliberate, documented posture, so this
+# is the expected steady state on EVERY run — it must not be reported at
+# alarm level (a WARN here reprinted forever with no way to acknowledge it).
+# (Scoped to this message: an unrelated WARN, e.g. the #4280 missing-daemon
+# .gitignore notice, can legitimately appear in the same run.)
+if grep -qEi "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT"; then
+    fail "(#4566) tracked vendored guard must not produce a WARN (got: $(grep -Ei "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT" | head -1))"
+else
+    pass "(#4566) no WARN for the deliberately-tracked vendored guard"
+fi
+if [[ -z "$(cd "$REPO" && git status --porcelain -- .loom/hooks/guard-destructive-generic.sh 2>&1)" ]]; then
+    pass "(#4403) tracked guard file stays non-dirty (no local mods/deletions) after the run"
+else
+    fail "(#4403) tracked guard file is dirty after the run"
+fi
+# #4566: routed through note(), so --quiet suppresses it entirely while the
+# file is still preserved (behavior unchanged, only the reporting is quieter).
+OUT_Q="$(cd "$REPO" && bash "$SCRIPT" --quiet 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4566) --quiet rerun exits 0"; else fail "(#4566) --quiet rerun exits 0 (got $RC)"; fi
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT_Q"; then
+    fail "(#4566) --quiet still printed the tracked-guard message (not routed through note())"
+else
+    pass "(#4566) --quiet suppresses the tracked-guard message"
+fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4566) --quiet rerun still preserves the git-tracked vendored guard"
+else
+    fail "(#4566) --quiet rerun removed the git-tracked vendored guard"
+fi
+
+# --- (#4403) canonical-guard-defer: untracked target keeps existing behavior -
+echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+# Note: intentionally NOT git-added, so this is the normal consumer-repo case
+# where .loom/ isn't committed.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with an untracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ ! -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) untracked hooks/guard-destructive-generic.sh removed (existing behavior unchanged)"
+else
+    fail "(#4403) untracked hooks/guard-destructive-generic.sh was NOT removed"
+fi
+if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
+    pass "(#4403) removal reported as before"
+else
+    fail "(#4403) removal not reported"
+fi
+
+# --- (#4894) capability-gap canonical guard: vendored guard must be KEPT ----
+# The canonical guard carries the repo#29 VERSION marker but NOT the
+# write-confinement CAPABILITY marker (the Repo Skills 0.7.0 shape that
+# motivated #4894). Before #4894, CANONICAL_GUARD_PRESENT was version-only, so
+# this untracked vendored copy would have been removed here too — stripping
+# the dispatcher's fallback out from under it and leaving zero destructive-
+# command coverage, since the dispatcher (correctly, post-#4894) declines to
+# exec a canonical guard that fails the capability probe.
+echo "Test group 15b: canonical guard has version marker but NOT capability marker -> vendored guard is kept, not removed (#4894)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard ONLY\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4894) apply exits 0 with a capability-gap canonical guard present"; else fail "(#4894) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4894) vendored guard-destructive-generic.sh is KEPT (dispatcher's fallback preserved)"
+else
+    fail "(#4894) vendored guard-destructive-generic.sh was removed despite the canonical guard lacking write-confinement"
+fi
+
+# --- (#4563) refuse to run from a linked worktree ----------------------------
+#
+# The installed .loom/ is always resolved against the PRIMARY worktree, so a run
+# from a linked (issue/PR) worktree writes to the MAIN checkout — the 2026-07-30
+# contamination incident. Assert the refusal, that it wrote NOTHING to main, and
+# that the explicit overrides still permit the write.
+echo "Test group 16: linked-worktree invocation is refused (#4563)"
+REPO="$(make_fixture)"
+LINKED_WT="$WORKDIR/linked-wt"
+rm -rf "$LINKED_WT"
+if ! git -C "$REPO" worktree add -q -b wt-4563 "$LINKED_WT" >/dev/null 2>&1; then
+    skip "(#4563) git worktree add unavailable in this environment"
+else
+    RC=0; OUT="$(cd "$LINKED_WT" && bash "$SCRIPT" 2>&1)" || RC=$?
+    if [[ $RC -ne 0 ]]; then
+        pass "(#4563) run from a linked worktree exits non-zero (got $RC)"
+    else
+        fail "(#4563) run from a linked worktree did NOT refuse (exit 0)"
+    fi
+    if grep -qi "worktree" <<<"$OUT"; then
+        pass "(#4563) refusal explains the worktree context"
+    else
+        fail "(#4563) refusal message does not mention the worktree"
+    fi
+    if grep -q -- "--allow-worktree" <<<"$OUT"; then
+        pass "(#4563) refusal names the --allow-worktree override"
+    else
+        fail "(#4563) refusal does not name the override flag"
+    fi
+    # (b) NOTHING written under the main checkout's .loom/
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "OLD" ]]; then
+        pass "(#4563) main checkout's drifted hooks/guard.sh left UNCHANGED"
+    else
+        fail "(#4563) main checkout's hooks/guard.sh was written from the worktree"
+    fi
+    if [[ ! -f "$REPO/.loom/scripts/lib/bar.sh" ]]; then
+        pass "(#4563) main checkout's missing scripts/lib/bar.sh NOT created"
+    else
+        fail "(#4563) a file was created under the main checkout's .loom/"
+    fi
+    if grep -q '"loom_version": "0.0.0"' "$REPO/.loom/install-metadata.json"; then
+        pass "(#4563) main checkout's install-metadata.json NOT re-stamped"
+    else
+        fail "(#4563) main checkout's install-metadata.json was re-stamped"
+    fi
+    # --dry-run is refused too: it reports on the MAIN checkout, not this worktree.
+    RC=0; (cd "$LINKED_WT" && bash "$SCRIPT" --dry-run >/dev/null 2>&1) || RC=$?
+    if [[ $RC -eq 1 ]]; then
+        pass "(#4563) --dry-run from a linked worktree is also refused (exit 1)"
+    else
+        fail "(#4563) --dry-run from a linked worktree was not refused (got $RC)"
+    fi
+
+    # (c) the override permits the write (still targeting the MAIN checkout).
+    RC=0; OUT="$(cd "$LINKED_WT" && bash "$SCRIPT" --allow-worktree 2>&1)" || RC=$?
+    if [[ $RC -eq 0 ]]; then
+        pass "(#4563) --allow-worktree permits the run (exit 0)"
+    else
+        fail "(#4563) --allow-worktree did not permit the run (got $RC)"
+    fi
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4563) --allow-worktree wrote the main checkout's installed copy"
+    else
+        fail "(#4563) --allow-worktree did not apply the resync"
+    fi
+    if grep -qi "WARN.*linked worktree" <<<"$OUT"; then
+        pass "(#4563) --allow-worktree still WARNs that writes target the main checkout"
+    else
+        fail "(#4563) --allow-worktree did not warn about the main-checkout target"
+    fi
+
+    # The env override is the non-interactive equivalent of the flag.
+    REPO="$(make_fixture)"
+    rm -rf "$LINKED_WT"
+    git -C "$REPO" worktree add -q -b wt-4563-env "$LINKED_WT" >/dev/null 2>&1
+    RC=0; (cd "$LINKED_WT" && LOOM_RESYNC_ALLOW_WORKTREE=1 bash "$SCRIPT" >/dev/null 2>&1) || RC=$?
+    if [[ $RC -eq 0 && "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4563) LOOM_RESYNC_ALLOW_WORKTREE=1 is equivalent to --allow-worktree"
+    else
+        fail "(#4563) LOOM_RESYNC_ALLOW_WORKTREE=1 did not permit the run (rc=$RC)"
+    fi
+fi
+
+# --- (#4563) the MAIN checkout is completely unaffected ----------------------
+#
+# Including from a SUBDIRECTORY of it, where `git rev-parse --git-common-dir`
+# returns a RELATIVE path ("../../.git") — a naive string compare against the
+# absolute `--show-toplevel` would refuse this legitimate run.
+echo "Test group 17: main-checkout invocation (incl. subdirectories) still works (#4563)"
+REPO="$(make_fixture)"
+RC=0; (cd "$REPO/defaults/scripts" && bash "$SCRIPT" >/dev/null 2>&1) || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4563) run from a main-checkout subdirectory exits 0"
+else
+    fail "(#4563) run from a main-checkout subdirectory was refused (got $RC)"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+    pass "(#4563) run from a main-checkout subdirectory still applies the resync"
+else
+    fail "(#4563) run from a main-checkout subdirectory did not apply the resync"
+fi
+
+# --- (#4669) the resync must survive updating the script it is running -------
+#
+# resync-installed.sh is itself a file under defaults/scripts/, so every run
+# copies a newer version over the very path the running bash process is still
+# reading from. The old in-place `cp` truncated and rewrote that file, letting
+# bash resume reading the (shorter) new file at a stale byte offset -> `syntax
+# error near unexpected token`, aborting the run with dozens of surfaces
+# already partially refreshed.
+#
+# This drives the REAL script as the installed/running copy, padded so it
+# differs substantially in both content and byte offsets from the newer source
+# that replaces it mid-run — the exact reported scenario.
+echo "Test group 18: self-update is atomic + deferred; the run completes (#4669)"
+
+# Builds $1/.loom/scripts/resync-installed.sh as a padded "older" variant of the
+# real script, with the real script as the defaults/ source it will sync from.
+make_self_update_fixture() {
+    local repo="$1"
+    mkdir -p "$repo/defaults/scripts" "$repo/.loom/scripts"
+    cp "$SCRIPT" "$repo/defaults/scripts/resync-installed.sh"
+    chmod +x "$repo/defaults/scripts/resync-installed.sh"
+    {
+        head -n 1 "$SCRIPT"
+        awk 'BEGIN { for (i = 0; i < 6000; i++) print "# old-installed-version padding line " i }'
+        tail -n +2 "$SCRIPT"
+    } > "$repo/.loom/scripts/resync-installed.sh"
+    chmod +x "$repo/.loom/scripts/resync-installed.sh"
+}
+
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4669) a self-updating run completes cleanly (exit 0)"
+else
+    fail "(#4669) a self-updating run did not exit 0 (got $RC)"
+fi
+if grep -qiE "syntax error|unexpected token|unexpected end of file" <<<"$OUT"; then
+    fail "(#4669) the running script observed a half-written copy of itself: $(grep -iE "syntax error|unexpected token|unexpected end of file" <<<"$OUT" | head -1)"
+else
+    pass "(#4669) no mid-run syntax error from the rewritten script"
+fi
+if cmp -s "$REPO/defaults/scripts/resync-installed.sh" "$INSTALLED_RESYNC"; then
+    pass "(#4669) the installed resync script was updated to match defaults/"
+else
+    fail "(#4669) the installed resync script was not updated"
+fi
+if [[ -x "$INSTALLED_RESYNC" ]] && bash -n "$INSTALLED_RESYNC" 2>/dev/null; then
+    pass "(#4669) the updated installed script is executable and syntactically whole"
+else
+    fail "(#4669) the updated installed script is not executable/parseable"
+fi
+# The self-update must not cost the rest of the refresh (the reported failure
+# left unrelated surfaces half-refreshed).
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" && -f "$REPO/.loom/scripts/lib/bar.sh" && \
+      "$(cat "$REPO/.loom/roles/builder.md")" == "ROLE-NEW" && \
+      "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
+    pass "(#4669) every other surface was still fully refreshed in the same run"
+else
+    fail "(#4669) the self-updating run left other surfaces unrefreshed"
+fi
+# Deferral: the self-copy is applied only after every other surface settled.
+SELF_LINE="$(grep -n "scripts/resync-installed.sh" <<<"$OUT" | tail -1 | cut -d: -f1)"
+OTHER_LINE="$(grep -n "commands/loom/builder.md" <<<"$OUT" | tail -1 | cut -d: -f1)"
+if [[ -n "$SELF_LINE" && -n "$OTHER_LINE" && "$SELF_LINE" -gt "$OTHER_LINE" ]]; then
+    pass "(#4669) the self-copy is applied last, after the other surfaces"
+else
+    fail "(#4669) the self-copy was not deferred to the end (self=$SELF_LINE other=$OTHER_LINE)"
+fi
+# Rerunning the freshly-updated installed copy is a clean no-op.
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(#4669) rerunning the updated installed copy is idempotent (already in sync)"
+else
+    fail "(#4669) rerunning the updated installed copy was not a clean no-op (rc=$RC)"
+fi
+# --dry-run must still preview the self-update without writing it.
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+cp "$INSTALLED_RESYNC" "$WORKDIR/self-before-dry-run"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" --dry-run 2>&1)" || RC=$?
+if [[ $RC -eq 2 ]] && grep -q "scripts/resync-installed.sh" <<<"$OUT"; then
+    pass "(#4669) --dry-run previews the self-update (exit 2)"
+else
+    fail "(#4669) --dry-run did not preview the self-update (rc=$RC)"
+fi
+if cmp -s "$WORKDIR/self-before-dry-run" "$INSTALLED_RESYNC"; then
+    pass "(#4669) --dry-run left the running script byte-identical"
+else
+    fail "(#4669) --dry-run modified the running script"
+fi
+
+# --- (#4669) writes are staged + renamed, never done in place ----------------
+echo "Test group 19: installed files are replaced by atomic rename (#4669)"
+REPO="$(make_fixture)"
+INODE_BEFORE="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_BEFORE="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+INODE_AFTER="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_AFTER="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+if [[ -n "$INODE_BEFORE" && "$INODE_BEFORE" != "$INODE_AFTER" ]]; then
+    pass "(#4669) an updated file gets a NEW inode (renamed into place, not truncated)"
+else
+    fail "(#4669) the updated file kept its inode (still rewritten in place)"
+fi
+if [[ "$MODE_BEFORE" == "$MODE_AFTER" ]]; then
+    pass "(#4669) the rename preserves the destination's permissions (not mktemp's 0600)"
+else
+    fail "(#4669) permissions changed across the rename ($MODE_BEFORE -> $MODE_AFTER)"
+fi
+STRAY_STAGE="$(find "$REPO" -name '.resync-stage.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+if [[ "$STRAY_STAGE" == "0" ]]; then
+    pass "(#4669) no staging temp files are left behind"
+else
+    fail "(#4669) $STRAY_STAGE staging temp file(s) left behind"
+fi
+
+# --- (#4669) a failed file is reported as a PARTIAL refresh, never swallowed --
+echo "Test group 20: an unsyncable file reports a PARTIAL refresh and exits 1 (#4669)"
+if [[ "$(id -u)" -eq 0 ]]; then
+    skip "(#4669) running as root — an unwritable destination cannot be simulated"
+else
+    REPO="$(make_fixture)"
+    chmod 500 "$REPO/.loom/scripts/lib"      # scripts/lib/bar.sh cannot be staged here
+    RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)" || RC=$?
+    chmod 700 "$REPO/.loom/scripts/lib"
+    if [[ $RC -eq 1 ]]; then
+        pass "(#4669) an unsyncable file exits 1"
+    else
+        fail "(#4669) an unsyncable file did not exit 1 (got $RC)"
+    fi
+    if grep -q "PARTIAL REFRESH" <<<"$OUT" && grep -q "scripts/lib/bar.sh" <<<"$OUT"; then
+        pass "(#4669) the summary names the partial state and the failed path"
+    else
+        fail "(#4669) the summary did not report the partial state / failed path"
+    fi
+    if grep -qi "re-running completes the refresh\|fixing the cause" <<<"$OUT"; then
+        pass "(#4669) the summary states the recovery action"
+    else
+        fail "(#4669) the summary does not state a recovery action"
+    fi
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4669) unrelated surfaces are still refreshed despite the failure"
+    else
+        fail "(#4669) the failure aborted the rest of the refresh"
+    fi
+    if grep -q "Already in sync\|file(s) updated," <<<"$OUT"; then
+        fail "(#4669) a partial refresh still printed a success summary"
+    else
+        pass "(#4669) no success summary is printed for a partial refresh"
+    fi
+fi
+
+# --- (w) .loom/runtimes/ backfill for a workspace that never had it (#4688) --
+echo "Test group 21: .loom/runtimes/ is backfilled when absent (#4688)"
+# Builds its own throwaway repo rather than reusing make_fixture(), so it can
+# deliberately NOT create .loom/runtimes/ at all — the exact live-incident
+# layout: .loom/roles/ (and the rest of a normal install) present, but
+# .loom/runtimes/ was never provisioned by any prior install/resync.
+RUNTIMES_REPO="$WORKDIR/runtimes-repo"
+rm -rf "$RUNTIMES_REPO"
+mkdir -p "$RUNTIMES_REPO/defaults/roles" "$RUNTIMES_REPO/defaults/runtimes" \
+         "$RUNTIMES_REPO/.loom/roles"
+git -C "$RUNTIMES_REPO" init -q
+printf 'ROLE\n' > "$RUNTIMES_REPO/defaults/roles/builder.md"
+printf 'ROLE\n' > "$RUNTIMES_REPO/.loom/roles/builder.md"
+printf '{"runtime":"claude","capabilities":{"mcp":"yes"}}\n' > "$RUNTIMES_REPO/defaults/runtimes/claude.json"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RUNTIMES_REPO" > "$RUNTIMES_REPO/.loom/install-metadata.json"
+git -C "$RUNTIMES_REPO" add -A >/dev/null 2>&1
+git -C "$RUNTIMES_REPO" commit -qm "fixture" >/dev/null 2>&1
+
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) fixture precondition: .loom/runtimes/ absent before resync"
+else
+    fail "(w) fixture precondition: .loom/runtimes/ unexpectedly present before resync"
+fi
+
+# --dry-run must report the directory would be populated, without writing.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+if grep -q "runtimes/claude.json" <<<"$OUT"; then
+    pass "(w) --dry-run reports runtimes/claude.json would be created"
+else
+    fail "(w) --dry-run did not mention runtimes/claude.json"
+fi
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) --dry-run does not create .loom/runtimes/"
+else
+    fail "(w) --dry-run created .loom/runtimes/ (should be preview-only)"
+fi
+
+# apply: the directory must now exist and be populated from defaults/.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(w) apply exits 0"
+else
+    fail "(w) apply did not exit 0 (got $RC)"
+fi
+if [[ -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) .loom/runtimes/ created by apply"
+else
+    fail "(w) .loom/runtimes/ was not created by apply"
+fi
+if [[ "$(cat "$RUNTIMES_REPO/.loom/runtimes/claude.json" 2>/dev/null)" == '{"runtime":"claude","capabilities":{"mcp":"yes"}}' ]]; then
+    pass "(w) .loom/runtimes/claude.json populated from defaults/runtimes/"
+else
+    fail "(w) .loom/runtimes/claude.json missing or content mismatch"
+fi
+# second run is a clean no-op.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(w) runtimes backfill is idempotent (second run already in sync)"
+else
+    fail "(w) runtimes backfill is not idempotent (rc=$RC)"
+fi
+
 # --- contract checks ---------------------------------------------------------
 echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
@@ -547,6 +1309,12 @@ else
     fail "--help did not print usage"
 fi
 if bash "$SCRIPT" --help >/dev/null 2>&1; then pass "--help exits 0"; else fail "--help did not exit 0"; fi
+HELP_OUT="$(bash "$SCRIPT" --help 2>&1)"
+if grep -q -- "--allow-worktree" <<<"$HELP_OUT" && grep -qi "linked worktree" <<<"$HELP_OUT"; then
+    pass "(#4563) --help documents --allow-worktree and the refusal behavior"
+else
+    fail "(#4563) --help does not document --allow-worktree / the refusal behavior"
+fi
 
 REPO="$(make_fixture)"
 RC=0; (cd "$REPO" && bash "$SCRIPT" --bogus >/dev/null 2>&1) || RC=$?

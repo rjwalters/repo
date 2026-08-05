@@ -1,7 +1,7 @@
 {
-  "name": "loom-workspace",
+  "name": "repo-skills",
   "version": "0.8.0",
-  "description": "Loom-managed workspace with AI development orchestration",
+  "description": "General-purpose repository skills for Claude Code",
   "private": true,
   "scripts": {
     "worktree:return": "./.loom/scripts/worktree-return.sh",
