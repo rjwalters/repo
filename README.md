@@ -104,6 +104,28 @@ The installer copies the skill files into a target repository's `.claude/` direc
 
 To remove: `./uninstall.sh /path/to/target-repo`.
 
+### Updating an existing install
+
+Installed surfaces are **copies**, so a fix merged here does not reach a repo
+that already installed. Refresh one from its recorded source clone without
+re-running the installer:
+
+```bash
+# From inside the consumer repo
+.claude/skills/repo/scripts/resync-installed.sh --dry-run   # report drift, write nothing
+.claude/skills/repo/scripts/resync-installed.sh             # apply
+```
+
+It is idempotent, reports per-file created/updated/unchanged/skipped, skips
+symlinked (`--dev`) destinations, and **never removes a file** — a file with no
+source counterpart is named and left alone. Exit status is `0` in sync, `2` from
+`--dry-run` when drift was found, `1` on error. Add `--quiet` for a one-line
+summary (what a fleet-wide driver wants).
+
+This is requirement C7 of [`INSTALLER-CONTRACT.md`](INSTALLER-CONTRACT.md), the
+normative installer contract this repo owns for the whole tool-package family
+(Loom, Anvil, Repo Skills, squad).
+
 ### Write footprint
 
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
@@ -112,6 +134,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall)
 - `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
@@ -127,6 +150,7 @@ Opt-in only, and outside the target repository: with `--shell-wrapper`, your she
 skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
 commands/repo/*.md           Command files installed to .claude/commands/repo/
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
+scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
 hooks/repo/tests/run.sh      Smoke suite covering both hooks (bash, no framework needed)
@@ -137,9 +161,14 @@ hooks/repo/tests/test-shell-wrapper.sh  claude + codex shell wrapper suite (run.
 commands/repo/tests/test-branches-loss-check.sh  branches.md permanent-loss check suite (run.sh delegates)
 commands/repo/tests/test-repo-remote.sh  repo-remote.sh provisioning-contract suite (run.sh delegates)
 commands/repo/tests/test-verify-fix-persistence.sh  verify-after-write contract suite (run.sh delegates)
+commands/repo/tests/test-resync-installed.sh  resync-installed.sh suite (run.sh delegates)
+commands/repo/tests/test-installer-contract.sh  INSTALLER-CONTRACT.md C1-C8 conformance (run.sh delegates)
+INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
+lib/render.sh                Template-variable rendering shared by install.sh/resync-installed.sh
+lib/metadata.sh              The C5/C6 tracked-vs-sidecar metadata shape, same two callers
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 ```
 

@@ -114,26 +114,26 @@ reconcile_orphaned_block() {
 # copy and fails fast if a known placeholder survives into an installed file.
 # The consumer-repo identity (owner/name) is derived from its git remote below;
 # repo-specific behavior is otherwise read at runtime, not baked in here.
-TEMPLATE_PLACEHOLDERS=('{{REPO_OWNER}}' '{{REPO_NAME}}' '{{REPO_SKILLS_VERSION}}' '{{REPO_SKILLS_COMMIT}}' '{{INSTALL_DATE}}')
+#
+# The substitution table and the leak check live in lib/render.sh because
+# scripts/repo/resync-installed.sh (requirement C7) writes the same files into
+# the same destinations and must render them identically — see that file's
+# header for why a second copy of this logic would drift silently.
+# shellcheck source=lib/render.sh
+source "$SOURCE_ROOT/lib/render.sh"
+
+# The C5/C6 tracked-vs-machine-local metadata split, shared with the resync for
+# the same reason. See lib/metadata.sh.
+# shellcheck source=lib/metadata.sh
+source "$SOURCE_ROOT/lib/metadata.sh"
+
 INSTALL_DATE="$(date -u +%Y-%m-%d)"
 REPO_OWNER="OWNER"
 REPO_NAME="REPO"
 
-render() {  # stdin -> stdout with template variables substituted
-  sed \
-    -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
-    -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
-    -e "s|{{REPO_SKILLS_VERSION}}|${VERSION}|g" \
-    -e "s|{{REPO_SKILLS_COMMIT}}|${COMMIT}|g" \
-    -e "s|{{INSTALL_DATE}}|${INSTALL_DATE}|g"
-}
-
 assert_no_placeholders() {  # <file> <label> — fail if a known placeholder leaked through
-  local file="$1" label="$2" ph found=()
-  for ph in "${TEMPLATE_PLACEHOLDERS[@]}"; do
-    grep -qF "$ph" "$file" && found+=("$ph")
-  done
-  [[ ${#found[@]} -eq 0 ]] || error "Unsubstituted template placeholder(s) in $label: ${found[*]}"
+  render_assert_no_placeholders "$1" \
+    || error "Unsubstituted template placeholder(s) in $2: ${RENDER_LEAKED[*]}"
 }
 
 TARGET=""
@@ -180,14 +180,7 @@ fi
 
 # Derive the consumer repo's identity for template substitution (best-effort:
 # parse owner/name from the origin remote, else fall back to the directory name).
-REPO_NAME="$(basename "$TARGET")"
-_remote="$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null || true)"
-if [[ -n "$_remote" ]]; then
-  _remote="${_remote%.git}"
-  REPO_NAME="${_remote##*/}"
-  _rest="${_remote%/*}"
-  REPO_OWNER="${_rest##*[:/]}"
-fi
+render_repo_identity "$TARGET"
 
 # Resolve command selection
 ALL_COMMANDS="$(list_commands)"
@@ -243,6 +236,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
+  echo "  $TARGET/.claude/skills/repo/scripts/resync-installed.sh"
   echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
   while IFS= read -r cmd; do
@@ -425,14 +419,18 @@ success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude
 # Tracked file: only fields that are identical for any machine installing the
 # same version/commit/skill-set, so repeat installs of a release are byte-
 # reproducible and no machine-local path/timestamp leaks into consumer history.
-{
-  echo "{"
-  echo "  \"version\": \"$VERSION\","
-  echo "  \"commit\": \"$COMMIT\","
-  echo "  \"dev\": $DEV,"
-  echo "  \"commands\": [$(echo "$COMMANDS" | sed 's/.*/"&"/' | paste -sd, -)]"
-  echo "}"
-} >"$TARGET/.claude/skills/repo/install-metadata.json"
+#
+# `filtered` records whether `commands` is a deliberate SUBSET (--skills=…) or
+# simply "everything the source had at install time". Without it a later
+# resync-installed.sh run cannot tell a curated three-command install from a
+# full one, and would either never deliver newly-added commands or silently
+# widen a filtered install (INSTALLER-CONTRACT.md C7).
+#
+# The field list itself lives in lib/metadata.sh so the resync writes the same
+# shape — see that file for why one emitter matters here.
+metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
+  "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" \
+  >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
 
 # Machine-local sidecar (gitignored): the absolute source-clone path and the
@@ -440,12 +438,8 @@ success "Wrote install-metadata.json"
 # must never be committed. /repo:update-tools reads `source` from here to prefer
 # the local source clone; this mirrors the existing .loom/loom-source-path
 # precedent for the identical Loom-self-install problem.
-{
-  echo "{"
-  echo "  \"source\": \"$SOURCE_ROOT\","
-  echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-  echo "}"
-} >"$TARGET/.claude/skills/repo/.install-local.json"
+metadata_sidecar_json "$SOURCE_ROOT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  >"$TARGET/.claude/skills/repo/.install-local.json"
 success "Wrote .install-local.json (machine-local, gitignored)"
 
 # A previously-tracked sidecar (pre-split installs, or a repo that accidentally
@@ -535,7 +529,18 @@ install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/scripts/repo-remote.sh"
 
-# 3e. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
+# 3e. Consumer-side resync script — requirement C7 of INSTALLER-CONTRACT.md.
+# Same colocation + chmod rationale as the scripts above. This is what lets a
+# consumer repo (or a fleet-wide driver such as 2am/scripts/fleet-resync.sh)
+# refresh the copied surfaces non-destructively without a full installer
+# invocation driven from outside. Installing it is what makes the consumer
+# self-sufficient, so it ships on every install, dev mode included.
+install_file "$SOURCE_ROOT/scripts/repo/resync-installed.sh" \
+  "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" "scripts/repo/resync-installed.sh"
+chmod +x "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" 2>/dev/null || true
+success "Installed .claude/skills/repo/scripts/resync-installed.sh"
+
+# 3f. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
 # to the HUMAN before Claude starts (the SessionStart hook above is the half
 # Claude itself sees). This is the one thing install.sh writes outside the
 # target repo, so unlike every step above it is opt-in and defensive: a
