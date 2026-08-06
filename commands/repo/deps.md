@@ -377,7 +377,7 @@ Summarize the split explicitly below the table so callers (including
 **open**, **majors** (real forward majors only), and **stale**:
 
 ```
-3 open, 1 major, 1 stale — already satisfied by manifest
+4 open, 2 majors, 1 stale — already satisfied by manifest
 ```
 
 The majors count excludes every stale PR. A PR whose title names a major bump
