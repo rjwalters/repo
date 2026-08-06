@@ -167,3 +167,27 @@ Behavioral contract:
 There are no configuration toggles — the hook's behavior is fixed. To disable
 it, remove its `SessionStart` entries from `.claude/settings.json` (or run
 `uninstall.sh`, which removes only the entries it owns).
+
+## Refreshing this install (`resync-installed.sh`)
+
+Everything above is a **copy** made at install time, so a fix merged upstream
+does not reach this repo on its own. `.claude/skills/repo/scripts/resync-installed.sh`
+refreshes the copied surfaces from the source clone recorded in the
+machine-local sidecar:
+
+```bash
+.claude/skills/repo/scripts/resync-installed.sh --dry-run   # report drift, write nothing
+.claude/skills/repo/scripts/resync-installed.sh             # apply
+```
+
+It is idempotent, reports per-file created/updated/unchanged/skipped, skips
+symlinked (`--dev`) destinations, and **never removes a file** — anything with
+no source counterpart is named and left alone. Exit status: `0` in sync, `2`
+from `--dry-run` when drift was found, `1` on error. `--quiet` reduces it to a
+one-line summary; `--source` / `--target` override the resolved paths.
+
+Hook wiring in `.claude/settings.json`, the `CLAUDE.md` block, and `.gitignore`
+belong to `install.sh`, not to a refresh — re-run the installer if those need
+updating. This split is requirement **C7** of the normative
+[tool-package installer contract](https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md),
+which [[update-tools]] follows for every tool in the family.

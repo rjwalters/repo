@@ -20,8 +20,10 @@
 # test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
-# commands/repo/tests/test-early-sync-switch.sh, and
-# commands/repo/tests/test-tidy-keep-tiers.sh.
+# commands/repo/tests/test-early-sync-switch.sh,
+# commands/repo/tests/test-tidy-keep-tiers.sh,
+# commands/repo/tests/test-resync-installed.sh, and
+# commands/repo/tests/test-installer-contract.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -606,6 +608,74 @@ else
     PASS=$((PASS + TK_PASS))
     FAIL=$((FAIL + TK_FAIL))
     record_suite "test-tidy-keep-tiers.sh" "$TK_PASS" "$TK_FAIL" "$TK_NOTE"
+fi
+
+# scripts/repo/resync-installed.sh — the consumer-side resync required by
+# INSTALLER-CONTRACT.md C7 (repo#156). Same delegation shape as the suites above.
+echo
+echo "-- resync-installed.sh consumer resync (delegated suite) --"
+RI_TEST="$TESTS_DIR/../../../commands/repo/tests/test-resync-installed.sh"
+if [[ ! -f "$RI_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-resync-installed.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-resync-installed.sh" "$RI_TEST"
+else
+    RI_OUT="$(bash "$RI_TEST" 2>&1)"
+    RI_STATUS=$?
+    RI_PASS="$(suite_count Passed "$RI_OUT")"
+    RI_FAIL="$(suite_count Failed "$RI_OUT")"
+    if ! [[ "$RI_PASS" =~ ^[0-9]+$ && "$RI_FAIL" =~ ^[0-9]+$ ]]; then
+        RI_PASS=0
+        RI_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-resync-installed.sh" "$RI_STATUS"
+        strip_ansi "$RI_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RI_STATUS" -ne 0 || "$RI_FAIL" -ne 0 ]]; then
+        [[ "$RI_FAIL" -eq 0 ]] && RI_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-resync-installed.sh" "$RI_PASS" "$RI_FAIL" "$RI_STATUS"
+        strip_ansi "$RI_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-resync-installed.sh" "$RI_PASS"
+    fi
+    PASS=$((PASS + RI_PASS))
+    FAIL=$((FAIL + RI_FAIL))
+    record_suite "test-resync-installed.sh" "$RI_PASS" "$RI_FAIL" "C7 consumer resync"
+fi
+
+# INSTALLER-CONTRACT.md C1–C8 conformance. This suite re-derives the contract's
+# `repo` column from the working tree and asserts it matches the published table,
+# so the conformance table cannot go stale silently (repo#156). Same delegation
+# shape as every suite above.
+echo
+echo "-- installer-contract C1-C8 conformance (delegated suite) --"
+IC_TEST="$TESTS_DIR/../../../commands/repo/tests/test-installer-contract.sh"
+if [[ ! -f "$IC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-installer-contract.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-installer-contract.sh" "$IC_TEST"
+else
+    IC_OUT="$(bash "$IC_TEST" 2>&1)"
+    IC_STATUS=$?
+    IC_PASS="$(suite_count Passed "$IC_OUT")"
+    IC_FAIL="$(suite_count Failed "$IC_OUT")"
+    if ! [[ "$IC_PASS" =~ ^[0-9]+$ && "$IC_FAIL" =~ ^[0-9]+$ ]]; then
+        IC_PASS=0
+        IC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-installer-contract.sh" "$IC_STATUS"
+        strip_ansi "$IC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$IC_STATUS" -ne 0 || "$IC_FAIL" -ne 0 ]]; then
+        [[ "$IC_FAIL" -eq 0 ]] && IC_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-installer-contract.sh" "$IC_PASS" "$IC_FAIL" "$IC_STATUS"
+        strip_ansi "$IC_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-installer-contract.sh" "$IC_PASS"
+    fi
+    PASS=$((PASS + IC_PASS))
+    FAIL=$((FAIL + IC_FAIL))
+    record_suite "test-installer-contract.sh" "$IC_PASS" "$IC_FAIL" "contract conformance"
 fi
 
 echo

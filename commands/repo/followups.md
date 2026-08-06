@@ -73,20 +73,13 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   ls .claude/skills/*/install-metadata.json 2>/dev/null
   ```
 
-  Resolve each tool's `source` clone path in this order (each step failing is
-  "source unknown", not an error):
+  Resolve each tool's `source` clone path with the **sidecar → legacy inline →
+  unknown** order that is normative in the [tool-package installer
+  contract][contract] (requirement **C6**, which also covers the repo#96 signature
+  below). Each step failing is "source unknown", not an error. Do not re-derive
+  the order from what a given tool happens to do — read C6.
 
-  1. **Sidecar first.** For Repo Skills read
-     `.claude/skills/repo/.install-local.json` (generally
-     `.claude/skills/*/.install-local.json`); it holds `source` /
-     `installed_at`. Loom uses the plain-text `.loom/loom-source-path` sidecar
-     for the same purpose. A sidecar is gitignored, so it exists only on the
-     machine that ran the install.
-  2. **Legacy inline fallback.** Pre-split installs still embed `source` /
-     `installed_at` directly in `install-metadata.json` — read from there if no
-     sidecar exists.
-  3. **Unknown → GitHub.** If neither yields a path, the local source clone is
-     simply unknown (normal on a fresh clone elsewhere).
+  [contract]: https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md
 
   Then derive the slug from the resolved clone's remote:
 
@@ -106,20 +99,14 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   Likewise, if a candidate doesn't clearly belong to any discovered repo,
   surface it for a target decision rather than dropping it or guessing.
 
-  **Signature check: distinguish "never installed here" from "sidecar was
-  deleted by a pull"** (kept consistent with `/repo:update-tools`, whose
-  discovery this reuses). If `install-metadata.json` exists — proof a successful
-  install previously ran in *this* checkout — but no sidecar is present **and**
-  no legacy inline `source` / `installed_at` fields exist in
-  `install-metadata.json` either, that combination is also what a previously
-  *tracked* `.install-local.json` produces once it is untracked upstream and this
-  checkout pulls that commit: git deletes the untracked file's working-tree copy
-  in every checkout except the one that ran `git rm --cached` (repo#96). Still
-  mark the target UNKNOWN (there is no path to read), but append the distinct
-  suggestion `"sidecar missing but install-metadata.json present — if this was
-  previously installed, re-run <tool>'s installer to regenerate the sidecar."`
-  rather than treating it identically to a fresh clone. A genuinely fresh clone
-  (no `install-metadata.json` at all) gets no such suggestion.
+  **Signature check** (contract **C6**, "the repo#96 signature"): when
+  `install-metadata.json` exists but neither a sidecar nor legacy inline fields
+  do, that is also what a previously *tracked* sidecar leaves behind once it is
+  untracked upstream. Still mark the target UNKNOWN — there is no path to read —
+  but append C6's distinct suggestion (`"sidecar missing but
+  install-metadata.json present — …"`) rather than treating it identically to a
+  fresh clone, which gets no such suggestion. This is the same handling
+  `/repo:update-tools` step 1 applies, and both follow C6 rather than each other.
 
 Honor scope flags: `--here` keeps only this-repo targets; `--repo <tool>`
 restricts to a single discovered tool.
