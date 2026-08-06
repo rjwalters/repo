@@ -5,6 +5,8 @@ by the Guide triage agent. Newest entries first.
 
 ### 2026-08-06
 
+- **PR #159**: feat: own the installer contract and ship a consumer-side resync
+- **Issue #156** (closed): Own the tool-package installer contract normatively, and ship a consumer-side resync
 - **PR #154**: docs(deps): classify stale Dependabot PRs the manifest already satisfies
 - **Issue #152** (closed): deps --check counts Dependabot PRs the manifest already satisfies
 
