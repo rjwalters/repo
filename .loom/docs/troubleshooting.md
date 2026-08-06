@@ -309,6 +309,36 @@ cat .loom/config.json.bak
 `loom-daemon init` against a workspace that already has a `.loom/config.json`, so
 repeat provisioning passes cannot re-enter this path on a tuned host.
 
+### `install.sh` refuses to run: "Another Loom install is already running" (#4928)
+
+`install.sh`'s `--quick` / `--clean` paths take a per-target lock at
+`<target>/.loom/.install.lock` before any destructive phase, because two
+installers racing over one target interleave one run's uninstall (which stages
+Loom file deletions and strips the Loom sections out of `CLAUDE.md` /
+`.gitignore` **in place**) with the other's copy phase. The message names the
+owning PID, host, and phase:
+
+```bash
+cat <target>/.loom/.install.lock   # pid / host / started / phase
+```
+
+- **The PID is alive** — a real install is in flight (a `cargo build --release`
+  can run for minutes; it emits a progress line every 15s). Wait for it.
+- **The PID is gone** — the next installer reclaims the lock automatically; you
+  should never need to delete it. If you do (e.g. a lock written by another
+  host, which cannot be liveness-probed and is only reclaimed after
+  `LOOM_INSTALL_LOCK_MAX_AGE`, default 6h), `rm -f <target>/.loom/.install.lock`.
+
+If the lock's `phase` is `uninstalling` / `installing` / `restoring`, that run
+died **inside the destructive window** and the target may be partially
+uninstalled. The next installer prints the recovery commands; the short form is:
+
+```bash
+git -C <target> status --short
+git -C <target> restore --staged --worktree -- .loom .claude CLAUDE.md .gitignore
+git -C <target> stash list | grep loom-install   # changes the installer stashed, if any
+```
+
 ### Daemon won't start
 
 ```bash
@@ -323,6 +353,64 @@ tail -f ~/.loom/daemon.log
 which claude
 
 # Install if missing (see Claude Code documentation)
+```
+
+### `loom-daemon: command not found` over plain ssh (#5393)
+
+```
+$ ssh loom-worker-2 'loom-daemon workspace list'
+bash: line 1: loom-daemon: command not found
+```
+
+`loom-daemon` is installed at `~/.local/bin/loom-daemon`, which is added to PATH
+by your **login shell's rc file**. `ssh host <cmd>` runs a *non-login,
+non-interactive* shell that never sources that rc file, so `~/.local/bin` is not
+on PATH and the bare name does not resolve. (The same mechanism produces the
+false "missing dependency" from `install.sh` — see [`install.sh` reports a
+dependency that is installed](#installsh-reports-a-dependency-that-is-installed-5393)
+below.)
+
+Three supported ways to drive `loom-daemon` over ssh, in order of preference:
+
+1. **Source the login profile** so PATH is populated exactly as it is
+   interactively:
+
+   ```bash
+   ssh loom-worker-2 'bash -lc "loom-daemon workspace list"'
+   ```
+
+2. **Call the fixed install location** directly — the machine-level install path
+   is stable, so no PATH is needed:
+
+   ```bash
+   ssh loom-worker-2 '~/.local/bin/loom-daemon workspace list'
+   ```
+
+3. **Let Loom's own scripts resolve it** — every in-tree caller sources
+   `defaults/scripts/lib/locate-daemon-bin.sh` (`loom_locate_daemon_bin`), which
+   already probes `$LOOM_DAEMON_BIN` → PATH → `${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}`
+   → repo-local build output (#4875). Point new fleet automation at that helper
+   rather than reimplementing per-caller path probing.
+
+### `install.sh` reports a dependency that is installed (#5393)
+
+```
+$ ssh loom-worker-1 'cd ~/GitHub/loom && ./install.sh --quick -y ~/GitHub/repo'
+✗ Error: Missing required dependencies: pnpm cargo -- cannot continue ...
+```
+
+Same root cause as the daemon case above: over a non-login ssh shell, PATH lacks
+the per-user install roots (`~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
+…), so tools that are installed and runnable look absent. `install.sh` now
+probes those roots directly: a tool found there is used (its directory is added
+to PATH for the rest of the install) and reported with a `not on this shell's
+PATH` warning rather than as missing. Only tools that are absent from **every**
+probed root are treated as genuinely missing — a distinction that matters
+because the two need different fixes (install the tool vs. fix PATH). If you
+prefer to fix PATH once up front, run the whole install under a login shell:
+
+```bash
+ssh loom-worker-1 'bash -lc "cd ~/GitHub/loom && ./install.sh --quick -y ~/GitHub/repo"'
 ```
 
 ### Sweep output invisible when invoked with `2>&1`
