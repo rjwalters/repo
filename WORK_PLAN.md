@@ -15,7 +15,6 @@ _No issues currently marked `loom:issue` (human/Champion-approved, awaiting a Bu
 
 ## Proposed
 
-- **#156**: Own the tool-package installer contract normatively, and ship a consumer-side resync *(curated)*
 - **#145**: tidy: offer package-manager-native pruning of orphaned node_modules content (pnpm prune / npm prune) *(curated)*
 
 ## Epics
