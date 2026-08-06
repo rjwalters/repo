@@ -178,11 +178,20 @@ itself, … against their sources. Report what's behind and offer to update.
 - the repo-level **security-updates** flag — report it **UNKNOWN (needs
   admin)**, not `disabled`, when the token can't read the setting, exactly as
   [[deps]] does; "can't see it" and "it's off" are different answers,
-- the **count of open Dependabot PRs**, noting how many are majors.
+- the **count of open Dependabot PRs**, split into how many are real forward
+  majors and how many are **stale** — proposing a version the manifest on the
+  base branch already satisfies (or exceeds). [[deps]]' stale check does this
+  comparison; a stale PR is never counted as a major and is **never** presented
+  here as pending upgrade work. This split matters right after a bulk-update
+  merge — the exact moment someone runs `/repo:all` to confirm the repo is
+  clean — because Dependabot's still-open PRs from a pre-merge scan are stale,
+  and reporting them as majors is a false upgrade-pressure signal.
 
-That count is all `/repo:all` needs — leave [[deps]]' per-PR classification
-table (ecosystem, update type, CI status, diff notes) to `/repo:deps --review`,
-which is a separate, confirm-gated activity.
+Those counts — open, real majors, stale — are all `/repo:all` needs. Computing
+the stale count requires [[deps]]' cheap per-PR manifest comparison (base-branch
+manifest vs. the PR's target), but the rest of the per-PR classification table
+(ecosystem, CI status, diff notes) stays with `/repo:deps --review`, which is a
+separate, confirm-gated activity.
 
 Only `--check` runs from here. `/repo:all` **never** scaffolds
 `.github/dependabot.yml`, **never** flips a repository flag, and **never**
@@ -232,7 +241,7 @@ Audit:        3 findings surfaced (gitignore rule fixed)
 Docs:         2 fixed (README table, CHANGELOG entry), 1 deferred: docs/analysis/ missing README
 Tidy:         freed 240 MB (build/, .cache/, 3 empty dirs)
 Tools:        Anvil updated 1.4.0 → 1.5.1; Loom current
-Deps:         dependabot.yml present, security updates OFF, 2 open PRs (1 major)
+Deps:         dependabot.yml present, security updates OFF, 3 open PRs (0 majors, 2 stale — already satisfied by manifest)
 Reset:        on main (up to date), tree clean, 4 branches deleted, 1 stash kept
 Skipped:      remote (never part of /repo:all); deps install/review (confirm-first — run /repo:deps)
 ```
