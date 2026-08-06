@@ -3,8 +3,15 @@
 Chronological record of merged PRs and closed issues, maintained automatically
 by the Guide triage agent. Newest entries first.
 
+### 2026-08-06
+
+- **PR #154**: docs(deps): classify stale Dependabot PRs the manifest already satisfies
+- **Issue #152** (closed): deps --check counts Dependabot PRs the manifest already satisfies
+
 ### 2026-08-05
 
+- **PR #153**: fix(guide): exclude docs-maintenance PRs from WORK_LOG.md new_prs scan
+- **Issue #151** (closed): Guide document-maintenance phase creates an infinite self-triggering loop of docs PRs
 - **PR #149**: docs: Guide document maintenance update
 - **PR #148**: docs: Guide document maintenance update
 - **PR #147**: docs: Guide document maintenance update
