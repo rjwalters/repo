@@ -100,6 +100,19 @@ set_mtime_ago() {  # <file> <bsd-spec e.g. -8d> <gnu-spec e.g. "8 days ago">
     touch -t "$stamp" "$1"
 }
 
+# Portable mtime reader (BSD/macOS `stat -f %m` vs GNU `stat -c %Y`). GNU
+# `stat -f` means "filesystem status" (not "-f FORMAT"), so it doesn't fail
+# cleanly on GNU — it prints a filesystem report (including free-block counts
+# that change between calls) which corrupts an unguarded `stat -f %m ... ||
+# stat -c %Y ...` fallback. Capture, then validate against ^[0-9]+$, matching
+# the pattern already proven correct in session-start-handoff.sh:117-119.
+mtime_of() {  # <file> -> epoch seconds
+    local m
+    m=$(stat -f %m "$1" 2>/dev/null)
+    [[ "$m" =~ ^[0-9]+$ ]] || m=$(stat -c %Y "$1" 2>/dev/null)
+    printf '%s' "$m"
+}
+
 # A throwaway git repo with a handoff note in it.
 make_repo() {  # <name> -> echoes path
     local d="$SCRATCH/$1"
@@ -162,10 +175,10 @@ assert_eq        "resume: also fires"                     "SessionStart" "$EVENT
 
 # Read-only guarantee: content and mtime are untouched by the hook.
 BEFORE_SUM=$(cksum < "$FRESH/.claude/handoff.md")
-BEFORE_MTIME=$(stat -f %m "$FRESH/.claude/handoff.md" 2>/dev/null || stat -c %Y "$FRESH/.claude/handoff.md")
+BEFORE_MTIME=$(mtime_of "$FRESH/.claude/handoff.md")
 run_hook "$FRESH" startup
 AFTER_SUM=$(cksum < "$FRESH/.claude/handoff.md")
-AFTER_MTIME=$(stat -f %m "$FRESH/.claude/handoff.md" 2>/dev/null || stat -c %Y "$FRESH/.claude/handoff.md")
+AFTER_MTIME=$(mtime_of "$FRESH/.claude/handoff.md")
 assert_eq        "read-only: note content unchanged"      "$BEFORE_SUM" "$AFTER_SUM"
 assert_eq        "read-only: note mtime unchanged"        "$BEFORE_MTIME" "$AFTER_MTIME"
 
