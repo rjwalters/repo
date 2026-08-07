@@ -63,15 +63,20 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   ```
 
 - **Upstream tool repos**: discover installed tools exactly as
-  `/repo:update-tools` step 1 does — find their metadata files, then resolve
-  each tool's local source clone **sidecar-first**, and derive a GitHub slug
-  from that clone's `origin` remote.
+  `/repo:update-tools` step 1 does — sweep for their metadata files, then
+  resolve each tool's local source clone **sidecar-first**, and derive a
+  GitHub slug from that clone's `origin` remote.
 
   ```bash
-  # a. Find installed-tool metadata (same locations update-tools checks)
-  ls .loom/install-metadata.json .anvil/install-metadata.json 2>/dev/null
-  ls .claude/skills/*/install-metadata.json 2>/dev/null
+  # a. Find installed-tool metadata (same sweep /repo:update-tools step 1 uses)
+  find . -maxdepth 4 -name "install-metadata.json" \
+    -not -path "*/node_modules/*" -not -path "*/.venv/*" 2>/dev/null
   ```
+
+  A fixed list of known paths structurally cannot find a family member added
+  after this doc was last updated (repo#165) — sweep for the file itself
+  instead. `-maxdepth 4` reaches every known tool root (`.loom/`, `.anvil/`,
+  `.kct/` at depth 2, and the two-levels-deeper `.claude/skills/*/` at depth 4).
 
   Resolve each tool's `source` clone path with the **sidecar → legacy inline →
   unknown** order that is normative in the [tool-package installer
@@ -81,6 +86,16 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
 
   [contract]: https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md
 
+  **kicad-tools does not conform to C6.** `.kct/install-metadata.json` carries
+  `kct_version` / `kct_commit` and no sidecar — it always records `source_mode`
+  (`"path"` or `"git"`) and `source_ref` inline instead. When `source_mode` is
+  `"path"`, `source_ref` **is** the local clone path — read its `origin`
+  remote directly, skipping the sidecar ladder above. When `source_mode` is
+  `"git"` (kicad-tools' default), there is no local clone at all — this
+  degrades to "source unknown" exactly like a fresh clone, not an error, and
+  the slug can be read straight off `source_ref` (a `<git-url>@<tag-or-rev>`
+  string) without a `git -C <source> config` lookup.
+
   Then derive the slug from the resolved clone's remote:
 
   ```bash
@@ -88,10 +103,12 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   ```
 
   `install-metadata.json` (tracked) is JSON, and key names vary by tool
-  (`version` vs `loom_version` / `anvil_version`, etc.) — read whichever variant
-  is present, same as `/repo:update-tools`. Neither the tracked metadata nor the
-  sidecar stores an `owner/repo` slug directly; it is always derived from the
-  source clone's `origin` remote.
+  (`version` vs `loom_version` / `anvil_version` / `kct_version`, etc.) — read
+  whichever variant is present, same as `/repo:update-tools`. Neither the
+  tracked metadata nor the sidecar stores an `owner/repo` slug directly for
+  Loom / Anvil / Repo Skills — it is always derived from the source clone's
+  `origin` remote; kicad-tools' `source_ref` in `"git"` mode is the one
+  exception, since it already embeds the full GitHub URL to parse directly.
 
 - **Unresolvable targets.** If a tool's source clone is unknown (no sidecar, no
   legacy field) there is no local remote to read — mark that follow-up

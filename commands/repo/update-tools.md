@@ -41,18 +41,27 @@ for manual review. See step 5 and the Safety Rules for details.
 
 ### 1. Discover installed tools
 
-Tools in this family record their install in a metadata file. Look for:
+Tools in this family record their install in a metadata file. Sweep for it
+rather than listing known paths — a fixed list structurally cannot find a
+family member added after this doc was last updated, which is exactly how
+`.kct/install-metadata.json` went undiscovered before (repo#165):
 
 ```bash
-ls .loom/install-metadata.json .anvil/install-metadata.json 2>/dev/null
-ls .claude/skills/*/install-metadata.json 2>/dev/null
+find . -maxdepth 4 -name "install-metadata.json" \
+  -not -path "*/node_modules/*" -not -path "*/.venv/*" 2>/dev/null
 ```
 
-Key names vary by tool (`version` vs `loom_version` / `anvil_version`, `source`
-vs `loom_source` / `anvil_source`) — read whichever variant is present. Each
-file gives: installed version, installed commit, install date, and (for the
-"prefer local source clone" fast path) the path of the local source clone it
-was installed from.
+`-maxdepth 4` reaches every known tool root (`.loom/`, `.anvil/`, `.kct/` at
+depth 2, and the two-levels-deeper `.claude/skills/*/` at depth 4) and any
+future tool that follows the same shallow layout, without needing a doc edit
+when one is added.
+
+Key names vary by tool (`version` vs `loom_version` / `anvil_version` /
+`kct_version`, `source` vs `loom_source` / `anvil_source`) — read whichever
+variant is present. Each file gives: installed version, installed commit,
+install date, and (for the "prefer local source clone" fast path) the path of
+the local source clone it was installed from — **except kicad-tools**, whose
+shape differs; see below.
 
 **The metadata layout and the source-resolution order are normative in the
 [tool-package installer contract][contract]** — requirements **C5** (tracked
@@ -68,6 +77,20 @@ stay here: an unresolved source means **skip to the GitHub check in step 2**
 see step 3.
 
 [contract]: https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md
+
+**kicad-tools does not conform to C5/C6 — resolve its shape directly instead
+of via the sidecar ladder.** `.kct/install-metadata.json` carries `kct_version`
+/ `kct_commit` (not `version` / `commit`), and it never writes a sidecar: it
+always records `source_mode` (`"path"` or `"git"`) and `source_ref` inline in
+the tracked file.
+
+- `source_mode: "path"` — `source_ref` **is** the local source clone path; use
+  it directly as `<source>` in step 2, no sidecar lookup needed.
+- `source_mode: "git"` (kicad-tools' default) — there is no local clone at all;
+  `source_ref` is a `<git-url>@<tag-or-rev>` string, not a path. This is the
+  normal/default install shape, not a degraded case — treat it exactly like
+  "source unknown" above and skip straight to the GitHub check in step 2. Never
+  report it as a missing/broken source repo.
 
 Known family members: Loom (`.loom/`), Anvil (`.anvil/`), Repo Skills
 (`.claude/skills/repo/`), kicad-tools, and anything else that follows the same
