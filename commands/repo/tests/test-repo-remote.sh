@@ -124,6 +124,25 @@ case "$1 $2" in
     # Fleet-marker lookup (repo#164) is also an --instance-ids call, so it must
     # be matched FIRST by its Tags[?Key=...] query projection.
     if printf '%s' "$*" | grep -qF "Tags[?Key=="; then
+      # repo#170: down's tag-discovery path can resolve MULTIPLE ids, so the
+      # per-id marker needs to be distinguishable in tests (mixed-batch
+      # scenarios). MOCK_AWS_FLEET_MARKED_IDS, when set, is a space-separated
+      # allowlist of instance ids that carry the marker; any id NOT in that
+      # list is reported unmarked. When unset, every id gets the single
+      # MOCK_AWS_FLEET_TAG value (existing behavior, unchanged).
+      if [[ -n "${MOCK_AWS_FLEET_MARKED_IDS:-}" ]]; then
+        lookup_id=""
+        prev=""
+        for a in "$@"; do
+          [[ "$prev" == "--instance-ids" ]] && lookup_id="$a"
+          prev="$a"
+        done
+        case " ${MOCK_AWS_FLEET_MARKED_IDS} " in
+          *" $lookup_id "*) printf '%s\n' "${MOCK_AWS_FLEET_TAG:-loom}" ;;
+          *) printf '%s\n' "None" ;;
+        esac
+        exit 0
+      fi
       printf '%s\n' "${MOCK_AWS_FLEET_TAG:-None}"
       exit 0
     fi
@@ -532,6 +551,104 @@ assert_contains "terminate-instances actually called" "$(cat "$MOCK_LOG")" "term
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- fleet-marker guard on AWS down (repo#170) --"
+# ---------------------------------------------------------------------------
+# `down` resolves instances from the SAME never-expiring handles `up` does (a
+# pinned REPO_REMOTE_INSTANCE_ID, or the repo-remote=<name> tag), and is
+# strictly worse when it hits a repurposed fleet host: it STOPS it, or with
+# --delete TERMINATES it (disk gone, unrecoverable) — the 2AMLogic/2am#52
+# failure mode. Mirrors the up-side block above.
+
+# (a) Marker ABSENT -> unchanged behavior (stops as before).
+run_rr MOCK_AWS_FIND="i-0abc" MOCK_AWS_FLEET_TAG=None -- down --yes --json
+assert_eq   "no fleet marker: down still succeeds (exit 0)" "0" "$RR_RC"
+assert_contains "no fleet marker: still stops" "$RR_OUT" '"disposition":"stopped"'
+assert_contains "no fleet marker: stop-instances called" "$(cat "$MOCK_LOG")" "stop-instances"
+
+# (b) Marker PRESENT (pinned id), no --force -> refused before any stop call.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_FLEET_TAG=loom -- down --yes --json
+assert_eq   "fleet-marked pinned instance refused on down (exit 5)" "5" "$RR_RC"
+assert_contains "down refusal names the instance" "$RR_ERR" "i-0pinned"
+assert_contains "down refusal names the marker tag" "$RR_ERR" "Fleet=loom"
+assert_contains "down refusal points at --force" "$RR_ERR" "--force"
+assert_eq   "blocked down never stopped anything"    "0" "$(grep -c 'stop-instances' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "blocked down never terminated anything" "0" "$(grep -c 'terminate-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# (c) Marker PRESENT with --force -> proceeds after a loud WARNING, and
+#     --delete actually terminates once forced.
+run_rr MOCK_AWS_FLEET_TAG=loom -- down --yes --force --delete --json
+assert_eq   "--force lets a fleet-marked instance through on down (exit 0)" "0" "$RR_RC"
+assert_contains "--force warns loudly on down" "$RR_ERR" "WARNING"
+assert_contains "--force warning names the marker" "$RR_ERR" "Fleet=loom"
+assert_contains "--force down terminates" "$RR_OUT" '"disposition":"terminated"'
+assert_contains "--force down actually called terminate-instances" "$(cat "$MOCK_LOG")" "terminate-instances"
+
+# (d) Tag-discovery, MULTIPLE resolved ids, ONLY ONE marked -> the WHOLE batch
+#     is refused (the safer default per the issue sketch), not just the marked
+#     one — zero stop/terminate calls for ANY of them.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="$(printf 'i-0clean\ni-0mixedmarked')" MOCK_AWS_FLEET_MARKED_IDS="i-0mixedmarked" \
+  -- down --yes --json
+assert_eq   "partial batch match refuses the WHOLE batch (exit 5)" "5" "$RR_RC"
+assert_contains "batch refusal names the marked instance" "$RR_ERR" "i-0mixedmarked"
+assert_eq   "batch refusal: unmarked sibling also NOT stopped" "0" "$(grep -c 'stop-instances' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "batch refusal: nothing terminated either"        "0" "$(grep -c 'terminate-instances' "$MOCK_LOG" 2>/dev/null)"
+# --force proceeds and acts on the WHOLE batch (both the marked and unmarked id).
+run_rr MOCK_AWS_FIND="$(printf 'i-0clean\ni-0mixedmarked')" MOCK_AWS_FLEET_MARKED_IDS="i-0mixedmarked" \
+  -- down --yes --force --json
+assert_eq   "--force proceeds on a mixed batch (exit 0)" "0" "$RR_RC"
+assert_contains "--force stops the whole batch" "$RR_OUT" '"disposition":"stopped"'
+assert_contains "--force batch: stop-instances called" "$(cat "$MOCK_LOG")" "stop-instances"
+
+# (e) Dry run (no --yes) is NEVER blocked by the guard, even when marked — and
+#     annotates which resolved id(s) carry the marker.
+run_rr MOCK_AWS_FIND="i-0worker" MOCK_AWS_FLEET_TAG=loom -- down --json
+assert_eq   "dry-run down is never blocked by the fleet marker" "0" "$RR_RC"
+assert_contains "dry-run down still reports dry-run" "$RR_OUT" '"disposition":"dry-run"'
+assert_contains "dry-run down annotates the fleet-marked id" "$RR_OUT" '"fleet_marked":["i-0worker"]'
+assert_eq   "dry-run down still stopped nothing" "0" "$(grep -c 'stop-instances' "$MOCK_LOG" 2>/dev/null)"
+# An unmarked dry-run listing carries an empty fleet_marked array.
+run_rr MOCK_AWS_FIND="i-0worker" MOCK_AWS_FLEET_TAG=None -- down --json
+assert_contains "dry-run down: unmarked id -> empty fleet_marked array" "$RR_OUT" '"fleet_marked":[]'
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- fleet-marker guard on GCP down (labels, repo#170) --"
+# ---------------------------------------------------------------------------
+write_repo_env "${GCP_ENV[@]}"
+
+# (a) Label absent -> down proceeds unchanged.
+run_rr MOCK_GCP_STATE=RUNNING MOCK_GCP_FLEET_LABEL= -- down --yes --json
+assert_eq   "GCP: no fleet label -> down succeeds" "0" "$RR_RC"
+assert_contains "GCP: down stops" "$RR_OUT" '"disposition":"stopped"'
+assert_contains "GCP: instances stop called" "$(cat "$MOCK_LOG")" "instances stop"
+
+# (b) Label present, no --force -> refused before any stop/delete call.
+run_rr MOCK_GCP_STATE=RUNNING MOCK_GCP_FLEET_LABEL=loom -- down --yes --json
+assert_eq   "GCP: fleet-labeled instance refused on down (exit 5)" "5" "$RR_RC"
+assert_contains "GCP: down refusal names the marker" "$RR_ERR" "Fleet=loom"
+assert_eq   "GCP: blocked down never stopped it" "0" "$(grep -c 'instances stop' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "GCP: blocked down never deleted it" "0" "$(grep -c 'instances delete' "$MOCK_LOG" 2>/dev/null)"
+
+# (c) Label present with --force -> proceeds after a loud warning.
+run_rr MOCK_GCP_STATE=RUNNING MOCK_GCP_FLEET_LABEL=loom -- down --yes --force --json
+assert_eq   "GCP: --force lets it through on down" "0" "$RR_RC"
+assert_contains "GCP: --force warns loudly on down" "$RR_ERR" "WARNING"
+assert_contains "GCP: --force down stops it" "$(cat "$MOCK_LOG")" "instances stop"
+
+# (d) Dry run is never blocked, and annotates the marked instance.
+run_rr MOCK_GCP_STATE=RUNNING MOCK_GCP_FLEET_LABEL=loom -- down --json
+assert_eq   "GCP: dry-run down is never blocked" "0" "$RR_RC"
+assert_contains "GCP: dry-run down annotates the fleet-marked vm" "$RR_OUT" '"fleet_marked":["repo-remote-myrepo"]'
+assert_eq   "GCP: dry-run down stopped nothing" "0" "$(grep -c 'instances stop' "$MOCK_LOG" 2>/dev/null)"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- auth failure stops loudly, no fallback --"
 # ---------------------------------------------------------------------------
 run_rr MOCK_AWS_AUTH_FAIL=1 MOCK_AWS_STATE=None -- up --yes --json
@@ -577,6 +694,15 @@ assert_contains "remote.md documents the fleet-marker key var" "$MD" "REPO_REMOT
 assert_contains "remote.md documents the fleet-marker value var" "$MD" "REPO_REMOTE_FLEET_TAG_VALUE"
 assert_contains "remote.md documents the default fleet marker" "$MD" "Fleet=loom"
 assert_contains "remote.md documents the refusal exit code" "$MD" "exit \`5\`"
+
+# repo#170: the guard now also gates `down`, including its multi-id batch
+# refusal and dry-run annotation — remote.md must document that extension too.
+assert_contains "remote.md documents down is gated by the fleet marker too" \
+  "$MD" "does to that same resolved instance is **stop it"
+assert_contains "remote.md documents the whole-batch refusal on down" \
+  "$MD" "whole batch is refused"
+assert_contains "remote.md documents dry-run annotation (not blocking) on down" \
+  "$MD" "fleet_marked"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).

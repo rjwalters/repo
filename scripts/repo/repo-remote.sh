@@ -33,9 +33,12 @@
 #   repo-remote status|--status [--json] [aws|gcp]   List instances this command
 #       created (tagged repo-remote=<name>) with state; no mutation.
 #
-#   repo-remote down|--down [--yes] [--delete] [--json] [aws|gcp]   Teardown.
-#       Without --yes: a DRY-RUN listing of exactly what would stop/terminate.
+#   repo-remote down|--down [--yes] [--force] [--json] [aws|gcp]   Teardown.
+#       Without --yes: a DRY-RUN listing of exactly what would stop/terminate
+#       (fleet-marked instances, if any, are annotated but never block a dry
+#       run — see the fleet-marker guard below).
 #       With --yes: stop them; add --delete to terminate (disk goes with it).
+#       --force overrides the fleet-marker guard described below, same as `up`.
 #
 # Config: two layers, shared first then repo (repo overrides), matching the
 # skill exactly:
@@ -49,26 +52,34 @@
 # not consent. Non-cost-relevant fields (disk, idle window, image) do fall back
 # to built-in defaults, matching the prose command.
 #
-# Fleet-marker guard (repo#164): `up` reuses an instance it *discovers* — a
-# pinned REPO_REMOTE_INSTANCE_ID, or one carrying the repo-remote=<name> tag/label.
-# That discovery is stale-tag-prone: a host provisioned once for an ephemeral dev
-# session can later become a persistent fleet worker while still carrying the
-# repo-remote tag, at which point this ephemeral tooling would happily start and
-# SSH-alias a production box (2AMLogic/2am#52). So before starting or aliasing a
-# REUSED instance, its tags (AWS) / labels (GCP) are checked for a fleet marker —
-# by default Fleet=loom, configurable via REPO_REMOTE_FLEET_TAG_KEY /
+# Fleet-marker guard (repo#164, repo#170): both `up` and `down` resolve an
+# instance from the SAME two never-expiring handles — a pinned
+# REPO_REMOTE_INSTANCE_ID, or one carrying the repo-remote=<name> tag/label
+# (`down`'s tag-discovery path can resolve more than one). That resolution is
+# stale-tag-prone: a host provisioned once for an ephemeral dev session can
+# later become a persistent fleet worker while still carrying the repo-remote
+# tag, at which point this ephemeral tooling would happily reuse it
+# (2AMLogic/2am#52). `down` is the strictly worse case: it STOPS the resolved
+# instance, or — with --delete — TERMINATES it, disk and all, unrecoverable.
+# So before `up` starts/aliases a REUSED instance, or `down` stops/terminates
+# any resolved instance, its tags (AWS) / labels (GCP) are checked for a fleet
+# marker — by default Fleet=loom, configurable via REPO_REMOTE_FLEET_TAG_KEY /
 # REPO_REMOTE_FLEET_TAG_VALUE. If present, the run STOPS (exit 5) with a clear
-# message unless --force is given; with --force it proceeds after a loud warning.
-# Setting REPO_REMOTE_FLEET_TAG_KEY= (empty) disables the check entirely. The
-# guard never applies to a freshly created instance (nothing to inherit) and
-# never to a dry run (which touches no cloud resource at all).
+# message unless --force is given; with --force it proceeds after a loud
+# warning. `down` refuses the WHOLE resolved batch if ANY id in it carries the
+# marker, rather than silently acting on a subset. Setting
+# REPO_REMOTE_FLEET_TAG_KEY= (empty) disables the check entirely. The guard
+# never applies to a freshly created instance (nothing to inherit) and never to
+# a dry run (which touches no cloud resource at all) — a `down` dry run
+# annotates any fleet-marked instances in its listing instead of blocking.
 #
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure)
 #   3  provider authentication failed
 #   4  cloud operation failed
-#   5  refused to reuse a fleet-marked instance (pass --force to override)
+#   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
+#      fleet-marked instance (pass --force to override)
 #   64 usage error
 #
 # Testability hooks (honored so the suite can exercise the full contract against
@@ -604,10 +615,33 @@ aws_down() {
     return 0
   fi
 
+  # Fleet-marker guard (repo#164, repo#170) — `down` resolves instances from
+  # the SAME never-expiring handles `up` does (a pinned REPO_REMOTE_INSTANCE_ID,
+  # or the repo-remote=<name> tag, which can resolve MULTIPLE ids here unlike
+  # `up`'s single-id resolution). A dry run touches no cloud resource, so it is
+  # only annotated below, never blocked.
   if [[ "$YES" != true ]]; then
-    emit_down_result "$ids" "dry-run"
+    local marked="" id mv
+    for id in $ids; do
+      mv="$(aws_fleet_marker "$id")"
+      fleet_marker_matches "$mv" && marked="${marked:+$marked }$id"
+    done
+    emit_down_result "$ids" "dry-run" "$marked"
     return 0
   fi
+
+  # About to actually mutate: check EVERY resolved id BEFORE any
+  # stop/terminate call is made. fleet_marker_gate is a no-op for an unmarked
+  # id; for a marked one it dies (exit 5) unless --force, in which case it
+  # warns and returns. Checking the whole list up front — rather than
+  # skipping just the marked ids and acting on the rest — means a refusal
+  # here leaves every resolved instance untouched (refuse the WHOLE batch,
+  # the safer default per repo#170: a partial stop/terminate is a worse
+  # operator surprise than an outright refusal).
+  local id
+  for id in $ids; do
+    fleet_marker_gate "$id" "$(aws_fleet_marker "$id")" tag
+  done
 
   if [[ "$DELETE" == true ]]; then
     # shellcheck disable=SC2086
@@ -682,7 +716,20 @@ gcp_down() {
   local exists
   exists="$(gcloud compute instances describe "$vm" --zone "$REGION" --format='value(name)' 2>/dev/null || true)"
   if [[ -z "$exists" ]]; then emit_down_result "" "noop"; return 0; fi
-  if [[ "$YES" != true ]]; then emit_down_result "$vm" "dry-run"; return 0; fi
+
+  # Fleet-marker guard (repo#164, repo#170) — GCP analogue of aws_down's guard,
+  # against the resolved instance's labels. `down` here only ever resolves a
+  # single vm (derived name or pinned id), so no batch semantics are needed —
+  # this mirrors gcp_up's single fleet_marker_gate call. A dry run touches no
+  # cloud resource, so it is only annotated, never blocked.
+  if [[ "$YES" != true ]]; then
+    local marked=""
+    fleet_marker_matches "$(gcp_fleet_marker "$vm")" && marked="$vm"
+    emit_down_result "$vm" "dry-run" "$marked"
+    return 0
+  fi
+  fleet_marker_gate "$vm" "$(gcp_fleet_marker "$vm")" label
+
   if [[ "$DELETE" == true ]]; then
     gcloud compute instances delete "$vm" --zone "$REGION" --quiet >/dev/null 2>&1 \
       || die 4 "gcloud compute instances delete failed for $vm"
@@ -832,8 +879,12 @@ emit_status_result() {  # <rows: id state type ip launch, tab/space separated pe
   fi
 }
 
-emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated>
-  local ids="$1" disp="$2"
+emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated> [fleet-marked ids]
+  # The 3rd arg (repo#170) is populated only for a "dry-run" disposition — a
+  # dry run never blocks on the fleet-marker guard (see aws_down/gcp_down), so
+  # this is how it surfaces which of the listed ids WOULD be refused (absent
+  # --force) if the caller re-ran with --yes.
+  local ids="$1" disp="$2" marked="${3:-}"
   if [[ "$JSON_OUT" == true ]]; then
     printf '{"action":"down","provider":"%s","name":"%s","disposition":"%s","instances":[' \
       "$(json_escape "$PROVIDER")" "$(json_escape "$NAME")" "$(json_escape "$disp")"
@@ -842,11 +893,18 @@ emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated>
       [[ "$first" == true ]] && first=false || printf ','
       printf '"%s"' "$(json_escape "$id")"
     done
+    printf '],"fleet_marked":['
+    first=true
+    for id in $marked; do
+      [[ "$first" == true ]] && first=false || printf ','
+      printf '"%s"' "$(json_escape "$id")"
+    done
     printf ']}\n'
   else
     case "$disp" in
       noop)     log "no instances tagged repo-remote=${NAME} to stop" ;;
-      dry-run)  log "DRY RUN — would stop$([[ "$DELETE" == true ]] && echo /terminate): $ids (pass --yes to act)" ;;
+      dry-run)  log "DRY RUN — would stop$([[ "$DELETE" == true ]] && echo /terminate): $ids (pass --yes to act)"
+                [[ -n "$marked" ]] && log "  NOTE: fleet-marked (would be refused without --force): $marked" ;;
       stopped)  log "stopped: $ids" ;;
       terminated) log "terminated (disks removed): $ids" ;;
     esac
