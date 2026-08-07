@@ -83,6 +83,12 @@ git -C "$REPO" init -q
 write_shared() { mkdir -p "$XDG/repo"; printf '%s\n' "$@" >"$SHARED"; }
 write_repo_env() { printf '%s\n' "$@" >"$REPO/.env"; }
 
+# A fixture SSH key pair for the aws_resolve_keypair() path (repo#177):
+# run_rr defaults REPO_REMOTE_SSH_KEY at it so every scenario has a usable
+# `<key>.pub` unless a test deliberately overrides/removes it.
+SSH_KEY_FIXTURE="$SCRATCH/id_test"
+ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_FIXTURE" -q
+
 # run_rr <extra-env...> -- <args...>  -> runs the script in the fixture repo with
 # XDG_CONFIG_HOME set, SSH config redirected to scratch, and the mock aws on PATH.
 MOCK_BIN="$SCRATCH/bin"
@@ -99,6 +105,7 @@ run_rr() {
         PATH="$MOCK_BIN:$PATH" \
         XDG_CONFIG_HOME="$XDG" \
         REPO_REMOTE_SSH_CONFIG="$SCRATCH/ssh_config" \
+        REPO_REMOTE_SSH_KEY="$SSH_KEY_FIXTURE" \
         MOCK_AWS_LOG="$MOCK_LOG" \
         "${envs[@]}" \
         bash "$RR" "$@" 2>"$errf")"
@@ -172,12 +179,35 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_FLEET_TAG:-None}"
       exit 0
     fi
+    # Post-create KeyName verification (repo#177) is ALSO a --instance-ids
+    # describe-instances call, so it must be distinguished by its distinct
+    # `.KeyName` query projection before falling into the generic
+    # State.Name/PublicIpAddress branch below (which both share the single
+    # MOCK_AWS_STATE canned value). Defaults to a non-null name so every
+    # EXISTING test (none of which care about this new check) still passes;
+    # a dedicated test overrides MOCK_AWS_KEYNAME_CHECK=None to exercise the
+    # die-loudly path.
+    if printf '%s' "$*" | grep -qF ".KeyName"; then
+      printf '%s\n' "${MOCK_AWS_KEYNAME_CHECK:-repo-remote-myrepo}"
+      exit 0
+    fi
     # --instance-ids (pinned lookup) vs --filters (tag find)
     if printf '%s' "$*" | grep -q -- '--instance-ids'; then
       echo "${MOCK_AWS_STATE:-None}"
     else
       # tag find / status: emit configured rows (may be empty)
       printf '%s' "${MOCK_AWS_FIND:-}"
+    fi
+    exit 0 ;;
+  "ec2 describe-key-pairs")
+    # aws_resolve_keypair() fingerprint-reuse lookup (repo#177). Default: no
+    # match -> falls through to import-key-pair. A test sets
+    # MOCK_AWS_KEYPAIR_NAME to simulate an existing account key pair.
+    printf '%s\n' "${MOCK_AWS_KEYPAIR_NAME:-None}"; exit 0 ;;
+  "ec2 import-key-pair")
+    if [[ "${MOCK_AWS_IMPORT_KEYPAIR_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (InvalidKeyPair.Duplicate) when calling the ImportKeyPair operation" >&2
+      exit 254
     fi
     exit 0 ;;
   "ec2 run-instances")
@@ -531,27 +561,93 @@ assert_contains "guard embeds the overridden marker path" "$UD2" 'MARKER=/run/cu
 assert_not_contains "overridden path replaces the default" "$UD2" 'MARKER=/var/run/repo-remote-daemon-idle.marker'
 
 # (c) repo#163 regression: REPO_REMOTE_IDLE_SHUTDOWN_MIN=0 must DISABLE the
-#     guard entirely, not feed 0 into the fallback countdown's arithmetic
-#     (`(NOW - LAST) / 60 -ge 0` is true on the very first post-$STAMP tick,
-#     which used to shut the host down almost immediately instead of never).
-#     No cron/watchdog script — and no --user-data at all — should be emitted.
+#     guard's cron/watchdog script, not feed 0 into the fallback countdown's
+#     arithmetic (`(NOW - LAST) / 60 -ge 0` is true on the very first
+#     post-$STAMP tick, which used to shut the host down almost immediately
+#     instead of never). repo#177: --user-data itself is NO LONGER omitted in
+#     this case — it now ALWAYS carries the authorized_keys belt-and-suspenders
+#     injection regardless of the idle-guard setting; only the cron/watchdog
+#     portion is conditional on IDLE_MIN.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=0"
 rm -f "$UD_CAP"
 run_rr MOCK_AWS_NEW_ID=i-0noguard MOCK_AWS_STATE=None -- up --yes --json
 assert_eq "IDLE_MIN=0 still provisions successfully" "0" "$RR_RC"
-assert_not_contains "IDLE_MIN=0: no --user-data flag passed to run-instances" \
+assert_contains "IDLE_MIN=0: --user-data flag is still passed (repo#177 authorized_keys)" \
   "$(cat "$MOCK_LOG")" "user-data"
-assert_eq "IDLE_MIN=0: no user-data content was captured at all" \
-  "" "$(cat "$UD_CAP" 2>/dev/null)"
+assert_contains "IDLE_MIN=0: user-data still injects authorized_keys" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "authorized_keys"
+assert_not_contains "IDLE_MIN=0: no idle-guard cron/watchdog content is embedded" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "repo-remote-idle-check"
 
-# Negative windows are treated the same as 0 (also "disabled").
+# Negative windows are treated the same as 0 (also "disabled") — same
+# repo#177 carve-out: the cron/watchdog portion is skipped, authorized_keys
+# injection is not.
 rm -f "$UD_CAP"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=-5"
 run_rr MOCK_AWS_NEW_ID=i-0noguard2 MOCK_AWS_STATE=None -- up --yes --json
-assert_not_contains "negative IDLE_MIN: no --user-data flag passed to run-instances" \
+assert_contains "negative IDLE_MIN: --user-data flag is still passed" \
   "$(cat "$MOCK_LOG")" "user-data"
-assert_eq "negative IDLE_MIN: no user-data content was captured at all" \
-  "" "$(cat "$UD_CAP" 2>/dev/null)"
+assert_contains "negative IDLE_MIN: user-data still injects authorized_keys" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "authorized_keys"
+assert_not_contains "negative IDLE_MIN: no idle-guard cron/watchdog content is embedded" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "repo-remote-idle-check"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS key-pair resolution at launch (repo#177: KeyName: None fix) --"
+# ---------------------------------------------------------------------------
+# Root cause: aws_create() used to read --key-name from an undocumented
+# REPO_REMOTE_SSH_KEY_NAME that nothing ever set, so --key-name was silently
+# omitted and instances launched unreachable (KeyName: None). The fix resolves
+# the key pair from REPO_REMOTE_SSH_KEY's public key instead.
+
+# (a) No matching account key pair -> import-key-pair is called, and the
+#     resulting --key-name is present on the run-instances call.
+rm -f "$UD_CAP"
+run_rr MOCK_AWS_NEW_ID=i-0keypair1 MOCK_AWS_STATE=None MOCK_AWS_KEYPAIR_NAME=None -- up --yes --json
+assert_eq   "no matching key pair: provisions successfully" "0" "$RR_RC"
+assert_contains "no matching key pair: import-key-pair was called" \
+  "$(cat "$MOCK_LOG")" "import-key-pair"
+assert_contains "run-instances always carries --key-name" \
+  "$(cat "$MOCK_LOG")" "--key-name repo-remote-myrepo"
+
+# (b) A matching account key pair already exists (by fingerprint) ->
+#     import-key-pair must NOT be called; the discovered name is reused.
+run_rr MOCK_AWS_NEW_ID=i-0keypair2 MOCK_AWS_STATE=None MOCK_AWS_KEYPAIR_NAME=existing-key -- up --yes --json
+assert_eq   "matching key pair found: provisions successfully" "0" "$RR_RC"
+assert_not_contains "matching key pair found: import-key-pair NOT called" \
+  "$(cat "$MOCK_LOG")" "import-key-pair"
+assert_contains "matching key pair found: reused name is passed as --key-name" \
+  "$(cat "$MOCK_LOG")" "--key-name existing-key"
+
+# (c) Post-create verification: the mock reports KeyName: null after creation
+#     -> `up` must fail loudly (exit 4) instead of reporting success on an
+#     unreachable-by-design host.
+run_rr MOCK_AWS_NEW_ID=i-0nokey MOCK_AWS_STATE=None MOCK_AWS_KEYNAME_CHECK=None -- up --yes --json
+assert_eq   "post-create KeyName:null -> exit 4" "4" "$RR_RC"
+assert_contains "failure message names the instance" "$RR_ERR" "i-0nokey"
+assert_contains "failure message names KeyName" "$RR_ERR" "KeyName"
+
+# (d) Edge case: missing REPO_REMOTE_SSH_KEY's .pub file -> a loud, actionable
+#     failure (never a silent key-less launch).
+run_rr REPO_REMOTE_SSH_KEY="$SCRATCH/no-such-key" MOCK_AWS_NEW_ID=i-0nopub MOCK_AWS_STATE=None \
+  -- up --yes --json
+assert_eq   "missing .pub file -> loud failure (exit 2)" "2" "$RR_RC"
+assert_contains "failure names the expected .pub path" "$RR_ERR" "no-such-key.pub"
+assert_eq   "missing .pub file: nothing was ever launched" "0" \
+  "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# (e) The authorized_keys belt-and-suspenders injection is present and
+#     idempotent (deduplicated) across repeat boots.
+rm -f "$UD_CAP"
+run_rr MOCK_AWS_NEW_ID=i-0authkeys MOCK_AWS_STATE=None -- up --yes --json
+UD_AUTH="$(cat "$UD_CAP" 2>/dev/null)"
+assert_contains "user-data appends to authorized_keys" "$UD_AUTH" ">>~ubuntu/.ssh/authorized_keys"
+assert_contains "user-data dedupes on repeat boots (grep -qxF guard)" "$UD_AUTH" "grep -qxF"
+PUBLINE="$(cat "${SSH_KEY_FIXTURE}.pub")"
+assert_contains "user-data embeds the resolved public key" "$UD_AUTH" "$PUBLINE"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
@@ -945,6 +1041,14 @@ assert_contains "remote.md documents the whole-batch refusal on down" \
   "$MD" "whole batch is refused"
 assert_contains "remote.md documents dry-run annotation (not blocking) on down" \
   "$MD" "fleet_marked"
+
+# repo#177: remote.md must document that --key-name is always resolved from
+# REPO_REMOTE_SSH_KEY (never silently omitted) so the doc and script stay in
+# sync on the KeyName:None fix.
+assert_contains "remote.md documents always attaching a resolved key pair" \
+  "$MD" "always attach a key pair"
+assert_contains "remote.md documents the key pair is derived from REPO_REMOTE_SSH_KEY" \
+  "$MD" "resolved from"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).

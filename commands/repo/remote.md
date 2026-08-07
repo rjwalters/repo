@@ -110,6 +110,9 @@ AWS_REGION=us-west-2
 # gcp instead: GCP_PROJECT, GCP_ZONE, GOOGLE_APPLICATION_CREDENTIALS=/abs/sa.json
 
 REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session (fine to share)
+                                           # AWS: its .pub is ALSO what resolves/imports the
+                                           # EC2 key pair at launch (repo#177) — the same key,
+                                           # two roles, so `up` never launches keyless.
 
 # --- dev-session auth (optional; used ON the VM) ---
 # Unlike the provisioning creds above, these DO travel to the VM so gh/claude
@@ -317,6 +320,17 @@ Requirements for the created instance:
 - Label/tag it `repo-remote=<repo-name>` so `--status`/`--down` only ever touch
   instances this command created
 - Ubuntu LTS image, disk size from config
+- **AWS: always attach a key pair** (`--key-name`), resolved from
+  `REPO_REMOTE_SSH_KEY`'s public key (`<REPO_REMOTE_SSH_KEY>.pub`) — an
+  existing account key pair with a matching fingerprint is reused,
+  otherwise the public key is imported as a new one. This must never be
+  skipped: a `run-instances` call with no `--key-name` launches an instance
+  with `KeyName: None`, which is unreachable via SSH by design (repo#177).
+  After creation, verify the launched instance's `KeyName` came back
+  non-null before reporting success. As belt-and-suspenders, the same
+  public key is also injected into `~ubuntu/.ssh/authorized_keys` via
+  cloud-init user-data on every boot, so the host stays reachable even if
+  key-pair attachment itself ever regresses.
 - For GPU hosts, see **GPU hosts** below — this needs a GPU-ready image and,
   on AWS, quota-aware handling.
 - Install an idle-shutdown guard (cron checking SSH sessions + CPU, running
