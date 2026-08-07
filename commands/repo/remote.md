@@ -57,6 +57,14 @@ prints the plan and estimated hourly cost and spends nothing, so a caller can
 implement a "plan shown before money is spent" check against the `--json`
 output (instance id, public IP, SSH alias, estimated hourly cost).
 
+The `--json` output for `up` (both the dry-run plan and a real provision) also
+carries `estimated_cost_approximate` (bool) and `estimated_cost_basis`
+(`"table"` | `"vcpu-scaled"` | `"heuristic"`) alongside
+`estimated_hourly_cost_usd`, so a caller can tell an exact price-table hit
+apart from a vCPU-count-scaled guess or a last-resort flat heuristic for an
+instance type with no price data at all — a confidently-wrong flat number is
+worse for cost consent than an honestly-vague one.
+
 `--force` is a **separate** override with a single job: it lets `up` reuse, or
 `down` stop/terminate, an instance carrying a **fleet marker** (see
 [Fleet-marked hosts: the reuse and teardown

@@ -508,11 +508,38 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
 run_rr -- up --json
 assert_contains "GPU family flagged gpu=true" "$RR_OUT" '"gpu":true'
 assert_eq "GPU instance carries a GPU-tier cost" "1.861" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
-# Unknown type -> approximate cost, still a number present.
+assert_contains "GPU table hit has basis=table" "$RR_OUT" '"estimated_cost_basis":"table"'
+
+# Current-gen (7th-gen) type present in the explicit price table -> an exact
+# hit, not a guess (repo#178: the price table previously had zero 7th-gen
+# entries at all).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=c7i.xlarge"
+run_rr -- up --json
+assert_eq "c7i.xlarge table hit carries its exact price" "0.1785" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
+assert_contains "c7i.xlarge table hit not flagged approximate" "$RR_OUT" '"estimated_cost_approximate":false'
+assert_contains "c7i.xlarge table hit basis is table" "$RR_OUT" '"estimated_cost_basis":"table"'
+
+# Current-gen type NOT in the table (a large, 96-vCPU size) -> vCPU-scaled
+# fallback, not the old flat-$0.20 bug this issue reports (repo#178). 96 vCPU
+# * $0.045/vCPU-hr = $4.32/hr — the right order of magnitude, unlike the
+# previous ~20x-too-low flat heuristic.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=c7i.24xlarge"
+run_rr -- up --json
+assert_eq "c7i.24xlarge unlisted -> vCPU-scaled, not the flat \$0.20 bug" "4.3200" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
+assert_contains "c7i.24xlarge flagged approximate" "$RR_OUT" '"estimated_cost_approximate":true'
+assert_contains "c7i.24xlarge basis is vcpu-scaled, distinguishable from a table hit" "$RR_OUT" '"estimated_cost_basis":"vcpu-scaled"'
+
+# Unknown type with no AWS-style size suffix -> the true last-resort flat
+# heuristic. The $0.20 value itself is unchanged (there is nothing to scale
+# from), but it is now explicitly labeled via estimated_cost_basis so a caller
+# can distinguish it from a table hit or a vCPU-scaled guess — this replaces
+# the old assertion that pinned the flat value with no way to tell it apart
+# from a real price.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=zz.unknown"
 run_rr -- up --json
 assert_contains "unknown type flagged approximate" "$RR_OUT" '"estimated_cost_approximate":true'
 assert_contains "unknown type still carries a cost number" "$RR_OUT" '"estimated_hourly_cost_usd":0.20'
+assert_contains "unknown type basis is the last-resort heuristic" "$RR_OUT" '"estimated_cost_basis":"heuristic"'
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
