@@ -12,6 +12,9 @@ node_modules
 # Guard hook diagnostic logs (runtime artifact, never committed)
 hooks/logs/
 
+# repo-scrub-forks fork-list snapshots (runtime artifact, never committed)
+.loom/state/repo-scrub-forks/
+
 # Loom install metadata holds a machine-local source path + timestamp
 .loom/install-metadata.json
 
