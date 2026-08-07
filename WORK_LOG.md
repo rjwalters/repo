@@ -3,6 +3,17 @@
 Chronological record of merged PRs and closed issues, maintained automatically
 by the Guide triage agent. Newest entries first.
 
+### 2026-08-07
+
+- **PR #171**: fix: gate repo-remote down behind the fleet-marker guard
+- **Issue #170** (closed): repo-remote down is not gated by the fleet marker that now guards up
+- **PR #169**: feat: gate repo-remote reuse of fleet-marked hosts behind --force
+- **Issue #164** (closed): Design proposal: should repo-remote.sh's idle guard treat fleet-tagged/daemon-managed hosts differently at attach time?
+- **PR #167**: fix(repo): discover .kct/install-metadata.json via bounded find sweep
+- **Issue #165** (closed): update-tools discovery misses .kct/install-metadata.json — kicad-tools is a named family member with no path in the documented ls
+- **PR #166**: fix: disable repo-remote idle-shutdown guard when IDLE_MIN<=0 instead of firing immediately
+- **Issue #163** (closed): repo-remote.sh idle guard: REPO_REMOTE_IDLE_SHUTDOWN_MIN=0 shuts the host down almost immediately instead of disabling the guard
+
 ### 2026-08-06
 
 - **PR #161**: fix: guard mtime capture against GNU stat -f fallback corruption
