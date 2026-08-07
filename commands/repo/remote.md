@@ -146,6 +146,10 @@ REPO_REMOTE_IDLE_MARKER=                   # optional idle-exit marker path (def
 # --- fleet-marker guard (refuse to reuse a managed fleet host) ---
 REPO_REMOTE_FLEET_TAG_KEY=Fleet           # tag (AWS) / label (GCP) key that marks a managed fleet host; empty disables the check
 REPO_REMOTE_FLEET_TAG_VALUE=loom          # required value for that key; empty means "any non-empty value counts"
+
+# --- SSH ingress (AWS only; see "Security group and SSH ingress" below) ---
+REPO_REMOTE_SSH_CIDR=                     # optional: pin the SG's SSH-ingress CIDR (e.g. 203.0.113.7/32, or
+                                           # 0.0.0.0/0 as a deliberate opt-in); overrides current-IP detection outright
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -313,10 +317,54 @@ Requirements for the created instance:
   its exact activity model, the daemon-host short-window recommendation, and the
   idle-exit marker contract.
 - AWS: security group allowing SSH from the user's IP only, using
-  `REPO_REMOTE_SSH_KEY`'s public key. GCP: prefer OS Login / IAP.
+  `REPO_REMOTE_SSH_KEY`'s public key — see **Security group and SSH ingress
+  (AWS)** below for exactly how the CIDR is resolved and verified. GCP: prefer
+  OS Login / IAP.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
 alternative zone or the next type down rather than failing.
+
+#### Security group and SSH ingress (AWS)
+
+A VPC's **default** security group has no SSH ingress rule at all, so
+attaching it silently (the old behavior when `REPO_REMOTE_SECURITY_GROUP` was
+unset) produces a box that times out on SSH indefinitely — `describe-security-groups`
+shows an empty ingress set as the only symptom. `repo-remote up` now
+resolve-or-creates a dedicated security group and proves SSH ingress actually
+landed before it ever calls `run-instances`:
+
+1. **Resolve the group.** `REPO_REMOTE_SECURITY_GROUP`, if set, wins outright
+   (unchanged). Otherwise, reuse a security group already tagged
+   `repo-remote=<repo-name>` from a prior run; otherwise create one with that
+   tag. This makes repeated `up` runs idempotent — no new SG accumulates per
+   invocation.
+2. **Resolve the CIDR.** `REPO_REMOTE_SSH_CIDR`, if set, wins outright
+   (including an explicit `0.0.0.0/0` opt-in). Otherwise, detect the current
+   IP via an HTTPS echo service (`checkip.amazonaws.com`) and use it as a
+   `/32` — but treat that detection as **unverified**: there is no reliable
+   way for this tooling to confirm the detected address is the one SSH egress
+   will actually use. Behind an HTTPS proxy it commonly isn't (an increasingly
+   common failure mode on agent hosts) — the echo service returns the proxy's
+   address, producing a correct-looking `/32` rule that can never match. If
+   detection fails outright (or you know it will be unreliable), set
+   `REPO_REMOTE_SSH_CIDR` yourself.
+3. **Fall back loudly, never silently.** If IP detection fails and
+   `REPO_REMOTE_SSH_CIDR` is unset, the rule falls back to `0.0.0.0/0` (SSH
+   remains key-only auth, so this is a scan-noise tradeoff, not an auth
+   bypass) with an explicit printed notice — never a `/32` that looks correct
+   but can never match.
+4. **Authorize idempotently.** `authorize-security-group-ingress` for tcp/22
+   from the resolved CIDR; a duplicate rule on a reused group counts as
+   success.
+5. **Verify before spending money.** `describe-security-groups` on the
+   resolved group must show a tcp/22 rule, or the run fails loudly (exit `4`)
+   before `run-instances` is ever called — this is what would have caught the
+   originally reported incident in-run instead of as a bare SSH timeout.
+6. **End-of-run reachability check.** After the SSH alias is written, `up`
+   probes it — `ssh -o ConnectTimeout=10 -o BatchMode=yes -o
+   StrictHostKeyChecking=accept-new <alias> true` — and fails loudly (exit
+   `4`) if it doesn't succeed, so an unreachable instance is caught in-run
+   rather than discovered on the next manual SSH attempt.
 
 #### The idle-shutdown guard
 

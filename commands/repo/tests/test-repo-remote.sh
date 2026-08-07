@@ -120,6 +120,32 @@ case "$1 $2" in
     echo '{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/test"}'; exit 0 ;;
   "ec2 describe-images")
     echo "${MOCK_AWS_AMI:-ami-0ubuntu2204}"; exit 0 ;;
+  "ec2 describe-security-groups")
+    if printf '%s' "$*" | grep -q -- '--group-ids'; then
+      # Post-authorize verification (aws_verify_ssh_ingress): a tcp/22 ingress
+      # rule must be present, or repo-remote.sh must die loudly (repo#176 AC1).
+      if [[ "${MOCK_AWS_SG_INGRESS_EMPTY:-0}" == 1 ]]; then
+        printf '\n'
+      else
+        printf '22\t22\ttcp\t0.0.0.0/0\n'
+      fi
+    else
+      # Tag-based resolve-or-create lookup (aws_find_tagged_sg).
+      printf '%s\n' "${MOCK_AWS_SG_FIND:-None}"
+    fi
+    exit 0 ;;
+  "ec2 create-security-group")
+    if [[ "${MOCK_AWS_SG_CREATE_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the CreateSecurityGroup operation" >&2
+      exit 254
+    fi
+    echo "${MOCK_AWS_SG_NEW_ID:-sg-0new}"; exit 0 ;;
+  "ec2 authorize-security-group-ingress")
+    if [[ "${MOCK_AWS_INGRESS_DUP:-0}" == 1 ]]; then
+      echo "An error occurred (InvalidPermission.Duplicate) when calling the AuthorizeSecurityGroupIngress operation" >&2
+      exit 254
+    fi
+    exit 0 ;;
   "ec2 describe-instances")
     # Fleet-marker lookup (repo#164) is also an --instance-ids call, so it must
     # be matched FIRST by its Tags[?Key=...] query projection.
@@ -200,6 +226,30 @@ esac
 exit 0
 MOCK
 chmod +x "$MOCK_BIN/gcloud"
+
+# ---------------------------------------------------------------------------
+# Mock `curl` (backs aws_resolve_ssh_cidr's current-IP detection, repo#176)
+# and mock `ssh` (backs aws_check_reachability's end-of-run probe). Both
+# default to a benign success so every pre-existing scenario below — which
+# doesn't care about either — is unaffected; specific tests override via
+# MOCK_CURL_FAIL / MOCK_CURL_IP / MOCK_SSH_FAIL.
+# ---------------------------------------------------------------------------
+cat >"$MOCK_BIN/curl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+[[ "${MOCK_CURL_FAIL:-0}" == 1 ]] && exit 1
+printf '%s' "${MOCK_CURL_IP:-203.0.113.7}"
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/curl"
+
+cat >"$MOCK_BIN/ssh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'ssh %s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+[[ "${MOCK_SSH_FAIL:-0}" == 1 ]] && exit 255
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/ssh"
 
 echo "repo-remote.sh test suite"
 echo "========================="
@@ -292,6 +342,136 @@ assert_contains "instance tagged repo-remote=<name>" "$LOGTXT" "repo-remote,Valu
 assert_contains "requested instance type is passed"  "$LOGTXT" "m5.2xlarge"
 assert_contains "disk size from config is applied"   "$LOGTXT" "VolumeSize=50"
 assert_contains "user-data (idle guard) is passed"   "$LOGTXT" "user-data"
+assert_contains "the resolved security group is attached to run-instances" "$LOGTXT" "security-group-ids sg-0new"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- security group: resolve-or-create + SSH ingress (repo#176) --"
+# ---------------------------------------------------------------------------
+# The original incident: a created security group's ingress permission set was
+# EMPTY (no SSH rule at all), so SSH timed out indefinitely with no other
+# symptom. aws_create() must now resolve-or-create a security group, authorize
+# tcp/22 into it, and verify the rule actually landed before run-instances is
+# ever called.
+
+# (a) REPO_REMOTE_SECURITY_GROUP unset -> no pre-existing tagged SG found ->
+#     a fresh one is created and tagged repo-remote=<name>.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_NEW_ID=i-0sgnew MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=None MOCK_AWS_SG_NEW_ID=sg-0created \
+  -- up --yes --json
+assert_eq   "SG create path: up still succeeds (exit 0)" "0" "$RR_RC"
+SGLOG="$(cat "$MOCK_LOG")"
+assert_contains "a security group is created when none is tagged yet" "$SGLOG" "create-security-group"
+assert_contains "the created SG is tagged repo-remote=<name>"         "$SGLOG" "repo-remote,Value=myrepo"
+assert_contains "the created SG's name embeds the repo name"          "$SGLOG" "repo-remote-myrepo"
+# (b) A tcp/22 ingress request is issued against the resolved SG.
+assert_contains "an ingress request is issued"          "$SGLOG" "authorize-security-group-ingress"
+assert_contains "the ingress request targets the created SG" "$SGLOG" "group-id sg-0created"
+assert_contains "the ingress request is for tcp/22"      "$SGLOG" "protocol tcp --port 22"
+assert_contains "the created SG is attached to the instance" "$SGLOG" "security-group-ids sg-0created"
+
+# (c) A previously-tagged SG is reused instead of creating a new one
+#     (idempotent across repeated `up` runs).
+run_rr MOCK_AWS_NEW_ID=i-0sgreuse MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing -- up --yes --json
+assert_eq   "SG reuse path: up still succeeds (exit 0)" "0" "$RR_RC"
+REUSELOG="$(cat "$MOCK_LOG")"
+assert_not_contains "a tagged SG is reused, not recreated" "$REUSELOG" "create-security-group"
+assert_contains "ingress is still (idempotently) authorized on the reused SG" \
+  "$REUSELOG" "group-id sg-0existing"
+assert_contains "the reused SG is attached to the instance" "$REUSELOG" "security-group-ids sg-0existing"
+
+# (d) An explicit REPO_REMOTE_SECURITY_GROUP still wins outright (unchanged
+#     prior behavior) -- no resolve-or-create lookup, but ingress is still
+#     authorized+verified on it.
+run_rr MOCK_AWS_NEW_ID=i-0sgpinned MOCK_AWS_STATE=None REPO_REMOTE_SECURITY_GROUP=sg-0pinned -- up --yes --json
+assert_eq   "explicit REPO_REMOTE_SECURITY_GROUP: up succeeds" "0" "$RR_RC"
+PINLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "explicit SG: no tag-based lookup/creation" "$PINLOG" "create-security-group"
+assert_contains "explicit SG: ingress still authorized on it" "$PINLOG" "group-id sg-0pinned"
+assert_contains "explicit SG: attached to the instance" "$PINLOG" "security-group-ids sg-0pinned"
+
+# (e) Post-create verification (AC1): an empty ingress rule set after
+#     authorize is a LOUD failure (exit 4), not a silently-provisioned box.
+run_rr MOCK_AWS_NEW_ID=i-0sgempty MOCK_AWS_STATE=None MOCK_AWS_SG_INGRESS_EMPTY=1 -- up --yes --json
+assert_eq   "empty post-create ingress -> loud failure (exit 4)" "4" "$RR_RC"
+assert_contains "failure names the missing tcp/22 rule" "$RR_ERR" "no tcp/22 ingress rule"
+assert_not_contains "no up result emitted on ingress-verification failure" "$RR_OUT" '"action":"up"'
+
+# (f) InvalidPermission.Duplicate on authorize (a reused SG that already has
+#     the rule) is treated as success, not an error.
+run_rr MOCK_AWS_NEW_ID=i-0sgdup MOCK_AWS_STATE=None MOCK_AWS_INGRESS_DUP=1 -- up --yes --json
+assert_eq   "InvalidPermission.Duplicate is treated as success" "0" "$RR_RC"
+
+# (g) create-security-group itself failing is a loud failure (exit 4), not a
+#     silent fall-through to the VPC default SG.
+run_rr MOCK_AWS_NEW_ID=i-0sgfail MOCK_AWS_STATE=None MOCK_AWS_SG_CREATE_FAIL=1 -- up --yes --json
+assert_eq   "SG creation failure -> loud failure (exit 4)" "4" "$RR_RC"
+assert_contains "failure names the failed SG creation" "$RR_ERR" "create-security-group failed"
+assert_eq   "SG creation failure: no instance was launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- SSH-ingress CIDR: current-IP detection, override, and fallback (repo#176) --"
+# ---------------------------------------------------------------------------
+# (a) Default path: current IP is detected via the HTTPS echo service and
+#     used as a /32.
+run_rr MOCK_AWS_NEW_ID=i-0cidrdetect MOCK_AWS_STATE=None MOCK_CURL_IP=198.51.100.9 -- up --yes --json
+assert_eq   "detected-IP path succeeds" "0" "$RR_RC"
+assert_contains "detected IP is used as a /32 ingress CIDR" \
+  "$(cat "$MOCK_LOG")" "cidr 198.51.100.9/32"
+
+# (b) REPO_REMOTE_SSH_CIDR overrides detection outright -- including an
+#     explicit 0.0.0.0/0 opt-in -- and no echo-service lookup is made at all.
+run_rr MOCK_AWS_NEW_ID=i-0cidroverride MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=203.0.113.55/32 -- up --yes --json
+assert_eq   "REPO_REMOTE_SSH_CIDR override succeeds" "0" "$RR_RC"
+OVLOG="$(cat "$MOCK_LOG")"
+assert_contains     "the override CIDR is used for ingress" "$OVLOG" "cidr 203.0.113.55/32"
+assert_not_contains "detection is skipped when the override is set" "$OVLOG" "curl "
+
+run_rr MOCK_AWS_NEW_ID=i-0cidrallopen MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=0.0.0.0/0 -- up --yes --json
+assert_eq   "an explicit 0.0.0.0/0 opt-in succeeds" "0" "$RR_RC"
+assert_contains "0.0.0.0/0 opt-in is honored verbatim" "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+
+# (c) IP-detection failure (no REPO_REMOTE_SSH_CIDR set) falls back to
+#     0.0.0.0/0 with an explicit printed notice -- never a silently-broken
+#     /32 that can never match.
+run_rr MOCK_AWS_NEW_ID=i-0cidrfallback MOCK_AWS_STATE=None MOCK_CURL_FAIL=1 -- up --yes --json
+assert_eq   "detection failure still provisions (fallback, not a hard error)" "0" "$RR_RC"
+assert_contains "fallback CIDR is 0.0.0.0/0"        "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+assert_contains "an explicit fallback notice is printed" "$RR_ERR" "NOTICE"
+assert_contains "the notice explains detection failed"   "$RR_ERR" "could not detect current IP"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- end-of-run SSH reachability check (repo#176 AC3) --"
+# ---------------------------------------------------------------------------
+# After the SSH alias is written, `up` probes it; an unreachable instance is a
+# loud, actionable failure caught in-run rather than a bare timeout later.
+# (the mock's describe-instances doesn't distinguish a state vs. a public-IP
+# lookup, so MOCK_AWS_STATE doubles as the resolved public IP here — an
+# IP-shaped value is needed to make the probe actually run, as opposed to the
+# empty-IP "nothing to probe yet" skip exercised elsewhere in this suite.)
+run_rr MOCK_AWS_NEW_ID=i-0reachok MOCK_AWS_STATE=203.0.113.20 -- up --yes --json
+assert_eq   "reachable (mocked ssh success) -> up still succeeds" "0" "$RR_RC"
+assert_contains "the reachability probe actually ran"       "$(cat "$MOCK_LOG")" "ssh "
+assert_contains "the probe uses a bounded ConnectTimeout"   "$(cat "$MOCK_LOG")" "ConnectTimeout=10"
+assert_contains "the probe is non-interactive (BatchMode)"  "$(cat "$MOCK_LOG")" "BatchMode=yes"
+
+run_rr MOCK_AWS_NEW_ID=i-0reachfail MOCK_AWS_STATE=203.0.113.21 MOCK_SSH_FAIL=1 -- up --yes --json
+assert_eq   "unreachable instance -> loud failure (exit 4)" "4" "$RR_RC"
+assert_contains "failure names the reachability check" "$RR_ERR" "SSH reachability check failed"
+
+# A missing public IP (nothing to probe) skips the check rather than failing.
+run_rr MOCK_AWS_NEW_ID=i-0reachskip MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "no public IP -> up still succeeds (probe skipped)" "0" "$RR_RC"
+assert_not_contains "no probe attempted without a public IP" "$(cat "$MOCK_LOG")" "ssh "
+assert_contains "a skip notice is logged" "$RR_ERR" "skipping the end-of-run SSH reachability check"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -396,10 +576,17 @@ run_rr MOCK_AWS_STATE=running -- up --yes --json
 assert_contains "reused the pinned running instance" "$RR_OUT" '"instance_id":"i-0pinned"'
 assert_contains "reported reused=true" "$RR_OUT" '"reused":true'
 assert_eq "no new instance launched on reuse" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+# repo#176 edge case: reusing an instance must NOT re-run security-group
+# creation/ingress-authorization on every `up` — that logic belongs solely to
+# aws_create(), which the reuse path never calls.
+assert_eq "reuse: no SG creation on every up"  "0" "$(grep -c 'create-security-group' "$MOCK_LOG" 2>/dev/null)"
+assert_eq "reuse: no ingress re-authorized on every up" "0" "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
 # A stopped pinned instance is started, still reused.
 run_rr MOCK_AWS_STATE=stopped -- up --yes --json
 assert_contains "stopped pinned instance is started" "$(cat "$MOCK_LOG")" "start-instances"
 assert_contains "still reported reused" "$RR_OUT" '"reused":true'
+assert_eq "reuse (start-from-stopped): no SG creation either" \
+  "0" "$(grep -c 'create-security-group' "$MOCK_LOG" 2>/dev/null)"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
