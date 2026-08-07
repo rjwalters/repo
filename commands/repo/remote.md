@@ -57,11 +57,12 @@ prints the plan and estimated hourly cost and spends nothing, so a caller can
 implement a "plan shown before money is spent" check against the `--json`
 output (instance id, public IP, SSH alias, estimated hourly cost).
 
-`--force` is a **separate** override with a single job: it lets `up` reuse an
-instance carrying a **fleet marker** (see [Fleet-marked hosts: the reuse
-guard](#fleet-marked-hosts-the-reuse-guard)). It does **not** relax the cost
-gate — `--force` without a pre-supplied `REPO_REMOTE_INSTANCE_TYPE` still fails
-loudly.
+`--force` is a **separate** override with a single job: it lets `up` reuse, or
+`down` stop/terminate, an instance carrying a **fleet marker** (see
+[Fleet-marked hosts: the reuse and teardown
+guard](#fleet-marked-hosts-the-reuse-and-teardown-guard)). It does **not**
+relax the cost gate — `--force` without a pre-supplied
+`REPO_REMOTE_INSTANCE_TYPE` still fails loudly.
 
 Exit codes: `0` success (including a dry-run plan), `2` missing/invalid required
 config (the cost gate), `3` provider authentication failed, `4` cloud operation
@@ -291,8 +292,9 @@ RUNNING → offer reuse; STOPPED → offer to start.
 
 3. **Before starting or SSH-aliasing anything you *reused*** (either branch
    above), check the resolved instance's tags/labels for a **fleet marker** and
-   stop unless `--force` was given — see **Fleet-marked hosts: the reuse guard**
-   below. A freshly created instance is never subject to this check.
+   stop unless `--force` was given — see **Fleet-marked hosts: the reuse and
+   teardown guard** below (the same guard applies to `--down`/`down`). A
+   freshly created instance is never subject to this check.
 
 ### 4. Create the instance (with confirmation)
 
@@ -387,32 +389,51 @@ On a daemon-managed host the two stages compose: the daemon's own idle-exit
 (writing the marker) is the first stage; this guard, `IDLE_MIN` minutes later, is
 the second and final stage that actually powers the box off.
 
-#### Fleet-marked hosts: the reuse guard
+#### Fleet-marked hosts: the reuse and teardown guard
 
 The idle guard above is attached **once, at creation** — this command never
 re-attaches user-data to an instance it reuses, so the guard a host carries is
-whatever it got the day it was created. What reuse *does* do is **start a
-stopped instance and rewrite this repo's SSH alias to point at it**, and the
-handles it resolves that instance from — a pinned `REPO_REMOTE_INSTANCE_ID`, or
-the `repo-remote=<name>` tag/label — never expire. A box provisioned once for an
+whatever it got the day it was created. What `up` reuse *does* do is **start a
+stopped instance and rewrite this repo's SSH alias to point at it**; what `down`
+does to that same resolved instance is **stop it, or — with `--delete` —
+terminate it, disk and all**. Both verbs resolve their target from the same
+handles — a pinned `REPO_REMOTE_INSTANCE_ID`, or the `repo-remote=<name>`
+tag/label — and neither handle ever expires. A box provisioned once for an
 ephemeral dev session can since have been repurposed into a persistent,
 daemon-managed fleet worker while still carrying the old tag, at which point
-ephemeral dev-session tooling would silently start and re-alias a production
-host. That is the second finding of the 2AMLogic/2am#52 incident, where
-`repo-remote=anvil` tooling kept rediscovering the host that had become
-`loom-worker-1`.
+ephemeral dev-session tooling would silently start-and-re-alias it (`up`) or
+stop/terminate it (`down`) as if it were still just a throwaway dev box. That is
+the second finding of the 2AMLogic/2am#52 incident, where `repo-remote=anvil`
+tooling kept rediscovering the host that had become `loom-worker-1`; `down
+--delete` against that same stale handle is the strictly worse outcome — the
+disk is gone, unrecoverable.
 
-**The check.** Before starting or aliasing a **reused** instance — on both AWS
-reuse branches (pinned id and `repo-remote=<name>` tag lookup) and on the GCP
-existing-instance branch — the resolved instance's **AWS tags** / **GCP labels**
+**The check.** Before starting or aliasing a **reused** instance on `up` — on
+both AWS reuse branches (pinned id and `repo-remote=<name>` tag lookup) and on
+the GCP existing-instance branch — or before stopping/terminating **any**
+instance `down` resolves, the resolved instance's **AWS tags** / **GCP labels**
 are read and matched against a fleet marker, by default **`Fleet=loom`** (the
 tag 2am's own remediation sets on its persistent workers). If it matches:
 
 - **Without `--force`**: the run **stops with exit `5`** and a message naming the
-  instance, the marker it found, and the override. Nothing is started, nothing is
-  terminated, and the SSH alias is left untouched.
+  instance, the marker it found, and the override. On `up`, nothing is started,
+  nothing is terminated, and the SSH alias is left untouched. On `down`, nothing
+  is stopped or terminated.
 - **With `--force`**: it warns loudly that it is about to touch what looks like a
   managed fleet host, then proceeds as normal.
+
+**`down`'s multi-id batch semantics.** Unlike `up` (always exactly one resolved
+instance), AWS `down`'s tag-discovery path can resolve **multiple** instances at
+once. If **any** resolved instance in that set carries the fleet marker, the
+**whole batch is refused** — none of the resolved instances are stopped or
+terminated, not even the unmarked ones — rather than silently acting on a
+subset. `--force` overrides for the whole batch at once, the same as the
+single-instance case. A **dry run** (`down` without `--yes`) never touches a
+cloud resource, so it is never blocked by this guard even against a
+fleet-marked instance; instead, the dry-run listing **annotates** which of the
+listed instances carry the marker (via a `fleet_marked` array in `--json`
+output, or an inline `NOTE:` line otherwise) so an operator can see, before
+spending nothing, which instances a subsequent `--yes` run would refuse.
 
 **Configuration.**
 
@@ -630,7 +651,8 @@ Both delegate to the shared script (`repo-remote status` / `repo-remote down`),
 which resolves the same two config layers and only ever touches instances
 carrying this repo's `repo-remote` tag. `repo-remote down` without `--yes` is a
 dry run that lists exactly what would stop; `--yes` acts, and `--delete`
-terminates.
+terminates. `down` is subject to the same fleet-marker guard as `up`'s reuse
+path — see **Fleet-marked hosts: the reuse and teardown guard** above.
 
 - `--status`: list all instances labeled `repo-remote=<repo-name>` with state
   and uptime; estimate accumulated cost. Uses the resolved credentials (shared
