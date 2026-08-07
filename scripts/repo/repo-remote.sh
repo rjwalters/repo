@@ -20,12 +20,15 @@
 # Subcommands (both the `up`/`down`/`status` verbs and the remote.md-style
 # `--status`/`--down` flags are accepted, for parity with the prose command):
 #
-#   repo-remote up [--yes] [--json] [aws|gcp]     Provision (or reuse) an instance.
+#   repo-remote up [--yes] [--force] [--json] [aws|gcp]   Provision (or reuse)
+#       an instance.
 #       Without --yes: a DRY-RUN plan (resolved spec + estimated cost) is emitted
 #       and NOTHING is created — this is the "plan shown before money spent" path.
 #       With --yes: the plan is executed. --yes removes the *prompt*, never the
 #       *consent requirement*: a cost-relevant field missing from config is a
 #       loud, non-zero-exit failure, never a silent default (repo#52 cost gate).
+#       --force overrides the fleet-marker guard described below. It does NOT
+#       relax the cost gate.
 #
 #   repo-remote status|--status [--json] [aws|gcp]   List instances this command
 #       created (tagged repo-remote=<name>) with state; no mutation.
@@ -46,11 +49,26 @@
 # not consent. Non-cost-relevant fields (disk, idle window, image) do fall back
 # to built-in defaults, matching the prose command.
 #
+# Fleet-marker guard (repo#164): `up` reuses an instance it *discovers* — a
+# pinned REPO_REMOTE_INSTANCE_ID, or one carrying the repo-remote=<name> tag/label.
+# That discovery is stale-tag-prone: a host provisioned once for an ephemeral dev
+# session can later become a persistent fleet worker while still carrying the
+# repo-remote tag, at which point this ephemeral tooling would happily start and
+# SSH-alias a production box (2AMLogic/2am#52). So before starting or aliasing a
+# REUSED instance, its tags (AWS) / labels (GCP) are checked for a fleet marker —
+# by default Fleet=loom, configurable via REPO_REMOTE_FLEET_TAG_KEY /
+# REPO_REMOTE_FLEET_TAG_VALUE. If present, the run STOPS (exit 5) with a clear
+# message unless --force is given; with --force it proceeds after a loud warning.
+# Setting REPO_REMOTE_FLEET_TAG_KEY= (empty) disables the check entirely. The
+# guard never applies to a freshly created instance (nothing to inherit) and
+# never to a dry run (which touches no cloud resource at all).
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure)
 #   3  provider authentication failed
 #   4  cloud operation failed
+#   5  refused to reuse a fleet-marked instance (pass --force to override)
 #   64 usage error
 #
 # Testability hooks (honored so the suite can exercise the full contract against
@@ -69,6 +87,7 @@ die()  { local code="$1"; shift; printf '%s\n' "repo-remote: ERROR: $*" >&2; exi
 
 JSON_OUT=false   # --json
 YES=false        # --yes
+FORCE=false      # --force (override the fleet-marker guard)
 DELETE=false     # --down --delete
 ACTION=""        # up | down | status
 PROVIDER_ARG=""  # aws | gcp (positional override)
@@ -117,6 +136,8 @@ IMAGE=""
 GPU_ACCEL=""       # GCP accelerator string, e.g. nvidia-l4:1
 IDLE_MIN=""
 IS_GPU=false
+FLEET_TAG_KEY=""   # tag/label key that marks a managed fleet host ("" disables)
+FLEET_TAG_VALUE="" # required value for that key ("" = any non-empty value)
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -206,6 +227,12 @@ resolve_settings() {
   # works standalone — it stays inert until the file actually exists on-host.
   IDLE_MARKER="${REPO_REMOTE_IDLE_MARKER:-/var/run/repo-remote-daemon-idle.marker}"
 
+  # Fleet marker (repo#164). Defaults match the tag 2am's remediation already
+  # sets on its persistent workers, so the guard is useful with zero config.
+  # An empty key is the deliberate opt-out: no marker lookup is performed.
+  FLEET_TAG_KEY="${REPO_REMOTE_FLEET_TAG_KEY-Fleet}"
+  FLEET_TAG_VALUE="${REPO_REMOTE_FLEET_TAG_VALUE-loom}"
+
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
     gcp) REGION="${GCP_ZONE:-}" ;;
@@ -252,6 +279,76 @@ require_cost_config() {
     log "set them in ${SHARED_ENV} (shared) or ${REPO_ENV:-<git-root>/.env} (per-repo), or run /repo:remote --configure."
     exit 2
   fi
+}
+
+# ── the fleet-marker guard (reuse discovery, repo#164) ──────────────────────
+# `up` never re-attaches user-data to an instance it reuses — the guard a host
+# carries is whatever it got at its one-time creation. What reuse DOES do is
+# start a stopped instance and rewrite this repo's SSH alias to point at it. The
+# instance it reaches is resolved from a pinned REPO_REMOTE_INSTANCE_ID or from
+# the repo-remote=<name> tag/label, and neither of those handles expires: a box
+# provisioned once as an ephemeral dev session can since have become a
+# persistent, daemon-managed fleet worker while still carrying the old tag. That
+# is exactly how `repo-remote=anvil` tooling kept rediscovering `loom-worker-1`
+# after it became a fleet host (2AMLogic/2am#52).
+#
+# So: before a REUSED instance is started or aliased, look for a fleet marker
+# the fleet-management side already had to set deliberately elsewhere. This is a
+# provisioning-time check against declared metadata — deliberately NOT an
+# on-host "is some process running" heuristic, which repo#79 rejected for the
+# guard's runtime logic and which nothing here reopens.
+
+# True when a discovered marker value counts as "this is a fleet host".
+# Compared case-insensitively: GCP lower-cases label values, AWS tags don't.
+# An empty REPO_REMOTE_FLEET_TAG_VALUE means "any non-empty value matches".
+fleet_marker_matches() {  # <discovered-value>
+  local got want
+  [[ -n "$1" && "$1" != "None" ]] || return 1
+  [[ -n "$FLEET_TAG_VALUE" ]] || return 0
+  got="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  want="$(printf '%s' "$FLEET_TAG_VALUE" | tr '[:upper:]' '[:lower:]')"
+  [[ "$got" == "$want" ]]
+}
+
+# Warn-or-refuse once a marker has been read off a resource being reused.
+# Dies with exit 5 unless --force; with --force it warns loudly and continues.
+fleet_marker_gate() {  # <resource-id> <marker-value> <"tag"|"label">
+  local id="$1" val="$2" kind="$3"
+  fleet_marker_matches "$val" || return 0
+  if [[ "$FORCE" == true ]]; then
+    log "WARNING: ${id} carries the fleet marker ${kind} ${FLEET_TAG_KEY}=${val} — it looks like a managed fleet/daemon host, not an ephemeral dev box. Proceeding anyway because --force was given; this run will start and/or re-alias a production host."
+    return 0
+  fi
+  # Same "repo-remote: ERROR:" shape as die(), but die() is a single line and
+  # this refusal is only actionable with the remediation lines that follow it.
+  printf '%s\n' "repo-remote: ERROR: refusing to reuse ${id}: it carries the fleet marker ${kind} ${FLEET_TAG_KEY}=${val}." >&2
+  log "  That marker means the host is managed as part of a fleet (e.g. a persistent loom-daemon worker), so starting or re-aliasing it from ephemeral dev-session tooling is almost certainly not what you want (2AMLogic/2am#52)."
+  log "  If you really mean to target it, re-run with --force."
+  log "  To use a different box instead, clear REPO_REMOTE_INSTANCE_ID from ${REPO_ENV:-<git-root>/.env} (and/or remove the repo-remote=${NAME} tag from the fleet host)."
+  log "  To disable this check entirely, set REPO_REMOTE_FLEET_TAG_KEY= (empty)."
+  exit 5
+}
+
+# AWS: read the fleet tag off an instance. Echoes "" when absent/disabled.
+aws_fleet_marker() {  # <instance-id>
+  [[ -n "$FLEET_TAG_KEY" ]] || return 0
+  local v
+  v="$(aws ec2 describe-instances --instance-ids "$1" \
+      --query "Reservations[0].Instances[0].Tags[?Key=='${FLEET_TAG_KEY}'].Value | [0]" \
+      --output text 2>/dev/null)" || return 0
+  [[ "$v" == "None" ]] && v=""
+  printf '%s' "$v"
+}
+
+# GCP: read the fleet label off an instance. Label keys are lower-case on GCP,
+# so the configured key is lower-cased for the lookup. Echoes "" when absent.
+gcp_fleet_marker() {  # <instance-name>
+  [[ -n "$FLEET_TAG_KEY" ]] || return 0
+  local k v
+  k="$(printf '%s' "$FLEET_TAG_KEY" | tr '[:upper:]' '[:lower:]')"
+  v="$(gcloud compute instances describe "$1" --zone "$REGION" \
+      --format="value(labels.${k})" 2>/dev/null || true)"
+  printf '%s' "$v"
 }
 
 # ── the idle-shutdown guard (cloud-init user-data) ──────────────────────────
@@ -430,6 +527,12 @@ aws_up() {
 
   if [[ -n "$INSTANCE_ID" ]]; then
     state="$(aws_instance_state "$INSTANCE_ID")"
+    # Fleet-marker guard BEFORE any start/alias: a pinned id can outlive the
+    # host's role as an ephemeral dev box (repo#164). Skipped when the pin is
+    # already stale (missing) — there is nothing to protect.
+    if [[ "$state" != missing ]]; then
+      fleet_marker_gate "$INSTANCE_ID" "$(aws_fleet_marker "$INSTANCE_ID")" tag
+    fi
     case "$state" in
       running)          iid="$INSTANCE_ID"; reused=true ;;
       stopped|stopping) aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null 2>&1 \
@@ -446,6 +549,9 @@ aws_up() {
     if [[ -n "$found" ]]; then
       iid="$(printf '%s' "$found" | awk '{print $1}')"
       state="$(printf '%s' "$found" | awk '{print $2}')"
+      # Same guard on the tag-discovery path — the repo-remote=<name> tag is
+      # exactly the stale handle that let dev tooling rediscover a fleet host.
+      fleet_marker_gate "$iid" "$(aws_fleet_marker "$iid")" tag
       reused=true
       if [[ "$state" == stopped || "$state" == stopping ]]; then
         aws ec2 start-instances --instance-ids "$iid" >/dev/null 2>&1 \
@@ -529,6 +635,9 @@ gcp_up() {
   state="$(gcloud compute instances describe "$vm" --zone "$REGION" \
     --format='value(status)' 2>/dev/null || true)"
   if [[ -n "$state" ]]; then
+    # Fleet-marker guard BEFORE any start/alias (repo#164) — the GCP analogue of
+    # the AWS reuse check, against instance labels instead of tags.
+    fleet_marker_gate "$vm" "$(gcp_fleet_marker "$vm")" label
     reused=true
     if [[ "$state" != "RUNNING" ]]; then
       gcloud compute instances start "$vm" --zone "$REGION" >/dev/null 2>&1 \
@@ -746,7 +855,10 @@ emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated>
 
 # ── argument parsing ────────────────────────────────────────────────────────
 usage() {
-  sed -n '4,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print the whole leading comment block (from line 4 to the first non-comment
+  # line) rather than a hard-coded line range, so --help cannot silently start
+  # truncating the header when documentation is added to it.
+  awk 'NR >= 4 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 parse_args() {
@@ -756,6 +868,7 @@ parse_args() {
       --status)       ACTION="status" ;;
       --down)         ACTION="down" ;;
       --yes|-y)       YES=true ;;
+      --force)        FORCE=true ;;
       --json)         JSON_OUT=true ;;
       --delete)       DELETE=true ;;
       aws|gcp)        PROVIDER_ARG="$1" ;;

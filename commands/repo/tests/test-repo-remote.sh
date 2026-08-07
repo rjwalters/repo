@@ -121,6 +121,12 @@ case "$1 $2" in
   "ec2 describe-images")
     echo "${MOCK_AWS_AMI:-ami-0ubuntu2204}"; exit 0 ;;
   "ec2 describe-instances")
+    # Fleet-marker lookup (repo#164) is also an --instance-ids call, so it must
+    # be matched FIRST by its Tags[?Key=...] query projection.
+    if printf '%s' "$*" | grep -qF "Tags[?Key=="; then
+      printf '%s\n' "${MOCK_AWS_FLEET_TAG:-None}"
+      exit 0
+    fi
     # --instance-ids (pinned lookup) vs --filters (tag find)
     if printf '%s' "$*" | grep -q -- '--instance-ids'; then
       echo "${MOCK_AWS_STATE:-None}"
@@ -152,6 +158,29 @@ case "$1 $2" in
 esac
 MOCK
 chmod +x "$MOCK_BIN/aws"
+
+# ---------------------------------------------------------------------------
+# A minimal mock `gcloud`, covering only the calls gcp_up() makes. Added for the
+# GCP half of the fleet-marker guard (repo#164) so the label-based check is
+# exercised, not just the AWS tag-based one.
+# ---------------------------------------------------------------------------
+cat >"$MOCK_BIN/gcloud" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+case "$1 $2 ${3:-}" in
+  "compute instances describe")
+    if printf '%s' "$*" | grep -qF 'labels.'; then
+      printf '%s\n' "${MOCK_GCP_FLEET_LABEL:-}"      # fleet-marker lookup
+    elif printf '%s' "$*" | grep -qF 'natIP'; then
+      printf '%s\n' "${MOCK_GCP_IP:-1.2.3.4}"        # public IP lookup
+    else
+      printf '%s\n' "${MOCK_GCP_STATE:-}"            # existence/status lookup
+    fi
+    exit 0 ;;
+esac
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/gcloud"
 
 echo "repo-remote.sh test suite"
 echo "========================="
@@ -356,6 +385,104 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- fleet-marker guard on AWS reuse discovery (repo#164) --"
+# ---------------------------------------------------------------------------
+# Reuse discovery (a pinned REPO_REMOTE_INSTANCE_ID, or the repo-remote=<name>
+# tag) resolves a handle that can outlive the host's role as an ephemeral dev
+# box. Starting/re-aliasing a host that has since become a fleet worker is the
+# second finding of 2AMLogic/2am#52, so a fleet marker on the resolved instance
+# must block the run unless --force is passed.
+
+# (a) Marker ABSENT -> behavior is exactly as before (reuse proceeds).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_FLEET_TAG=None -- up --yes --json
+assert_eq   "no fleet marker: reuse still succeeds (exit 0)" "0" "$RR_RC"
+assert_contains "no fleet marker: still reports reused" "$RR_OUT" '"reused":true'
+assert_contains "no fleet marker: stopped instance still started" "$(cat "$MOCK_LOG")" "start-instances"
+
+# (b) Marker PRESENT, no --force -> blocked before any start/alias.
+SSH_BEFORE="$(cat "$SCRATCH/ssh_config" 2>/dev/null || true)"
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_FLEET_TAG=loom -- up --yes --json
+assert_eq   "fleet-marked pinned instance is refused (exit 5)" "5" "$RR_RC"
+assert_contains "message names the instance"          "$RR_ERR" "i-0pinned"
+assert_contains "message names the marker tag"        "$RR_ERR" "Fleet=loom"
+assert_contains "message points at the --force override" "$RR_ERR" "--force"
+assert_not_contains "blocked run emitted no up result" "$RR_OUT" '"action":"up"'
+assert_eq   "blocked run never started the instance" "0" "$(grep -c 'start-instances' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "blocked run never launched anything"    "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "blocked run left the SSH alias untouched" "$SSH_BEFORE" "$(cat "$SCRATCH/ssh_config" 2>/dev/null || true)"
+
+# (c) Marker PRESENT with --force -> proceeds, after a loud warning.
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_FLEET_TAG=loom -- up --yes --force --json
+assert_eq   "--force lets a fleet-marked instance through (exit 0)" "0" "$RR_RC"
+assert_contains "--force warns loudly first" "$RR_ERR" "WARNING"
+assert_contains "--force warning names the marker" "$RR_ERR" "Fleet=loom"
+assert_contains "--force run reuses the instance" "$RR_OUT" '"instance_id":"i-0pinned"'
+assert_contains "--force run actually started it" "$(cat "$MOCK_LOG")" "start-instances"
+
+# (d) The tag-discovery path (no pinned id) is guarded identically — this is the
+#     branch that let `repo-remote=<name>` tooling rediscover a fleet host.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="i-0worker stopped" MOCK_AWS_FLEET_TAG=loom -- up --yes --json
+assert_eq   "fleet-marked tag-discovered instance is refused (exit 5)" "5" "$RR_RC"
+assert_contains "message names the discovered instance" "$RR_ERR" "i-0worker"
+assert_eq   "tag-discovery block never started it" "0" "$(grep -c 'start-instances' "$MOCK_LOG" 2>/dev/null)"
+run_rr MOCK_AWS_FIND="i-0worker stopped" MOCK_AWS_FLEET_TAG=loom -- up --yes --force --json
+assert_eq   "--force allows the tag-discovered instance" "0" "$RR_RC"
+assert_contains "--force reuses the discovered instance" "$RR_OUT" '"instance_id":"i-0worker"'
+
+# (e) A tag present with a DIFFERENT value is not this fleet's marker.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_FLEET_TAG=someone-elses -- up --yes --json
+assert_eq "a non-matching Fleet value does not block" "0" "$RR_RC"
+
+# (f) The marker key/value are configurable, and an empty key disables the check.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_FLEET_TAG=prod \
+  REPO_REMOTE_FLEET_TAG_KEY=Environment REPO_REMOTE_FLEET_TAG_VALUE=prod -- up --yes --json
+assert_eq   "custom marker key/value blocks (exit 5)" "5" "$RR_RC"
+assert_contains "message names the custom marker" "$RR_ERR" "Environment=prod"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_FLEET_TAG=loom REPO_REMOTE_FLEET_TAG_KEY= -- up --yes --json
+assert_eq "empty REPO_REMOTE_FLEET_TAG_KEY disables the check" "0" "$RR_RC"
+
+# (g) The guard is a *reuse* check: a dry run touches nothing and is never blocked.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_FLEET_TAG=loom -- up --json
+assert_eq "dry run is never blocked by the fleet marker" "0" "$RR_RC"
+assert_contains "dry run still prints the plan" "$RR_OUT" '"dry_run":true'
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- fleet-marker guard on GCP reuse discovery (labels) --"
+# ---------------------------------------------------------------------------
+GCP_ENV=("REPO_REMOTE_PROVIDER=gcp" "REPO_REMOTE_INSTANCE_TYPE=e2-standard-4"
+         "GCP_PROJECT=proj" "GCP_ZONE=us-central1-a"
+         "GOOGLE_APPLICATION_CREDENTIALS=$SCRATCH/sa.json")
+: >"$SCRATCH/sa.json"
+write_repo_env "${GCP_ENV[@]}"
+
+# (a) Label absent -> existing-instance reuse proceeds unchanged.
+run_rr MOCK_GCP_STATE=TERMINATED MOCK_GCP_FLEET_LABEL= -- up --yes --json
+assert_eq   "GCP: no fleet label -> reuse succeeds" "0" "$RR_RC"
+assert_contains "GCP: reports reused" "$RR_OUT" '"reused":true'
+assert_contains "GCP: stopped instance started" "$(cat "$MOCK_LOG")" "instances start"
+
+# (b) Label present, no --force -> blocked before start/alias.
+write_repo_env "${GCP_ENV[@]}"
+run_rr MOCK_GCP_STATE=TERMINATED MOCK_GCP_FLEET_LABEL=loom -- up --yes --json
+assert_eq   "GCP: fleet-labeled instance is refused (exit 5)" "5" "$RR_RC"
+assert_contains "GCP: message names the marker label" "$RR_ERR" "Fleet=loom"
+assert_eq   "GCP: blocked run never started it" "0" "$(grep -c 'instances start' "$MOCK_LOG" 2>/dev/null)"
+
+# (c) Label present with --force -> proceeds.
+run_rr MOCK_GCP_STATE=TERMINATED MOCK_GCP_FLEET_LABEL=loom -- up --yes --force --json
+assert_eq   "GCP: --force lets it through" "0" "$RR_RC"
+assert_contains "GCP: --force warns loudly" "$RR_ERR" "WARNING"
+assert_contains "GCP: --force run started the instance" "$(cat "$MOCK_LOG")" "instances start"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- GPU detection + cost --"
 # ---------------------------------------------------------------------------
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
@@ -442,6 +569,14 @@ assert_contains "remote.md documents the default marker path" \
 assert_contains "remote.md documents the marker's mtime semantics" "$MD" "mtime"
 assert_contains "remote.md recommends a short idle window for daemon/worker hosts" \
   "$MD" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=20"
+
+# repo#164: the fleet-marker reuse guard and its --force override are part of
+# the implemented surface, so remote.md must document them too.
+assert_contains "remote.md documents the --force override" "$MD" "--force"
+assert_contains "remote.md documents the fleet-marker key var" "$MD" "REPO_REMOTE_FLEET_TAG_KEY"
+assert_contains "remote.md documents the fleet-marker value var" "$MD" "REPO_REMOTE_FLEET_TAG_VALUE"
+assert_contains "remote.md documents the default fleet marker" "$MD" "Fleet=loom"
+assert_contains "remote.md documents the refusal exit code" "$MD" "exit \`5\`"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).
