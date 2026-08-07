@@ -517,12 +517,40 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- dry-run plan text: (GPU) tag only for genuine GPU families (repo#175) --"
+# ---------------------------------------------------------------------------
+# ${IS_GPU:+ (GPU)} previously fired on the *string* "false" too, tagging every
+# instance type as GPU. Assert the human-readable plan line only tags real GPU
+# families, using non-JSON output so the plan text itself is exercised.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=c7i.24xlarge"
+run_rr -- up
+assert_eq   "plan (dry run) for standard family -> exit 0" "0" "$RR_RC"
+assert_not_contains "standard family plan line has NO (GPU) tag" "$RR_ERR" "c7i.24xlarge (GPU)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
+run_rr -- up
+assert_eq   "plan (dry run) for GPU family -> exit 0" "0" "$RR_RC"
+assert_contains "GPU family plan line DOES carry the (GPU) tag" "$RR_ERR" "g6e.xlarge (GPU)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- GPU quota (VcpuLimitExceeded) surfaces the exact remediation --"
 # ---------------------------------------------------------------------------
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge"
 run_rr MOCK_AWS_QUOTA_FAIL=1 MOCK_AWS_STATE=None -- up --yes --json
 assert_eq   "quota failure -> non-zero exit" "4" "$RR_RC"
 assert_contains "names the Service Quotas code" "$RR_ERR" "L-DB2E81BA"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- standard-family quota (VcpuLimitExceeded) names the standard quota code (repo#175) --"
+# ---------------------------------------------------------------------------
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_QUOTA_FAIL=1 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "quota failure -> non-zero exit" "4" "$RR_RC"
+assert_contains "names the standard Service Quotas code" "$RR_ERR" "L-1216C47A"
+assert_not_contains "does NOT name the GPU quota code" "$RR_ERR" "L-DB2E81BA"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
