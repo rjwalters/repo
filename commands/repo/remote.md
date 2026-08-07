@@ -127,7 +127,7 @@ REPO_REMOTE_DOCKERFILE=./Dockerfile       # optional: build & run this checked-i
 REPO_REMOTE_SETUP="make setup"            # optional first-boot command; fallback when no Dockerfile
 
 # --- session ---
-REPO_REMOTE_IDLE_SHUTDOWN_MIN=120         # interactive-host default; use ~20 for daemon-managed/worker hosts (see below)
+REPO_REMOTE_IDLE_SHUTDOWN_MIN=120         # interactive-host default; use ~20 for daemon-managed/worker hosts; 0 disables the guard entirely (see below)
 REPO_REMOTE_IDLE_MARKER=                   # optional idle-exit marker path (default: /var/run/repo-remote-daemon-idle.marker)
 ```
 
@@ -300,6 +300,16 @@ alternative zone or the next type down rather than failing.
 The guard is a cron watchdog (`/usr/local/bin/repo-remote-idle-check`, run every
 minute) installed via cloud-init user-data. It powers the host off with
 `shutdown -h` once it has been idle for `REPO_REMOTE_IDLE_SHUTDOWN_MIN` minutes.
+
+**`REPO_REMOTE_IDLE_SHUTDOWN_MIN=0` (or any non-positive value) disables the
+guard outright** — no cron/watchdog script is installed at all. This is
+distinct from "a very long window": a long window still counts down and
+eventually shuts the host off, while `0` means the guard is never installed in
+the first place, so the host never self-shuts-down. Use this for hosts that
+must never be powered off by this mechanism (e.g. a persistent fleet-tagged
+worker) — do **not** rely on `0` as a stand-in for "infinite window," since
+prior to repo#163 that value made the guard's fallback countdown fire almost
+immediately instead.
 
 **Activity model (what keeps the host alive).** "Activity" is exactly two local
 signals: an **open SSH session** (`who`) **or** a **CPU load average > 0.2**.
@@ -578,4 +588,5 @@ terminates.
    to `chmod 600` the shared `~/.config/repo/remote.env` if it's readable by
    others
 5. **Always install the idle-shutdown guard** — a VM that outlives the session
-   should turn itself off
+   should turn itself off, unless the guard is explicitly disabled via
+   `REPO_REMOTE_IDLE_SHUTDOWN_MIN=0`

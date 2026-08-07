@@ -275,7 +275,22 @@ require_cost_config() {
 # standalone: with no marker file present it falls back to the unchanged
 # who/load/$STAMP behavior. The marker path is always embedded (default below,
 # overridable via REPO_REMOTE_IDLE_MARKER) so the branch is inert-but-ready.
+#
+# IDLE_MIN <= 0 means "guard disabled" (repo#163) — the opt-out an operator
+# reaches for via REPO_REMOTE_IDLE_SHUTDOWN_MIN=0, e.g. for a fleet-tagged host
+# that should never self-shutdown. This must NOT be handled by feeding 0 into
+# the generated script's `(NOW - LAST) / 60 -ge IDLE_MIN` arithmetic — that
+# makes the guard fire almost immediately (0 >= 0 is true on the very first
+# post-$STAMP tick) instead of never. So the window is validated here, before
+# any guard/cron script is emitted at all: a non-positive (or non-numeric)
+# IDLE_MIN short-circuits to no output, and callers (aws_create, gcp_up) must
+# check idle_guard_enabled too so they skip embedding user-data entirely.
+idle_guard_enabled() {
+  [[ "$IDLE_MIN" =~ ^[0-9]+$ ]] && (( IDLE_MIN > 0 ))
+}
+
 idle_guard_userdata() {
+  idle_guard_enabled || return 0
   cat <<EOF
 #!/bin/bash
 # repo-remote idle-shutdown guard (idle window: ${IDLE_MIN} min)
@@ -388,8 +403,10 @@ aws_create() {
     --instance-type "$INSTANCE_TYPE"
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${DISK_GB}}"
     --tag-specifications "ResourceType=instance,Tags=[{Key=repo-remote,Value=${NAME}}]"
-    --user-data "file://${udfile}"
     --query 'Instances[0].InstanceId' --output text)
+  # IDLE_MIN<=0 means the guard is disabled (repo#163) — skip embedding
+  # user-data at all rather than passing an empty/no-op script.
+  idle_guard_enabled && args+=(--user-data "file://${udfile}")
   [[ -n "$key" ]] && args+=(--key-name "$key")
   [[ -n "$sg" ]]  && args+=(--security-group-ids "$sg")
 
@@ -526,7 +543,9 @@ gcp_up() {
       --image-family "${IMAGE:-ubuntu-2204-lts}" --image-project "${REPO_REMOTE_IMAGE_PROJECT:-ubuntu-os-cloud}")
     [[ -n "$GPU_ACCEL" ]] && args+=(--accelerator "type=${GPU_ACCEL%%:*},count=${GPU_ACCEL##*:}" --maintenance-policy TERMINATE)
     local ud; ud="$(mktemp)"; idle_guard_userdata >"$ud"
-    args+=(--metadata-from-file "startup-script=${ud}")
+    # IDLE_MIN<=0 means the guard is disabled (repo#163) — skip embedding the
+    # startup-script metadata at all rather than passing an empty/no-op script.
+    idle_guard_enabled && args+=(--metadata-from-file "startup-script=${ud}")
     gcloud "${args[@]}" >/dev/null 2>&1 || { rm -f "$ud"; die 4 "gcloud compute instances create failed for $vm"; }
     rm -f "$ud"
   fi

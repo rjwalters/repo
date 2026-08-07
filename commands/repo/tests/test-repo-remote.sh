@@ -301,6 +301,30 @@ run_rr MOCK_AWS_NEW_ID=i-0guard2 MOCK_AWS_STATE=None REPO_REMOTE_IDLE_MARKER=/ru
 UD2="$(cat "$UD_CAP" 2>/dev/null)"
 assert_contains "guard embeds the overridden marker path" "$UD2" 'MARKER=/run/custom-idle.marker'
 assert_not_contains "overridden path replaces the default" "$UD2" 'MARKER=/var/run/repo-remote-daemon-idle.marker'
+
+# (c) repo#163 regression: REPO_REMOTE_IDLE_SHUTDOWN_MIN=0 must DISABLE the
+#     guard entirely, not feed 0 into the fallback countdown's arithmetic
+#     (`(NOW - LAST) / 60 -ge 0` is true on the very first post-$STAMP tick,
+#     which used to shut the host down almost immediately instead of never).
+#     No cron/watchdog script — and no --user-data at all — should be emitted.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=0"
+rm -f "$UD_CAP"
+run_rr MOCK_AWS_NEW_ID=i-0noguard MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "IDLE_MIN=0 still provisions successfully" "0" "$RR_RC"
+assert_not_contains "IDLE_MIN=0: no --user-data flag passed to run-instances" \
+  "$(cat "$MOCK_LOG")" "user-data"
+assert_eq "IDLE_MIN=0: no user-data content was captured at all" \
+  "" "$(cat "$UD_CAP" 2>/dev/null)"
+
+# Negative windows are treated the same as 0 (also "disabled").
+rm -f "$UD_CAP"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=-5"
+run_rr MOCK_AWS_NEW_ID=i-0noguard2 MOCK_AWS_STATE=None -- up --yes --json
+assert_not_contains "negative IDLE_MIN: no --user-data flag passed to run-instances" \
+  "$(cat "$MOCK_LOG")" "user-data"
+assert_eq "negative IDLE_MIN: no user-data content was captured at all" \
+  "" "$(cat "$UD_CAP" 2>/dev/null)"
+
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
