@@ -73,11 +73,38 @@
 # a dry run (which touches no cloud resource at all) — a `down` dry run
 # annotates any fleet-marked instances in its listing instead of blocking.
 #
+# SSH reachability (AWS, repo#176): a box nothing can connect to is a failed
+# provision, not a successful one. Three things enforce that on the AWS create
+# path, because previously NONE of them existed and `run-instances` silently
+# landed in the VPC's default security group (whose inbound set allows only
+# same-SG traffic — i.e. no SSH at all):
+#   1. Resolve-or-create a security group. An explicit REPO_REMOTE_SECURITY_GROUP
+#      is honored as-is and never mutated; otherwise one tagged
+#      repo-remote=<name> is reused, or created (named repo-remote-<name>) and
+#      tagged, so repeat `up` runs don't accumulate a group per invocation.
+#   2. Authorize tcp/22 ingress from a resolved CIDR (InvalidPermission.Duplicate
+#      is success), then VERIFY via describe-security-groups that a tcp/22 rule
+#      actually exists — before a billable instance is launched into it.
+#      The CIDR comes from REPO_REMOTE_SSH_CIDR when set (including an explicit
+#      0.0.0.0/0 opt-in), else best-effort detection of this host's public IP.
+#      Detection is treated as UNVERIFIED: an HTTPS echo service reports the
+#      address HTTPS egressed from, which behind a proxy is not the address SSH
+#      will use — a correct-looking /32 that can never match. If detection fails
+#      the run falls back to 0.0.0.0/0 with an explicit printed notice rather
+#      than silently creating an unreachable box (SSH is key-only, so this is a
+#      scan-noise tradeoff, not an auth bypass).
+#   3. End of `up`: an actual `ssh -o ConnectTimeout=… -o BatchMode=yes` probe
+#      against the alias just written, retried within REPO_REMOTE_SSH_WAIT_SEC
+#      (default 90s) while sshd comes up. The `up` result is still emitted, then
+#      the run exits 4 with remediation — an unreachable instance is caught
+#      in-run instead of surfacing later as an indefinite SSH timeout.
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure)
 #   3  provider authentication failed
-#   4  cloud operation failed
+#   4  cloud operation failed (including: the security group has no tcp/22
+#      ingress rule, or the provisioned instance is not SSH-reachable)
 #   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
 #      fleet-marked instance (pass --force to override)
 #   64 usage error
@@ -87,7 +114,10 @@
 #   XDG_CONFIG_HOME            locates the shared remote.env (already standard)
 #   REPO_REMOTE_SSH_CONFIG     SSH config file to write the alias into
 #                              (default: ~/.ssh/config)
-#   PATH                       mock `aws`/`gcloud` are picked up from PATH
+#   REPO_REMOTE_SSH_WAIT_SEC   reachability-probe budget; 0 = a single attempt
+#                              with no sleeps (default: 90)
+#   PATH                       mock `aws`/`gcloud`/`curl`/`ssh` are picked up
+#                              from PATH
 #
 set -uo pipefail
 
@@ -149,6 +179,9 @@ IDLE_MIN=""
 IS_GPU=false
 FLEET_TAG_KEY=""   # tag/label key that marks a managed fleet host ("" disables)
 FLEET_TAG_VALUE="" # required value for that key ("" = any non-empty value)
+SECURITY_GROUP=""  # explicit, user-managed SG id (never mutated when set)
+SSH_CIDR=""        # explicit SSH ingress CIDR override (skips IP detection)
+SSH_WAIT_SEC=""    # reachability-probe budget in seconds (0 = one attempt)
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -243,6 +276,15 @@ resolve_settings() {
   # An empty key is the deliberate opt-out: no marker lookup is performed.
   FLEET_TAG_KEY="${REPO_REMOTE_FLEET_TAG_KEY-Fleet}"
   FLEET_TAG_VALUE="${REPO_REMOTE_FLEET_TAG_VALUE-loom}"
+
+  # SSH reachability (repo#176). None of these are cost-relevant, so they follow
+  # the same "fall back to a built-in default" rule as disk/idle/image.
+  # REPO_REMOTE_SSH_CIDR unset = detect this host's public IP (best effort, and
+  # explicitly treated as unverified — see aws_resolve_ssh_cidr).
+  SECURITY_GROUP="${REPO_REMOTE_SECURITY_GROUP:-}"
+  SSH_CIDR="${REPO_REMOTE_SSH_CIDR:-}"
+  SSH_WAIT_SEC="${REPO_REMOTE_SSH_WAIT_SEC:-90}"
+  [[ "$SSH_WAIT_SEC" =~ ^[0-9]+$ ]] || SSH_WAIT_SEC=90
 
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
@@ -492,6 +534,142 @@ aws_public_ip() {  # <instance-id>
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null
 }
 
+# ── SSH ingress: security group + CIDR resolution (repo#176) ────────────────
+# Without any of this, `run-instances` with no --security-group-ids lands in the
+# VPC's DEFAULT security group, whose inbound rule set only admits traffic from
+# other members of that same group — so the box comes up with no SSH ingress at
+# all and the run "succeeds" into an indefinite connection timeout.
+
+# Resolve the CIDR tcp/22 is opened to, into RESOLVED_SSH_CIDR.
+#
+# An explicit REPO_REMOTE_SSH_CIDR always wins — including an explicit
+# 0.0.0.0/0, which is the supported opt-out for hosts where detection can't be
+# trusted. Otherwise the public IP is detected best-effort via an HTTPS echo
+# service. That detection is deliberately treated as UNVERIFIED: it reports the
+# address an HTTPS request egressed from, and on a host whose HTTPS egress goes
+# through a proxy that is NOT the address SSH traffic will originate from — a
+# correct-looking /32 rule that can never match. There is no way for this script
+# to confirm the two agree, so the notice below always says so, and a detection
+# FAILURE falls back to 0.0.0.0/0 (loudly) rather than silently authorizing a
+# rule that cannot work. SSH on the provisioned image is key-only, so the
+# fallback is a scan-noise tradeoff, not an auth bypass.
+RESOLVED_SSH_CIDR=""
+aws_resolve_ssh_cidr() {
+  if [[ -n "$SSH_CIDR" ]]; then
+    RESOLVED_SSH_CIDR="$SSH_CIDR"
+    if [[ "$SSH_CIDR" == "0.0.0.0/0" ]]; then
+      log "SSH ingress: REPO_REMOTE_SSH_CIDR=0.0.0.0/0 — tcp/22 will be open to the whole internet. SSH stays key-only (no password auth), so this is a scan-noise tradeoff, not an auth bypass."
+    else
+      log "SSH ingress: using REPO_REMOTE_SSH_CIDR=${SSH_CIDR} (no IP detection performed)."
+    fi
+    return 0
+  fi
+
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')"
+  fi
+  if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    RESOLVED_SSH_CIDR="${ip}/32"
+    log "SSH ingress: allowlisting ${RESOLVED_SSH_CIDR}, detected via checkip.amazonaws.com. UNVERIFIED: that is the address HTTPS egressed from — behind an HTTPS proxy it differs from the address SSH will use, producing a rule that looks right and never matches. Set REPO_REMOTE_SSH_CIDR (0.0.0.0/0 is a supported opt-in) if this host can't reach the box."
+    return 0
+  fi
+
+  RESOLVED_SSH_CIDR="0.0.0.0/0"
+  log "SSH ingress: could not detect this host's public IP (checkip.amazonaws.com unreachable or returned no address), so falling back to 0.0.0.0/0 instead of creating an instance nothing can reach. SSH stays key-only (no password auth), so this is a scan-noise tradeoff, not an auth bypass. Set REPO_REMOTE_SSH_CIDR to pin a narrower range."
+}
+
+# Resolve-or-create the security group into RESOLVED_SG, mirroring the
+# reuse-by-tag pattern aws_find_tagged already uses for instances so repeat `up`
+# runs don't accumulate one group per invocation. Sets SG_IS_EXPLICIT=true when
+# the caller pinned REPO_REMOTE_SECURITY_GROUP — that group is user-managed, so
+# it is verified but never modified.
+RESOLVED_SG=""
+SG_IS_EXPLICIT=false
+aws_resolve_security_group() {
+  local sg errfile err rc
+  if [[ -n "$SECURITY_GROUP" ]]; then
+    RESOLVED_SG="$SECURITY_GROUP"; SG_IS_EXPLICIT=true
+    return 0
+  fi
+  SG_IS_EXPLICIT=false
+
+  sg="$(aws ec2 describe-security-groups \
+        --filters "Name=tag:repo-remote,Values=${NAME}" \
+        --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)" || sg=""
+  sg="$(printf '%s' "$sg" | tr -d '[:space:]')"
+  [[ "$sg" == "None" ]] && sg=""
+  if [[ -n "$sg" ]]; then
+    RESOLVED_SG="$sg"
+    log "reusing security group ${sg} (tagged repo-remote=${NAME})"
+    return 0
+  fi
+
+  errfile="$(mktemp)"
+  sg="$(aws ec2 create-security-group \
+        --group-name "repo-remote-${NAME}" \
+        --description "repo-remote dev host for ${NAME} (SSH ingress)" \
+        --tag-specifications "ResourceType=security-group,Tags=[{Key=repo-remote,Value=${NAME}}]" \
+        --query 'GroupId' --output text 2>"$errfile")"; rc=$?
+  err="$(cat "$errfile" 2>/dev/null)"; rm -f "$errfile"
+  sg="$(printf '%s' "$sg" | tr -d '[:space:]')"
+  if [[ $rc -ne 0 || -z "$sg" || "$sg" == "None" ]]; then
+    die 4 "aws ec2 create-security-group failed for repo-remote-${NAME}: ${err:-unknown error}. Set REPO_REMOTE_SECURITY_GROUP to an existing group that allows tcp/22 to skip this step."
+  fi
+  RESOLVED_SG="$sg"
+  log "created security group ${sg} (repo-remote-${NAME}, tagged repo-remote=${NAME})"
+}
+
+# Idempotent tcp/22 authorization. A reused group already carries the rule, and
+# AWS reports that as InvalidPermission.Duplicate — which is success here.
+aws_authorize_ssh_ingress() {  # <sg-id> <cidr>
+  local sg="$1" cidr="$2" err rc
+  err="$(aws ec2 authorize-security-group-ingress \
+        --group-id "$sg" --protocol tcp --port 22 --cidr "$cidr" 2>&1 >/dev/null)"; rc=$?
+  [[ $rc -eq 0 ]] && return 0
+  if printf '%s' "$err" | grep -q 'InvalidPermission.Duplicate'; then
+    return 0   # the rule is already there — exactly the desired end state
+  fi
+  die 4 "aws ec2 authorize-security-group-ingress failed for ${sg} (tcp/22 from ${cidr}): ${err:-unknown error}"
+}
+
+# AC1: prove the group actually carries a tcp/22 ingress rule. The original
+# incident was a group whose ingress permission set was EMPTY — the failure only
+# surfaced later as an indefinite SSH timeout. This runs BEFORE run-instances so
+# no billable instance is launched into an unreachable configuration.
+aws_verify_ssh_ingress() {  # <sg-id>
+  local sg="$1" rules
+  rules="$(aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?IpProtocol=='tcp' && FromPort<=\`22\` && ToPort>=\`22\`]" \
+    --output text 2>/dev/null | grep -v '^None' || true)"
+  rules="$(printf '%s' "$rules" | tr -d '[:space:]')"
+  [[ -n "$rules" ]] && return 0
+
+  log "security group ${sg} reports NO tcp/22 ingress rule after authorization — an instance launched into it would be unreachable over SSH (this is the repo#176 failure mode: an empty ingress permission set discovered only as an indefinite connection timeout)."
+  log "  Nothing was launched. Check the group in the console, or authorize it manually:"
+  log "    aws ec2 authorize-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr ${RESOLVED_SSH_CIDR:-<your-ip>/32}"
+  die 4 "security group ${sg} has no tcp/22 ingress rule; refusing to launch an unreachable instance."
+}
+
+# AC3: the end-of-run reachability probe. Retries within SSH_WAIT_SEC because a
+# freshly created instance reaches "running" well before sshd accepts
+# connections; SSH_WAIT_SEC=0 means a single attempt with no sleeps.
+aws_ssh_reachable() {  # <alias> -> 0 reachable / 1 not
+  local alias="$1" cfg deadline now
+  cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
+  command -v ssh >/dev/null 2>&1 || return 0   # no ssh client here: nothing to assert
+  deadline=$(( $(date +%s) + SSH_WAIT_SEC ))
+  while :; do
+    if ssh -F "$cfg" -o ConnectTimeout=10 -o BatchMode=yes \
+         -o StrictHostKeyChecking=accept-new "$alias" true >/dev/null 2>&1; then
+      return 0
+    fi
+    now="$(date +%s)"
+    (( now >= deadline )) && return 1
+    sleep 5
+  done
+}
+
 # Create a fresh instance into CREATED_ID (global, so a `die` propagates rather
 # than being swallowed by a command-substitution subshell). run-instances is
 # invoked EXACTLY ONCE — capturing stdout and stderr in one call — because a
@@ -501,7 +679,18 @@ aws_create() {
   local ami sg key udfile errfile iid rc err
   aws_resolve_image; ami="$RESOLVED_AMI"
   key="${REPO_REMOTE_SSH_KEY_NAME:-}"
-  sg="${REPO_REMOTE_SECURITY_GROUP:-}"
+
+  # SSH ingress (repo#176). Done BEFORE run-instances so a group that cannot
+  # admit SSH fails the run without spending money. An explicitly pinned
+  # REPO_REMOTE_SECURITY_GROUP is user-managed: it is verified, never modified.
+  aws_resolve_security_group; sg="$RESOLVED_SG"
+  if [[ "$SG_IS_EXPLICIT" == true ]]; then
+    log "using pinned security group ${sg} (REPO_REMOTE_SECURITY_GROUP) — not modifying its rules"
+  else
+    aws_resolve_ssh_cidr
+    aws_authorize_ssh_ingress "$sg" "$RESOLVED_SSH_CIDR"
+  fi
+  aws_verify_ssh_ingress "$sg"
 
   udfile="$(mktemp)"; idle_guard_userdata >"$udfile"
   errfile="$(mktemp)"
@@ -585,6 +774,23 @@ aws_up() {
   local alias; alias="$(write_ssh_alias "$ip")"
 
   emit_up_result "$iid" "$ip" "$alias" "$reused"
+
+  # AC3 (repo#176): end the run with a real connection attempt, so "provisioned
+  # but unreachable" is a loud in-run failure instead of something the caller
+  # discovers minutes later as an SSH timeout. The result above is emitted
+  # first on purpose — the caller still needs the instance id to tear it down.
+  if [[ -z "$ip" ]]; then
+    log "WARNING: instance $iid has no public IP, so no SSH reachability check was possible. If this instance is meant to be reachable over SSH, check its subnet's public-IP assignment."
+    return 0
+  fi
+  if ! aws_ssh_reachable "$alias"; then
+    log "provisioned instance $iid at $ip is NOT reachable over SSH after ${SSH_WAIT_SEC}s (ssh -o ConnectTimeout=10 -o BatchMode=yes ${alias} true)."
+    log "  security group:  ${RESOLVED_SG:-<pre-existing>} (tcp/22 from ${RESOLVED_SSH_CIDR:-<unchanged>})"
+    log "  Most common causes: the allowlisted CIDR is not the address your SSH traffic actually egresses from (set REPO_REMOTE_SSH_CIDR, e.g. 0.0.0.0/0); the instance has no key pair attached (REPO_REMOTE_SSH_KEY_NAME); or sshd is still starting — retry with a larger REPO_REMOTE_SSH_WAIT_SEC."
+    log "  The instance is still running and billing: tear it down with 'repo-remote down --yes' (add --delete to terminate)."
+    die 4 "instance $iid is not SSH-reachable at $ip"
+  fi
+  log "SSH reachability confirmed: ssh ${alias}"
 }
 
 aws_status() {

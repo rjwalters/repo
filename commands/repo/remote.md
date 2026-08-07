@@ -143,6 +143,11 @@ REPO_REMOTE_SETUP="make setup"            # optional first-boot command; fallbac
 REPO_REMOTE_IDLE_SHUTDOWN_MIN=120         # interactive-host default; use ~20 for daemon-managed/worker hosts; 0 disables the guard entirely (see below)
 REPO_REMOTE_IDLE_MARKER=                   # optional idle-exit marker path (default: /var/run/repo-remote-daemon-idle.marker)
 
+# --- SSH ingress (AWS; see "SSH ingress (AWS)" below) ---
+REPO_REMOTE_SECURITY_GROUP=                # optional existing SG id; used as-is and NEVER modified (else one tagged repo-remote=<name> is reused/created)
+REPO_REMOTE_SSH_CIDR=                      # CIDR tcp/22 is opened to; unset = detect this host's public IP (unverified behind an HTTPS proxy). 0.0.0.0/0 is a supported opt-in
+REPO_REMOTE_SSH_WAIT_SEC=90                # budget for the end-of-run SSH reachability probe (0 = a single attempt)
+
 # --- fleet-marker guard (refuse to reuse a managed fleet host) ---
 REPO_REMOTE_FLEET_TAG_KEY=Fleet           # tag (AWS) / label (GCP) key that marks a managed fleet host; empty disables the check
 REPO_REMOTE_FLEET_TAG_VALUE=loom          # required value for that key; empty means "any non-empty value counts"
@@ -312,11 +317,54 @@ Requirements for the created instance:
   ones especially — doesn't burn money. See **The idle-shutdown guard** below for
   its exact activity model, the daemon-host short-window recommendation, and the
   idle-exit marker contract.
-- AWS: security group allowing SSH from the user's IP only, using
-  `REPO_REMOTE_SSH_KEY`'s public key. GCP: prefer OS Login / IAP.
+- AWS: a security group that actually admits SSH, resolved-or-created and then
+  **verified** — see **SSH ingress (AWS)** below, which also covers the
+  current-IP detection failure mode. GCP: prefer OS Login / IAP.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
 alternative zone or the next type down rather than failing.
+
+#### SSH ingress (AWS)
+
+A box nothing can connect to is a failed provision, not a successful one. Prior
+to repo#176 nothing here created a security group at all: `run-instances` fell
+back to the VPC's **default** group, whose inbound rule set admits only traffic
+from other members of that same group — so `up --yes` "succeeded" and SSH then
+timed out indefinitely. The create path now does three things:
+
+1. **Resolve-or-create the group.** An explicit `REPO_REMOTE_SECURITY_GROUP` is
+   honored as-is and **never modified** (it is user-managed). Otherwise a group
+   tagged `repo-remote=<name>` is reused — mirroring the instance reuse-by-tag
+   convention — or one named `repo-remote-<name>` is created and tagged, so
+   repeated `up` runs don't accumulate a group per invocation.
+2. **Authorize and then verify tcp/22.**
+   `authorize-security-group-ingress --protocol tcp --port 22 --cidr <resolved>`
+   (an `InvalidPermission.Duplicate` on a reused group *is* the desired end
+   state), followed by a `describe-security-groups` check that a tcp/22 rule is
+   really present. A group with an empty ingress set fails the run with exit `4`
+   **before** a billable instance is launched into it.
+3. **End the run with a real connection attempt** — see step 7.
+
+**The current-IP problem (`REPO_REMOTE_SSH_CIDR`).** "SSH from the user's IP
+only" is the goal, but the address is only knowable by asking an HTTPS echo
+service (`checkip.amazonaws.com`), and that reports the address **HTTPS**
+egressed from. On a host whose HTTPS traffic goes through a proxy — increasingly
+common on agent machines — that is *not* the address SSH traffic will originate
+from, producing a correct-looking `/32` rule that can never match. This script
+cannot confirm the two agree, so detection is treated as **unverified** and
+always announced as such.
+
+- `REPO_REMOTE_SSH_CIDR` set → used verbatim, no detection at all. This includes
+  an explicit `REPO_REMOTE_SSH_CIDR=0.0.0.0/0`, the supported opt-in for exactly
+  the proxy case above.
+- `REPO_REMOTE_SSH_CIDR` unset and detection succeeds → `<detected-ip>/32`, with
+  a notice saying it is unverified and how to override.
+- `REPO_REMOTE_SSH_CIDR` unset and detection **fails** (echo service unreachable
+  or returning no address) → fall back to `0.0.0.0/0` with an explicit printed
+  notice, rather than silently authorizing a rule that cannot work. SSH on the
+  provisioned image is **key-only** (no password auth), so the wide-open case is
+  a scan-noise/bandwidth tradeoff, not an auth bypass — but prefer a pinned
+  `REPO_REMOTE_SSH_CIDR` when you know the right range.
 
 #### The idle-shutdown guard
 
@@ -610,11 +658,23 @@ Host repo-remote-<name>
 
 ### 7. Open the SSH session
 
-Verify reachability first:
+**Verify reachability first — `repo-remote up` does this itself** and treats a
+failure as a failed provision (exit `4`), so an unreachable box is caught in-run
+instead of surfacing later as an indefinite timeout:
 
 ```bash
-ssh -o ConnectTimeout=30 repo-remote-<name> 'echo "SSH OK: $(hostname)"'
+ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  repo-remote-<name> true
 ```
+
+The probe is retried within `REPO_REMOTE_SSH_WAIT_SEC` (default 90s) because a
+freshly created instance reaches "running" well before `sshd` accepts
+connections. On failure the `up` result is still emitted (the caller needs the
+instance id to tear the box down) and the message names the likely causes: the
+allowlisted CIDR isn't the address SSH actually egresses from (set
+`REPO_REMOTE_SSH_CIDR`), no key pair is attached (`REPO_REMOTE_SSH_KEY_NAME`),
+or `sshd` needs longer than the wait budget. An instance with no public IP is
+warned about rather than failed — there is nothing to probe.
 
 Then open a new terminal window with the session. Where it lands depends on the
 environment path:
