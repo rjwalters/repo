@@ -22,8 +22,9 @@
 # commands/repo/tests/test-verify-fix-persistence.sh,
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
-# commands/repo/tests/test-resync-installed.sh, and
-# commands/repo/tests/test-installer-contract.sh.
+# commands/repo/tests/test-resync-installed.sh,
+# commands/repo/tests/test-installer-contract.sh, and
+# commands/repo/tests/test-repo-scrub-forks.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -676,6 +677,42 @@ else
     PASS=$((PASS + IC_PASS))
     FAIL=$((FAIL + IC_FAIL))
     record_suite "test-installer-contract.sh" "$IC_PASS" "$IC_FAIL" "contract conformance"
+fi
+
+# Fork-network sweep (repo#185) — separate from any code/search-based sweep
+# because GitHub search structurally cannot see forks (forks API only,
+# recursive walk) and a fork is content the operator has already lost control
+# of (findings are unremediable by definition). Same delegation shape as every
+# suite above.
+echo
+echo "-- repo-scrub-forks.sh fork sweep (delegated suite) --"
+SF_TEST="$TESTS_DIR/../../../commands/repo/tests/test-repo-scrub-forks.sh"
+if [[ ! -f "$SF_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-repo-scrub-forks.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-repo-scrub-forks.sh" "$SF_TEST"
+else
+    SF_OUT="$(bash "$SF_TEST" 2>&1)"
+    SF_STATUS=$?
+    SF_PASS="$(suite_count Passed "$SF_OUT")"
+    SF_FAIL="$(suite_count Failed "$SF_OUT")"
+    if ! [[ "$SF_PASS" =~ ^[0-9]+$ && "$SF_FAIL" =~ ^[0-9]+$ ]]; then
+        SF_PASS=0
+        SF_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-repo-scrub-forks.sh" "$SF_STATUS"
+        strip_ansi "$SF_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SF_STATUS" -ne 0 || "$SF_FAIL" -ne 0 ]]; then
+        [[ "$SF_FAIL" -eq 0 ]] && SF_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-repo-scrub-forks.sh" "$SF_PASS" "$SF_FAIL" "$SF_STATUS"
+        strip_ansi "$SF_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-repo-scrub-forks.sh" "$SF_PASS"
+    fi
+    PASS=$((PASS + SF_PASS))
+    FAIL=$((FAIL + SF_FAIL))
+    record_suite "test-repo-scrub-forks.sh" "$SF_PASS" "$SF_FAIL" "fork-network sweep"
 fi
 
 echo
