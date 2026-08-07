@@ -44,6 +44,7 @@ loom's `fleet add-worker`) invokes directly:
 ```
 repo-remote up [aws|gcp]              # DRY RUN: print the resolved plan + estimated cost as JSON, create NOTHING
 repo-remote up --yes [--json]        # provision (or reuse) with no prompts; requires pre-supplied cost-relevant config
+repo-remote up --yes --force         # additionally override the fleet-marker guard (see below)
 repo-remote status [--json]          # list instances tagged repo-remote=<name>
 repo-remote down [--yes] [--delete]  # dry-run listing without --yes; stop (or --delete to terminate) with --yes
 ```
@@ -55,6 +56,17 @@ billable size on its own. Plain `repo-remote up` (no `--yes`) is a dry run that
 prints the plan and estimated hourly cost and spends nothing, so a caller can
 implement a "plan shown before money is spent" check against the `--json`
 output (instance id, public IP, SSH alias, estimated hourly cost).
+
+`--force` is a **separate** override with a single job: it lets `up` reuse an
+instance carrying a **fleet marker** (see [Fleet-marked hosts: the reuse
+guard](#fleet-marked-hosts-the-reuse-guard)). It does **not** relax the cost
+gate — `--force` without a pre-supplied `REPO_REMOTE_INSTANCE_TYPE` still fails
+loudly.
+
+Exit codes: `0` success (including a dry-run plan), `2` missing/invalid required
+config (the cost gate), `3` provider authentication failed, `4` cloud operation
+failed, `5` refused to reuse a fleet-marked instance (pass `--force`), `64`
+usage error.
 
 ## Configuration — two layers
 
@@ -129,6 +141,10 @@ REPO_REMOTE_SETUP="make setup"            # optional first-boot command; fallbac
 # --- session ---
 REPO_REMOTE_IDLE_SHUTDOWN_MIN=120         # interactive-host default; use ~20 for daemon-managed/worker hosts; 0 disables the guard entirely (see below)
 REPO_REMOTE_IDLE_MARKER=                   # optional idle-exit marker path (default: /var/run/repo-remote-daemon-idle.marker)
+
+# --- fleet-marker guard (refuse to reuse a managed fleet host) ---
+REPO_REMOTE_FLEET_TAG_KEY=Fleet           # tag (AWS) / label (GCP) key that marks a managed fleet host; empty disables the check
+REPO_REMOTE_FLEET_TAG_VALUE=loom          # required value for that key; empty means "any non-empty value counts"
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -273,6 +289,11 @@ gcloud compute instances list --filter="labels.repo-remote=<name>" \
 
 RUNNING → offer reuse; STOPPED → offer to start.
 
+3. **Before starting or SSH-aliasing anything you *reused*** (either branch
+   above), check the resolved instance's tags/labels for a **fleet marker** and
+   stop unless `--force` was given — see **Fleet-marked hosts: the reuse guard**
+   below. A freshly created instance is never subject to this check.
+
 ### 4. Create the instance (with confirmation)
 
 **Before creating anything**, show the exact command, the machine spec
@@ -365,6 +386,56 @@ anything ever writes the file:
 On a daemon-managed host the two stages compose: the daemon's own idle-exit
 (writing the marker) is the first stage; this guard, `IDLE_MIN` minutes later, is
 the second and final stage that actually powers the box off.
+
+#### Fleet-marked hosts: the reuse guard
+
+The idle guard above is attached **once, at creation** — this command never
+re-attaches user-data to an instance it reuses, so the guard a host carries is
+whatever it got the day it was created. What reuse *does* do is **start a
+stopped instance and rewrite this repo's SSH alias to point at it**, and the
+handles it resolves that instance from — a pinned `REPO_REMOTE_INSTANCE_ID`, or
+the `repo-remote=<name>` tag/label — never expire. A box provisioned once for an
+ephemeral dev session can since have been repurposed into a persistent,
+daemon-managed fleet worker while still carrying the old tag, at which point
+ephemeral dev-session tooling would silently start and re-alias a production
+host. That is the second finding of the 2AMLogic/2am#52 incident, where
+`repo-remote=anvil` tooling kept rediscovering the host that had become
+`loom-worker-1`.
+
+**The check.** Before starting or aliasing a **reused** instance — on both AWS
+reuse branches (pinned id and `repo-remote=<name>` tag lookup) and on the GCP
+existing-instance branch — the resolved instance's **AWS tags** / **GCP labels**
+are read and matched against a fleet marker, by default **`Fleet=loom`** (the
+tag 2am's own remediation sets on its persistent workers). If it matches:
+
+- **Without `--force`**: the run **stops with exit `5`** and a message naming the
+  instance, the marker it found, and the override. Nothing is started, nothing is
+  terminated, and the SSH alias is left untouched.
+- **With `--force`**: it warns loudly that it is about to touch what looks like a
+  managed fleet host, then proceeds as normal.
+
+**Configuration.**
+
+- `REPO_REMOTE_FLEET_TAG_KEY` — the tag/label key to look for. Defaults to
+  `Fleet`. **Set it to the empty string to disable the check entirely.** GCP
+  label keys are lower-case, so the configured key is lower-cased for the GCP
+  lookup (`Fleet` → `labels.fleet`).
+- `REPO_REMOTE_FLEET_TAG_VALUE` — the value that counts as a match. Defaults to
+  `loom`; comparison is case-insensitive (GCP lower-cases label values). Set it
+  to the empty string to treat *any* non-empty value of the key as a match.
+
+**Scope — what this deliberately is not.** It is a **provisioning-time check
+against declared metadata** an operator already had to set elsewhere, not an
+on-host "is `loom-daemon` running" heuristic. The idle guard's activity model
+above is unchanged, and gains no process-name veto from this; the two are
+independent. It also does not fire on **creation** (a brand-new instance has no
+prior role to protect) or on a **dry run** (`repo-remote up` without `--yes`
+touches no cloud resource at all).
+
+**Related but distinct**: if the fleet host should also never power itself off,
+that is the idle guard's `REPO_REMOTE_IDLE_SHUTDOWN_MIN=0` opt-out above. This
+guard stops *this tooling* from touching the host; that one stops the *host*
+from shutting itself down.
 
 #### GPU hosts
 
