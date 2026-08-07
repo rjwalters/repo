@@ -158,6 +158,7 @@ SSH_CIDR=""        # AWS only: pinned SSH-ingress CIDR override (see aws_resolve
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
+COST_BASIS=""      # "table" | "vcpu-scaled" | "heuristic" — how COST_HOURLY was derived
 
 # GPU-family detection: infer a GPU host from the instance family so the caller
 # needn't set a separate flag (remote.md "GPU hosts").
@@ -171,12 +172,49 @@ is_gpu_family() {  # <provider> <instance-type>
   return 1
 }
 
-# Approximate on-demand USD/hour by instance type. Unknown types fall back to a
-# GPU/non-GPU heuristic flagged approximate — the JSON always carries a number
-# so a caller can implement a budget check, and never silently claims precision.
-estimate_cost() {  # sets COST_HOURLY, COST_APPROX
+# AWS instance-type size suffixes double vCPU count in a well-known, fixed
+# progression (large=2 ... 32xlarge=128). This holds for AWS's current
+# general-purpose/compute/memory families named `<family>.<size>` — but NOT
+# for the burstable `t`-family (a differently-priced CPU-credit model, not a
+# flat vCPU rate) or for nano/micro/small/medium sizes (they don't follow the
+# doubling pattern). Prints the vCPU count on stdout and returns 0 when the
+# type is confidently parseable this way; returns 1 (no output) otherwise so
+# the caller falls through to the last-resort flat heuristic.
+aws_vcpu_from_size() {  # <instance-type> -> vcpu count
+  local t="$1" family size
+  family="${t%%.*}"
+  size="${t#*.}"
+  [[ "$family" == "$size" ]] && return 1   # no "family.size" dot -> not AWS-style
+  [[ "$family" =~ ^t[0-9] ]] && return 1   # burstable credit model, not a flat rate
+  case "$size" in
+    large)    printf '2'   ;;
+    xlarge)   printf '4'   ;;
+    2xlarge)  printf '8'   ;;
+    4xlarge)  printf '16'  ;;
+    8xlarge)  printf '32'  ;;
+    12xlarge) printf '48'  ;;
+    16xlarge) printf '64'  ;;
+    24xlarge) printf '96'  ;;
+    32xlarge) printf '128' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Approximate on-demand USD/hour by instance type. COST_BASIS records how the
+# number was derived so a caller (and the plan/up output) can distinguish a
+# real price-table hit from a scaled or last-resort guess:
+#   table        — exact match in the case table below
+#   vcpu-scaled  — no table entry, but the AWS size suffix parsed to a vCPU
+#                  count, scaled by a blended $/vCPU-hr rate
+#   heuristic    — no table entry and no parseable vCPU count (or a GPU type
+#                  with no table entry — vCPU count is a poor proxy for GPU
+#                  instance price, so those stay on the flat GPU heuristic)
+# The JSON always carries a number so a caller can implement a budget check,
+# and never silently claims precision it doesn't have.
+estimate_cost() {  # sets COST_HOURLY, COST_APPROX, COST_BASIS
   local t="$1"
   COST_APPROX=false
+  COST_BASIS="table"
   case "$t" in
     # AWS general purpose / compute
     t3.medium)   COST_HOURLY=0.0416 ;;
@@ -192,6 +230,20 @@ estimate_cost() {  # sets COST_HOURLY, COST_APPROX
     c5.xlarge)   COST_HOURLY=0.17   ;;
     c5.2xlarge)  COST_HOURLY=0.34   ;;
     c5.4xlarge)  COST_HOURLY=0.68   ;;
+    # AWS current-gen (7th-gen) compute/general/memory, x86 (c7i/m7i/r7i).
+    # Approximate on-demand, us-east-1, derived from a ~$0.0446/vCPU-hr
+    # blended rate (cross-checked against this issue's reported
+    # c7i.24xlarge ~$4.28/hr anchor: 4.28 / 96 vCPU ≈ $0.0446/vCPU-hr) —
+    # re-verify against live AWS pricing before relying on these for a
+    # budget-critical decision; larger/unlisted sizes fall through to the
+    # vcpu-scaled fallback below rather than being hand-populated here.
+    c7i.large)   COST_HOURLY=0.0893 ;;
+    c7i.xlarge)  COST_HOURLY=0.1785 ;;
+    c7i.2xlarge) COST_HOURLY=0.357  ;;
+    m7i.large)   COST_HOURLY=0.1008 ;;
+    m7i.xlarge)  COST_HOURLY=0.2016 ;;
+    r7i.large)   COST_HOURLY=0.1323 ;;
+    r7i.xlarge)  COST_HOURLY=0.2646 ;;
     # AWS GPU
     g4dn.xlarge) COST_HOURLY=0.526  ;;
     g5.xlarge)   COST_HOURLY=1.006  ;;
@@ -211,7 +263,14 @@ estimate_cost() {  # sets COST_HOURLY, COST_APPROX
     a2-highgpu-1g)  COST_HOURLY=3.67  ;;
     *)
       COST_APPROX=true
-      if [[ "$IS_GPU" == true ]]; then COST_HOURLY=1.50; else COST_HOURLY=0.20; fi
+      local vcpu
+      if [[ "$IS_GPU" != true ]] && vcpu="$(aws_vcpu_from_size "$t")"; then
+        COST_BASIS="vcpu-scaled"
+        COST_HOURLY="$(awk -v v="$vcpu" 'BEGIN{printf "%.4f", v * 0.045}')"
+      else
+        COST_BASIS="heuristic"
+        if [[ "$IS_GPU" == true ]]; then COST_HOURLY=1.50; else COST_HOURLY=0.20; fi
+      fi
       ;;
   esac
   # A GCP accelerator adds to the machine price; fold in a rough per-card cost so
@@ -945,6 +1004,19 @@ write_ssh_alias() {  # <ip>
 }
 
 # ── result emitters ─────────────────────────────────────────────────────────
+# cost_note_human -> a human-readable suffix explaining COST_BASIS/COST_APPROX
+# on the printed cost line. A vcpu-scaled or heuristic guess says so
+# explicitly rather than the generic "(approximate)" — a confidently-wrong
+# flat number is worse for the cost-consent gate than an honestly-vague one.
+cost_note_human() {
+  [[ "$COST_APPROX" != true ]] && return 0
+  case "$COST_BASIS" in
+    vcpu-scaled) printf ' (no price data for this type — rough vCPU-scaled guess)' ;;
+    heuristic)   printf ' (approximate — no price data for this type)' ;;
+    *)           printf ' (approximate)' ;;  # e.g. a table price + GCP accelerator surcharge
+  esac
+}
+
 emit_plan() {  # dry-run plan (no cloud mutation)
   if [[ "$JSON_OUT" == true ]]; then
     printf '{'
@@ -959,7 +1031,8 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"ssh_alias":"repo-remote-%s",' "$(json_escape "$NAME")"
     printf '"estimated_hourly_cost_usd":%s,' "$COST_HOURLY"
-    printf '"estimated_cost_approximate":%s' "$COST_APPROX"
+    printf '"estimated_cost_approximate":%s,' "$COST_APPROX"
+    printf '"estimated_cost_basis":"%s"' "$(json_escape "$COST_BASIS")"
     printf '}\n'
   else
     log "PLAN (dry run — nothing created; pass --yes to provision):"
@@ -968,7 +1041,7 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     log "  region/zone:         $REGION"
     log "  disk:                ${DISK_GB} GB"
     log "  idle shutdown:       ${IDLE_MIN} min"
-    log "  est. hourly cost:    \$${COST_HOURLY}/hr$([[ "$COST_APPROX" == true ]] && echo ' (approximate)')"
+    log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  ssh alias:           repo-remote-${NAME}"
   fi
 }
@@ -989,12 +1062,13 @@ emit_up_result() {  # <id> <ip> <alias> <reused>
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"reused":%s,' "$reused"
     printf '"estimated_hourly_cost_usd":%s,' "$COST_HOURLY"
-    printf '"estimated_cost_approximate":%s' "$COST_APPROX"
+    printf '"estimated_cost_approximate":%s,' "$COST_APPROX"
+    printf '"estimated_cost_basis":"%s"' "$(json_escape "$COST_BASIS")"
     printf '}\n'
   else
     log "$([[ "$reused" == true ]] && echo reused || echo created) instance $id (${INSTANCE_TYPE}) @ ${ip:-<no public ip>}"
     log "  ssh alias:        $alias"
-    log "  est. hourly cost: \$${COST_HOURLY}/hr$([[ "$COST_APPROX" == true ]] && echo ' (approximate)')"
+    log "  est. hourly cost: \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  teardown:         repo-remote down --yes   (or /repo:remote --down)"
   fi
 }
