@@ -525,7 +525,11 @@ aws_create() {
   if [[ $rc -ne 0 || -z "$iid" || "$iid" == "None" ]]; then
     # Surface the quota-exceeded case with the exact remediation (remote.md).
     if printf '%s' "$err" | grep -q 'VcpuLimitExceeded'; then
-      die 4 "AWS GPU vCPU quota is 0 by default (VcpuLimitExceeded). Request a limit >= this type's vCPUs at Service Quotas -> EC2 -> quota code L-DB2E81BA, then retry."
+      if [[ "$IS_GPU" == true ]]; then
+        die 4 "AWS GPU vCPU quota is 0 by default (VcpuLimitExceeded). Request a limit >= this type's vCPUs at Service Quotas -> EC2 -> quota code L-DB2E81BA, then retry."
+      else
+        die 4 "AWS standard vCPU quota exceeded (VcpuLimitExceeded). Request a limit >= this type's vCPUs at Service Quotas -> EC2 -> quota code L-1216C47A (Running On-Demand Standard instances), then retry."
+      fi
     fi
     die 4 "aws ec2 run-instances failed: ${err:-unknown error}"
   fi
@@ -815,7 +819,7 @@ emit_plan() {  # dry-run plan (no cloud mutation)
   else
     log "PLAN (dry run — nothing created; pass --yes to provision):"
     log "  provider:            $PROVIDER"
-    log "  instance type:       $INSTANCE_TYPE${IS_GPU:+ (GPU)}"
+    log "  instance type:       $INSTANCE_TYPE$([[ "$IS_GPU" == true ]] && echo ' (GPU)')"
     log "  region/zone:         $REGION"
     log "  disk:                ${DISK_GB} GB"
     log "  idle shutdown:       ${IDLE_MIN} min"
