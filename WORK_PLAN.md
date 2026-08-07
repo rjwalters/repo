@@ -16,6 +16,7 @@ _No issues currently marked `loom:issue` (human/Champion-approved, awaiting a Bu
 ## Proposed
 
 - **#145**: tidy: offer package-manager-native pruning of orphaned node_modules content (pnpm prune / npm prune) *(curated)*
+- **#168**: The canonical destructive-command guard never runs in a Loom-managed repo *(curated)*
 
 ## Epics
 
