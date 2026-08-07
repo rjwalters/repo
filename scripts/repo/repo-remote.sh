@@ -516,6 +516,100 @@ aws_authenticate() {
     || die 3 "AWS authentication failed with the resolved credentials (aws sts get-caller-identity). Not falling back to ambient/other credentials."
 }
 
+# Expand a leading '~' to $HOME. REPO_REMOTE_SSH_KEY's documented default
+# (and any operator override) commonly uses '~/...', but bash only
+# tilde-expands a literal token — not a value that has been through a
+# variable — so anywhere THIS script opens/stats the file itself (unlike
+# write_ssh_alias, which hands the raw string to the SSH config's
+# IdentityFile and lets ssh expand it) needs this first.
+expand_home() {  # <path>
+  local p="$1"
+  [[ "$p" == "~"* ]] && p="${HOME}${p#\~}"
+  printf '%s' "$p"
+}
+
+# Compute the EC2 "imported key pair" fingerprint for a public key file, using
+# the same DER-encoded-SubjectPublicKeyInfo basis AWS uses for an imported
+# (not AWS-generated) key pair: MD5 for RSA, SHA256/base64 for ED25519
+# (repo#177). Echoes empty — never dies — on an unsupported key type or a
+# missing ssh-keygen/openssl: the caller treats that as "can't dedupe by
+# fingerprint" and falls through to import-key-pair, which is always safe (a
+# genuine duplicate --key-name is handled by the caller too).
+aws_keypair_fingerprint() {  # <path-to-.pub>
+  local pub="$1" type
+  command -v ssh-keygen >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || return 0
+  type="$(awk '{print $1}' "$pub" 2>/dev/null)"
+  case "$type" in
+    ssh-rsa)
+      ssh-keygen -f "$pub" -e -m PKCS8 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | openssl md5 -c 2>/dev/null | awk '{print $NF}'
+      ;;
+    ssh-ed25519)
+      # ssh-keygen cannot -e/PKCS8-export an ED25519 key, so the DER
+      # SubjectPublicKeyInfo is built by hand: the fixed 12-byte ASN.1 header
+      # for an Ed25519 SPKI (RFC 8410) followed by the raw 32-byte public
+      # key, which is always the LAST 32 bytes of the OpenSSH wire-format
+      # blob (4-byte-length-prefixed "ssh-ed25519" + 4-byte-length-prefixed
+      # key material).
+      {
+        printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'
+        awk '{print $2}' "$pub" | openssl base64 -d -A 2>/dev/null | tail -c 32
+      } | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# Resolve (or import) an EC2 key pair name from the local SSH public key
+# derived from REPO_REMOTE_SSH_KEY, so aws_create() ALWAYS has a --key-name to
+# pass (repo#177: a launch with no key pair attached is unreachable by
+# design — this is the fix for that). Sets RESOLVED_KEY_NAME and
+# RESOLVED_PUB_KEY_LINE (globals, so a `die` here propagates instead of being
+# swallowed by a `$(...)` subshell, matching aws_resolve_image's pattern).
+RESOLVED_KEY_NAME=""
+RESOLVED_PUB_KEY_LINE=""
+aws_resolve_keypair() {
+  local priv pub fp existing kname impf imperr
+  priv="$(expand_home "${REPO_REMOTE_SSH_KEY:-~/.ssh/id_ed25519}")"
+  pub="${priv}.pub"
+  [[ -f "$pub" ]] \
+    || die 2 "SSH public key not found at ${pub} (derived from REPO_REMOTE_SSH_KEY=${priv}). Generate one (ssh-keygen) or point REPO_REMOTE_SSH_KEY at an existing key pair before provisioning -- a launch with no key pair attached is unreachable by design."
+  RESOLVED_PUB_KEY_LINE="$(head -n1 "$pub")"
+
+  fp="$(aws_keypair_fingerprint "$pub")"
+  if [[ -n "$fp" ]]; then
+    existing="$(aws ec2 describe-key-pairs \
+      --filters "Name=fingerprint,Values=${fp}" \
+      --query 'KeyPairs[0].KeyName' --output text 2>/dev/null)"
+    if [[ -n "$existing" && "$existing" != "None" ]]; then
+      RESOLVED_KEY_NAME="$existing"
+      return 0
+    fi
+  fi
+
+  kname="repo-remote-${NAME}"
+  impf="$(mktemp)"
+  if aws ec2 import-key-pair --key-name "$kname" \
+      --public-key-material "fileb://${pub}" >/dev/null 2>"$impf"; then
+    RESOLVED_KEY_NAME="$kname"
+  else
+    imperr="$(cat "$impf" 2>/dev/null)"
+    # A prior run may already have imported this exact name (e.g. the
+    # fingerprint lookup above missed it) -- AWS rejects that as a duplicate,
+    # which is safe to just reuse rather than treat as a hard failure.
+    if printf '%s' "$imperr" | grep -q 'InvalidKeyPair.Duplicate'; then
+      RESOLVED_KEY_NAME="$kname"
+    else
+      rm -f "$impf"
+      die 4 "aws ec2 import-key-pair failed for ${pub} (key-name ${kname}): ${imperr:-unknown error}"
+    fi
+  fi
+  rm -f "$impf"
+}
+
 # Resolve the AMI into RESOLVED_AMI: an explicit override wins; a GPU host
 # defaults to the AWS Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu
 # 22.04); otherwise the latest Ubuntu 22.04 LTS. (remote.md "GPU hosts".)
@@ -670,15 +764,48 @@ aws_verify_ssh_ingress() {  # <sg-id>
     || die 4 "security group ${sg} has no tcp/22 ingress rule after provisioning — SSH would time out indefinitely. Check REPO_REMOTE_SECURITY_GROUP / REPO_REMOTE_SSH_CIDR, or add the rule manually with: aws ec2 authorize-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr <your-ip>/32"
 }
 
+# Belt-and-suspenders SSH access (repo#177): append the resolved public key to
+# ~ubuntu/.ssh/authorized_keys on every boot (this runs on every boot, same as
+# the idle-guard cron install below), so the box stays reachable even if
+# key-pair attachment itself ever regresses. grep -qxF guards against a
+# duplicate line across repeat boots.
+authorized_keys_userdata() {  # <pubkey-line>
+  local pubkey="$1"
+  [[ -n "$pubkey" ]] || return 0
+  cat <<EOF
+mkdir -p ~ubuntu/.ssh
+touch ~ubuntu/.ssh/authorized_keys
+grep -qxF '${pubkey}' ~ubuntu/.ssh/authorized_keys || echo '${pubkey}' >>~ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu ~ubuntu/.ssh
+chmod 700 ~ubuntu/.ssh
+chmod 600 ~ubuntu/.ssh/authorized_keys
+EOF
+}
+
+# Build the full AWS EC2 user-data script for a newly created instance:
+# ALWAYS injects the resolved SSH public key into authorized_keys
+# (unconditional belt-and-suspenders, repo#177), then folds in the
+# idle-shutdown guard's cron watchdog when idle_guard_enabled (repo#163's
+# IDLE_MIN<=0 opt-out still applies to THAT section only).
+aws_userdata() {  # <pubkey-line>
+  printf '#!/bin/bash\n'
+  authorized_keys_userdata "$1"
+  if idle_guard_enabled; then
+    # idle_guard_userdata() emits its own leading shebang; strip it since the
+    # combined script only needs the ONE shebang emitted above.
+    idle_guard_userdata | tail -n +2
+  fi
+}
+
 # Create a fresh instance into CREATED_ID (global, so a `die` propagates rather
 # than being swallowed by a command-substitution subshell). run-instances is
 # invoked EXACTLY ONCE — capturing stdout and stderr in one call — because a
 # retry-to-read-the-error would risk launching a second billable instance.
 CREATED_ID=""
 aws_create() {
-  local ami key udfile errfile iid rc err
+  local ami key udfile errfile iid rc err attached
   aws_resolve_image; ami="$RESOLVED_AMI"
-  key="${REPO_REMOTE_SSH_KEY_NAME:-}"
+  aws_resolve_keypair; key="$RESOLVED_KEY_NAME"
 
   # Resolve-or-create the security group and prove it actually allows SSH
   # BEFORE spending money on run-instances (repo#176).
@@ -687,7 +814,7 @@ aws_create() {
   aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_verify_ssh_ingress "$RESOLVED_SG"
 
-  udfile="$(mktemp)"; idle_guard_userdata >"$udfile"
+  udfile="$(mktemp)"; aws_userdata "$RESOLVED_PUB_KEY_LINE" >"$udfile"
   errfile="$(mktemp)"
 
   local -a args=(ec2 run-instances
@@ -696,11 +823,18 @@ aws_create() {
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${DISK_GB}}"
     --security-group-ids "$RESOLVED_SG"
     --tag-specifications "ResourceType=instance,Tags=[{Key=repo-remote,Value=${NAME}}]"
+    # NOTE (repo#177): `--user-data` here takes `file://<path>` at LAUNCH time.
+    # A POST-launch update (e.g. a future repair-in-place tool) is a different
+    # call — `modify-instance-attribute --user-data Value=<base64>` — NOT
+    # `--attribute userData --value fileb://...`, which fails AWS CLI
+    # parameter validation.
+    --user-data "file://${udfile}"
+    # Always pass --key-name — never conditionally. A key-less launch is
+    # exactly the `KeyName: None` / unreachable-by-design failure this fix
+    # exists to prevent (repo#177); aws_resolve_keypair() above either
+    # resolves one or dies loudly, so $key is never empty here.
+    --key-name "$key"
     --query 'Instances[0].InstanceId' --output text)
-  # IDLE_MIN<=0 means the guard is disabled (repo#163) — skip embedding
-  # user-data at all rather than passing an empty/no-op script.
-  idle_guard_enabled && args+=(--user-data "file://${udfile}")
-  [[ -n "$key" ]] && args+=(--key-name "$key")
 
   iid="$(aws "${args[@]}" 2>"$errfile")"; rc=$?
   err="$(cat "$errfile" 2>/dev/null)"
@@ -717,6 +851,18 @@ aws_create() {
     fi
     die 4 "aws ec2 run-instances failed: ${err:-unknown error}"
   fi
+
+  # Post-create verification (repo#177): confirm the instance actually came up
+  # with a key pair attached before reporting success — catches a regression
+  # in-run instead of surfacing later as a silent `Permission denied
+  # (publickey)`. Deliberately checked here (creation only); a REUSED instance
+  # is not re-verified since this run never touched its key-pair attachment.
+  attached="$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].KeyName' --output text 2>/dev/null)"
+  if [[ -z "$attached" || "$attached" == "None" ]]; then
+    die 4 "instance ${iid} launched with no KeyName attached (expected '${key}') — refusing to report success on a host that is unreachable by design. It was NOT auto-terminated; clean it up manually: aws ec2 terminate-instances --instance-ids ${iid}"
+  fi
+
   CREATED_ID="$iid"
 }
 
