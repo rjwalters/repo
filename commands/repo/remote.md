@@ -102,6 +102,12 @@ AWS_REGION=us-west-2
 # gcp instead: GCP_PROJECT, GCP_ZONE, GOOGLE_APPLICATION_CREDENTIALS=/abs/sa.json
 
 REPO_REMOTE_SSH_KEY=~/.ssh/id_ed25519     # key used for the SSH session (fine to share)
+                                           # ALSO the source of the EC2 key pair `up` attaches at
+                                           # launch (`${REPO_REMOTE_SSH_KEY}.pub`, resolved by
+                                           # fingerprint / imported if new — see "Create the
+                                           # instance" below). One setting drives both AWS reachability
+                                           # and the local `ssh` session; there is no separate
+                                           # key-pair-name knob.
 
 # --- dev-session auth (optional; used ON the VM) ---
 # Unlike the provisioning creds above, these DO travel to the VM so gh/claude
@@ -314,6 +320,9 @@ Requirements for the created instance:
   idle-exit marker contract.
 - AWS: security group allowing SSH from the user's IP only, using
   `REPO_REMOTE_SSH_KEY`'s public key. GCP: prefer OS Login / IAP.
+- AWS: attach an EC2 key pair resolved from `REPO_REMOTE_SSH_KEY` and verify it
+  actually landed — see **SSH key-pair attachment (reachability guarantee)**
+  below. A created instance is unusable without this.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
 alternative zone or the next type down rather than failing.
@@ -388,6 +397,33 @@ anything ever writes the file:
 On a daemon-managed host the two stages compose: the daemon's own idle-exit
 (writing the marker) is the first stage; this guard, `IDLE_MIN` minutes later, is
 the second and final stage that actually powers the box off.
+
+#### SSH key-pair attachment (reachability guarantee)
+
+A created instance is worthless if nothing can SSH into it, so this is treated
+as a hard launch requirement, not a best-effort extra:
+
+- **Resolve, don't guess.** The EC2 key pair `up` attaches is derived from
+  `REPO_REMOTE_SSH_KEY` — the same, documented variable already used for the
+  SSH session itself (there is no separate key-pair-name setting). Its public
+  key (`${REPO_REMOTE_SSH_KEY}.pub`) is fingerprinted and looked up against the
+  account's existing key pairs (`aws ec2 describe-key-pairs`); a match is
+  **reused by name** so repeated runs — from this repo or any other session
+  sharing the same physical key — never import a duplicate. No match ⇒ the
+  public key is imported (`aws ec2 import-key-pair`) under a
+  `repo-remote-<repo-name>` name. A missing `.pub` file is a loud, immediate
+  failure — `up` never launches keyless.
+- **Verify, don't assume.** Immediately after `run-instances` succeeds, `up`
+  re-reads the instance's `KeyName` via `describe-instances` and fails loudly
+  (non-zero exit) if it comes back null, instead of reporting success on an
+  instance nothing can reach.
+- **Belt-and-suspenders.** The same public key is also appended to
+  `~ubuntu/.ssh/authorized_keys` via cloud-init user-data on every boot
+  (deduplicated, so repeated boots don't grow the file) — this runs
+  unconditionally, including when the idle-shutdown guard above is disabled
+  (`REPO_REMOTE_IDLE_SHUTDOWN_MIN=0`), so a persistent, key-pair-attached
+  fleet host still gets the fallback. The host stays reachable even if
+  key-pair attachment ever regresses.
 
 #### Fleet-marked hosts: the reuse and teardown guard
 

@@ -50,6 +50,15 @@ fi
 SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# A real (throwaway) ED25519 key pair — repo#177's aws_resolve_key_pair() now
+# resolves the EC2 key pair from REPO_REMOTE_SSH_KEY, so the suite needs a
+# real key fixture rather than touching the test runner's actual ~/.ssh.
+TESTKEY="$SCRATCH/testkey"
+ssh-keygen -q -t ed25519 -N '' -f "$TESTKEY" -C repo-remote-test >/dev/null 2>&1 || {
+    echo "FATAL: ssh-keygen unavailable or failed — cannot build the SSH key fixture" >&2
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Assertion helpers (same shape as test-branches-loss-check.sh)
 # ---------------------------------------------------------------------------
@@ -94,12 +103,23 @@ run_rr() {
     while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
     shift
     : >"$MOCK_LOG"
+    rm -f "${MOCK_LOG}.keyname" "${MOCK_LOG}.userdata"
     local errf; errf="$(mktemp)"
+    # Default REPO_REMOTE_SSH_KEY to the scratch fixture (repo#177) unless a
+    # test explicitly overrides it (e.g. the missing-.pub edge case) — placed
+    # BEFORE "${envs[@]}" below so an explicit override always wins.
+    local -a keyenv=()
+    local e has_key=false
+    for e in "${envs[@]}"; do
+        [[ "$e" == REPO_REMOTE_SSH_KEY=* ]] && has_key=true
+    done
+    [[ "$has_key" == false ]] && keyenv=("REPO_REMOTE_SSH_KEY=$TESTKEY")
     RR_OUT="$(cd "$REPO" && env \
         PATH="$MOCK_BIN:$PATH" \
         XDG_CONFIG_HOME="$XDG" \
         REPO_REMOTE_SSH_CONFIG="$SCRATCH/ssh_config" \
         MOCK_AWS_LOG="$MOCK_LOG" \
+        "${keyenv[@]}" \
         "${envs[@]}" \
         bash "$RR" "$@" 2>"$errf")"
     RR_RC=$?
@@ -146,6 +166,21 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_FLEET_TAG:-None}"
       exit 0
     fi
+    # repo#177: the post-create KeyName verification query, also an
+    # --instance-ids call — matched by its distinct query projection, same
+    # pattern as the Tags[?Key==...] fleet-marker lookup above. Echoes back
+    # whatever --key-name was actually passed to the run-instances call that
+    # created this instance (captured below) unless a test forces a null
+    # result via MOCK_AWS_KEYNAME_NULL, to exercise the "launched keyless"
+    # failure path deterministically.
+    if printf '%s' "$*" | grep -qF "KeyName"; then
+      if [[ "${MOCK_AWS_KEYNAME_NULL:-0}" == 1 ]]; then
+        echo "None"
+      else
+        cat "${MOCK_AWS_LOG}.keyname" 2>/dev/null || echo "None"
+      fi
+      exit 0
+    fi
     # --instance-ids (pinned lookup) vs --filters (tag find)
     if printf '%s' "$*" | grep -q -- '--instance-ids'; then
       echo "${MOCK_AWS_STATE:-None}"
@@ -154,16 +189,32 @@ case "$1 $2" in
       printf '%s' "${MOCK_AWS_FIND:-}"
     fi
     exit 0 ;;
+  "ec2 describe-key-pairs")
+    # repo#177: fingerprint-based key-pair lookup in aws_resolve_key_pair().
+    # MOCK_AWS_KEYPAIR_EXISTS, when set, is the KeyName of an already-imported
+    # key pair sharing this fingerprint (the "reuse" scenario); unset means no
+    # match, driving the "import a new one" scenario — same shape as the
+    # real `--query "...KeyName | [0]"` --output text, which prints "None"
+    # for no match.
+    echo "${MOCK_AWS_KEYPAIR_EXISTS:-None}"
+    exit 0 ;;
+  "ec2 import-key-pair")
+    [[ "${MOCK_AWS_IMPORT_KEY_FAIL:-0}" == 1 ]] && exit 1
+    exit 0 ;;
   "ec2 run-instances")
     if [[ "${MOCK_AWS_QUOTA_FAIL:-0}" == 1 ]]; then
       echo "An error occurred (VcpuLimitExceeded) when calling the RunInstances operation" >&2
       exit 254
     fi
-    # Capture the generated user-data (idle guard) so the suite can assert on the
-    # guard script's content. --user-data is passed as `file://<path>`; the temp
-    # file still exists at call time (repo-remote.sh deletes it only afterwards).
+    # Capture the generated user-data (idle guard + repo#177 SSH-key
+    # injection) and the resolved --key-name so the suite can assert on both.
+    # --user-data is passed as `file://<path>`; the temp file still exists at
+    # call time (repo-remote.sh deletes it only afterwards).
     prev=""
     for a in "$@"; do
+      if [[ "$prev" == "--key-name" ]]; then
+        printf '%s' "$a" >"${MOCK_AWS_LOG}.keyname"
+      fi
       if [[ "$prev" == "--user-data" ]]; then
         f="${a#file://}"
         [[ -f "$f" ]] && cat "$f" >"${MOCK_AWS_LOG}.userdata"
@@ -292,6 +343,62 @@ assert_contains "instance tagged repo-remote=<name>" "$LOGTXT" "repo-remote,Valu
 assert_contains "requested instance type is passed"  "$LOGTXT" "m5.2xlarge"
 assert_contains "disk size from config is applied"   "$LOGTXT" "VolumeSize=50"
 assert_contains "user-data (idle guard) is passed"   "$LOGTXT" "user-data"
+assert_contains "--key-name is ALWAYS passed to run-instances (repo#177)" "$LOGTXT" "--key-name"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- SSH key-pair resolution for --key-name (repo#177) --"
+# ---------------------------------------------------------------------------
+# repo#177: aws_create() must never launch keyless. The key pair is resolved
+# from REPO_REMOTE_SSH_KEY (the DOCUMENTED variable) — never from the phantom,
+# never-populated REPO_REMOTE_SSH_KEY_NAME this bug read from.
+
+# (a) No existing key pair for this fingerprint -> import-key-pair is called,
+#     and its resolved name (repo-remote-<repo-name>) flows into --key-name.
+run_rr MOCK_AWS_NEW_ID=i-0keyimport MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "no matching key pair: still provisions (exit 0)" "0" "$RR_RC"
+assert_contains "no matching key pair: import-key-pair IS called" \
+  "$(cat "$MOCK_LOG")" "import-key-pair"
+assert_contains "no matching key pair: imported key named repo-remote-<repo>" \
+  "$(cat "$MOCK_LOG")" "repo-remote-myrepo"
+assert_contains "no matching key pair: run-instances got the imported --key-name" \
+  "$(cat "$MOCK_LOG")" "--key-name repo-remote-myrepo"
+
+# (b) Belt-and-suspenders (AC3), asserted against (a)'s successful create: the
+#     generated user-data always contains the SSH-key injection, deduplicated
+#     via a grep -qxF guard — read BEFORE the failure-path scenarios below
+#     overwrite/clear the capture file.
+UD_KEY="$(cat "${MOCK_LOG}.userdata" 2>/dev/null)"
+assert_contains "user-data appends the resolved public key to authorized_keys" \
+  "$UD_KEY" "authorized_keys"
+assert_contains "user-data injection is deduplicated (grep -qxF guard)" \
+  "$UD_KEY" "grep -qxF"
+
+# (c) A key pair sharing this fingerprint ALREADY exists -> reused by name,
+#     import-key-pair is NOT called (no duplicate import).
+run_rr MOCK_AWS_NEW_ID=i-0keyreuse MOCK_AWS_STATE=None MOCK_AWS_KEYPAIR_EXISTS=repo-remote-existing \
+  -- up --yes --json
+assert_eq   "matching key pair: still provisions (exit 0)" "0" "$RR_RC"
+assert_not_contains "matching key pair: import-key-pair is NOT called" \
+  "$(cat "$MOCK_LOG")" "import-key-pair"
+assert_contains "matching key pair: run-instances reuses the existing --key-name" \
+  "$(cat "$MOCK_LOG")" "--key-name repo-remote-existing"
+
+# (d) Post-create verification: a null KeyName after creation is a loud,
+#     non-zero-exit failure — never a silent "launched, good luck" success.
+run_rr MOCK_AWS_NEW_ID=i-0keynull MOCK_AWS_STATE=None MOCK_AWS_KEYNAME_NULL=1 -- up --yes --json
+assert_eq   "post-create KeyName=None -> non-zero exit (repo#177)" "4" "$RR_RC"
+assert_contains "KeyName=None failure names the instance"  "$RR_ERR" "i-0keynull"
+assert_contains "KeyName=None failure mentions KeyName"    "$RR_ERR" "KeyName=None"
+assert_not_contains "KeyName=None: no up result emitted"   "$RR_OUT" '"action":"up"'
+
+# (e) Missing REPO_REMOTE_SSH_KEY.pub -> a loud, actionable failure, never a
+#     silent keyless launch.
+run_rr REPO_REMOTE_SSH_KEY="$SCRATCH/does-not-exist" MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "missing .pub -> non-zero exit" "2" "$RR_RC"
+assert_contains "missing .pub failure names the expected path" "$RR_ERR" "does-not-exist.pub"
+assert_eq   "missing .pub: no cloud call was made at all" "0" \
+  "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -351,27 +458,33 @@ assert_contains "guard embeds the overridden marker path" "$UD2" 'MARKER=/run/cu
 assert_not_contains "overridden path replaces the default" "$UD2" 'MARKER=/var/run/repo-remote-daemon-idle.marker'
 
 # (c) repo#163 regression: REPO_REMOTE_IDLE_SHUTDOWN_MIN=0 must DISABLE the
-#     guard entirely, not feed 0 into the fallback countdown's arithmetic
-#     (`(NOW - LAST) / 60 -ge 0` is true on the very first post-$STAMP tick,
-#     which used to shut the host down almost immediately instead of never).
-#     No cron/watchdog script — and no --user-data at all — should be emitted.
+#     idle-shutdown guard entirely, not feed 0 into the fallback countdown's
+#     arithmetic (`(NOW - LAST) / 60 -ge 0` is true on the very first
+#     post-$STAMP tick, which used to shut the host down almost immediately
+#     instead of never). No cron/watchdog script content should be emitted.
+#     repo#177 update: --user-data itself is now ALWAYS attached (it also
+#     carries the belt-and-suspenders SSH-key injection, which must run
+#     unconditionally — see below), so the assertion is on the ABSENCE of the
+#     idle-guard's own content within that user-data, not on the flag itself.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=0"
 rm -f "$UD_CAP"
 run_rr MOCK_AWS_NEW_ID=i-0noguard MOCK_AWS_STATE=None -- up --yes --json
 assert_eq "IDLE_MIN=0 still provisions successfully" "0" "$RR_RC"
-assert_not_contains "IDLE_MIN=0: no --user-data flag passed to run-instances" \
+assert_contains "IDLE_MIN=0: --user-data flag IS still passed (repo#177 SSH-key injection)" \
   "$(cat "$MOCK_LOG")" "user-data"
-assert_eq "IDLE_MIN=0: no user-data content was captured at all" \
-  "" "$(cat "$UD_CAP" 2>/dev/null)"
+assert_not_contains "IDLE_MIN=0: no idle-shutdown cron/watchdog content is embedded" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "repo-remote-idle-check"
+assert_contains "IDLE_MIN=0: the SSH-key belt-and-suspenders content IS embedded" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "authorized_keys"
 
 # Negative windows are treated the same as 0 (also "disabled").
 rm -f "$UD_CAP"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=-5"
 run_rr MOCK_AWS_NEW_ID=i-0noguard2 MOCK_AWS_STATE=None -- up --yes --json
-assert_not_contains "negative IDLE_MIN: no --user-data flag passed to run-instances" \
+assert_contains "negative IDLE_MIN: --user-data flag IS still passed (repo#177 SSH-key injection)" \
   "$(cat "$MOCK_LOG")" "user-data"
-assert_eq "negative IDLE_MIN: no user-data content was captured at all" \
-  "" "$(cat "$UD_CAP" 2>/dev/null)"
+assert_not_contains "negative IDLE_MIN: no idle-shutdown cron/watchdog content is embedded" \
+  "$(cat "$UD_CAP" 2>/dev/null)" "repo-remote-idle-check"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
@@ -703,6 +816,20 @@ assert_contains "remote.md documents the whole-batch refusal on down" \
   "$MD" "whole batch is refused"
 assert_contains "remote.md documents dry-run annotation (not blocking) on down" \
   "$MD" "fleet_marked"
+
+# repo#177: the EC2 key-pair resolution, post-create verification, and
+# belt-and-suspenders SSH-key injection are part of the implemented surface —
+# remote.md must document them so the doc and script cannot silently diverge.
+assert_contains "remote.md documents REPO_REMOTE_SSH_KEY also resolves the EC2 key pair" \
+  "$MD" "ALSO the source of the EC2 key pair"
+assert_contains "remote.md documents fingerprint-based key-pair reuse" \
+  "$MD" "aws ec2 describe-key-pairs"
+assert_contains "remote.md documents importing a key pair when no match is found" \
+  "$MD" "aws ec2 import-key-pair"
+assert_contains "remote.md documents the post-create KeyName verification" \
+  "$MD" "re-reads the instance's \`KeyName\`"
+assert_contains "remote.md documents the belt-and-suspenders authorized_keys injection" \
+  "$MD" "~ubuntu/.ssh/authorized_keys"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).
