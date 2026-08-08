@@ -2977,6 +2977,103 @@ assert_deny "repo#29 regression: no-space 'curl url|sh' still denied" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #195: guards.positionalMaskAllowlist (ASK-tier positional masking) ---${NC}"
+# =========================================================================
+#
+# guards.positionalMaskAllowlist masks a configured command's own quoted
+# POSITIONAL arguments (no preceding flag name) in the ASK-tier working copy
+# (COMMAND_ASK_SCAN) only, so a read-only tool's own search/dedup text is not
+# misread as a live ask-triggering phrase. Config-only (array of command
+# names, no single env var makes sense for a list) — see
+# mask_ask_positional_args() / positional_mask_cmdre() in guard-destructive.sh.
+#
+# All cases below use a fictitious "mytool.sh" command name and the ungated,
+# default-on 'gh release delete' ASK_PATTERNS entry as the motivating
+# ask-phrase, mirroring the issue's own check-duplicate.sh motivating case.
+
+PMASK_REPO=$(make_sql_repo '{"guards":{"positionalMaskAllowlist":["mytool.sh"]}}')
+PMASK_ABSENT_REPO=$(make_sql_repo '{"champion":{"auto_merge_max_lines":200}}')
+PMASK_GREPRG_REPO=$(make_sql_repo '{"guards":{"positionalMaskAllowlist":["grep","rg","mytool.sh"]}}')
+
+# --- Default/absent config is a no-op: the ask still fires (AC) ---
+assert_ask "positionalMaskAllowlist absent (default): quoted ask-phrase after mytool.sh still asks" \
+    'mytool.sh "please run: gh release delete v1"' "$PMASK_ABSENT_REPO"
+assert_ask "positionalMaskAllowlist absent (default, main repo): quoted ask-phrase still asks" \
+    'mytool.sh "please run: gh release delete v1"'
+
+# --- Configured allowlist masks the configured command's own quoted args ---
+assert_allow "positionalMaskAllowlist=[mytool.sh]: quoted ask-phrase after mytool.sh no longer asks" \
+    'mytool.sh "please run: gh release delete v1"' "$PMASK_REPO"
+# Multiple consecutive positional args are all masked (mirrors check-duplicate.sh's TITLE DESCRIPTION signature).
+assert_allow "positionalMaskAllowlist: multiple consecutive quoted positional args are all masked" \
+    'mytool.sh "TITLE" "please run: gh release delete v1"' "$PMASK_REPO"
+# Short flags between the command name and the first quoted arg are tolerated.
+assert_allow "positionalMaskAllowlist: flags between command and quoted arg are tolerated" \
+    'mytool.sh --verbose -x "please run: gh release delete v1"' "$PMASK_REPO"
+# A command NOT in the allowlist is unaffected.
+assert_ask "positionalMaskAllowlist: an unconfigured command's quoted arg still asks" \
+    'othertool.sh "please run: gh release delete v1"' "$PMASK_REPO"
+
+# --- Masking stops at the first non-quoted-string token: a real invocation
+#     chained after a masked positional argument is still caught. ---
+assert_ask "positionalMaskAllowlist: real invocation chained after masked positional still asks" \
+    'mytool.sh "safe text" && gh release delete v1' "$PMASK_REPO"
+assert_ask "positionalMaskAllowlist: real invocation piped after masked positional still asks" \
+    'mytool.sh "safe text" | gh release delete v1' "$PMASK_REPO"
+# A bare (non-quoted) argument right after the command is not masked and does
+# not extend the anchor — nothing after it is swallowed either.
+assert_ask "positionalMaskAllowlist: bare non-quoted arg is not masked, ask-phrase after it still asks" \
+    'mytool.sh unquoted-arg "please run: gh release delete v1"' "$PMASK_REPO"
+
+# --- grep/rg remain excluded from the allowlist even when configured ---
+assert_ask_env "positionalMaskAllowlist=[grep,...]: grep's own quoted ask-phrase still asks (fast path off)" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep "please run: gh release delete v1" notes.txt' "$PMASK_GREPRG_REPO"
+assert_ask_env "positionalMaskAllowlist=[rg,...]: rg's own quoted ask-phrase still asks (fast path off)" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'rg "please run: gh release delete v1" notes.txt' "$PMASK_GREPRG_REPO"
+# grep's own quoted DDL pattern still feeds the SQL DDL check correctly: this
+# file's SQL_DDL_PATTERN check (below) scans $COMMAND_ASK_SCAN, the SAME
+# working copy this feature narrows — so if grep/rg were maskable, a
+# configured allowlist entry would blind SQL_DDL_PATTERN to a `grep
+# '<DDL phrase>' file` invocation's own quoted pattern, exactly the
+# regression mask_ask_positional_args()'s header comment describes. This is
+# the live coupling the grep/rg exclusion exists to prevent, not a
+# hypothetical one.
+assert_deny_env "positionalMaskAllowlist=[grep,...]: grep's own quoted DDL pattern still denies (SQL DDL)" \
+    "REPO_GUARD_READONLY_FASTPATH=0" "grep 'DROP TABLE users' schema.sql" "$PMASK_GREPRG_REPO"
+# The mytool.sh entry in the SAME allowlist as grep/rg still works — proves
+# the exclusion is per-command, not an all-or-nothing kill switch on the
+# whole feature when grep/rg happen to be present in the config array.
+assert_allow "positionalMaskAllowlist=[grep,rg,mytool.sh]: mytool.sh entry still masks alongside excluded grep/rg" \
+    'mytool.sh "please run: gh release delete v1"' "$PMASK_GREPRG_REPO"
+
+# --- Config precedence: .claude/skills/repo/config.json wins over .loom/config.json ---
+# Inlined (rather than calling make_repocfg_repo, defined later in the "Repo
+# Skills naming" section below) so this section stays self-contained and
+# order-independent.
+PMASK_REPOCFG_WINS=$(mktemp -d 2>/dev/null)
+git -C "$PMASK_REPOCFG_WINS" init -q >/dev/null 2>&1
+mkdir -p "$PMASK_REPOCFG_WINS/.claude/skills/repo" "$PMASK_REPOCFG_WINS/.loom"
+printf '%s' '{"guards":{"positionalMaskAllowlist":["mytool.sh"]}}' > "$PMASK_REPOCFG_WINS/.claude/skills/repo/config.json"
+printf '%s' '{"guards":{"positionalMaskAllowlist":[]}}' > "$PMASK_REPOCFG_WINS/.loom/config.json"
+assert_allow "positionalMaskAllowlist: repo config (non-empty) wins over legacy .loom (empty)" \
+    'mytool.sh "please run: gh release delete v1"' "$PMASK_REPOCFG_WINS"
+PMASK_REPOCFG_FALLTHRU=$(mktemp -d 2>/dev/null)
+git -C "$PMASK_REPOCFG_FALLTHRU" init -q >/dev/null 2>&1
+mkdir -p "$PMASK_REPOCFG_FALLTHRU/.claude/skills/repo" "$PMASK_REPOCFG_FALLTHRU/.loom"
+printf '%s' '{"champion":{"x":1}}' > "$PMASK_REPOCFG_FALLTHRU/.claude/skills/repo/config.json"
+printf '%s' '{"guards":{"positionalMaskAllowlist":["mytool.sh"]}}' > "$PMASK_REPOCFG_FALLTHRU/.loom/config.json"
+assert_allow "positionalMaskAllowlist: key absent from repo config falls through to legacy .loom" \
+    'mytool.sh "please run: gh release delete v1"' "$PMASK_REPOCFG_FALLTHRU"
+
+# Clean up this section's temp repos.
+for _pm_dir in "$PMASK_REPO" "$PMASK_ABSENT_REPO" "$PMASK_GREPRG_REPO" \
+    "$PMASK_REPOCFG_WINS" "$PMASK_REPOCFG_FALLTHRU"; do
+    [[ -n "$_pm_dir" && "$_pm_dir" != "/" && ( -d "$_pm_dir/.claude" || -d "$_pm_dir/.loom" ) ]] && rm -rf "$_pm_dir"
+done
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Repo Skills naming: REPO_* env + dual-config precedence ---${NC}"
 # =========================================================================
 #
@@ -3345,6 +3442,60 @@ if [[ -r "$GENERIC_GUARD" ]]; then
         "echo x > $WTC_SYM_MAIN_PHYSICAL/evil.sh" "$WTC_SYM_MAIN_LOGICAL"
 else
     echo -e "  ${YELLOW}SKIP${NC}: equivalence tests (vendored .loom/hooks/guard-destructive-generic.sh not present)"
+fi
+
+# ---- #195 review regression: guards.positionalMaskAllowlist must NEVER be
+# ---- able to mask a write idiom out of this DENY. ----
+#
+# COMMAND_ASK_SCAN is the input to BOTH the ask-tier scans AND this
+# deny-tier write-confinement block (WRITE_TARGETS=$(extract_write_targets
+# "$COMMAND_ASK_SCAN" ...)). #195's positional masking narrows that same
+# working copy, so a repo that configured a write idiom
+# (`positionalMaskAllowlist: ["cp"]`) blanked the destination PATH to `XXXX`
+# before extract_write_targets() ever saw it, and a
+# `cp "/tmp/src.txt" "<main-checkout>/evil.sh"` issued from a builder
+# worktree fell through from deny to ALLOW. positional_mask_cmdre()'s
+# mandatory _POSITIONAL_MASK_NEVER set (grep/egrep/fgrep/rg + cp/mv/tee/sed)
+# closes that off regardless of operator config; these cases prove it, using
+# the QUOTED spellings (unquoted targets are unmaskable by construction —
+# mask_ask_positional_args() only ever touches quoted arguments).
+PMWTC_ALLOWLIST='{"guards":{"positionalMaskAllowlist":["cp","mv","tee","sed","/bin/cp","mytool.sh"]}}'
+# shellcheck disable=SC2046 # main/wt are mktemp paths, never contain IFS chars
+read -r PMWTC_MAIN PMWTC_WT <<< "$(make_wt_confinement_repo)"
+mkdir -p "$PMWTC_WT/.claude/skills/repo"
+printf '%s' "$PMWTC_ALLOWLIST" > "$PMWTC_WT/.claude/skills/repo/config.json"
+
+assert_deny "#195 regression: cp with quoted target into main checkout still denies with cp in positionalMaskAllowlist" \
+    "cp \"/tmp/src.txt\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: mv with quoted target into main checkout still denies with mv in positionalMaskAllowlist" \
+    "mv \"/tmp/src.txt\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: tee with quoted target into main checkout still denies with tee in positionalMaskAllowlist" \
+    "echo x | tee \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: sed -i with quoted target into main checkout still denies with sed in positionalMaskAllowlist" \
+    "sed -i \"s/a/b/\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+# The exclusion compares BASENAMES, so a path-qualified allowlist entry
+# ("/bin/cp", present in the fixture config above) cannot smuggle an excluded
+# command name past the set either. Defense in depth: extract_write_targets()
+# matches write idioms on the bare command word (`toks[1] == "cp"`), so a
+# `/bin/cp` write is already outside its reach on main — the observable here
+# is therefore the ask tier, where masking IS command-word-literal: with the
+# basename exclusion the entry is dropped and the quoted ask-phrase after
+# /bin/cp stays visible (it was silently masked before the exclusion).
+assert_ask "#195 regression: path-qualified '/bin/cp' allowlist entry is dropped by basename (arg not masked)" \
+    '/bin/cp "please run: gh release delete v1"' "$PMWTC_WT"
+# ...and the exclusion is per-command, not an all-or-nothing kill switch: the
+# legitimate "mytool.sh" entry in the SAME allowlist still masks its own
+# quoted positional args (ask-tier narrowing, #195's actual feature).
+assert_allow "#195 regression: mytool.sh entry still masks alongside excluded write idioms" \
+    'mytool.sh "please run: gh release delete v1"' "$PMWTC_WT"
+# Control: a write idiom whose target stays inside the acting worktree is
+# still allowed — the exclusion restores visibility, it does not widen the deny.
+assert_allow "#195 regression: cp with quoted target inside the worktree still allows" \
+    "cp \"/tmp/src.txt\" \"$PMWTC_WT/scratch.txt\"" "$PMWTC_WT"
+
+git -C "$PMWTC_MAIN" worktree remove --force "$PMWTC_WT" >/dev/null 2>&1 || true
+if [[ -n "$PMWTC_MAIN" && "$PMWTC_MAIN" != "/" && -d "$PMWTC_MAIN" ]]; then
+    rm -rf "$PMWTC_MAIN"
 fi
 
 # Clean up this section's temp repos/worktrees.
