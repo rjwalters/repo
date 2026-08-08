@@ -3115,6 +3115,210 @@ for _rs_dir in "$REPOENV_FEATURE" "$REPOCFG_SQL_OFF" "$REPOCFG_RM_OFF" "$REPOCFG
     [[ -n "$_rs_dir" && "$_rs_dir" != "/" && ( -d "$_rs_dir/.claude" || -d "$_rs_dir/.loom" ) ]] && rm -rf "$_rs_dir"
 done
 
+# =========================================================================
+echo -e "${YELLOW}--- BASH-TOOL WRITE CONFINEMENT (rjwalters/repo#188, #168, Loom #4178/#4495) ---${NC}"
+# =========================================================================
+
+# Build a throwaway git repo with a REAL linked worktree at the default
+# worktree.sh layout (<repo>/.loom/worktrees/issue-N) carrying the
+# `.loom-managed` sentinel — the write-confinement block's
+# _any_managed_worktree_exists()/_in_any_managed_worktree() gates walk real
+# files on disk, unlike the pure-string rm-scope tests above, so a fixture
+# with an actual `git worktree add` + sentinel is required to exercise them.
+# Echoes "<main-repo-path> <worktree-path>" (space-separated; mktemp paths
+# never contain a space).
+make_wt_confinement_repo() {
+    local main wt branch
+    main=$(mktemp -d 2>/dev/null)
+    git -C "$main" init -q >/dev/null 2>&1
+    git -C "$main" -c user.email=test@example.com -c user.name=test commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$main/.loom/worktrees"
+    wt="$main/.loom/worktrees/issue-1"
+    branch="wtc-$(basename "$main")"
+    git -C "$main" worktree add -q -b "$branch" "$wt" >/dev/null 2>&1
+    touch "$wt/.loom-managed"
+    printf '%s %s' "$main" "$wt"
+}
+
+# shellcheck disable=SC2046 # main/wt are mktemp paths, never contain IFS chars
+read -r WTC_MAIN WTC_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- Core deny cases: each write idiom, absolute path into the main checkout,
+# ---- issued from the builder's own worktree cwd (the #4178 escape). ----
+assert_deny "write-confinement: '>' redirect into main checkout denies" \
+    "echo x > $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_deny "write-confinement: '>>' append into main checkout denies" \
+    "echo x >> $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_deny "write-confinement: tee into main checkout denies" \
+    "echo x | tee $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_deny "write-confinement: sed -i into main checkout denies" \
+    "sed -i s/a/b/ $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_deny "write-confinement: cp into main checkout denies" \
+    "cp /tmp/src.txt $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_deny "write-confinement: mv into main checkout denies" \
+    "mv /tmp/src.txt $WTC_MAIN/evil.sh" "$WTC_WT"
+
+# The decision tag itself — dedicated check since assert_deny only inspects
+# permissionDecision, and this is the exact probe Loom's dispatcher greps for
+# (grep -q 'worktree-write-confinement' hooks/repo/guard-destructive.sh). The
+# tag is not embedded in the human-readable permissionDecisionReason text (it
+# is the second positional arg to deny(), used only for decision-log
+# telemetry) — so verify it via the JSONL decision log, the same mechanism the
+# "Decision telemetry log (#3771)" section above already exercises.
+TOTAL=$((TOTAL + 1))
+WTC_TAG_LOG=$(mktemp -d 2>/dev/null)/decisions.log
+make_input "echo x > $WTC_MAIN/evil.sh" "$WTC_WT" | \
+    env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_TAG_LOG" "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$WTC_TAG_LOG" ]] && [[ "$(tail -1 "$WTC_TAG_LOG" | jq -r '.pattern' 2>/dev/null)" == "worktree-write-confinement" ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: write-confinement: deny decision log records the worktree-write-confinement tag"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: write-confinement: deny decision log records the worktree-write-confinement tag"
+    echo -e "       Got: $(tail -1 "$WTC_TAG_LOG" 2>/dev/null)"
+fi
+rm -rf "$(dirname "$WTC_TAG_LOG")"
+
+# ---- Unresolved shell variable as a write target fails CLOSED (#4921). ----
+assert_deny 'write-confinement: unexpanded $VAR write target fails closed' \
+    'echo x > $DEST' "$WTC_WT"
+
+# ---- Allow cases: writes that stay inside the acting worktree, or land
+# ---- somewhere this guard does not protect. ----
+assert_allow "write-confinement: absolute write inside the worktree itself allows" \
+    "echo x > $WTC_WT/scratch.txt" "$WTC_WT"
+assert_allow "write-confinement: relative write inside the worktree itself allows" \
+    "echo x > ./scratch.txt" "$WTC_WT"
+assert_allow "write-confinement: write to unrelated /tmp scratch allows" \
+    "echo x > /tmp/wtc-scratch-$$.txt" "$WTC_WT"
+
+# ---- Fail-open: no managed worktree exists anywhere for this repo -> allow,
+# ---- exactly the guard-worktree-paths.sh contract this block mirrors. ----
+WTC_NOWT=$(mktemp -d 2>/dev/null)
+git -C "$WTC_NOWT" init -q >/dev/null 2>&1
+git -C "$WTC_NOWT" -c user.email=test@example.com -c user.name=test commit -q --allow-empty -m init >/dev/null 2>&1
+assert_allow "write-confinement: no managed worktree exists anywhere -> fail open" \
+    "echo x > $WTC_NOWT/evil.sh" "$WTC_NOWT"
+
+# ---- Toggle: guards.worktreeIsolation:false / REPO_GUARD_WORKTREE_ISOLATION=0
+# ---- / legacy LOOM_GUARD_WORKTREE_ISOLATION=0 disable the category even
+# ---- though a managed worktree genuinely exists. ----
+assert_allow_env "write-confinement: REPO_GUARD_WORKTREE_ISOLATION=0 disables the category" \
+    "REPO_GUARD_WORKTREE_ISOLATION=0" "echo x > $WTC_MAIN/evil.sh" "$WTC_WT"
+assert_allow_env "write-confinement: legacy LOOM_GUARD_WORKTREE_ISOLATION=0 disables the category" \
+    "LOOM_GUARD_WORKTREE_ISOLATION=0" "echo x > $WTC_MAIN/evil.sh" "$WTC_WT"
+
+WTC_TOGGLE_OFF_MAIN=$(mktemp -d 2>/dev/null)
+git -C "$WTC_TOGGLE_OFF_MAIN" init -q >/dev/null 2>&1
+git -C "$WTC_TOGGLE_OFF_MAIN" -c user.email=test@example.com -c user.name=test commit -q --allow-empty -m init >/dev/null 2>&1
+mkdir -p "$WTC_TOGGLE_OFF_MAIN/.loom/worktrees"
+WTC_TOGGLE_OFF_WT="$WTC_TOGGLE_OFF_MAIN/.loom/worktrees/issue-1"
+git -C "$WTC_TOGGLE_OFF_MAIN" worktree add -q -b "wtc-toggle-off-$(basename "$WTC_TOGGLE_OFF_MAIN")" "$WTC_TOGGLE_OFF_WT" >/dev/null 2>&1
+touch "$WTC_TOGGLE_OFF_WT/.loom-managed"
+# guard_cfg() reads "$REPO_ROOT/.claude/skills/repo/config.json", and
+# REPO_ROOT is `git rev-parse --show-toplevel` from CWD — which for a linked
+# worktree cwd is the WORKTREE's own toplevel, not the main checkout (the same
+# REPO_ROOT-vs-_WT_MAIN_ROOT distinction the write-confinement block's own
+# header comment explains). So the config that disables the toggle for a
+# session running FROM the worktree must live in the worktree's own tree.
+mkdir -p "$WTC_TOGGLE_OFF_WT/.claude/skills/repo"
+printf '%s' '{"guards":{"worktreeIsolation":false}}' > "$WTC_TOGGLE_OFF_WT/.claude/skills/repo/config.json"
+assert_allow "write-confinement: repo config guards.worktreeIsolation:false disables the category" \
+    "echo x > $WTC_TOGGLE_OFF_MAIN/evil.sh" "$WTC_TOGGLE_OFF_WT"
+
+# ---- Symlinked main-checkout path (#4495): a repo reached through a
+# ---- symlinked ancestor (a /tmp checkout on macOS, a symlinked home, a
+# ---- bind-mounted workspace) must still deny under BOTH the physical and the
+# ---- logical (symlinked) spelling of the main-checkout root — pwd -P alone
+# ---- was the #4495 regression (every write through the symlinked spelling
+# ---- was silently allowed). ----
+WTC_SYM_REAL=$(mktemp -d 2>/dev/null)
+WTC_SYM_LINKDIR=$(mktemp -d 2>/dev/null)
+rm -rf "$WTC_SYM_LINKDIR"
+ln -s "$WTC_SYM_REAL" "$WTC_SYM_LINKDIR"
+WTC_SYM_MAIN_LOGICAL="$WTC_SYM_LINKDIR/main"
+WTC_SYM_MAIN_PHYSICAL="$WTC_SYM_REAL/main"
+mkdir -p "$WTC_SYM_MAIN_PHYSICAL"
+git -C "$WTC_SYM_MAIN_LOGICAL" init -q >/dev/null 2>&1
+git -C "$WTC_SYM_MAIN_LOGICAL" -c user.email=test@example.com -c user.name=test commit -q --allow-empty -m init >/dev/null 2>&1
+mkdir -p "$WTC_SYM_MAIN_LOGICAL/.loom/worktrees"
+WTC_SYM_WT="$WTC_SYM_MAIN_LOGICAL/.loom/worktrees/issue-1"
+git -C "$WTC_SYM_MAIN_LOGICAL" worktree add -q -b "wtc-sym-$(basename "$WTC_SYM_REAL")" "$WTC_SYM_WT" >/dev/null 2>&1
+touch "$WTC_SYM_WT/.loom-managed"
+
+assert_deny "write-confinement (#4495): relative write from the symlinked main checkout cwd denies" \
+    "echo x > evil.sh" "$WTC_SYM_MAIN_LOGICAL"
+assert_deny "write-confinement (#4495): write via the LOGICAL (symlinked) spelling denies" \
+    "echo x > $WTC_SYM_MAIN_LOGICAL/evil.sh" "$WTC_SYM_MAIN_LOGICAL"
+assert_deny "write-confinement (#4495): write via the PHYSICAL spelling denies" \
+    "echo x > $WTC_SYM_MAIN_PHYSICAL/evil.sh" "$WTC_SYM_MAIN_LOGICAL"
+assert_allow "write-confinement (#4495): write inside the worktree (reached via symlinked cwd) allows" \
+    "echo x > $WTC_SYM_WT/scratch.txt" "$WTC_SYM_WT"
+
+# ---- Equivalence test (acceptance criterion): the canonical implementation
+# ---- and Loom's vendored .loom/hooks/guard-destructive-generic.sh must reach
+# ---- the SAME deny/allow verdict for the same write-target shapes — absolute
+# ---- path into the main checkout, an unexpanded shell variable, and
+# ---- redirection/tee/sed -i/cp/mv into the worktree-isolated main checkout,
+# ---- including the #4495 symlinked-path case. Exact wording/tag text is
+# ---- allowed to differ between the two implementations; only the verdict
+# ---- (deny vs allow) is compared. Skips gracefully if the vendored guard is
+# ---- not present (e.g. a non-Loom-managed checkout of this repo).
+GENERIC_GUARD="$REPO_ROOT/.loom/hooks/guard-destructive-generic.sh"
+assert_guard_equivalence() {
+    local description="$1" cmd="$2" cwd="$3"
+    TOTAL=$((TOTAL + 1))
+    local out_canonical out_generic dec_canonical dec_generic
+    out_canonical=$(make_input "$cmd" "$cwd" | "$GUARD" 2>&1)
+    out_generic=$(make_input "$cmd" "$cwd" | bash "$GENERIC_GUARD" 2>&1)
+    dec_canonical=$(echo "$out_canonical" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null || echo "parse-error")
+    dec_generic=$(echo "$out_generic" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null || echo "parse-error")
+    if [[ "$dec_canonical" == "$dec_generic" ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description (both: $dec_canonical)"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (cwd: $cwd)"
+        echo -e "       canonical=$dec_canonical  vendored=$dec_generic"
+        echo -e "       canonical output: $out_canonical"
+        echo -e "       vendored  output: $out_generic"
+    fi
+}
+
+if [[ -r "$GENERIC_GUARD" ]]; then
+    assert_guard_equivalence "equivalence: absolute path into main checkout" \
+        "echo x > $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: unexpanded shell variable target" \
+        'echo x > $DEST' "$WTC_WT"
+    assert_guard_equivalence "equivalence: '>>' append into main checkout" \
+        "echo x >> $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: tee into main checkout" \
+        "echo x | tee $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: sed -i into main checkout" \
+        "sed -i s/a/b/ $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: cp into main checkout" \
+        "cp /tmp/src.txt $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: mv into main checkout" \
+        "mv /tmp/src.txt $WTC_MAIN/evil.sh" "$WTC_WT"
+    assert_guard_equivalence "equivalence: write inside the worktree itself" \
+        "echo x > $WTC_WT/scratch.txt" "$WTC_WT"
+    assert_guard_equivalence "equivalence (#4495): write via the symlinked (logical) main-checkout spelling" \
+        "echo x > $WTC_SYM_MAIN_LOGICAL/evil.sh" "$WTC_SYM_MAIN_LOGICAL"
+    assert_guard_equivalence "equivalence (#4495): write via the physical main-checkout spelling" \
+        "echo x > $WTC_SYM_MAIN_PHYSICAL/evil.sh" "$WTC_SYM_MAIN_LOGICAL"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: equivalence tests (vendored .loom/hooks/guard-destructive-generic.sh not present)"
+fi
+
+# Clean up this section's temp repos/worktrees.
+git -C "$WTC_MAIN" worktree remove --force "$WTC_WT" >/dev/null 2>&1 || true
+git -C "$WTC_TOGGLE_OFF_MAIN" worktree remove --force "$WTC_TOGGLE_OFF_WT" >/dev/null 2>&1 || true
+git -C "$WTC_SYM_MAIN_LOGICAL" worktree remove --force "$WTC_SYM_WT" >/dev/null 2>&1 || true
+for _wtc_dir in "$WTC_MAIN" "$WTC_NOWT" "$WTC_TOGGLE_OFF_MAIN" "$WTC_SYM_REAL" "$WTC_SYM_LINKDIR"; do
+    [[ -n "$_wtc_dir" && "$_wtc_dir" != "/" && -d "$_wtc_dir" ]] && rm -rf "$_wtc_dir"
+done
+
 echo ""
 
 # =========================================================================
