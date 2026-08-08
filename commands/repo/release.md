@@ -392,18 +392,49 @@ as part of matching the file's format above — not as a separate Phase 5 step:
    back to a fuzzy text match only for bullets that cite no number). Keep a
    captured `## Unreleased` bullet only if none of its numbers already appear in
    the git-log-derived draft.
-4. Produce **one** combined entry headed with the new version + today's date,
+4. **Coherence check — read the merged item list as one document.** Changelog
+   entries are written serially, one PR at a time over the life of the release
+   cycle, but this section is read all at once, from the vantage point of the
+   finished release. That mismatch lets two individually-accurate entries land
+   in the same `## Unreleased` section while jointly asserting something
+   incoherent — a claim corrected and then the underlying thing fixed so the
+   original claim becomes true again, a default flipped and flipped back, a
+   limitation documented and then removed, a feature reworked or renamed
+   between when it was logged and now. Before producing the combined entry
+   below, read every item being folded — the captured `## Unreleased` bullets
+   **and** the git-log-derived draft items, together, as the single document a
+   release reader will see — and flag any pair that:
+   - **Contradicts or supersedes another** — read for meaning, not keywords;
+     this is a judgment call about what the entries jointly claim, not a
+     regex or pattern match.
+   - **Near-duplicates another** — the same underlying change logged twice
+     because it landed across two different PRs.
+
+   Report each flagged pair by quoting **both entries verbatim, side by
+   side**, so the operator sees the contradiction directly instead of being
+   told one exists — do not just name the entries or summarize the conflict.
+   This is report-and-confirm only: never rewrite, merge, reorder, or drop an
+   entry to resolve it. Ask the operator whether to hand-edit before
+   continuing, or proceed with the draft exactly as captured — either answer
+   is fine, and if the operator does nothing this check **does not block**
+   moving on to the next step. A clean set of items produces **no output at
+   all** — do not report "no contradictions found" or otherwise add
+   commentary when there is nothing to flag; this check must stay silent in
+   the common case.
+5. Produce **one** combined entry headed with the new version + today's date,
    positioned **where `## Unreleased` was** — since that heading conventionally
    sits at the very top, this is a rename-in-place (`## Unreleased` →
    `## X.Y.Z (date)`), not an append elsewhere and no reordering. The
    `## Unreleased` heading itself is removed as part of drafting.
 
 > Seam interaction: under a `pre-changelog-style (replace)` policy the default
-> draft heuristic — including this fold — is skipped per the seam's
-> "policy steps produce the entry; skip the default draft heuristic" semantics
-> (see the seam table below), so folding any `## Unreleased` section becomes the
+> draft heuristic — including this fold and its coherence check (step 4 above)
+> — is skipped per the seam's "policy steps produce the entry; skip the
+> default draft heuristic" semantics (see the seam table below), so folding
+> any `## Unreleased` section, and checking it for contradictions, becomes the
 > policy's responsibility. Under `augment` (the default), the seam's steps run
-> first and then this fold runs, so there is no conflict.
+> first and then this fold — including the coherence check — runs, so there is
+> no conflict.
 
 ## Phase 5 — Apply
 
