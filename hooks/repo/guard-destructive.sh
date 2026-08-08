@@ -517,6 +517,32 @@ sql_guard_enabled() {
 #      (default true when absent)
 #   3. Default: true (guard on)
 #
+# Mirrors sql_guard_enabled() exactly: cached in _STASH_SCOPE_CACHE, invoked
+# LAZILY only after the stash pattern has already matched.
+# =============================================================================
+_STASH_SCOPE_CACHE=""
+stash_scope_guard_enabled() {
+    if [[ -z "$_STASH_SCOPE_CACHE" ]]; then
+        local enabled=true
+        case "$(guard_cfg stashScope)" in
+            false) enabled=false ;;
+            true)  enabled=true ;;
+        esac
+        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
+        case "${LOOM_GUARD_STASH_SCOPE:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        case "${REPO_GUARD_STASH_SCOPE:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _STASH_SCOPE_CACHE="$enabled"
+    fi
+    [[ "$_STASH_SCOPE_CACHE" == "true" ]]
+}
+
+# =============================================================================
 # Mirrors sql_guard_enabled() exactly: cached in _CLOUD_GUARD_CACHE, invoked
 # LAZILY only after a cloud pattern has already matched so the jq config read
 # never touches the hot path for non-cloud commands. The config read is
@@ -2080,9 +2106,19 @@ done < <(lifecycle_or_cloud_reason "$COMMAND_NO_COMMENT")
 # sql_guard_enabled() is consulted only after a match, so the config read stays
 # off the hot path.
 # =============================================================================
+#
+# Scanned against COMMAND_ASK_SCAN — the comment-stripped, literal-text-redacted
+# working copy — NOT the raw COMMAND_NO_COMMENT (repo#188 parity fix). A DDL
+# phrase quoted inside a `--body`/`-m`/`--title` value is prose *about* a
+# destructive statement, not a destructive statement, and denying it blocks
+# ordinary work: filing the issue that describes the hazard, or committing the
+# migration note that mentions it. This guard's own repository trips it — a
+# `grep` for the phrase, and this very comment, both used to deny. Loom's
+# vendored copy has always scanned the redacted copy here; the raw scan was the
+# single largest source of behavioral divergence between the two guards.
 SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
-if echo "$COMMAND_NO_COMMENT" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
-    matched=$(echo "$COMMAND_NO_COMMENT" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
+if echo "$COMMAND_ASK_SCAN" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
+    matched=$(echo "$COMMAND_ASK_SCAN" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
     deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}" "sql-ddl"
 fi
 
@@ -2411,6 +2447,62 @@ mark_expandable_dollars() {
 # then fall back to the raw, quote-preserved token, so an unbalanced quote
 # can only ever keep today's verdict, never widen a deny into an allow.
 # =============================================================================
+# =============================================================================
+# resolve_stash_cwd — the effective cwd a `git stash pop/drop/clear` runs in.
+#
+# Transplanted from Loom's vendored copy (loom#5173) as part of the repo#188
+# parity reconciliation. Mirrors parse_force_ops' cd-tracking: threads a
+# `cd <dir> &&` prefix earlier in the SAME compound command through to the
+# stash invocation, so `cd <worktree> && git stash pop` — hook session cwd
+# still the main repo root, the common worktree shape — resolves scope
+# against the cd TARGET rather than the hook's raw session cwd.
+#
+# Classification uses strip_cd_quoting() so a fully or partially quoted
+# absolute argument is not misclassified as relative; curcwd is still built
+# from the RAW cd argument (loom#5372), because the caller unquotes a COPY
+# before touching the filesystem.
+#
+# KNOWN LIMITATION, carried over deliberately: unlike parse_force_ops, this
+# does not thread a `git -C <path>` argument, so `git -C <main-checkout>
+# stash pop` run from a worktree cwd is not caught. Documented rather than
+# silently fixed, so the two guards keep identical behavior here.
+# =============================================================================
+resolve_stash_cwd() {
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    BEGIN { curcwd = startcwd; found = 0 }
+    {
+        $0 = qsplit($0)   # quote-aware segmentation
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            if (seg == "") continue
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    cdarg = expand_cd_arg(toks[2], home)
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) {
+                        curcwd = cdarg
+                    } else if (curcwd != "") {
+                        curcwd = curcwd "/" cdarg
+                    }
+                }
+                continue
+            }
+            if (toks[1] == "git" && m >= 3 && toks[2] == "stash" && (toks[3] == "pop" || toks[3] == "drop" || toks[3] == "clear")) {
+                print curcwd
+                found = 1
+                exit
+            }
+        }
+    }
+    END { if (!found) print curcwd }'
+}
+
 _UNQUOTED_TARGET=""
 strip_target_quoting() {
     local rc=0
@@ -3980,7 +4072,29 @@ if worktree_isolation_guard_enabled && \
     # guard protects: inside a managed worktree, inside the main checkout
     # (either spelling), or under the configured worktree base (which may live
     # on an external volume, outside the main checkout entirely).
-    _wt_in_protected_area() {
+    # Physical (symlink-resolved) spelling of an absolute path that may not
+    # exist yet — the write TARGET usually doesn't. normalize_abs_path() is
+    # lexical-only, so it keeps a symlinked ancestor intact; walk up to the
+    # longest ancestor that does exist, resolve THAT with `pwd -P`, and
+    # re-append the remainder. Prints nothing when the path is relative or no
+    # ancestor resolves, so callers can treat empty as "no second spelling".
+    _wt_physical_form() {
+        local _p="$1" _dir _tail="" _resolved
+        [[ "$_p" == /* ]] || return 0
+        _dir="$_p"
+        while [[ -n "$_dir" && "$_dir" != "/" && ! -d "$_dir" ]]; do
+            _tail="/${_dir##*/}$_tail"
+            _dir="${_dir%/*}"
+            [[ -z "$_dir" ]] && _dir="/"
+        done
+        [[ -d "$_dir" ]] || return 0
+        _resolved=$(cd "$_dir" 2>/dev/null && pwd -P) || return 0
+        [[ -n "$_resolved" ]] || return 0
+        printf '%s%s' "$_resolved" "$_tail"
+    }
+
+    # The string comparisons, run against ONE spelling of the target.
+    _wt_in_protected_area_spelling() {
         local _p="$1"
         [[ -n "$_p" ]] || return 1
         _in_any_managed_worktree "$_p" && return 0
@@ -4000,6 +4114,33 @@ if worktree_isolation_guard_enabled && \
             esac
         fi
         return 1
+    }
+
+    # True if $1 (an absolute, normalized path) sits anywhere in the protected
+    # area, tested against BOTH the target's own spelling and its physical
+    # spelling.
+    #
+    # The second test closes the remaining half of the #4495 class. That fix
+    # captured a logical spelling of the ROOTS, which covers a symlink at or
+    # below the repo root — but not one in an ANCESTOR of it. Both roots here
+    # are derived through git, which reports physical paths, so a target
+    # written through a symlinked ancestor (`/var/... -> /private/var/...` on
+    # macOS, where every `mktemp` path is exactly that; a symlinked home; a
+    # bind-mounted workspace) matched neither root spelling and EVERY Bash
+    # write into the main checkout was silently allowed. Loom's vendored copy
+    # still has this gap — verified by probing both guards with the two
+    # spellings of the same fixture, which is also why this repo's own
+    # write-confinement tests were red before this change.
+    #
+    # Resolved LAZILY, only after the direct comparisons have all failed, so a
+    # command whose target is already physical never pays for the subshell.
+    _wt_in_protected_area() {
+        local _p="$1" _pp
+        [[ -n "$_p" ]] || return 1
+        _wt_in_protected_area_spelling "$_p" && return 0
+        _pp=$(_wt_physical_form "$_p")
+        [[ -n "$_pp" && "$_pp" != "$_p" ]] || return 1
+        _wt_in_protected_area_spelling "$_pp"
     }
 
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
@@ -4191,18 +4332,37 @@ if worktree_isolation_guard_enabled && \
         fi
         _wabs=$(normalize_abs_path "$_wabs")
 
+        # Second spelling of the same target: physical, symlink-resolved.
+        # normalize_abs_path() is lexical-only, so it keeps a symlinked
+        # ancestor intact, while BOTH roots below come from git and are
+        # therefore physical. Without this, a target written through a
+        # symlinked ancestor matches neither root and every Bash write into
+        # the main checkout is silently allowed — the #4495 class, of which
+        # the earlier logical-root fix caught only the half where the symlink
+        # sits at or below the repo root. On macOS every `mktemp` path is a
+        # `/var -> /private/var` symlink, which is why this repo's own
+        # write-confinement tests were red. Loom's vendored copy still has
+        # this gap. Resolved once per target and only when it differs.
+        _wabsp=$(_wt_physical_form "$_wabs")
+        [[ "$_wabsp" == "$_wabs" ]] && _wabsp=""
+
         # (a) Already inside some managed worktree -> allow. This is exactly
-        # where a builder is supposed to write.
+        # where a builder is supposed to write. Checked against both spellings
+        # so the allow stays as wide as the deny below.
         _in_any_managed_worktree "$_wabs" && continue
+        [[ -n "$_wabsp" ]] && _in_any_managed_worktree "$_wabsp" && continue
 
         # Not under any worktree. If it's also not under the main checkout,
         # there is nothing this guard protects (e.g. /tmp scratch) -> allow.
         [[ -z "$_WT_MAIN_ROOT" ]] && continue
-        case "$_wabs" in
-            "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
-            "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) : ;;
-            *) continue ;;
-        esac
+        _wt_root_hit=""
+        for _wcand in "$_wabs" ${_wabsp:+"$_wabsp"}; do
+            case "$_wcand" in
+                "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) _wt_root_hit=1; break ;;
+                "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) _wt_root_hit=1; break ;;
+            esac
+        done
+        [[ -n "$_wt_root_hit" ]] || continue
 
         # Target resolves inside the main checkout and outside every
         # worktree. Deny only if worktree isolation is actually in play for
@@ -4249,11 +4409,17 @@ fi
 # A cheap pre-check keeps the config read + segment parser off the hot path for
 # the ~99% of commands with no force flag at all.
 # =============================================================================
-if [[ "$COMMAND_NO_COMMENT" == *git* ]] && \
-   echo "$COMMAND_NO_COMMENT" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
+
+# Pre-check and parse both read COMMAND_ASK_SCAN, not the raw
+# COMMAND_NO_COMMENT (repo#188 parity fix) — a `--force` mentioned inside a
+# quoted `--body`/`-m` value is prose, and asking on it stalls ordinary issue
+# and commit authoring. Matches Loom's vendored copy, which has always scanned
+# the redacted copy here.
+if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
+   echo "$COMMAND_ASK_SCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
-        _FORCE_OPS=$(parse_force_ops "$COMMAND_NO_COMMENT")
+        _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN")
         if [[ -n "$_FORCE_OPS" ]]; then
             if [[ "$_FORCE_MODE" == "all" ]]; then
                 # Preserve pre-#3674 behaviour byte-for-byte: any force op asks.
@@ -4416,6 +4582,94 @@ if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+r
 fi
 
 # =============================================================================
+# GIT STASH SCOPE ASK — gated by the stash-scope guard toggle
+#
+# Transplanted from Loom's vendored copy (loom#5173/#4821/#5217) as part of the
+# repo#188 parity reconciliation. Before this, the canonical guard had ZERO
+# coverage of `git stash` — an agent could destroy operator-preserved WIP with
+# no confirmation, while the vendored guard asked. That was the single largest
+# capability gap between the two.
+#
+# Two distinct hazards, both real:
+#
+# 1. MAIN CHECKOUT. The main checkout's stash stack is operator-owned, not
+#    scratch space for an integration check. `pop`/`drop`/`clear` there can
+#    destroy state a human deliberately preserved.
+#
+# 2. WORKTREE-TO-WORKTREE COLLISION. `refs/stash` is a SINGLE stack shared by
+#    every linked worktree of a repo, not per-worktree. Two agents working in
+#    different worktrees can pop or drop each other's WIP, and a main-checkout-
+#    only check asks for neither side. A single active worktree has nobody to
+#    collide with, so it stays ungated.
+#
+#    GENERALIZED from Loom's version, which counted `.loom-managed` marker
+#    files under `<main>/.loom/worktrees/`. This counts what git itself
+#    reports, so the hazard is caught for any tool's worktrees — or none at
+#    all — rather than only Loom's. Same reasoning as the tool-agnostic
+#    worktree-root detection elsewhere in this file.
+#
+# A same-chain heuristic ("push and pop appear in the same command, so allow")
+# was considered and rejected upstream (loom#5217): push and pop are separate
+# guard-approved calls with arbitrary time between them, so another worktree's
+# concurrent push can land on the shared stack in that window and the paired
+# pop then restores the WRONG entry. A same-chain check cannot see that.
+#
+# Gated by stash_scope_guard_enabled() (guards.stashScope /
+# REPO_GUARD_STASH_SCOPE, legacy LOOM_GUARD_STASH_SCOPE, default on), invoked
+# LAZILY only after the pattern matched, mirroring every other cold-path toggle.
+# =============================================================================
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+   && stash_scope_guard_enabled; then
+    _stash_effective_cwd="$CWD"
+    if [[ -n "$CWD" ]]; then
+        _stash_effective_cwd=$(resolve_stash_cwd "$COMMAND_NO_COMMENT" "$CWD")
+        [[ -z "$_stash_effective_cwd" ]] && _stash_effective_cwd="$CWD"
+    fi
+    # Shell-accurate quote removal for cwd RESOLUTION only — resolve_stash_cwd()
+    # threads curcwd from the RAW cd argument (quotes intact), so unquote a COPY
+    # before resolving against the filesystem. An unterminated quote falls back
+    # to the raw value (today's verdict — ambiguous/ask), never widening to allow.
+    if [[ "$_stash_effective_cwd" == *"'"* || "$_stash_effective_cwd" == *'"'* ]]; then
+        strip_target_quoting "$_stash_effective_cwd" && _stash_effective_cwd="$_UNQUOTED_TARGET"
+    fi
+
+    _stash_toplevel=""
+    _stash_common_parent=""
+    if [[ -n "$_stash_effective_cwd" && -d "$_stash_effective_cwd" ]]; then
+        _stash_toplevel=$(cd "$_stash_effective_cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
+        [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
+            _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
+
+        _stash_common=$(cd "$_stash_effective_cwd" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
+        if [[ -n "$_stash_common" ]]; then
+            _stash_common_parent=$(cd "$_stash_effective_cwd" 2>/dev/null && cd "$_stash_common/.." 2>/dev/null && pwd -P) || _stash_common_parent=""
+        fi
+    fi
+
+    if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
+        ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
+    elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
+        # cwd is a linked worktree, not the main checkout. Count the repo's
+        # linked worktrees as git reports them — a collision needs at least one
+        # other active worktree to race with.
+        _stash_worktree_count=$(cd "$_stash_effective_cwd" 2>/dev/null && \
+            git worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
+        [[ "$_stash_worktree_count" =~ ^[0-9]+$ ]] || _stash_worktree_count=0
+
+        # >=3 entries = the main checkout plus two or more linked worktrees, so
+        # some OTHER worktree exists besides this one to collide with.
+        if [[ "$_stash_worktree_count" -ge 3 ]]; then
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER agent's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $((_stash_worktree_count - 1)) linked worktrees are currently active. Use a per-worktree WIP ref instead of the shared stash stack; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
+        fi
+    elif [[ "$_stash_effective_cwd" != "$CWD" ]]; then
+        # A `cd <dir>` prefix resolved to a target that does not exist or is not
+        # inside any git checkout — ambiguous. Fail toward asking rather than
+        # guessing (mirrors parse_force_ops' detached-HEAD fail-safe).
+        ask "Command requires confirmation: $COMMAND (the cd target for this stash operation could not be resolved to a git checkout, so scope cannot be determined — refusing to silently allow an ambiguous stash pop/drop/clear; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:cd-unresolved"
+    fi
+fi
+
+# =============================================================================
 # CLOUD CLI ASK patterns — gated by the cloud CLI guard toggle
 #
 # Kept separate from ASK_PATTERNS so cloud-dev repos can opt out
@@ -4458,8 +4712,12 @@ CLOUD_ASK_PATTERNS=(
     'docker restart'
 )
 
+# Scanned against COMMAND_ASK_SCAN, not the raw COMMAND_NO_COMMENT (repo#188
+# parity fix) — same reasoning as the SQL DDL and force-op blocks above, and
+# the same copy the ungated ASK_PATTERNS loop already used. A cloud verb quoted
+# inside an issue body is documentation, not an invocation.
 for pattern in "${CLOUD_ASK_PATTERNS[@]}"; do
-    if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern" && cloud_guard_enabled; then
+    if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && cloud_guard_enabled; then
         ask "Command requires confirmation: $COMMAND (set guards.cloudCli:false in .claude/skills/repo/config.json if this repo manages cloud infra as a first-class workflow)" "cloud-cli:$pattern"
     fi
 done

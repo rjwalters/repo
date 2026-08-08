@@ -3265,20 +3265,56 @@ assert_allow "write-confinement (#4495): write inside the worktree (reached via 
 # ---- (deny vs allow) is compared. Skips gracefully if the vendored guard is
 # ---- not present (e.g. a non-Loom-managed checkout of this repo).
 GENERIC_GUARD="$REPO_ROOT/.loom/hooks/guard-destructive-generic.sh"
+
+# Strictness rank: a higher number is a more restrictive verdict.
+_guard_rank() {
+    case "$1" in
+        deny)  echo 2 ;;
+        ask)   echo 1 ;;
+        allow) echo 0 ;;
+        *)     echo -1 ;;   # parse-error and anything unrecognized
+    esac
+}
+
+# The acceptance criterion is NOT that the two guards agree exactly — it is
+# that the canonical guard is never WEAKER than the vendored copy. That is the
+# asymmetry that matters: Loom's dispatcher swaps this guard in for its own on
+# a single capability marker, so shipping something more permissive silently
+# downgrades protection fleet-wide, while shipping something stricter does not.
+#
+# Strict equality was the original form of this assertion, and it turned out to
+# encode the wrong invariant: fixing the symlinked-ANCESTOR half of the #4495
+# class here (see _wt_physical_form in the guard) makes the canonical guard
+# correctly deny writes that the vendored copy still allows, which failed a
+# test whose own subject was protection strength. A bug fix must not turn its
+# own suite red.
+#
+# So: equal verdicts pass; canonical-stricter passes and is reported as a known
+# divergence so it stays visible; canonical-weaker fails.
 assert_guard_equivalence() {
     local description="$1" cmd="$2" cwd="$3"
     TOTAL=$((TOTAL + 1))
-    local out_canonical out_generic dec_canonical dec_generic
+    local out_canonical out_generic dec_canonical dec_generic rank_c rank_g
     out_canonical=$(make_input "$cmd" "$cwd" | "$GUARD" 2>&1)
     out_generic=$(make_input "$cmd" "$cwd" | bash "$GENERIC_GUARD" 2>&1)
     dec_canonical=$(echo "$out_canonical" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null || echo "parse-error")
     dec_generic=$(echo "$out_generic" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null || echo "parse-error")
+    # A guard that allows emits no JSON at all, so jq yields an empty string
+    # rather than the "allow" default. Normalize, or the reported divergence
+    # reads as `deny vs vendored <blank>` and hides which verdict it compared.
+    [[ -z "$dec_canonical" ]] && dec_canonical="allow"
+    [[ -z "$dec_generic" ]] && dec_generic="allow"
+    rank_c=$(_guard_rank "$dec_canonical")
+    rank_g=$(_guard_rank "$dec_generic")
     if [[ "$dec_canonical" == "$dec_generic" ]]; then
         PASS=$((PASS + 1))
         echo -e "  ${GREEN}PASS${NC}: $description (both: $dec_canonical)"
+    elif [[ "$rank_c" -gt "$rank_g" ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description (canonical STRICTER: $dec_canonical vs vendored $dec_generic — allowed, never weaker)"
     else
         FAIL=$((FAIL + 1))
-        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "  ${RED}FAIL${NC}: $description — canonical is WEAKER than the vendored guard"
         echo -e "       Command: $cmd (cwd: $cwd)"
         echo -e "       canonical=$dec_canonical  vendored=$dec_generic"
         echo -e "       canonical output: $out_canonical"

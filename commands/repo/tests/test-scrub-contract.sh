@@ -318,27 +318,51 @@ assert_not_contains "README no longer claims Loom defers to this copy" "$README_
     "Loom and other tooling defer to this copy rather than shipping their own"
 assert_not_contains "SKILL.md no longer claims unconditional deferral" "$SKILL_TXT" \
     "Loom and other tooling defer to this copy instead"
-assert_contains "README states the deferral does not currently hold" "$README_TXT" \
-    "this guard does not currently run"
+assert_contains "README states the deferral now holds" "$README_TXT" \
+    "it now holds"
 assert_contains "README names the capability probe" "$README_TXT" \
     "worktree-write-confinement"
 assert_contains "SKILL.md states deferral is conditional" "$SKILL_TXT" \
     "Deferral by other tooling is conditional"
+assert_contains "SKILL.md records the single-marker hazard" "$SKILL_TXT" \
+    "switches which guard runs entirely"
+assert_contains "SKILL.md records the remaining deliberate divergence" "$SKILL_TXT" \
+    "stricter on IAM deletion"
 
-# The claim above is only true while the canonical guard lacks the marker. If
-# someone implements write confinement (repo#188) and forgets the docs, this
-# fails and tells them which files to update.
+# The docs now claim the deferral HOLDS, which is only true while the guard
+# actually emits the marker. If the marker is ever removed or renamed, the
+# claim silently becomes false — this fails and names the files to correct.
+# (Before repo#188 this assertion ran in the opposite direction, guarding the
+# "does not currently hold" wording; it flipped when parity was reached.)
 GUARD_SH="$REPO_ROOT/hooks/repo/guard-destructive.sh"
 if [[ -f "$GUARD_SH" ]]; then
     if grep -q 'worktree-write-confinement' "$GUARD_SH"; then
-        no "docs match reality: guard lacks the marker" \
-           "guard-destructive.sh NOW emits worktree-write-confinement (repo#188 landed?) — drop the 'does not currently hold' qualifier in README.md and skills/repo/SKILL.md"
+        ok "docs match reality: guard emits the capability marker"
     else
-        ok "docs match reality: guard lacks the marker"
+        no "docs match reality: guard emits the capability marker" \
+           "guard-destructive.sh no longer emits worktree-write-confinement, but README.md and skills/repo/SKILL.md still say Loom's dispatcher defers to it — restore the 'does not currently hold' qualifier in both"
     fi
 else
-    skip "docs match reality: guard lacks the marker" "guard not found at $GUARD_SH"
+    skip "docs match reality: guard emits the capability marker" "guard not found at $GUARD_SH"
 fi
+
+# Parity is the precondition for emitting that marker, so pin the two gaps the
+# reconciliation closed. Each has a tempting "simplification" that reopens it.
+assert_contains "guard covers git stash pop/drop/clear" "$(cat "$GUARD_SH")" \
+    'stash[[:space:]]+(pop|drop|clear)'
+assert_contains "stash guard is toggleable" "$(cat "$GUARD_SH")" \
+    "REPO_GUARD_STASH_SCOPE"
+# The four checks that must scan the literal-redacted copy, not the raw command.
+GUARD_TXT="$(cat "$GUARD_SH")"
+assert_contains "SQL DDL scans the redacted working copy" "$GUARD_TXT" \
+    'echo "$COMMAND_ASK_SCAN" | grep -qiE "$SQL_DDL_PATTERN"'
+assert_contains "cloud-CLI ask scans the redacted working copy" "$GUARD_TXT" \
+    'echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && cloud_guard_enabled'
+assert_contains "force-op parse reads the redacted working copy" "$GUARD_TXT" \
+    'parse_force_ops "$COMMAND_ASK_SCAN"'
+# The symlinked-ancestor half of the #4495 class.
+assert_contains "write confinement resolves a physical spelling" "$GUARD_TXT" \
+    "_wt_physical_form"
 
 # ---------------------------------------------------------------------------
 echo ""
