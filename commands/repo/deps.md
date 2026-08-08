@@ -131,6 +131,67 @@ not save you — zsh fails before `ls` ever runs.
 If **nothing** is detected, say there is nothing to scaffold and stop — do not
 guess an ecosystem the repo doesn't have.
 
+#### 2a. Classify each manifest as repo-owned or installer-owned
+
+Presence alone is not ownership. A manifest that lives under a tool root
+installed by Loom/Anvil/Repo-Skills-style installers is *vendored,
+installer-owned* code — the next tool install/upgrade overwrites it, so a
+Dependabot PR against it is churn, not value. This is the same signal
+[[update-tools]] step 1 already sweeps for — use the same bounded `find`, not a
+fixed path list, so a future tool family member is picked up without a doc
+edit here too:
+
+```bash
+find . -maxdepth 4 -name "install-metadata.json" \
+  -not -path "*/node_modules/*" -not -path "*/.venv/*" 2>/dev/null
+```
+
+Each hit establishes a **tool root** (the directory containing that
+`install-metadata.json`, e.g. `.anvil/`, `.loom/`, `.kct/`,
+`.claude/skills/repo/`). A manifest from step 2 is **installer-owned** when its
+path falls under one of these roots; everything else is **repo-owned**.
+
+Do this classification per manifest, not per ecosystem — an ecosystem can have
+both a repo-owned and an installer-owned manifest at once (e.g. a root
+`pyproject.toml` alongside `.anvil/pyproject.toml`), and only the latter is
+excluded.
+
+Report the two groups separately, and never fold an installer-owned manifest
+into the scaffold proposal:
+
+```
+MANIFESTS
+=========
+| Manifest                | Ecosystem | Ownership                                        |
+|--------------------------|-----------|---------------------------------------------------|
+| pyproject.toml (root)   | pip       | repo-owned                                       |
+| .anvil/pyproject.toml   | pip       | installer-owned (anvil); use /repo:update-tools  |
+| .anvil/uv.lock          | pip       | installer-owned (anvil); use /repo:update-tools  |
+| package.json (root)     | npm       | repo-owned — but dependency-free (see below)     |
+```
+
+A dependency-free manifest is also not scaffoldable: a `package.json` with no
+entries in `dependencies`, `devDependencies`, `peerDependencies`, or
+`optionalDependencies`, and no lockfile, has nothing for Dependabot to update.
+Check it explicitly rather than assuming presence implies content:
+
+```bash
+jq '{dependencies, devDependencies, peerDependencies, optionalDependencies}' package.json
+```
+
+If every detected manifest for an ecosystem is either installer-owned or
+dependency-free, that ecosystem drops out of the scaffold candidate list
+entirely — it does not get an `updates:` entry.
+
+If, after this filtering, **no ecosystem remains** — every detected manifest
+was installer-owned, dependency-free, or both — do not propose a
+`dependabot.yml` at all. Say so explicitly and why, and point installer-owned
+findings at `/repo:update-tools` as the remediation path for their
+dependencies (that command upgrades the vendored manifest itself; a Dependabot
+PR against it would just be reverted by the next install). Still continue to
+step 5 for the repo-level security flags — those are useful independent of
+whether there is anything to scaffold.
+
 ### 3. Validate every label the config would reference — by description
 
 A scaffolded config can attach labels to bot PRs (`labels:` in the `updates:`
@@ -173,6 +234,11 @@ Report the decision explicitly: which label was chosen, or which were rejected
 and why.
 
 ### 4. Offer to scaffold the config (confirm first)
+
+Only ecosystems that survived step 2a's filtering — repo-owned manifests with
+real dependencies — are candidates here. If step 2a already concluded there is
+nothing left to scaffold, skip straight to step 5 rather than proposing a
+config anyway.
 
 Grouping policy is **per-ecosystem**, not uniform. Reviewing every Actions bump
 individually is noise; batching a breaking change into line 4 of a 12-package
@@ -427,6 +493,13 @@ natural wrong assumption, and it is safety-relevant:
    it for humans (`Applied by: humans`). No suitable label → no `labels:` key.
 4. **Scaffold only detected ecosystems** — no fixed template, no guessing. Zero
    detected means nothing to scaffold.
-5. **Never auto-merge a major** — majors get their own confirmation, always.
+5. **Never scaffold against an installer-owned manifest** — a manifest under a
+   tool root that carries `install-metadata.json` (`.anvil/`, `.loom/`,
+   `.claude/skills/*/`, …) is vendored code the next tool install/upgrade
+   overwrites; propose `/repo:update-tools` for it instead. Also exclude
+   dependency-free manifests (no deps in any block, no lockfile) — nothing for
+   Dependabot to update. If every detected ecosystem is installer-owned or
+   dependency-free, recommend not scaffolding and say why.
+6. **Never auto-merge a major** — majors get their own confirmation, always.
    Red or pending CI is never merged.
-6. **Never push or merge under `--check`** — report-only means report-only.
+7. **Never push or merge under `--check`** — report-only means report-only.
