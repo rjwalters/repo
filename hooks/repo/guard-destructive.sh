@@ -1706,6 +1706,70 @@ parse_force_ops() {
 # it does not model backslash-escaped quotes, but since the result feeds only
 # the narrowing (never widening) catastrophic scan, the worst case is a raw
 # substring surviving — never a catastrophic block being skipped incorrectly.
+# =============================================================================
+# dequote_inert_spans (repo#197) — remove the quote CHARACTERS around inert
+# quoted spans, leaving their contents in place.
+#
+# Turns `rm -rf "/"` into `rm -rf /` so the literal catastrophic patterns match
+# what the shell would actually run. Callers MUST pass a copy that has already
+# been through the sink-aware literal-text redaction, so that prose quoted in a
+# --body/-m/--title/--notes/--comment value is already blanked and cannot be
+# resurrected into an apparent command by dequoting.
+#
+# A span containing a command substitution is left completely intact, quotes and
+# all, so smuggling still reaches the raw scan unchanged.
+#
+# Unterminated quotes are emitted verbatim: an unbalanced quote is ambiguous,
+# and the raw copy is still scanned, so failing to dequote can only ever keep
+# the existing verdict, never widen it.
+#
+# NOTE: the awk program below is SINGLE-QUOTED. An apostrophe anywhere inside
+# it, including in a comment, terminates the string and breaks the guard for
+# every command in the repo. Keep comments here apostrophe-free.
+# =============================================================================
+dequote_inert_spans() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        n = length(s)
+        i = 1
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == DQ || c == SQ) {
+                # Find the matching close quote.
+                endpos = 0
+                for (j = i + 1; j <= n; j++) {
+                    if (substr(s, j, 1) == c) { endpos = j; break }
+                }
+                if (endpos == 0) {
+                    # Unterminated: emit the rest verbatim and stop.
+                    out = out substr(s, i)
+                    i = n + 1
+                    continue
+                }
+                inner = substr(s, i + 1, endpos - i - 1)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    out = out inner
+                } else {
+                    out = out substr(s, i, endpos - i + 1)
+                }
+                i = endpos + 1
+                continue
+            }
+            out = out c
+            i++
+        }
+        printf "%s", out
+    }'
+}
+
 strip_literal_text() {
     printf '%s' "$1" | awk '
     BEGIN {
@@ -1808,14 +1872,26 @@ strip_datasink_literals() {
         i = 1
         atcmd = 1     # at the start of a simple command (command-word position)
         sink = 0      # inside an echo/printf data-sink command
+        redir = 0     # the previous token was a redirection operator (repo#197)
         while (i <= n) {
             c = substr(s, i, 1)
             # A shell separator resets to command-word position.
             if (c == ";" || c == "&" || c == "|" || c == "\n") {
-                out = out c; i++; atcmd = 1; sink = 0; continue
+                out = out c; i++; atcmd = 1; sink = 0; redir = 0; continue
             }
             # Leading whitespace is copied without leaving command-word position.
+            # It also does NOT clear redir, so the space between the operator
+            # and its target is transparent.
             if (c == " " || c == "\t") { out = out c; i++; continue }
+            # A redirection operator. What follows is a FILENAME handed to the
+            # redirection by the shell, never an argument to echo/printf, so it
+            # must not be redacted as data. Without this, a quoted redirect
+            # target after echo was blanked and Bash-tool write confinement went
+            # blind to it -- deny for a bare target, allow for the identical
+            # quoted one (repo#197). Only echo/printf were affected; cat, tee,
+            # cp, mv and sed -i confine quoted targets correctly because they
+            # are not data sinks.
+            if (c == ">") { out = out c; i++; redir = 1; continue }
             # Command-word position: read the first token and classify it.
             if (atcmd) {
                 atcmd = 0
@@ -1847,12 +1923,12 @@ strip_datasink_literals() {
                     out = out substr(s, i); i = n + 1; continue
                 }
                 inner = substr(s, i + 1, ci - i - 1)
-                if (sink && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (sink && !redir && index(inner, "$(") == 0 && index(inner, "`") == 0) {
                     gsub(/./, "X", inner)   # . never matches \n: multi-line stays same-length
                 }
-                out = out qc inner qc; i = ci + 1; continue
+                out = out qc inner qc; i = ci + 1; redir = 0; continue
             }
-            out = out c; i++
+            out = out c; i++; redir = 0
         }
         printf "%s", out
     }'
@@ -2193,9 +2269,42 @@ if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]] && \
     COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT")
 fi
 
+# =============================================================================
+# DEQUOTED CATASTROPHIC COPY (repo#197)
+#
+# The patterns above are literal command text, so quoting an argument used to
+# defeat them outright: `rm -rf "/"` was ALLOWED while `rm -rf /` denied, and
+# `git push --force origin "main"` fell through to a mere ask. Those are the
+# same commands to the shell — the guard was enforcing a spelling, not a
+# policy, and quoting a path is the ordinary thing to do.
+#
+# The fix is ORDER, not less redaction. This copy is derived from
+# COMMAND_NO_LITERAL_TEXT, i.e. AFTER the sink-aware redaction above has already
+# blanked the quoted values of --body/-m/--title/--notes/--comment and of
+# echo/printf data sinks. So prose that merely quotes a dangerous command
+# ("document rm -rf / hazard") is already inert before dequoting can see it,
+# and stays inert. What dequoting exposes is only the quoting of an OPERATIVE
+# argument, which is exactly what should be scanned.
+#
+# Spans containing $( or a backtick are left untouched, so command-substitution
+# smuggling keeps hard-denying via the raw copy.
+#
+# Scanned IN ADDITION to the raw copy, never instead of it — dequoting changes
+# byte offsets, so this copy is only ever fed to these pattern greps, never to
+# target extraction.
+# =============================================================================
+COMMAND_DEQUOTED="$COMMAND_NO_LITERAL_TEXT"
+if [[ "$COMMAND_NO_LITERAL_TEXT" == *'"'* || "$COMMAND_NO_LITERAL_TEXT" == *"'"* ]]; then
+    COMMAND_DEQUOTED=$(dequote_inert_spans "$COMMAND_NO_LITERAL_TEXT")
+fi
+
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
         deny "BLOCKED: Command matches dangerous pattern: $pattern" "catastrophic:$pattern"
+    fi
+    if [[ "$COMMAND_DEQUOTED" != "$COMMAND_NO_LITERAL_TEXT" ]] && \
+       echo "$COMMAND_DEQUOTED" | grep -qiE "$pattern"; then
+        deny "BLOCKED: Command matches dangerous pattern: $pattern (quoting an argument does not change what the shell runs)" "catastrophic-dequoted:$pattern"
     fi
 done
 
@@ -2738,13 +2847,14 @@ mark_expandable_dollars() {
 # from the RAW cd argument (loom#5372), because the caller unquotes a COPY
 # before touching the filesystem.
 #
-# KNOWN LIMITATION, carried over deliberately: unlike parse_force_ops, this
-# does not thread a `git -C <path>` argument, so `git -C <main-checkout>
-# stash pop` run from a worktree cwd is not caught. Documented rather than
-# silently fixed, so the two guards keep identical behavior here.
+# `git -C <path>` threading (repo#194): a `-C`/`-c` run before `stash` is
+# resolved the same way `parse_force_ops` already resolves it for force ops,
+# so `git -C <main-checkout> stash pop` run from a worktree cwd is caught
+# against the -C target rather than the worktree cwd. See the `toks[1] ==
+# "git"` block below.
 # =============================================================================
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation
@@ -2755,11 +2865,20 @@ resolve_stash_cwd() {
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
+            # Mask whitespace INSIDE quoted spans before tokenizing (repo#194
+            # review). Splitting on raw whitespace shreds a quoted path that
+            # contains a space, so a -C or cd argument like "/main dir" became
+            # two tokens and resolution collapsed -- a silent allow for exactly
+            # the shape this parser exists to catch. mask_ws/unmask_ws come
+            # from _MASKWS_AWK; do NOT redefine them here, awk rejects a
+            # duplicate function definition and the whole parser then fails
+            # open.
+            seg = mask_ws(seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)
+                    cdarg = expand_cd_arg(unmask_ws(toks[2]), home)
                     cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
@@ -2769,10 +2888,50 @@ resolve_stash_cwd() {
                 }
                 continue
             }
-            if (toks[1] == "git" && m >= 3 && toks[2] == "stash" && (toks[3] == "pop" || toks[3] == "drop" || toks[3] == "clear")) {
-                print curcwd
-                found = 1
-                exit
+            # `git [-C <path>] [-c k=v] … stash pop|drop|clear`.
+            #
+            # The -C threading is repo#194: git resolves -C against the process
+            # cwd and then operates there, so `git -C <main-checkout> stash pop`
+            # issued from a linked worktree touches the MAIN checkout stash
+            # stack while a cwd-only check sees only the worktree and allows it.
+            # refs/stash is one stack shared across every linked worktree, so
+            # that is a live path to destroying the WIP of another agent. This
+            # mirrors the -C handling parse_force_ops already had; the asymmetry
+            # was inherited from the vendored copy and documented there as a
+            # known limitation rather than fixed.
+            #
+            # NOTE: this whole block sits inside a SINGLE-QUOTED awk program.
+            # An apostrophe in a comment here terminates that string and breaks
+            # the guard for every command in the repo (it happened while
+            # writing this). Keep comments apostrophe-free.
+            #
+            # Multiple -C options compose in git (each resolved relative to the
+            # previous), which is why this loops rather than reading only the
+            # first. -c takes a key=value token and is skipped, not applied.
+            if (toks[1] == "git") {
+                gi = 2
+                gitcwd = curcwd
+                while (gi <= m) {
+                    if (toks[gi] == "-C" && gi + 1 <= m) {
+                        gcarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
+                        gcclass = strip_cd_quoting(gcarg)
+                        if (gcclass ~ /^\//) {
+                            gitcwd = gcarg
+                        } else if (gitcwd != "") {
+                            gitcwd = gitcwd "/" gcarg
+                        }
+                        gi += 2
+                        continue
+                    }
+                    if (toks[gi] == "-c" && gi + 1 <= m) { gi += 2; continue }
+                    break
+                }
+                if (gi + 1 <= m && toks[gi] == "stash" && \
+                    (toks[gi + 1] == "pop" || toks[gi + 1] == "drop" || toks[gi + 1] == "clear")) {
+                    print gitcwd
+                    found = 1
+                    exit
+                }
             }
         }
     }
@@ -4910,7 +5069,22 @@ fi
 # REPO_GUARD_STASH_SCOPE, legacy LOOM_GUARD_STASH_SCOPE, default on), invoked
 # LAZILY only after the pattern matched, mirroring every other cold-path toggle.
 # =============================================================================
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+# The optional `(-C <path>|-c <k=v>)*` run between `git` and `stash` is
+# repo#194: without it this pre-check never matches `git -C <path> stash pop`,
+# so the parser below never runs and the -C form escapes the ask entirely —
+# the pre-check, not the parser, is the actual gate.
+#
+# The flag value must tolerate whitespace inside quotes, and MIXED forms like
+# `-c user.name="John Doe"` where one token is part bare and part quoted. A
+# first cut used `[^[:space:]]+`, which silently reintroduced the very bypass
+# this closes: any quoted value containing a space failed the positional match,
+# so the whole pre-check missed and the ask was skipped — a silent allow, not
+# even an ask. Rather than enumerate token shapes, match the flag run
+# non-greedily up to `stash`, and let the parser below (which is genuinely
+# quote-aware via qsplit/mask_ws) decide scope. This gate only needs to be
+# permissive enough not to miss; being over-inclusive here costs a parser call,
+# never a wrong verdict.
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
     if [[ -n "$CWD" ]]; then

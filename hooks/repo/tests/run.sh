@@ -785,6 +785,47 @@ else
     record_suite "test-links-precision.sh" "$LP_PASS" "$LP_FAIL" "links precision rules"
 fi
 
+# Guard equivalence vs Loom's vendored copy (repo#193). Asserts the canonical
+# guard is never WEAKER — equal passes, stricter passes and is named, weaker
+# fails. Skips cleanly (counted, never silent) when the vendored guard is
+# absent. Same delegation shape as every suite above.
+echo
+echo "-- guard equivalence vs vendored copy (delegated suite) --"
+GE_TEST="$TESTS_DIR/../../../commands/repo/tests/test-guard-equivalence.sh"
+if [[ ! -f "$GE_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-guard-equivalence.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-guard-equivalence.sh" "$GE_TEST"
+else
+    GE_OUT="$(bash "$GE_TEST" 2>&1)"
+    GE_STATUS=$?
+    GE_PASS="$(suite_count Passed "$GE_OUT")"
+    GE_FAIL="$(suite_count Failed "$GE_OUT")"
+    GE_SKIP="$(suite_count Skipped "$GE_OUT")"
+    if ! [[ "$GE_PASS" =~ ^[0-9]+$ && "$GE_FAIL" =~ ^[0-9]+$ ]]; then
+        GE_PASS=0
+        GE_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-guard-equivalence.sh" "$GE_STATUS"
+        strip_ansi "$GE_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GE_STATUS" -ne 0 || "$GE_FAIL" -ne 0 ]]; then
+        [[ "$GE_FAIL" -eq 0 ]] && GE_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-guard-equivalence.sh" "$GE_PASS" "$GE_FAIL" "$GE_STATUS"
+        strip_ansi "$GE_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    elif [[ "$GE_PASS" -eq 0 && "${GE_SKIP:-0}" -gt 0 ]]; then
+        # Vendored guard absent — a real, reportable outcome, never a silent pass.
+        printf '  ok   %-52s -> SKIPPED (no vendored guard to compare against)\n' \
+            "test-guard-equivalence.sh"
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-guard-equivalence.sh" "$GE_PASS"
+        strip_ansi "$GE_OUT" | grep -E 'Stricter:' | sed 's/^/    /'
+    fi
+    PASS=$((PASS + GE_PASS))
+    FAIL=$((FAIL + GE_FAIL))
+    record_suite "test-guard-equivalence.sh" "$GE_PASS" "$GE_FAIL" "vendored-guard equivalence"
+fi
+
 echo
 echo "==============================="
 echo "Per-suite breakdown"

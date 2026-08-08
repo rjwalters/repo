@@ -3237,6 +3237,25 @@ make_wt_confinement_repo() {
     printf '%s %s' "$main" "$wt"
 }
 
+# Same fixture, but with a SPACE in the main-checkout path (repo#194 review).
+# Echoes "<main> <worktree>" separated by a TAB, since the paths themselves
+# contain spaces — callers must read with IFS=$'\t'.
+make_wt_confinement_repo_spaced() {
+    local base main wt branch
+    base=$(mktemp -d 2>/dev/null)
+    main="$base/main dir"
+    mkdir -p "$main"
+    git -C "$main" init -q >/dev/null 2>&1
+    git -C "$main" -c user.email=test@example.com -c user.name=test \
+        commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$main/.loom/worktrees"
+    wt="$main/.loom/worktrees/issue-1"
+    branch="wtcs-$(basename "$base")"
+    git -C "$main" worktree add -q -b "$branch" "$wt" >/dev/null 2>&1
+    touch "$wt/.loom-managed"
+    printf '%s\t%s' "$main" "$wt"
+}
+
 # shellcheck disable=SC2046 # main/wt are mktemp paths, never contain IFS chars
 read -r WTC_MAIN WTC_WT <<< "$(make_wt_confinement_repo)"
 
@@ -3552,6 +3571,143 @@ else
     PASS=$((PASS + 1))
     echo -e "  ${YELLOW}INFO${NC}: Average execution time: ${AVG_MS}ms (>= ${PERF_MAX_MS}ms threshold; informational only, set LOOM_GUARD_PERF_STRICT=1 to gate)"
 fi
+
+echo ""
+
+# =========================================================================
+# git stash scope guard (repo#188 port, repo#194 -C threading)
+#
+# The stash guard shipped in repo#188 with NO coverage in this suite. Added
+# here alongside the -C fix rather than left as a second gap.
+#
+# refs/stash is a SINGLE stack shared by every linked worktree of a repo, not
+# per-worktree, so pop/drop/clear from anywhere can destroy WIP that another
+# agent (or the operator) is relying on. The main-checkout stack in particular
+# is operator-owned.
+#
+# repo#194: git resolves `-C <path>` against the process cwd and then operates
+# there, so `git -C <main-checkout> stash pop` issued from a worktree touches
+# the main stack while a cwd-only check sees only the worktree. The pre-check
+# regex was the real gate — without the optional -C run in it, the parser never
+# ran for that shape at all.
+# =========================================================================
+echo -e "${YELLOW}--- git stash scope guard (#188, #194) ---${NC}"
+
+read -r STASH_MAIN STASH_WT <<< "$(make_wt_confinement_repo)"
+
+# Destructive subcommands in the main checkout -> ask.
+assert_ask "stash: pop in the main checkout asks" \
+    "git stash pop" "$STASH_MAIN"
+assert_ask "stash: drop in the main checkout asks" \
+    "git stash drop" "$STASH_MAIN"
+assert_ask "stash: clear in the main checkout asks" \
+    "git stash clear" "$STASH_MAIN"
+
+# Non-destructive subcommands are untouched.
+assert_allow "stash: list is read-only, never asks" \
+    "git stash list" "$STASH_MAIN"
+assert_allow "stash: show is read-only, never asks" \
+    "git stash show" "$STASH_MAIN"
+assert_allow "stash: push is non-destructive, never asks" \
+    "git stash push -m wip" "$STASH_MAIN"
+assert_allow "stash: bare 'git stash' is a push, never asks" \
+    "git stash" "$STASH_MAIN"
+
+# cd-prefix threading: scope resolves against the cd TARGET, not the hook cwd.
+assert_ask "stash: 'cd <main> && git stash pop' from a worktree asks" \
+    "cd $STASH_MAIN && git stash pop" "$STASH_WT"
+
+# repo#194 -- `git -C <path>` threading, the shape that escaped entirely.
+assert_ask "stash (#194): 'git -C <main> stash pop' from a worktree asks" \
+    "git -C $STASH_MAIN stash pop" "$STASH_WT"
+assert_ask "stash (#194): 'git -C <main> stash drop' from a worktree asks" \
+    "git -C $STASH_MAIN stash drop" "$STASH_WT"
+assert_ask "stash (#194): 'git -C <main> stash clear' from a worktree asks" \
+    "git -C $STASH_MAIN stash clear" "$STASH_WT"
+assert_ask "stash (#194): -c k=v before -C still resolves the -C target" \
+    "git -c user.name=x -C $STASH_MAIN stash pop" "$STASH_WT"
+
+# Must NOT over-block: operating on a worktree stack from the main checkout is
+# not the hazard this guard exists for.
+assert_allow "stash (#194): 'git -C <worktree> stash pop' from main does not ask" \
+    "git -C $STASH_WT stash pop" "$STASH_MAIN"
+assert_allow "stash (#194): 'git -C <main> stash list' stays read-only" \
+    "git -C $STASH_MAIN stash list" "$STASH_WT"
+
+echo ""
+
+# =========================================================================
+# Quoting no longer weakens the verdict (repo#197)
+#
+# Quoting an OPERATIVE argument used to defeat the literal catastrophic
+# patterns outright -- the guard enforced a spelling, not a policy. The fix is
+# ordering: a dequoted copy is derived AFTER the sink-aware redaction, so prose
+# quoted in a --body/-m/--title value is already inert and only the quoting of
+# an operative argument is exposed.
+#
+# The regression risk runs the OTHER way -- making a read-only command look
+# dangerous because its quoted argument contains a destructive phrase. Both
+# directions are pinned here.
+# =========================================================================
+echo -e "${YELLOW}--- quoting does not weaken the verdict (#197) ---${NC}"
+
+assert_deny "quoting (#197): rm -rf with a double-quoted root denies" \
+    'rm -rf "/"'
+assert_deny "quoting (#197): rm -rf with a single-quoted root denies" \
+    "rm -rf '/'"
+assert_deny "quoting (#197): force-push to a quoted main denies" \
+    'git push --force origin "main"'
+assert_deny "quoting (#197): force-push -f to a single-quoted main denies" \
+    "git push -f origin 'main'"
+
+# Must NOT regress: a quoted destructive phrase as DATA stays inert.
+assert_allow "quoting (#197): destructive phrase in -m stays prose" \
+    'git commit -m "document rm -rf / hazard"'
+assert_allow "quoting (#197): destructive phrase in --body stays prose" \
+    'gh issue create --body "never run rm -rf /"'
+assert_allow "quoting (#197): grep for a destructive phrase stays allowed" \
+    'grep -rn "rm -rf /" .'
+assert_allow "quoting (#197): echo of a destructive phrase is not execution" \
+    "echo 'git push --force origin main'"
+assert_deny "quoting (#197): echo piped INTO a shell still denies" \
+    "echo 'rm -rf /' | sh"
+
+echo ""
+
+# =========================================================================
+# Whitespace in a -C / -c value (repo#194 review finding)
+#
+# The first cut of the -C threading used `[^[:space:]]+` for the flag value in
+# the pre-check regex, and passed the raw segment to a whitespace tokenizer.
+# Both broke on a QUOTED value containing a space: the pre-check missed, the
+# parser shredded the path into two tokens, and the ask was skipped entirely --
+# a silent allow, reached through a quoted space instead of a bare -C. That is
+# the same shared-stash hazard #194 exists to close.
+#
+# Two fixes, both pinned here: the pre-check now matches the flag run
+# non-greedily up to `stash` (it only needs to be permissive enough not to
+# miss), and resolve_stash_cwd masks whitespace inside quoted spans before
+# tokenizing via mask_ws/unmask_ws.
+#
+# mask_ws lives in _MASKWS_AWK and itself calls bs_escaped from _ESCAPE_AWK --
+# omitting that dependency made awk abort at runtime, so the parser returned
+# nothing and fell back to the session cwd, which reads as a clean allow rather
+# than an error. A silent fail-open is exactly what these cases catch.
+# =========================================================================
+echo -e "${YELLOW}--- whitespace in a -C/-c value (#194 review) ---${NC}"
+
+IFS=$'\t' read -r STASHWS_MAIN STASHWS_WT <<< "$(make_wt_confinement_repo_spaced)"
+
+assert_ask "stash (#194): -C with a DOUBLE-QUOTED path containing a space asks" \
+    "git -C \"$STASHWS_MAIN\" stash pop" "$STASHWS_WT"
+assert_ask "stash (#194): -C with a SINGLE-QUOTED path containing a space asks" \
+    "git -C '$STASHWS_MAIN' stash pop" "$STASHWS_WT"
+assert_ask "stash (#194): a -c value containing a space does not break the gate" \
+    'git -c user.name="John Doe" stash pop' "$STASHWS_MAIN"
+assert_allow "stash (#194): -C at a worktree from a spaced main still does not ask" \
+    "git -C \"$STASHWS_WT\" stash pop" "$STASHWS_MAIN"
+assert_allow "stash (#194): stash list in a spaced main stays read-only" \
+    "git stash list" "$STASHWS_MAIN"
 
 echo ""
 
