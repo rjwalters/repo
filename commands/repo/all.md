@@ -198,7 +198,9 @@ fixes the audit surfaced — apply the ones the user approves.
 
 Inventory filesystem clutter — build artifacts, caches, temp files, empty dirs
 — present it grouped with sizes, and delete the SAFE junk (OS droppings, merge
-leftovers, empty dirs). **Regenerable caches are kept by default** in a routine
+leftovers, empty dirs outside tool-scaffolding/worktree roots — see [[tidy]]'s
+own SAFE/ASK categorization for exactly which empty directories qualify).
+**Regenerable caches are kept by default** in a routine
 hygiene pass — deleting them just forces a costly rebuild — so this stage does
 **not** pass `--caches` to [[tidy]] unless the user gave `/repo:all --caches`.
 Environments (`node_modules/`, virtualenvs) and other ASK items are never
