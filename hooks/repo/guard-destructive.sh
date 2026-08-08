@@ -4355,13 +4355,29 @@ if worktree_isolation_guard_enabled && \
         # Not under any worktree. If it's also not under the main checkout,
         # there is nothing this guard protects (e.g. /tmp scratch) -> allow.
         [[ -z "$_WT_MAIN_ROOT" ]] && continue
+        # Both spellings are tested with a QUOTED `case`, never a `for` over an
+        # unquoted expansion: `for x in ${var:+"$var"}` word-splits (and globs)
+        # its result despite the inner quotes, so a target containing a space
+        # or a glob character would be compared as fragments. The pre-existing
+        # single-spelling code was a quoted `case` for that reason, and adding
+        # the second spelling must not regress it.
+        #
+        # Defensive, not a fix for an observed escape: an UNQUOTED spaced
+        # redirect target genuinely splits in the shell too (`> /a/b c` really
+        # does redirect to `/a/b`), so the guard is right to see the first
+        # word there. The exposure would be a quoted target whose expansion
+        # reaches this comparison intact.
         _wt_root_hit=""
-        for _wcand in "$_wabs" ${_wabsp:+"$_wabsp"}; do
-            case "$_wcand" in
-                "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) _wt_root_hit=1; break ;;
-                "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) _wt_root_hit=1; break ;;
+        case "$_wabs" in
+            "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) _wt_root_hit=1 ;;
+            "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) _wt_root_hit=1 ;;
+        esac
+        if [[ -z "$_wt_root_hit" && -n "$_wabsp" ]]; then
+            case "$_wabsp" in
+                "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) _wt_root_hit=1 ;;
+                "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) _wt_root_hit=1 ;;
             esac
-        done
+        fi
         [[ -n "$_wt_root_hit" ]] || continue
 
         # Target resolves inside the main checkout and outside every
