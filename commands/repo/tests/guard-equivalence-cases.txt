@@ -112,9 +112,24 @@ rm -rf /tmp/scratch-dir
 rm -f /tmp/x/foo.tsv
 
 # ── quoting asymmetry (repo#197) ──────────────────────────────────────────
-# Currently WEAKER than the bare forms in BOTH guards, so these agree today
-# and the harness passes. They are here so the day one guard fixes it, the
-# divergence is reported rather than discovered by accident.
+# Quoting an OPERATIVE argument used to defeat the literal catastrophic
+# patterns outright — the guard enforced a spelling, not a policy. Canonical
+# now dequotes inert spans AFTER sink-aware redaction, so these deny; the
+# vendored copy still allows/asks, which is why they are declared divergences.
 rm -rf "/"
 rm -rf '/'
 git push --force origin "main"
+git push -f origin 'main'
+
+# ── dequoting must NOT make read-only commands look dangerous (repo#197) ──
+# This is the risk the dequote step introduces: a search or display command
+# whose quoted ARGUMENT contains a destructive phrase. It is data to that
+# command, and it must stay allowed. A regression here would deny ordinary
+# code search in any repo that documents destructive commands — including
+# this one.
+grep -rn "rm -rf /" .
+grep -F 'git push --force origin main' hooks/
+rg --fixed-strings "DROP TABLE users" .
+awk '/rm -rf \//' file.txt
+printf '%s\n' "rm -rf /"
+echo 'git push --force origin main'

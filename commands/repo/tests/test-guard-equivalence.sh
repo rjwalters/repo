@@ -30,14 +30,21 @@
 # fixes a bug the vendored copy still has, which is precisely what happened in
 # repo#188 (the symlinked-ancestor write-confinement bypass). So:
 #
-#   equal verdicts        -> pass
-#   canonical STRICTER    -> pass, and REPORTED BY NAME so it stays visible
-#   canonical WEAKER      -> fail
+#   equal verdicts             -> pass
+#   canonical STRICTER         -> pass, and REPORTED BY NAME so it stays visible
+#   canonical WEAKER, declared -> pass, and REPORTED, with the rationale
+#   canonical WEAKER otherwise -> fail
 #
 # Strictness order: deny > ask > allow.
 #
-# KNOWN DELIBERATE DIVERGENCES are declared in one place (below) with their
-# rationale, so they read as decisions rather than drift.
+# The declared-weaker case is not a loophole, it is the recognition that a
+# weaker VERDICT is not the same as a weaker GUARD. The vendored copy denies
+# `echo <destructive-string>` — but echo prints its argument, it does not run
+# it, so that deny prevents nothing and blocks ordinary work (documenting a
+# destructive command, filing an issue about one, running this repo's own guard
+# tests). Being correct there means being more permissive there. Both lists are
+# short, every row states its reasoning, and an UNDECLARED divergence in either
+# direction is surfaced — stricter as a warning, weaker as a hard failure.
 
 set -uo pipefail
 
@@ -53,6 +60,7 @@ FAIL=0
 SKIP=0
 TOTAL=0
 STRICTER=0
+WEAKER_DECLARED=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -73,11 +81,51 @@ declare -a DECLARED_DIVERGENCES=(
     "aws iam delete-role --role-name admin|canonical hard-denies IAM deletion; vendored asks. Documented in README.md and skills/repo/SKILL.md as the deliberate divergence that makes a Loom-managed repo stricter after the capability probe flips (repo#188)."
     "az group delete --name rg1 --yes|canonical hard-denies Azure resource-group deletion; vendored asks. Same posture as the IAM row: cloud teardown is deny-by-default here, and a repo whose job IS managing cloud infra opts out via guards.cloudCli:false rather than by weakening the default."
     "gcloud compute instances delete vm1|canonical hard-denies GCP instance deletion; vendored asks. Same rationale as the az row."
+    "rm -rf \"/\"|repo#197: canonical dequotes inert spans AFTER sink-aware redaction, so quoting an operative argument no longer defeats the literal catastrophic patterns. The vendored copy still allows this; it is the same command to the shell as the bare form."
+    "rm -rf '/'|repo#197: single-quoted form of the row above; same fix, same rationale."
+    "git push --force origin \"main\"|repo#197: quoting the branch name downgraded a hard deny to a mere ask in both guards. Canonical now denies; the vendored copy still asks."
+    "git push -f origin 'main'|repo#197: -f short-flag, single-quoted branch. Same fix and rationale as the --force row above."
+)
+
+# ---------------------------------------------------------------------------
+# Deliberately WEAKER than the vendored copy.
+#
+# "Weaker verdict" and "less safe" are not the same thing. The entries here are
+# cases where the vendored guard produces a FALSE POSITIVE and this guard is
+# correct to allow: a string handed to echo/printf as data is printed, not
+# executed, so denying it blocks ordinary work (documenting a destructive
+# command, filing an issue about one, running this repo's own guard tests) while
+# preventing nothing. That is repo#53.
+#
+# The safety property is preserved by construction: the redaction that makes
+# these allow is skipped entirely when a shell segment is present, so
+# `echo '<payload>' | sh` — where the data IS executed — still hard-denies. It
+# is also never applied to spans carrying $( or a backtick.
+#
+# This list is deliberately SHORT and every row states why the permissiveness is
+# correct. An undeclared weaker verdict is still a hard failure; adding a row
+# here to silence one is the wrong move unless the vendored guard is genuinely
+# wrong about it.
+# ---------------------------------------------------------------------------
+declare -a DECLARED_WEAKER=(
+    "printf '%s\\n' \"rm -rf /\"|repo#53: printf prints its argument, it does not execute it. The vendored guard denies this, which blocks documenting a destructive command. Redaction is skipped when a shell segment is present, so a piped-to-shell payload still denies."
+    "echo 'git push --force origin main'|repo#53: same as the printf row — echo of a string is not execution of it."
 )
 
 declared_reason() {  # <command> -> reason, or empty
     local cmd="$1" entry
     for entry in "${DECLARED_DIVERGENCES[@]}"; do
+        if [[ "${entry%%|*}" == "$cmd" ]]; then
+            printf '%s' "${entry#*|}"
+            return 0
+        fi
+    done
+    printf ''
+}
+
+declared_weaker_reason() {  # <command> -> reason, or empty
+    local cmd="$1" entry
+    for entry in "${DECLARED_WEAKER[@]}"; do
         if [[ "${entry%%|*}" == "$cmd" ]]; then
             printf '%s' "${entry#*|}"
             return 0
@@ -192,9 +240,18 @@ while IFS= read -r line; do
             UNDECLARED+=("$line ($dec_c vs $dec_v)")
         fi
     else
-        FAIL=$((FAIL + 1))
-        printf "  ${RED}FAIL${NC}  canonical WEAKER: canonical=%-5s vendored=%-5s %s\n" \
-            "$dec_c" "$dec_v" "$short"
+        wreason="$(declared_weaker_reason "$line")"
+        if [[ -n "$wreason" ]]; then
+            PASS=$((PASS + 1))
+            WEAKER_DECLARED=$((WEAKER_DECLARED + 1))
+            printf "  ${YELLOW}ok${NC}    ${YELLOW}WEAKER (declared)${NC} canonical=%-5s vendored=%-5s %s\n" \
+                "$dec_c" "$dec_v" "$short"
+            printf "        %s\n" "$wreason"
+        else
+            FAIL=$((FAIL + 1))
+            printf "  ${RED}FAIL${NC}  canonical WEAKER: canonical=%-5s vendored=%-5s %s\n" \
+                "$dec_c" "$dec_v" "$short"
+        fi
     fi
 done < "$CASES"
 
@@ -205,6 +262,7 @@ printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"
 printf "  ${RED}Failed${NC}: %s\n" "$FAIL"
 printf "  ${YELLOW}Skipped${NC}: %s\n" "$SKIP"
 printf "  ${BLUE}Stricter${NC}: %s (canonical ahead of the vendored copy)\n" "$STRICTER"
+printf "  ${YELLOW}Weaker (declared)${NC}: %s (vendored false positives this guard deliberately allows)\n" "$WEAKER_DECLARED"
 echo "========================="
 
 if [[ ${#UNDECLARED[@]} -gt 0 ]]; then

@@ -1706,6 +1706,70 @@ parse_force_ops() {
 # it does not model backslash-escaped quotes, but since the result feeds only
 # the narrowing (never widening) catastrophic scan, the worst case is a raw
 # substring surviving — never a catastrophic block being skipped incorrectly.
+# =============================================================================
+# dequote_inert_spans (repo#197) — remove the quote CHARACTERS around inert
+# quoted spans, leaving their contents in place.
+#
+# Turns `rm -rf "/"` into `rm -rf /` so the literal catastrophic patterns match
+# what the shell would actually run. Callers MUST pass a copy that has already
+# been through the sink-aware literal-text redaction, so that prose quoted in a
+# --body/-m/--title/--notes/--comment value is already blanked and cannot be
+# resurrected into an apparent command by dequoting.
+#
+# A span containing a command substitution is left completely intact, quotes and
+# all, so smuggling still reaches the raw scan unchanged.
+#
+# Unterminated quotes are emitted verbatim: an unbalanced quote is ambiguous,
+# and the raw copy is still scanned, so failing to dequote can only ever keep
+# the existing verdict, never widen it.
+#
+# NOTE: the awk program below is SINGLE-QUOTED. An apostrophe anywhere inside
+# it, including in a comment, terminates the string and breaks the guard for
+# every command in the repo. Keep comments here apostrophe-free.
+# =============================================================================
+dequote_inert_spans() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        n = length(s)
+        i = 1
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == DQ || c == SQ) {
+                # Find the matching close quote.
+                endpos = 0
+                for (j = i + 1; j <= n; j++) {
+                    if (substr(s, j, 1) == c) { endpos = j; break }
+                }
+                if (endpos == 0) {
+                    # Unterminated: emit the rest verbatim and stop.
+                    out = out substr(s, i)
+                    i = n + 1
+                    continue
+                }
+                inner = substr(s, i + 1, endpos - i - 1)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    out = out inner
+                } else {
+                    out = out substr(s, i, endpos - i + 1)
+                }
+                i = endpos + 1
+                continue
+            }
+            out = out c
+            i++
+        }
+        printf "%s", out
+    }'
+}
+
 strip_literal_text() {
     printf '%s' "$1" | awk '
     BEGIN {
@@ -1808,14 +1872,26 @@ strip_datasink_literals() {
         i = 1
         atcmd = 1     # at the start of a simple command (command-word position)
         sink = 0      # inside an echo/printf data-sink command
+        redir = 0     # the previous token was a redirection operator (repo#197)
         while (i <= n) {
             c = substr(s, i, 1)
             # A shell separator resets to command-word position.
             if (c == ";" || c == "&" || c == "|" || c == "\n") {
-                out = out c; i++; atcmd = 1; sink = 0; continue
+                out = out c; i++; atcmd = 1; sink = 0; redir = 0; continue
             }
             # Leading whitespace is copied without leaving command-word position.
+            # It also does NOT clear redir, so the space between the operator
+            # and its target is transparent.
             if (c == " " || c == "\t") { out = out c; i++; continue }
+            # A redirection operator. What follows is a FILENAME handed to the
+            # redirection by the shell, never an argument to echo/printf, so it
+            # must not be redacted as data. Without this, a quoted redirect
+            # target after echo was blanked and Bash-tool write confinement went
+            # blind to it -- deny for a bare target, allow for the identical
+            # quoted one (repo#197). Only echo/printf were affected; cat, tee,
+            # cp, mv and sed -i confine quoted targets correctly because they
+            # are not data sinks.
+            if (c == ">") { out = out c; i++; redir = 1; continue }
             # Command-word position: read the first token and classify it.
             if (atcmd) {
                 atcmd = 0
@@ -1847,12 +1923,12 @@ strip_datasink_literals() {
                     out = out substr(s, i); i = n + 1; continue
                 }
                 inner = substr(s, i + 1, ci - i - 1)
-                if (sink && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (sink && !redir && index(inner, "$(") == 0 && index(inner, "`") == 0) {
                     gsub(/./, "X", inner)   # . never matches \n: multi-line stays same-length
                 }
-                out = out qc inner qc; i = ci + 1; continue
+                out = out qc inner qc; i = ci + 1; redir = 0; continue
             }
-            out = out c; i++
+            out = out c; i++; redir = 0
         }
         printf "%s", out
     }'
@@ -2193,9 +2269,42 @@ if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]] && \
     COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT")
 fi
 
+# =============================================================================
+# DEQUOTED CATASTROPHIC COPY (repo#197)
+#
+# The patterns above are literal command text, so quoting an argument used to
+# defeat them outright: `rm -rf "/"` was ALLOWED while `rm -rf /` denied, and
+# `git push --force origin "main"` fell through to a mere ask. Those are the
+# same commands to the shell — the guard was enforcing a spelling, not a
+# policy, and quoting a path is the ordinary thing to do.
+#
+# The fix is ORDER, not less redaction. This copy is derived from
+# COMMAND_NO_LITERAL_TEXT, i.e. AFTER the sink-aware redaction above has already
+# blanked the quoted values of --body/-m/--title/--notes/--comment and of
+# echo/printf data sinks. So prose that merely quotes a dangerous command
+# ("document rm -rf / hazard") is already inert before dequoting can see it,
+# and stays inert. What dequoting exposes is only the quoting of an OPERATIVE
+# argument, which is exactly what should be scanned.
+#
+# Spans containing $( or a backtick are left untouched, so command-substitution
+# smuggling keeps hard-denying via the raw copy.
+#
+# Scanned IN ADDITION to the raw copy, never instead of it — dequoting changes
+# byte offsets, so this copy is only ever fed to these pattern greps, never to
+# target extraction.
+# =============================================================================
+COMMAND_DEQUOTED="$COMMAND_NO_LITERAL_TEXT"
+if [[ "$COMMAND_NO_LITERAL_TEXT" == *'"'* || "$COMMAND_NO_LITERAL_TEXT" == *"'"* ]]; then
+    COMMAND_DEQUOTED=$(dequote_inert_spans "$COMMAND_NO_LITERAL_TEXT")
+fi
+
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
         deny "BLOCKED: Command matches dangerous pattern: $pattern" "catastrophic:$pattern"
+    fi
+    if [[ "$COMMAND_DEQUOTED" != "$COMMAND_NO_LITERAL_TEXT" ]] && \
+       echo "$COMMAND_DEQUOTED" | grep -qiE "$pattern"; then
+        deny "BLOCKED: Command matches dangerous pattern: $pattern (quoting an argument does not change what the shell runs)" "catastrophic-dequoted:$pattern"
     fi
 done
 
