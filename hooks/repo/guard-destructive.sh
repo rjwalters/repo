@@ -2847,10 +2847,11 @@ mark_expandable_dollars() {
 # from the RAW cd argument (loom#5372), because the caller unquotes a COPY
 # before touching the filesystem.
 #
-# KNOWN LIMITATION, carried over deliberately: unlike parse_force_ops, this
-# does not thread a `git -C <path>` argument, so `git -C <main-checkout>
-# stash pop` run from a worktree cwd is not caught. Documented rather than
-# silently fixed, so the two guards keep identical behavior here.
+# `git -C <path>` threading (repo#194): a `-C`/`-c` run before `stash` is
+# resolved the same way `parse_force_ops` already resolves it for force ops,
+# so `git -C <main-checkout> stash pop` run from a worktree cwd is caught
+# against the -C target rather than the worktree cwd. See the `toks[1] ==
+# "git"` block below.
 # =============================================================================
 resolve_stash_cwd() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
