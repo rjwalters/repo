@@ -55,8 +55,11 @@
 # entry masks that command's own quoted POSITIONAL arguments in the ASK-tier
 # working copy ONLY (never the catastrophic scan), so a read-only tool's own
 # search/dedup text is not misread as an ask-triggering phrase (#195). Absent
-# or empty (the default) is a no-op. grep/egrep/fgrep/rg can never be added,
-# regardless of config — see mask_ask_positional_args()'s header comment.
+# or empty (the default) is a no-op. The command words the two DENY-tier
+# consumers of that scan recognize as their subject — grep/egrep/fgrep/rg
+# (SQL DDL) and cp/mv/tee/sed (#4178 write confinement) — can never be added,
+# regardless of config — see mask_ask_positional_args()'s header comment and
+# positional_mask_cmdre()'s consumer audit table.
 #
 # On/off toggles accept 0/false/no and 1/true/yes. rmScope accepts
 # repo|off|permissive; forceScope accepts all|protected|off. Loom-compat
@@ -495,25 +498,76 @@ guard_cfg_array() {
 # "./.loom/scripts/check-duplicate.sh") can't accidentally widen the anchor
 # regex built from it.
 #
-# grep/egrep/fgrep/rg are UNCONDITIONALLY dropped here, even if a repo
-# configures them — see mask_ask_positional_args()'s header comment (below,
-# near strip_datasink_literals()) for the tier-specific reason this exclusion
-# must be preserved deliberately rather than lost by a flat pass-through.
+# MANDATORY EXCLUSION SET (_POSITIONAL_MASK_NEVER) — these command names are
+# UNCONDITIONALLY dropped here, even if a repo configures them, because
+# COMMAND_ASK_SCAN feeds two DENY-tier consumers as well as the ask-tier ones
+# (audit table below). Masking a command that either deny-tier scan treats as
+# its SUBJECT would silently downgrade a hard deny to an allow, which no
+# operator config may ever do. See mask_ask_positional_args()'s header comment
+# (below, near strip_datasink_literals()) for the per-consumer reasoning.
+#
+# COMMAND_ASK_SCAN consumer audit (#195 review) — every reader of this scan,
+# and whether narrowing it is safe:
+#
+#   Consumer (search this file)          Tier   Narrowing safe?
+#   -----------------------------------  -----  --------------------------------
+#   ASK_PATTERNS                         ask    yes — the intended target (#195)
+#   parse_force_ops (force-op:*)         ask    yes
+#   stash-scope                          ask    yes
+#   reversible-gh / git-read-tree        ask    yes
+#   cloud-cli                            ask    yes
+#   SQL_DDL_PATTERN (sql-ddl)            DENY   NO — scans raw quoted text for a
+#                                               literal DDL phrase; masking a
+#                                               grep/rg pattern argument blinds
+#                                               it. => grep|egrep|fgrep|rg
+#   extract_write_targets (#4178         DENY   NO — extracts a write idiom's own
+#   worktree-write-confinement)                 target PATH from this scan;
+#                                               masking that argument blinds the
+#                                               confinement deny. => cp|mv|tee|sed
+#
+# The deny-tier rows are why this set is hardcoded rather than advisory: with
+# `positionalMaskAllowlist: ["cp"]` configured and no exclusion,
+# `cp "/tmp/src.txt" "<main-checkout>/evil.sh"` issued from a builder worktree
+# went from `deny` (worktree-write-confinement) to ALLOW, because
+# extract_write_targets() could no longer see the masked destination path.
+# cp/mv/tee/sed are exactly the command words extract_write_targets() recognizes
+# as write idioms (its `toks[1] == "tee" / "sed" / "cp" / "mv"` scans; `>`/`>>`
+# redirection has no command word and is never maskable by construction), so
+# excluding them restores the pre-#195 deny in every configuration.
+#
+# Comparison is on the BASENAME of the configured entry, so a path-qualified
+# spelling (`/bin/cp`, `./tee`) cannot smuggle an excluded name past the set.
+#
+# GENERAL OPERATOR RULE (the invariant this set enforces mechanically for the
+# two known deny-tier subjects): only allowlist a command whose positional
+# arguments are INERT TEXT it merely reads. A command that ACTS on its
+# positional arguments — writes them as paths (cp/mv/tee/sed) or executes them
+# as statements (`psql "DROP TABLE …"`, `sh -c "…"`) — must never be
+# allowlisted; masking its arguments hides exactly the text a deny-tier scan
+# exists to read. Extend _POSITIONAL_MASK_NEVER whenever a new deny-tier
+# consumer of COMMAND_ASK_SCAN is added with a recognizable command word.
 # =============================================================================
+_POSITIONAL_MASK_NEVER='grep egrep fgrep rg cp mv tee sed'
 _POSITIONAL_MASK_CMDRE_CACHE=""
 _POSITIONAL_MASK_CMDRE_DONE=""
 positional_mask_cmdre() {
     if [[ -z "$_POSITIONAL_MASK_CMDRE_DONE" ]]; then
         _POSITIONAL_MASK_CMDRE_DONE=1
-        local raw cmd
+        local raw cmd base never
         local -a escaped=()
         raw=$(guard_cfg_array positionalMaskAllowlist)
         if [[ -n "$raw" ]]; then
             while IFS= read -r cmd; do
                 [[ -z "$cmd" ]] && continue
-                case "$cmd" in
-                    grep|egrep|fgrep|rg) continue ;;
-                esac
+                # Basename comparison against the mandatory exclusion set
+                # above: `/bin/cp` and `./tee` are dropped exactly like the
+                # bare spellings.
+                base="${cmd##*/}"
+                local excluded=""
+                for never in $_POSITIONAL_MASK_NEVER; do
+                    [[ "$base" == "$never" ]] && { excluded=1; break; }
+                done
+                [[ -n "$excluded" ]] && continue
                 escaped+=("$(printf '%s' "$cmd" | sed -E 's/[][(){}.*+?^$|\\]/\\&/g')")
             done <<< "$raw"
         fi
@@ -1821,24 +1875,38 @@ strip_datasink_literals() {
 # WRAPS the phrase and then executes it — `sh -c "git stash pop"`, `bash -c
 # '...'`, `eval "..."` — is never in the allowlist and stays fully visible.
 #
-# DELIBERATELY EXCLUDES grep/egrep/fgrep/rg — enforced by the caller
-# (positional_mask_cmdre() above drops them even when configured), not by
-# this function, which simply masks whatever command-name alternation it is
-# given. The reason lives with the caller: COMMAND_ASK_SCAN also feeds the SQL
-# DDL/DML check (SQL_DDL_PATTERN, below), which intentionally scans a
-# `grep '<pattern>' file` invocation's own quoted positional pattern for a
-# literal DDL phrase like "DROP TABLE" and denies, by design — masking grep's
-# own quoted argument here would blind that scan to text it is specifically
-# meant to catch. Adding grep/rg to the allowlist was tried and directly
-# regresses the "Fast path security" / SQL-DDL test coverage in
-# hooks/repo/tests/test-guard-destructive.sh. Extend the exclusion set only
-# for another read-only positional-arg consumer with NO competing raw-text
-# consumer elsewhere in this file (mirrors the vendored guard's own
-# extend-only convention for this allowlist).
+# DELIBERATELY EXCLUDES grep/egrep/fgrep/rg AND cp/mv/tee/sed — enforced by
+# the caller (positional_mask_cmdre()'s _POSITIONAL_MASK_NEVER set above drops
+# them even when configured), not by this function, which simply masks
+# whatever command-name alternation it is given. The reasons live with the
+# caller (see its full COMMAND_ASK_SCAN consumer audit table); in short, this
+# scan feeds TWO deny-tier consumers besides the ask-tier ones:
+#
+#   - the SQL DDL/DML check (SQL_DDL_PATTERN, below), which intentionally
+#     scans a `grep '<pattern>' file` invocation's own quoted positional
+#     pattern for a literal DDL phrase like "DROP TABLE" and DENIES, by
+#     design — masking grep's own quoted argument here would blind that scan
+#     to text it is specifically meant to catch. Adding grep/rg to the
+#     allowlist was tried and directly regresses the "Fast path security" /
+#     SQL-DDL test coverage in hooks/repo/tests/test-guard-destructive.sh.
+#   - the #4178 Bash-tool WRITE CONFINEMENT block, which passes this exact
+#     scan to extract_write_targets() and DENIES a write landing in the main
+#     checkout from a builder worktree. cp/mv/tee/sed are the command words
+#     that extractor recognizes as write idioms, and their target PATH is a
+#     positional argument — masking it made `cp "/tmp/src.txt"
+#     "<main-checkout>/evil.sh"` fall through from deny to ALLOW under
+#     `positionalMaskAllowlist: ["cp"]` (#195 review finding).
+#
+# Extend the exclusion set only for another read-only positional-arg consumer
+# with NO competing raw-text consumer elsewhere in this file (mirrors the
+# vendored guard's own extend-only convention for this allowlist), and extend
+# _POSITIONAL_MASK_NEVER whenever a NEW deny-tier consumer of
+# COMMAND_ASK_SCAN with a recognizable command word is added.
 #
 # Only feeds COMMAND_ASK_SCAN, never the catastrophic scan (which keeps
-# reading raw $COMMAND/$COMMAND_NO_LITERAL_TEXT), so this can only NARROW an
-# ask, never suppress a hard deny.
+# reading raw $COMMAND/$COMMAND_NO_LITERAL_TEXT). Within COMMAND_ASK_SCAN it
+# narrows ask-tier matching only — the two deny-tier consumers above stay
+# intact because their subject command words can never enter the allowlist.
 #
 # Masks EVERY quoted argument that directly, consecutively follows the
 # command+flags (separated only by whitespace) — not just the first — so a
@@ -2191,8 +2259,16 @@ fi
 # many full-path commands that carry no quotes. positional_mask_cmdre() is
 # itself cached and resolves to an empty string on the (default) absent/
 # empty config, so this step is a true no-op on every repo that hasn't opted
-# in. Never feeds the catastrophic scan, so it can only NARROW an ask, never
-# miss a hard deny.
+# in.
+#
+# It never feeds the catastrophic scan. Note that NOT feeding the catastrophic
+# scan is by itself NOT enough to guarantee "can only narrow an ask" (#195
+# review): COMMAND_ASK_SCAN also feeds two DENY-tier consumers — the SQL DDL
+# check below and the #4178 Bash-tool write-confinement block, which passes
+# this very variable to extract_write_targets(). What actually preserves both
+# denies is positional_mask_cmdre()'s mandatory _POSITIONAL_MASK_NEVER
+# exclusion set (grep/egrep/fgrep/rg + cp/mv/tee/sed), which no operator
+# config can override — see its consumer audit table.
 if [[ "$COMMAND_NO_COMMENT" == *'"'* || "$COMMAND_NO_COMMENT" == *"'"* ]]; then
     _POSITIONAL_MASK_CMDRE="$(positional_mask_cmdre)"
     if [[ -n "$_POSITIONAL_MASK_CMDRE" ]]; then

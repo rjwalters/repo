@@ -3444,6 +3444,60 @@ else
     echo -e "  ${YELLOW}SKIP${NC}: equivalence tests (vendored .loom/hooks/guard-destructive-generic.sh not present)"
 fi
 
+# ---- #195 review regression: guards.positionalMaskAllowlist must NEVER be
+# ---- able to mask a write idiom out of this DENY. ----
+#
+# COMMAND_ASK_SCAN is the input to BOTH the ask-tier scans AND this
+# deny-tier write-confinement block (WRITE_TARGETS=$(extract_write_targets
+# "$COMMAND_ASK_SCAN" ...)). #195's positional masking narrows that same
+# working copy, so a repo that configured a write idiom
+# (`positionalMaskAllowlist: ["cp"]`) blanked the destination PATH to `XXXX`
+# before extract_write_targets() ever saw it, and a
+# `cp "/tmp/src.txt" "<main-checkout>/evil.sh"` issued from a builder
+# worktree fell through from deny to ALLOW. positional_mask_cmdre()'s
+# mandatory _POSITIONAL_MASK_NEVER set (grep/egrep/fgrep/rg + cp/mv/tee/sed)
+# closes that off regardless of operator config; these cases prove it, using
+# the QUOTED spellings (unquoted targets are unmaskable by construction —
+# mask_ask_positional_args() only ever touches quoted arguments).
+PMWTC_ALLOWLIST='{"guards":{"positionalMaskAllowlist":["cp","mv","tee","sed","/bin/cp","mytool.sh"]}}'
+# shellcheck disable=SC2046 # main/wt are mktemp paths, never contain IFS chars
+read -r PMWTC_MAIN PMWTC_WT <<< "$(make_wt_confinement_repo)"
+mkdir -p "$PMWTC_WT/.claude/skills/repo"
+printf '%s' "$PMWTC_ALLOWLIST" > "$PMWTC_WT/.claude/skills/repo/config.json"
+
+assert_deny "#195 regression: cp with quoted target into main checkout still denies with cp in positionalMaskAllowlist" \
+    "cp \"/tmp/src.txt\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: mv with quoted target into main checkout still denies with mv in positionalMaskAllowlist" \
+    "mv \"/tmp/src.txt\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: tee with quoted target into main checkout still denies with tee in positionalMaskAllowlist" \
+    "echo x | tee \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+assert_deny "#195 regression: sed -i with quoted target into main checkout still denies with sed in positionalMaskAllowlist" \
+    "sed -i \"s/a/b/\" \"$PMWTC_MAIN/evil.sh\"" "$PMWTC_WT"
+# The exclusion compares BASENAMES, so a path-qualified allowlist entry
+# ("/bin/cp", present in the fixture config above) cannot smuggle an excluded
+# command name past the set either. Defense in depth: extract_write_targets()
+# matches write idioms on the bare command word (`toks[1] == "cp"`), so a
+# `/bin/cp` write is already outside its reach on main — the observable here
+# is therefore the ask tier, where masking IS command-word-literal: with the
+# basename exclusion the entry is dropped and the quoted ask-phrase after
+# /bin/cp stays visible (it was silently masked before the exclusion).
+assert_ask "#195 regression: path-qualified '/bin/cp' allowlist entry is dropped by basename (arg not masked)" \
+    '/bin/cp "please run: gh release delete v1"' "$PMWTC_WT"
+# ...and the exclusion is per-command, not an all-or-nothing kill switch: the
+# legitimate "mytool.sh" entry in the SAME allowlist still masks its own
+# quoted positional args (ask-tier narrowing, #195's actual feature).
+assert_allow "#195 regression: mytool.sh entry still masks alongside excluded write idioms" \
+    'mytool.sh "please run: gh release delete v1"' "$PMWTC_WT"
+# Control: a write idiom whose target stays inside the acting worktree is
+# still allowed — the exclusion restores visibility, it does not widen the deny.
+assert_allow "#195 regression: cp with quoted target inside the worktree still allows" \
+    "cp \"/tmp/src.txt\" \"$PMWTC_WT/scratch.txt\"" "$PMWTC_WT"
+
+git -C "$PMWTC_MAIN" worktree remove --force "$PMWTC_WT" >/dev/null 2>&1 || true
+if [[ -n "$PMWTC_MAIN" && "$PMWTC_MAIN" != "/" && -d "$PMWTC_MAIN" ]]; then
+    rm -rf "$PMWTC_MAIN"
+fi
+
 # Clean up this section's temp repos/worktrees.
 git -C "$WTC_MAIN" worktree remove --force "$WTC_WT" >/dev/null 2>&1 || true
 git -C "$WTC_TOGGLE_OFF_MAIN" worktree remove --force "$WTC_TOGGLE_OFF_WT" >/dev/null 2>&1 || true

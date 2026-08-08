@@ -144,11 +144,20 @@ copy's hardcoded entry, since `check-duplicate.sh` is a Loom-specific script
 this repo doesn't ship: a repo that relies on the vendored copy's built-in
 masking for that script and switches to this guard must add it explicitly via
 config, or the switch is (by default) stricter for that one command — more
-asks, never fewer. grep/egrep/fgrep/rg can never be added to the allowlist
-here regardless of config, matching the vendored copy's own exclusion of them
-(see `mask_ask_positional_args()`'s header comment in `guard-destructive.sh`
-for why). Loom's vendored copy can adopt the same configurable mechanism to
-drop its hardcoded path (rjwalters/loom#5660).
+asks, never fewer. `grep`/`egrep`/`fgrep`/`rg` **and** `cp`/`mv`/`tee`/`sed`
+can never be added to the allowlist here regardless of config: the working
+copy this masking narrows (`COMMAND_ASK_SCAN`) also feeds two **deny**-tier
+scans — the SQL DDL/DML check (which reads a `grep '<pattern>' file`
+invocation's own quoted pattern, the vendored copy's reason for excluding the
+grep family) and the #4178 Bash-tool write-confinement check (which extracts
+`cp`/`mv`/`tee`/`sed` write targets from that same text). Masking either
+scan's subject would silently downgrade a hard deny to an allow, so the
+exclusion set is hardcoded and not operator-overridable. **Only allowlist a
+command whose positional arguments are inert text it merely reads** — never
+one that acts on them (writes them as paths, executes them as statements).
+See `positional_mask_cmdre()`'s consumer audit table in
+`guard-destructive.sh`. Loom's vendored copy can adopt the same configurable
+mechanism to drop its hardcoded path (rjwalters/loom#5660).
 
 Precision features ported from Loom's guard: quote-aware command segmentation
 (a `|` inside quotes is not a pipe), literal-text redaction (a dangerous phrase
@@ -169,7 +178,7 @@ All toggles resolve: `REPO_*` env var (wins) → legacy `LOOM_*` env var →
 | Toggle | Env var (wins) | Legacy env var | Config key | Default |
 |--------|----------------|----------------|------------|---------|
 | Read-only fast path | `REPO_GUARD_READONLY_FASTPATH` | `LOOM_GUARD_READONLY_FASTPATH` | `guards.readOnlyFastPath` (+ extend-only `guards.readOnlyFastPathExtra`) | on |
-| ASK-tier positional-arg masking allowlist | — (config-only) | — | `guards.positionalMaskAllowlist` (array of command names; grep/egrep/fgrep/rg can never be added) | `[]` (no-op) |
+| ASK-tier positional-arg masking allowlist | — (config-only) | — | `guards.positionalMaskAllowlist` (array of command names; grep/egrep/fgrep/rg and cp/mv/tee/sed can never be added — they are the subjects of deny-tier scans) | `[]` (no-op) |
 | SQL DDL/DML | `REPO_GUARD_SQL` | `LOOM_GUARD_SQL` | `guards.sqlDdl` | on |
 | Cloud CLI (mutating-verb asks + `az`/`gcloud` delete denies) | `REPO_GUARD_CLOUD` | `LOOM_GUARD_CLOUD` | `guards.cloudCli` | on |
 | Reversible-GitHub asks (`gh pr/issue close`, `gh label delete`) | `REPO_GUARD_REVERSIBLE_GH` | `LOOM_GUARD_REVERSIBLE_GH` | `guards.reversibleGh` | **off** (opt-in) |
