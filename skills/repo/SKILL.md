@@ -23,8 +23,9 @@ costs.
 | Command | What it does |
 |---------|--------------|
 | [[help]] | Explain the installed `/repo:*` commands — what each does, where to start |
-| [[all]] | The whole hygiene pass in order — audit, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
+| [[all]] | The whole hygiene pass in order — audit, scrub, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
 | [[audit]] | Full sweep — runs all hygiene checks, produces a summary report |
+| [[scrub]] | Public-surface scrub — scan code, history, issues, PRs (and forks) for sensitive identifiers, and report which findings can actually be removed. Report-only; severity gates verbosity so it stays quiet inside [[all]]. Its fork-network sweep is implemented in `scripts/repo/repo-scrub-forks.sh` (installed to `.claude/skills/repo/scripts/`) |
 | [[reset]] | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to the default branch |
 | [[handoff]] | Roll the session safely — file follow-ups, reset, check for a CLI update, write a handoff note the next session reads first |
 | [[tidy]] | Tidy up — build artifacts, caches, temp files, empty dirs |
@@ -54,6 +55,8 @@ costs.
 - Periodically, to keep installed tool packages current (`update-tools`) and
   third-party dependencies current — Dependabot setup and bot-PR triage (`deps`)
 - Periodically (monthly) as general hygiene (`audit`)
+- Before making a repo public, and periodically after — to check what the
+  public surface actually exposes (`scrub`)
 - Before a demo, handoff, or onboarding (clean up before they arrive)
 
 ## Principles
@@ -78,8 +81,7 @@ costs.
 Installing Repo Skills also wires a **PreToolUse safety hook** —
 `.claude/skills/repo/hooks/guard-destructive.sh` — into the consumer repo's
 `.claude/settings.json`. This is the **canonical generic destructive-command
-guard** (rjwalters/repo#30): Loom and other tooling defer to this copy instead
-of shipping their own. It runs before every agent `Bash` command and:
+guard** (rjwalters/repo#30). It runs before every agent `Bash` command and:
 
 - **Blocks** catastrophic operations outright: `rm -rf` of root / `$HOME` / a
   top-level system dir (with lexical `..`/`//` normalization so traversal
@@ -101,6 +103,20 @@ of shipping their own. It runs before every agent `Bash` command and:
 - **Allows** everything else — scoped deletes like `rm -rf node_modules` or
   `/tmp` subpaths, and obviously read-only commands (`git status`, `ls`,
   `grep`, …) via a structural fast path that skips the pattern gauntlet.
+
+**Deferral by other tooling is conditional, and in a Loom-managed repo it does
+not currently hold** (rjwalters/repo#168). Loom wires its own
+`.loom/hooks/guard-destructive.sh` as the registered hook; that script is a
+dispatcher which `exec`s this canonical guard only when the copy it finds
+passes both a version probe **and** a capability probe for Bash-tool write
+confinement (`grep -q 'worktree-write-confinement'`). This guard does not
+implement that category, so the probe fails and Loom runs its own vendored
+`guard-destructive-generic.sh` instead — which does carry write confinement, so
+nothing is unguarded. The practical consequence: improvements made here do not
+change destructive-command behavior in a Loom-managed repo, and an upgrade
+should not be justified on that basis. The probe is written so this reverses
+automatically — implement write confinement here, emit the marker, and Loom's
+dispatcher prefers this guard with no change on its side.
 
 Precision features ported from Loom's guard: quote-aware command segmentation
 (a `|` inside quotes is not a pipe), literal-text redaction (a dangerous phrase

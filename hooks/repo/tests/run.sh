@@ -715,6 +715,42 @@ else
     record_suite "test-repo-scrub-forks.sh" "$SF_PASS" "$SF_FAIL" "fork-network sweep"
 fi
 
+# /repo:scrub's prose contract (repo#174/#186), its /repo:all integration, and
+# the ASK-tier package-manager prune added to /repo:tidy (repo#145). Doc-drift
+# guards: each asserted rule has a tempting simplification that reintroduces a
+# real failure (excluding vendored trees, failing on history-only findings,
+# raw rm inside node_modules). Same delegation shape as every suite above.
+echo
+echo "-- /repo:scrub + /repo:all + tidy-prune contract (delegated suite) --"
+SC_TEST="$TESTS_DIR/../../../commands/repo/tests/test-scrub-contract.sh"
+if [[ ! -f "$SC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-scrub-contract.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-scrub-contract.sh" "$SC_TEST"
+else
+    SC_OUT="$(bash "$SC_TEST" 2>&1)"
+    SC_STATUS=$?
+    SC_PASS="$(suite_count Passed "$SC_OUT")"
+    SC_FAIL="$(suite_count Failed "$SC_OUT")"
+    if ! [[ "$SC_PASS" =~ ^[0-9]+$ && "$SC_FAIL" =~ ^[0-9]+$ ]]; then
+        SC_PASS=0
+        SC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-scrub-contract.sh" "$SC_STATUS"
+        strip_ansi "$SC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SC_STATUS" -ne 0 || "$SC_FAIL" -ne 0 ]]; then
+        [[ "$SC_FAIL" -eq 0 ]] && SC_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-scrub-contract.sh" "$SC_PASS" "$SC_FAIL" "$SC_STATUS"
+        strip_ansi "$SC_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-scrub-contract.sh" "$SC_PASS"
+    fi
+    PASS=$((PASS + SC_PASS))
+    FAIL=$((FAIL + SC_FAIL))
+    record_suite "test-scrub-contract.sh" "$SC_PASS" "$SC_FAIL" "scrub/all/prune contract"
+fi
+
 echo
 echo "==============================="
 echo "Per-suite breakdown"

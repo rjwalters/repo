@@ -485,14 +485,18 @@ assert_contains "all.md shows a composed Reset summary line" \
 
 # Stage ordering is the whole point: the sync stage must be documented BEFORE
 # the Docs stage, and the pruning Reset stage must remain the last one.
-heading_line() {  # <file> <heading>
-    grep -n -F -m1 -- "$2" "$1" | cut -d: -f1
+# Located by stage NAME, not by stage number: inserting a stage renumbers every
+# one after it, and this test is about relative order, not the digits. Pinning
+# the numbers made an ordering test fail on an unrelated stage insertion
+# (repo#174's Scrub stage) while the ordering it guards was still intact.
+heading_line() {  # <file> <stage-name>
+    grep -nE "^### [0-9]+\. $2" "$1" | head -1 | cut -d: -f1
 }
-SYNC_LN="$(heading_line "$ALL_MD" '### 2. Sync early')"
-DOCS_LN="$(heading_line "$ALL_MD" '### 3. Docs')"
-TIDY_LN="$(heading_line "$ALL_MD" '### 4. Tidy')"
-TOOLS_LN="$(heading_line "$ALL_MD" '### 5. Update tools')"
-RESET_LN="$(heading_line "$ALL_MD" '### 6. Reset')"
+SYNC_LN="$(heading_line "$ALL_MD" 'Sync early')"
+DOCS_LN="$(heading_line "$ALL_MD" 'Docs')"
+TIDY_LN="$(heading_line "$ALL_MD" 'Tidy')"
+TOOLS_LN="$(heading_line "$ALL_MD" 'Update tools')"
+RESET_LN="$(heading_line "$ALL_MD" 'Reset')"
 if [[ -n "$SYNC_LN" && -n "$DOCS_LN" && -n "$TIDY_LN" && -n "$TOOLS_LN" && -n "$RESET_LN" ]]; then
     assert_eq "sync stage is documented before Docs" "yes" \
         "$([[ "$SYNC_LN" -lt "$DOCS_LN" ]] && echo yes || echo no)"
@@ -501,9 +505,18 @@ if [[ -n "$SYNC_LN" && -n "$DOCS_LN" && -n "$TIDY_LN" && -n "$TOOLS_LN" && -n "$
     assert_eq "the Reset (pruning) stage is still last" "yes" \
         "$([[ "$TOOLS_LN" -lt "$RESET_LN" ]] && echo yes || echo no)"
 else
-    no "stage headings are numbered 2..6 in all.md" \
+    no "all five ordered stage headings are present in all.md" \
         "sync=$SYNC_LN docs=$DOCS_LN tidy=$TIDY_LN tools=$TOOLS_LN reset=$RESET_LN"
 fi
+
+# Stage numbers must still be contiguous from 1 and in ascending order — the
+# renumbering half of an insertion is exactly what gets forgotten.
+STAGE_NUMS="$(grep -oE '^### [0-9]+\.' "$ALL_MD" | grep -oE '[0-9]+' | tr '\n' ' ')"
+EXPECTED_NUMS=""
+_n=1
+for _ in $STAGE_NUMS; do EXPECTED_NUMS+="$_n "; _n=$((_n + 1)); done
+assert_eq "all.md stage headings are numbered contiguously from 1" \
+    "$EXPECTED_NUMS" "$STAGE_NUMS"
 
 # Composition guard (repo#82 + repo#89): stage reordering and verify-after-write
 # are orthogonal mechanisms — reordering prevents editing a stale checkout,
