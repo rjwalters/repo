@@ -29,15 +29,48 @@ you want to check; use [[docs]] for the full documentation sweep.
 Scan all `.md` files for `[text](path)` links where `path` is a relative file
 path (not a URL). Verify the target exists on disk.
 
+**Strip code before scanning.** Remove fenced blocks and inline code spans from
+the text first — a `[text](path)` inside backticks is a description of a link,
+not a link:
+
+```python
+text = re.sub(r'```.*?```', '', text, flags=re.S)   # fenced blocks
+text = re.sub(r'`[^`]*`', '', text)                  # inline spans
+```
+
+Without this the checker flags the sentences in this very file, and in
+[[audit]], that explain what it looks for. A checker that reports its own
+documentation as broken is not a checker anyone keeps running.
+
 Skip:
 - External URLs (http://, https://)
 - Anchor-only links (#section)
 - Image URLs from external services
 
+**Resolve against two bases, and only report a link that fails both.** A
+relative path can legitimately be written against either the file's own
+directory or the repo root, and both conventions are in active use:
+
+1. the directory of the file containing the link
+2. the repo root
+
+Report the link only when the target is missing under **both**. State which
+base resolved it when the answer is not the file's own directory, so a reader
+can tell a convention from a coincidence. Silently assuming the file's own
+directory is what produced 28 wrong findings in a single run against
+`.loom/CLAUDE.md`, whose links are root-relative and all correct.
+
 ### 2. CLAUDE.md File References
 CLAUDE.md files typically list key file paths (reference tables, "see X"
 pointers). Verify every path mentioned resolves. This is **critical**
 severity — these are the primary navigation paths for agents.
+
+Critical severity is exactly why the two-base rule above matters most here. **A
+CLAUDE.md is loaded into an agent's context and its paths are read from the repo
+root**, not from wherever the file happens to sit, so root-relative is the
+correct convention in one — not a defect. Resolving a CLAUDE.md link only
+against its own directory turns the highest-severity class in this checker into
+the one most likely to be wrong.
 
 ### 3. Skill/Command Cross-References
 If the repo has `.claude/skills/` and `.claude/commands/`:
@@ -48,7 +81,20 @@ If the repo has `.claude/skills/` and `.claude/commands/`:
 
 ### 4. Nested CLAUDE.md References
 Subdirectory CLAUDE.md files often list key files relative to their own
-directory. Verify those paths resolve relative to that directory.
+directory. Verify those paths resolve — against that directory **and** the repo
+root, per the two-base rule. Both conventions appear in nested files, and which
+one a given file uses is not knowable from its location.
+
+### 5. Vendored and installer-managed files
+A file under a tool's dot-directory (`.loom/CLAUDE.md`, `.anvil/CLAUDE.md`, and
+anything else written by an installer) is **reported but never edited in
+place**, even when the fix is unambiguous and `--ask` is not in play. The next
+install overwrites the edit, so a fix there is silently temporary and the
+finding returns.
+
+Report these in their own group, name the upstream repo that owns the file, and
+say the fix belongs there. Same reasoning as [[scrub]]'s handling of findings
+inside vendored trees.
 
 ## Interaction
 
@@ -70,6 +116,22 @@ For each broken link, find the most likely correct target (fuzzy match on
 filename). When there's a single confident match, fix the link and report it;
 when the match is ambiguous or no target exists, report it for a human call.
 Under `--ask`, propose every fix and confirm before editing.
+
+### Precision is itself a finding
+
+When a run produces many findings and few actionable ones, **say so on its own
+line** rather than printing the list and moving on:
+
+```
+30 findings, 0 actionable — 2 were code spans, 28 resolve from the repo root.
+Check the resolution rules before acting on this report.
+```
+
+A high false-positive rate is a defect in the checker, not a property of the
+repo, and it is the more useful signal of the two. The cost of a noisy run is
+not the wasted minute — it is that a check returning 100% noise on a healthy
+repo teaches people to skim past its output, which is expensive the first time
+it is right.
 
 ### Verify after write
 

@@ -751,6 +751,40 @@ else
     record_suite "test-scrub-contract.sh" "$SC_PASS" "$SC_FAIL" "scrub/all/prune contract"
 fi
 
+# /repo:links precision rules (repo#190): code-span stripping and two-base
+# resolution. A run that reports 30 findings and 0 real ones is worse than no
+# check at all, so both rules are pinned. Same delegation shape as above.
+echo
+echo "-- /repo:links precision rules (delegated suite) --"
+LP_TEST="$TESTS_DIR/../../../commands/repo/tests/test-links-precision.sh"
+if [[ ! -f "$LP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-links-precision.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-links-precision.sh" "$LP_TEST"
+else
+    LP_OUT="$(bash "$LP_TEST" 2>&1)"
+    LP_STATUS=$?
+    LP_PASS="$(suite_count Passed "$LP_OUT")"
+    LP_FAIL="$(suite_count Failed "$LP_OUT")"
+    if ! [[ "$LP_PASS" =~ ^[0-9]+$ && "$LP_FAIL" =~ ^[0-9]+$ ]]; then
+        LP_PASS=0
+        LP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-links-precision.sh" "$LP_STATUS"
+        strip_ansi "$LP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$LP_STATUS" -ne 0 || "$LP_FAIL" -ne 0 ]]; then
+        [[ "$LP_FAIL" -eq 0 ]] && LP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-links-precision.sh" "$LP_PASS" "$LP_FAIL" "$LP_STATUS"
+        strip_ansi "$LP_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-links-precision.sh" "$LP_PASS"
+    fi
+    PASS=$((PASS + LP_PASS))
+    FAIL=$((FAIL + LP_FAIL))
+    record_suite "test-links-precision.sh" "$LP_PASS" "$LP_FAIL" "links precision rules"
+fi
+
 echo
 echo "==============================="
 echo "Per-suite breakdown"
