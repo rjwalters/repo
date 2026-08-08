@@ -104,19 +104,34 @@ guard** (rjwalters/repo#30). It runs before every agent `Bash` command and:
   `/tmp` subpaths, and obviously read-only commands (`git status`, `ls`,
   `grep`, …) via a structural fast path that skips the pattern gauntlet.
 
-**Deferral by other tooling is conditional, and in a Loom-managed repo it does
-not currently hold** (rjwalters/repo#168). Loom wires its own
+**Deferral by other tooling is conditional, and as of 0.9.0 it holds**
+(rjwalters/repo#168, #188). Loom wires its own
 `.loom/hooks/guard-destructive.sh` as the registered hook; that script is a
 dispatcher which `exec`s this canonical guard only when the copy it finds
 passes both a version probe **and** a capability probe for Bash-tool write
-confinement (`grep -q 'worktree-write-confinement'`). This guard does not
-implement that category, so the probe fails and Loom runs its own vendored
-`guard-destructive-generic.sh` instead — which does carry write confinement, so
-nothing is unguarded. The practical consequence: improvements made here do not
-change destructive-command behavior in a Loom-managed repo, and an upgrade
-should not be justified on that basis. The probe is written so this reverses
-automatically — implement write confinement here, emit the marker, and Loom's
-dispatcher prefers this guard with no change on its side.
+confinement (`grep -q 'worktree-write-confinement'`). This guard implements
+that category and emits the marker, so the dispatcher now prefers it.
+
+The probe is a **single marker that switches which guard runs entirely**, not a
+per-feature advertisement — so emitting it while behind on any other category
+would silently downgrade protection fleet-wide. It was therefore gated on
+behavioral parity with the vendored copy, established by diffing both guards'
+deny/allow decisions across the pattern surface rather than by counting
+functions. Two classes of gap were closed:
+
+- **`git stash` had no coverage here at all.** `pop`/`drop`/`clear` were
+  allowed silently while the vendored guard asked. `refs/stash` is a single
+  stack shared across every linked worktree, so this is how one agent destroys
+  another's WIP. Now gated by `guards.stashScope` / `REPO_GUARD_STASH_SCOPE`.
+- **Four checks scanned the raw command** (`COMMAND_NO_COMMENT`, or `COMMAND`)
+  instead of the literal-redacted `COMMAND_ASK_SCAN`: SQL DDL, force ops, cloud
+  CLI, and `rm -rf` scope. That made this guard deny ordinary prose — filing an
+  issue that quoted a destructive statement, or committing a note mentioning
+  one. The vendored copy had always scanned the redacted copy.
+
+One deliberate divergence remains: `aws iam delete-role` is a hard **deny**
+here and an ask in the vendored copy, so the switch makes a Loom-managed repo
+stricter on IAM deletion rather than weaker.
 
 Precision features ported from Loom's guard: quote-aware command segmentation
 (a `|` inside quotes is not a pipe), literal-text redaction (a dangerous phrase
