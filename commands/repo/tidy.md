@@ -173,7 +173,10 @@ regenerable build output, kept unless `--caches`); a **never-delete denylist**
 overrides both; everything else gitignored falls through to ASK.
 
 Apply these tests in order — **denylist first, then the SAFE and CACHE
-allowlists, then fall through to ASK**:
+allowlists, then fall through to ASK**. For empty directories specifically, a
+**reference scan runs after the allowlist match, as an additional net, not a
+replacement for it** — see the SAFE empty-directory bullet below; the
+denylist/allowlist check still runs first and still wins:
 
 **Never-delete denylist (always ASK, never SAFE or CACHE — checked first,
 overrides everything below, regardless of gitignore status):**
@@ -242,6 +245,22 @@ reserved for tracked files.
     neither gitignore nor the denylist — so this check must be applied to its
     output before anything is deleted.
 
+    **Reference scan (additional net, after the denylist check, not instead of
+    it).** The denylist above is an enumerated/prefix-matched allowlist of known
+    tools (`.loom/`, `.anvil/`, `.wrangler/`, git worktree roots); it does not
+    cover a tool that is not on that list — a custom app's own state/spool dir,
+    or a future tool's coordination root not yet added here. For any empty
+    directory that clears the denylist check, run a cheap cross-reference scan
+    before finalizing SAFE: `grep -rl` its path (or just its dirname, for a
+    generic name) across tracked files. Any hit — a script, config, or source
+    file that names the directory — demotes it from SAFE to ASK, reported with
+    its reason (e.g. "referenced by N files"), regardless of whether the
+    directory matched a named tool-scaffolding prefix. A directory with no
+    reference hit and no denylist match remains SAFE. This scan never *promotes*
+    anything the denylist already routed to ASK — it only ever demotes a
+    would-be SAFE empty directory, and only when the allowlist match already let
+    it through.
+
   Nothing in this category may be tracked by git or match a source-code
   extension.
 - **CACHE** — regenerable compilation/tool/build output. Same certainty as SAFE
@@ -265,6 +284,10 @@ reserved for tracked files.
   - **Any empty directory whose path matches the denylist** (a `.loom/`,
     `.anvil/`, or `.wrangler/` coordination or runtime-state dir) — emptiness
     is that tool's normal state, so it lands here rather than in SAFE.
+  - **Any empty directory demoted by the reference scan** (see the SAFE
+    empty-directory bullet above) — a tracked file references its path even
+    though it matched no denylist entry. Report it with the reason, e.g.
+    "referenced by N files", rather than silently skipping it.
   - **Any git worktree root** detected in step 1 — surfaced on its own
     `worktree:` inventory line (see Report), never auto-deleted, whether or not
     it is gitignored and whether or not it sits under a recognized tool
