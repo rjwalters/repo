@@ -2769,10 +2769,50 @@ resolve_stash_cwd() {
                 }
                 continue
             }
-            if (toks[1] == "git" && m >= 3 && toks[2] == "stash" && (toks[3] == "pop" || toks[3] == "drop" || toks[3] == "clear")) {
-                print curcwd
-                found = 1
-                exit
+            # `git [-C <path>] [-c k=v] … stash pop|drop|clear`.
+            #
+            # The -C threading is repo#194: git resolves -C against the process
+            # cwd and then operates there, so `git -C <main-checkout> stash pop`
+            # issued from a linked worktree touches the MAIN checkout stash
+            # stack while a cwd-only check sees only the worktree and allows it.
+            # refs/stash is one stack shared across every linked worktree, so
+            # that is a live path to destroying the WIP of another agent. This
+            # mirrors the -C handling parse_force_ops already had; the asymmetry
+            # was inherited from the vendored copy and documented there as a
+            # known limitation rather than fixed.
+            #
+            # NOTE: this whole block sits inside a SINGLE-QUOTED awk program.
+            # An apostrophe in a comment here terminates that string and breaks
+            # the guard for every command in the repo (it happened while
+            # writing this). Keep comments apostrophe-free.
+            #
+            # Multiple -C options compose in git (each resolved relative to the
+            # previous), which is why this loops rather than reading only the
+            # first. -c takes a key=value token and is skipped, not applied.
+            if (toks[1] == "git") {
+                gi = 2
+                gitcwd = curcwd
+                while (gi <= m) {
+                    if (toks[gi] == "-C" && gi + 1 <= m) {
+                        gcarg = expand_cd_arg(toks[gi + 1], home)
+                        gcclass = strip_cd_quoting(gcarg)
+                        if (gcclass ~ /^\//) {
+                            gitcwd = gcarg
+                        } else if (gitcwd != "") {
+                            gitcwd = gitcwd "/" gcarg
+                        }
+                        gi += 2
+                        continue
+                    }
+                    if (toks[gi] == "-c" && gi + 1 <= m) { gi += 2; continue }
+                    break
+                }
+                if (gi + 1 <= m && toks[gi] == "stash" && \
+                    (toks[gi + 1] == "pop" || toks[gi + 1] == "drop" || toks[gi + 1] == "clear")) {
+                    print gitcwd
+                    found = 1
+                    exit
+                }
             }
         }
     }
@@ -4910,7 +4950,11 @@ fi
 # REPO_GUARD_STASH_SCOPE, legacy LOOM_GUARD_STASH_SCOPE, default on), invoked
 # LAZILY only after the pattern matched, mirroring every other cold-path toggle.
 # =============================================================================
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+# The optional `(-C <path>|-c <k=v>)*` run between `git` and `stash` is
+# repo#194: without it this pre-check never matches `git -C <path> stash pop`,
+# so the parser below never runs and the -C form escapes the ask entirely —
+# the pre-check, not the parser, was the actual gate.
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git([[:space:]]+-[Cc][[:space:]]+[^[:space:]]+)*[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
     if [[ -n "$CWD" ]]; then

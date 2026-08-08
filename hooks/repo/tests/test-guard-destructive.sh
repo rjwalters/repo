@@ -3556,6 +3556,68 @@ fi
 echo ""
 
 # =========================================================================
+# git stash scope guard (repo#188 port, repo#194 -C threading)
+#
+# The stash guard shipped in repo#188 with NO coverage in this suite. Added
+# here alongside the -C fix rather than left as a second gap.
+#
+# refs/stash is a SINGLE stack shared by every linked worktree of a repo, not
+# per-worktree, so pop/drop/clear from anywhere can destroy WIP that another
+# agent (or the operator) is relying on. The main-checkout stack in particular
+# is operator-owned.
+#
+# repo#194: git resolves `-C <path>` against the process cwd and then operates
+# there, so `git -C <main-checkout> stash pop` issued from a worktree touches
+# the main stack while a cwd-only check sees only the worktree. The pre-check
+# regex was the real gate — without the optional -C run in it, the parser never
+# ran for that shape at all.
+# =========================================================================
+echo -e "${YELLOW}--- git stash scope guard (#188, #194) ---${NC}"
+
+read -r STASH_MAIN STASH_WT <<< "$(make_wt_confinement_repo)"
+
+# Destructive subcommands in the main checkout -> ask.
+assert_ask "stash: pop in the main checkout asks" \
+    "git stash pop" "$STASH_MAIN"
+assert_ask "stash: drop in the main checkout asks" \
+    "git stash drop" "$STASH_MAIN"
+assert_ask "stash: clear in the main checkout asks" \
+    "git stash clear" "$STASH_MAIN"
+
+# Non-destructive subcommands are untouched.
+assert_allow "stash: list is read-only, never asks" \
+    "git stash list" "$STASH_MAIN"
+assert_allow "stash: show is read-only, never asks" \
+    "git stash show" "$STASH_MAIN"
+assert_allow "stash: push is non-destructive, never asks" \
+    "git stash push -m wip" "$STASH_MAIN"
+assert_allow "stash: bare 'git stash' is a push, never asks" \
+    "git stash" "$STASH_MAIN"
+
+# cd-prefix threading: scope resolves against the cd TARGET, not the hook cwd.
+assert_ask "stash: 'cd <main> && git stash pop' from a worktree asks" \
+    "cd $STASH_MAIN && git stash pop" "$STASH_WT"
+
+# repo#194 -- `git -C <path>` threading, the shape that escaped entirely.
+assert_ask "stash (#194): 'git -C <main> stash pop' from a worktree asks" \
+    "git -C $STASH_MAIN stash pop" "$STASH_WT"
+assert_ask "stash (#194): 'git -C <main> stash drop' from a worktree asks" \
+    "git -C $STASH_MAIN stash drop" "$STASH_WT"
+assert_ask "stash (#194): 'git -C <main> stash clear' from a worktree asks" \
+    "git -C $STASH_MAIN stash clear" "$STASH_WT"
+assert_ask "stash (#194): -c k=v before -C still resolves the -C target" \
+    "git -c user.name=x -C $STASH_MAIN stash pop" "$STASH_WT"
+
+# Must NOT over-block: operating on a worktree stack from the main checkout is
+# not the hazard this guard exists for.
+assert_allow "stash (#194): 'git -C <worktree> stash pop' from main does not ask" \
+    "git -C $STASH_WT stash pop" "$STASH_MAIN"
+assert_allow "stash (#194): 'git -C <main> stash list' stays read-only" \
+    "git -C $STASH_MAIN stash list" "$STASH_WT"
+
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
