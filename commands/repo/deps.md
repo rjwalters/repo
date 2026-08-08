@@ -21,6 +21,9 @@ compares *installer-managed tool packages* (Loom, Anvil, Repo Skills) against a
 local source clone; there is no source clone to diff for Dependabot, and
 "triage incoming bot PRs" is a different activity from "update an installed
 package." Keeping them separate keeps `update-tools`' comparison model intact.
+The boundary runs through manifests too: a **vendored, installer-owned**
+manifest (a tool's own `pyproject.toml` / lockfile under its install root) is
+`update-tools`' to update, never something to point Dependabot at — see step 2.
 
 Everything here either writes repo config, flips a repository setting, or
 merges a PR — so like `release`, `remote`, `followups`, and `update-tools`,
@@ -128,8 +131,88 @@ is a **hard error that aborts the whole command line**, so a repo with `.yml`
 workflows can end up reporting no Actions ecosystem at all. `2>/dev/null` does
 not save you — zsh fails before `ls` ever runs.
 
+Presence alone is not enough to scaffold against, though. Before the detected
+set feeds step 4, run the two filters below.
+
+#### Ownership check — repo-owned vs installer-owned
+
+A manifest that lives inside an installed tool root is **installer-owned**:
+vendored code, rewritten wholesale by the next install or upgrade of that tool.
+A Dependabot PR against it is churn — the bump is reverted by the next
+`install-*.sh` run, and upstream already owns the floors (Anvil's vendored
+`pyproject.toml` pins its own Pillow floor and says why in a comment). Those
+manifests belong to [[update-tools]], not here.
+
+Discover the tool roots with the **same sweep** step 1 of [[update-tools]]
+uses — never a hardcoded `.anvil/` / `.loom/` / `.kct/` list, for exactly the
+reason that command gives (a fixed list structurally cannot find a family
+member added later):
+
+```bash
+find . -maxdepth 4 -name "install-metadata.json" \
+  -not -path "*/node_modules/*" -not -path "*/.venv/*" 2>/dev/null
+```
+
+The **directory containing each hit** is a tool root (`.anvil/`, `.loom/`,
+`.kct/`, `.claude/skills/*/`, …). A detected manifest is installer-owned when
+its path is under one of those roots; everything else is repo-owned. Tie the
+call to the metadata file, not to the directory name — an `.anvil/` with no
+`install-metadata.json` is a plain directory whose manifests are repo-owned.
+Name the owning tool from the metadata (its root directory, or the
+`*_version` / `*_source` key prefix) so the report can say which one.
+
+History confirms a borderline call: an installer-owned manifest only ever
+changes as part of a tool install or upgrade, never by hand.
+
+```bash
+git log --oneline --follow -- .anvil/uv.lock
+```
+
+#### Dependency check — a manifest with nothing to update is not an ecosystem
+
+A manifest that declares **no dependencies at all** is not scaffoldable either:
+Dependabot has nothing to bump, so an `updates:` entry for it is dead config.
+The common case is a workspace stub — a root `package.json` with
+`private: true`, empty or absent `dependencies`, `devDependencies`,
+`peerDependencies`, and `optionalDependencies`, and no lockfile beside it:
+
+```bash
+jq '{dependencies, devDependencies, peerDependencies, optionalDependencies}' <manifest>
+git ls-files 'pnpm-lock.yaml' 'package-lock.json' 'yarn.lock'
+```
+
+All four blocks empty **and** no lockfile → report it, but do not count it as
+an ecosystem to scaffold.
+
+#### Report ownership before proposing anything
+
+List every detected manifest with its directory and its classification.
+Installer-owned and dependency-free manifests are **excluded** from the step 4
+proposal but still get their own line — never silently dropped:
+
+```
+DETECTED ECOSYSTEMS
+===================
+github-actions at /   — repo-owned; scaffold
+pip at /.anvil        — installer-owned (anvil); use /repo:update-tools
+npm at /              — no dependencies declared, no lockfile; nothing to update
+```
+
 If **nothing** is detected, say there is nothing to scaffold and stop — do not
-guess an ecosystem the repo doesn't have.
+guess an ecosystem the repo doesn't have. **Give the same answer when every
+detected ecosystem is installer-owned or dependency-free**: recommend *not*
+scaffolding a `.github/dependabot.yml`, and say why — each manifest is either
+rewritten by its installer or has nothing to bump, so the config would produce
+no useful PR. That is a complete, correct outcome, not a failure to configure
+something.
+
+The controls that do matter in that case are the repo-level flags of step 5 —
+vulnerability alerts fire on installer-owned manifests regardless of any config
+file — and the remediation path for anything they surface is
+**`/repo:update-tools`**, which pulls the fixed vendored manifest from
+upstream. (Observed live: a studio repo's 13 open Pillow alerts, 10 of them
+high, cleared when an Anvil `0.7.0 → 0.10.1` upgrade shipped a new `uv.lock`.
+No Dependabot PR could have done it.)
 
 ### 3. Validate every label the config would reference — by description
 
@@ -173,6 +256,11 @@ Report the decision explicitly: which label was chosen, or which were rejected
 and why.
 
 ### 4. Offer to scaffold the config (confirm first)
+
+Only the **repo-owned, non-empty** ecosystems from step 2 get an `updates:`
+entry; installer-owned and dependency-free manifests are already excluded. If
+that leaves nothing, follow step 2's recommendation — no config — rather than
+proposing one anyway.
 
 Grouping policy is **per-ecosystem**, not uniform. Reviewing every Actions bump
 individually is noise; batching a breaking change into line 4 of a 12-package
@@ -425,8 +513,11 @@ natural wrong assumption, and it is safety-relevant:
    UNKNOWN (not `disabled`) when the token can't read the setting.
 3. **Never create a label**, and never reference one whose description reserves
    it for humans (`Applied by: humans`). No suitable label → no `labels:` key.
-4. **Scaffold only detected ecosystems** — no fixed template, no guessing. Zero
-   detected means nothing to scaffold.
+4. **Scaffold only detected, repo-owned ecosystems** — no fixed template, no
+   guessing. Manifests under a tool root carrying `install-metadata.json` are
+   installer-owned and belong to `/repo:update-tools`; manifests declaring no
+   dependencies have nothing to bump. Zero detected — or zero left after those
+   two filters — means recommending no config at all.
 5. **Never auto-merge a major** — majors get their own confirmation, always.
    Red or pending CI is never merged.
 6. **Never push or merge under `--check`** — report-only means report-only.
