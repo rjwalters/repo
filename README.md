@@ -11,8 +11,9 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | Command | What it does |
 |---|---|
 | `/repo:help` | Explain the installed `/repo:*` commands — what each does, where to start |
-| `/repo:all` | The whole hygiene pass in order — audit, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
+| `/repo:all` | The whole hygiene pass in order — audit, scrub, docs, tidy, update-tools, reset — safe fixes by default, destructive steps gated |
 | `/repo:audit` | Full health sweep — runs every check below, produces one summary report |
+| `/repo:scrub` | Public-surface scrub — scan code, history, issues, PRs (and forks) for sensitive identifiers, and report which findings can actually be removed. Report-only |
 | `/repo:reset` | Back to baseline — review stale worktrees/branches/stashes, sync with remote, return to main |
 | `/repo:handoff` | Roll the session safely — file follow-ups, reset, check for a CLI update, write a handoff note the next session reads first |
 | `/repo:tidy` | Tidy up — build artifacts, caches, temp files, empty dirs |
@@ -34,9 +35,11 @@ Hygiene skills **apply their safe, reversible fixes by default** and report each
 
 ## Destructive-command protection
 
-Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructive.sh`) into the target repo's `.claude/settings.json`. This is the **canonical generic destructive-command guard** — Loom and other tooling defer to this copy rather than shipping their own. It runs before every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /` or `$HOME` or outside-repo targets, force-push to `main`, fork bombs, piping a download into a shell, `gh repo delete`, cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`, …) and **asks** for confirmation on risky-but-legitimate ones (force ops, mutating cloud verbs, `kubectl delete`, credential reads). Read-only commands take a zero-fork fast path; scoped deletes like `rm -rf node_modules` are allowed; quote-aware parsing and literal-text redaction keep prose, commit messages, and issue bodies from tripping it.
+Installing Repo Skills also wires a **PreToolUse safety hook** (`guard-destructive.sh`) into the target repo's `.claude/settings.json`. This is the **canonical generic destructive-command guard**. It runs before every agent `Bash` command and **blocks** catastrophic operations (`rm -rf /` or `$HOME` or outside-repo targets, force-push to `main`, fork bombs, piping a download into a shell, `gh repo delete`, cloud/stack/IAM destruction, `DROP TABLE`, `DELETE` without `WHERE`, …) and **asks** for confirmation on risky-but-legitimate ones (force ops, mutating cloud verbs, `kubectl delete`, credential reads). Read-only commands take a zero-fork fast path; scoped deletes like `rm -rf node_modules` are allowed; quote-aware parsing and literal-text redaction keep prose, commit messages, and issue bodies from tripping it.
 
 Every category is configurable per repo (`REPO_GUARD_*`/`REPO_*` env vars or `guards.*` config keys, with legacy `LOOM_*` names honored). See [`skills/repo/SKILL.md`](skills/repo/SKILL.md#destructive-command-guard-pretooluse-hook) for the toggle table and resolution order. If the target already has a compatible guard wired (e.g. a pre-consolidation Loom install), the installer defers to it rather than adding a duplicate.
+
+**In a Loom-managed repo, this guard does not currently run.** Loom wires its own `.loom/hooks/guard-destructive.sh`, which is a dispatcher: it execs this canonical guard only when that copy passes **both** a version probe and a capability probe for **Bash-tool write confinement** (grepping for the `worktree-write-confinement` marker). This guard does not implement that category yet, so the capability probe fails and the dispatcher runs Loom's own vendored `guard-destructive-generic.sh` instead. Nothing is unguarded — the vendored guard carries write confinement and does run — but do not read an upgrade of Repo Skills as a change to destructive-command protection in a repo Loom manages, because it is not one. What an upgrade delivers there is the `/repo:*` command surface. The deferral is designed to become real automatically: Loom's probe is already written so that the moment this guard implements write confinement and emits that marker, the dispatcher starts preferring it with no change on Loom's side.
 
 ## Handoff notes at session start
 
