@@ -2853,7 +2853,7 @@ mark_expandable_dollars() {
 # silently fixed, so the two guards keep identical behavior here.
 # =============================================================================
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation
@@ -2864,11 +2864,20 @@ resolve_stash_cwd() {
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
+            # Mask whitespace INSIDE quoted spans before tokenizing (repo#194
+            # review). Splitting on raw whitespace shreds a quoted path that
+            # contains a space, so a -C or cd argument like "/main dir" became
+            # two tokens and resolution collapsed -- a silent allow for exactly
+            # the shape this parser exists to catch. mask_ws/unmask_ws come
+            # from _MASKWS_AWK; do NOT redefine them here, awk rejects a
+            # duplicate function definition and the whole parser then fails
+            # open.
+            seg = mask_ws(seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)
+                    cdarg = expand_cd_arg(unmask_ws(toks[2]), home)
                     cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
@@ -2903,7 +2912,7 @@ resolve_stash_cwd() {
                 gitcwd = curcwd
                 while (gi <= m) {
                     if (toks[gi] == "-C" && gi + 1 <= m) {
-                        gcarg = expand_cd_arg(toks[gi + 1], home)
+                        gcarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
                         gcclass = strip_cd_quoting(gcarg)
                         if (gcclass ~ /^\//) {
                             gitcwd = gcarg
@@ -5062,8 +5071,19 @@ fi
 # The optional `(-C <path>|-c <k=v>)*` run between `git` and `stash` is
 # repo#194: without it this pre-check never matches `git -C <path> stash pop`,
 # so the parser below never runs and the -C form escapes the ask entirely —
-# the pre-check, not the parser, was the actual gate.
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git([[:space:]]+-[Cc][[:space:]]+[^[:space:]]+)*[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+# the pre-check, not the parser, is the actual gate.
+#
+# The flag value must tolerate whitespace inside quotes, and MIXED forms like
+# `-c user.name="John Doe"` where one token is part bare and part quoted. A
+# first cut used `[^[:space:]]+`, which silently reintroduced the very bypass
+# this closes: any quoted value containing a space failed the positional match,
+# so the whole pre-check missed and the ask was skipped — a silent allow, not
+# even an ask. Rather than enumerate token shapes, match the flag run
+# non-greedily up to `stash`, and let the parser below (which is genuinely
+# quote-aware via qsplit/mask_ws) decide scope. This gate only needs to be
+# permissive enough not to miss; being over-inclusive here costs a parser call,
+# never a wrong verdict.
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
     if [[ -n "$CWD" ]]; then
