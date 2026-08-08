@@ -159,9 +159,12 @@ this repo:
 - **Reverse.** `Q` names a location in the installed repo, so map it back to
   find what would be installed there. For each declared `T' → D'` whose
   destination `D'` is a path-prefix of `Q`, the candidate source is
-  `T'/relpath(Q, D')`. Try candidates **longest `D'` first**, and try literal `Q`
-  as well (some destinations also exist here, as installed copies). The link
-  resolves if any candidate exists on disk.
+  `T'/relpath(Q, D')`; when `D'` *equals* `Q` — a link that points at the
+  destination directory itself — the candidate is `T'`. Try candidates
+  **longest `D'` first**, and try literal `Q` as well (some destinations also
+  exist here, as installed copies). The link resolves if **any** candidate
+  exists on disk: a candidate that is absent is skipped and the search
+  continues, and only an exhausted candidate list is a finding.
 
 Worked example — the report that produced this rule. `defaults/.loom/CLAUDE.md`
 links to `.loom/docs/troubleshooting.md`. In place that is
@@ -174,12 +177,24 @@ installed itself. Forward: `defaults/.loom → ""`, so the file installs to
 exists. Resolved via install mapping; not a finding. All 22 findings in that run
 were this shape, and all 22 were wrong.
 
-Longest-first ordering in the reverse step is load-bearing, not a tie-break.
-`""` is a path-prefix of *every* path, so matching it first would send
-`.loom/docs/troubleshooting.md` back to `defaults/.loom/.loom/docs/…` and
-reproduce the false positive exactly. An asymmetric mapping — where a tree
-installs *above* one of its own siblings — is the normal case, not the corner
-case.
+Longest-first ordering in the reverse step is an **attribution** rule, not a
+correctness one. Because the step resolves on *any* existing candidate, the
+ordering cannot change a resolved-vs-`MISSING` verdict — an absent candidate is
+skipped, not fatal. What it changes is *which* declared tree is named as the
+source that satisfies the link — the disclosure below. `""` is a path-prefix of
+*every* path, so wherever `defaults/.loom/.loom/docs/…` does happen to exist a
+shortest-first search credits `defaults/.loom` for a target that
+`.loom/docs → defaults/docs` is what actually installs. Longest `D'` is the most
+specific mapping, and the most specific mapping is the one that owns the
+installed path, so it is the one to report.
+
+The verdict-changing longest-prefix rule is the **forward** step's. There
+exactly one `T` is chosen, and that choice fixes the installed path and
+therefore `Q` itself: taking a shorter prefix where a longer declared tree also
+contains `F` resolves the link against the wrong destination and can turn a
+healthy link into a finding. An asymmetric mapping — where a tree installs
+*above* one of its own siblings — is the normal case, not the corner case, so
+nested declarations and multi-candidate reverse steps both see real traffic.
 
 ### It adds a base; it never deletes a finding
 
@@ -218,9 +233,14 @@ Two rows of that table are findings in their own right:
 
 Per-link disclosure follows the same rule as the two-base case: name the base
 whenever it is not the file's own directory. A mapping-resolved link reads
-**resolved via install mapping (`defaults/.loom` -> `<dest root>`)**, never a
-bare "ok" — the whole point is that a mapping-resolved link and an in-place one
-are distinguishable at a glance.
+**resolved via install mapping (`defaults/.loom` -> `<dest root>`,
+source `defaults/docs/troubleshooting.md`)**, never a bare "ok" — the whole
+point is that a mapping-resolved link and an in-place one are distinguishable
+at a glance. The mapping named is the **forward** one (the tree the linking file
+sits in, which is also the tree the table's "Links resolved" column counts
+against); the **source** is the reverse candidate that was found, chosen by the
+longest-`D'` attribution rule above. Print both: they are frequently different
+trees, and a wrong mapping is easiest to spot in the pair.
 
 ### Fixing a link inside a template tree
 

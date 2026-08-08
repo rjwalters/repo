@@ -218,8 +218,14 @@ assert_contains "the reverse step maps the target back to a source path" \
     "$LINKS" "map it back to"
 assert_contains "reverse candidates are tried longest-destination-first" \
     "$LINKS" 'longest `D'"'"'` first'
-assert_contains "longest-first is called out as load-bearing" "$LINKS" \
-    "load-bearing, not a tie-break"
+assert_contains "the reverse step resolves on any existing candidate" "$LINKS" \
+    "resolves if **any** candidate"
+assert_contains "an absent reverse candidate is skipped, not fatal" "$LINKS" \
+    "skipped and the search"
+assert_contains "reverse-step ordering is scoped to attribution, not the verdict" \
+    "$LINKS" "attribution** rule, not a"
+assert_contains "the verdict-changing longest-prefix rule is the forward step's" \
+    "$LINKS" "longest-prefix rule is the **forward** step's"
 assert_contains "a link missing under all three bases is still reported" \
     "$LINKS" "It adds a base; it never deletes a finding"
 assert_contains "the report names every base that was tried" "$LINKS" \
@@ -230,6 +236,10 @@ assert_contains "a declared tree that resolved 0 links is itself a finding" \
     "$LINKS" "resolved **0** links"
 assert_contains "mapping-resolved links are distinguishable from in-place" \
     "$LINKS" "resolved via install mapping"
+assert_contains "the disclosure names the reverse candidate that was found" \
+    "$LINKS" "source \`defaults/docs/troubleshooting.md\`"
+assert_contains "the disclosure separates the forward mapping from the source" \
+    "$LINKS" "The mapping named is the **forward** one"
 assert_contains "a fix inside a template tree uses destination coordinates" \
     "$LINKS" "must be written in **destination**"
 assert_contains "the 22-finding incident is recorded" "$LINKS" \
@@ -285,27 +295,38 @@ norm() {  # <path> -> lexically normalized (targets need not exist)
 load_decl() {  # <.repo/link-roots.json path> — absent file = no declaration
     DECL_KEYS=(); DECL_VALS=()
     [[ -f "$1" ]] || return 0
-    local k v
-    while IFS=$'\t' read -r k v; do
+    local k v tab
+    # A literal tab in the replacement, not `\t`: BSD/macOS sed emits a bare "t"
+    # for `\t` there, which would silently defeat the IFS=$'\t' split below.
+    tab=$'\t'
+    while IFS="$tab" read -r k v; do
         DECL_KEYS+=("$k"); DECL_VALS+=("${v:-}")
-    done < <(sed -n 's/.*"\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p' "$1")
+    done < <(sed -n "s/.*\"\([^\"]*\)\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1${tab}\2/p" "$1")
 }
 
 rev_order() {  # <installed target> -> declaration indices, longest destination first
     local q="$1" i d out=()
     for i in "${!DECL_VALS[@]}"; do
         d="${DECL_VALS[$i]}"
-        if [[ -z "$d" || "$q" == "$d/"* ]]; then out+=("${#d}:$i"); fi
+        # `$q == $d` is deliberate: a link that points at a declared destination
+        # directory itself maps back to the tree T' that installs it.
+        if [[ -z "$d" || "$q" == "$d" || "$q" == "$d/"* ]]; then out+=("${#d}:$i"); fi
     done
     ((${#out[@]})) || return 0
     printf '%s\n' "${out[@]}" | sort -t: -k1,1nr | cut -d: -f2
 }
 
+# Set by resolve() to the repo-relative path that actually satisfied the link.
+# Ordering in rev_order() is an attribution rule, so this — not resolve()'s own
+# verdict string — is what a reverse-candidate ordering change is visible in.
+RESOLVED_SRC=""
+
 resolve() {  # <repo root> <file, repo-relative> <link target> -> base that resolved it
     local root="$1" f="$2" p="$3" dir c i best=-1 bestlen=-1 T D rel installed idir q j T2 D2 cand
+    RESOLVED_SRC=""
     dir="$(dirname "$f")"; [[ "$dir" == "." ]] && dir=""
-    c="$(norm "${dir:+$dir/}$p")";  [[ -e "$root/$c" ]] && { printf 'in place';  return 0; }
-    c="$(norm "$p")";               [[ -e "$root/$c" ]] && { printf 'repo root'; return 0; }
+    c="$(norm "${dir:+$dir/}$p")";  [[ -e "$root/$c" ]] && { RESOLVED_SRC="$c"; printf 'in place';  return 0; }
+    c="$(norm "$p")";               [[ -e "$root/$c" ]] && { RESOLVED_SRC="$c"; printf 'repo root'; return 0; }
     for i in "${!DECL_KEYS[@]}"; do
         T="${DECL_KEYS[$i]}"
         if [[ "$f" == "$T/"* ]] && ((${#T} > bestlen)); then best=$i; bestlen=${#T}; fi
@@ -316,17 +337,25 @@ resolve() {  # <repo root> <file, repo-relative> <link target> -> base that reso
     installed="$(norm "${D:+$D/}$rel")"
     idir="$(dirname "$installed")"; [[ "$idir" == "." ]] && idir=""
     for q in "$(norm "${idir:+$idir/}$p")" "$(norm "$p")"; do
-        [[ -e "$root/$q" ]] && { printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
+        [[ -e "$root/$q" ]] && { RESOLVED_SRC="$q"; printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
         while read -r j; do
             [[ -n "$j" ]] || continue
             T2="${DECL_KEYS[$j]}"; D2="${DECL_VALS[$j]}"
             if [[ -z "$D2" ]]; then cand="$(norm "$T2/$q")"
+            elif [[ "$q" == "$D2" ]]; then cand="$T2"
             else cand="$(norm "$T2/${q#"$D2"/}")"; fi
-            [[ -e "$root/$cand" ]] && { printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
+            # Any existing candidate resolves: an absent one is skipped, and the
+            # loop keeps going rather than ending the reverse step.
+            [[ -e "$root/$cand" ]] && { RESOLVED_SRC="$cand"; printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
         done < <(rev_order "$q")
     done
     printf 'MISSING'
     return 1
+}
+
+resolve_src() {  # same args as resolve -> the path that satisfied the link
+    resolve "$@" >/dev/null || true
+    printf '%s' "$RESOLVED_SRC"
 }
 
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/links-roots.XXXXXX")"
@@ -339,17 +368,29 @@ mkdir -p "$FIX/defaults/.loom" "$FIX/defaults/docs" "$FIX/docs" "$FIX/.repo"
 : > "$FIX/defaults/docs/guide.md"
 : > "$FIX/docs/a.md"
 : > "$FIX/docs/b.md"
+# Two reverse candidates that BOTH exist, for the attribution assertions below:
+# .loom/docs/deep -> defaults/elsewhere (longest) vs .loom/docs -> defaults/docs.
+mkdir -p "$FIX/defaults/elsewhere" "$FIX/defaults/docs/deep"
+: > "$FIX/defaults/elsewhere/x.md"
+: > "$FIX/defaults/docs/deep/x.md"
+# A declared tree nested inside another declared tree, for the forward-step
+# longest-prefix assertion. Only the ""-mapping reverse candidate exists.
+mkdir -p "$FIX/defaults/.loom/docs" "$FIX/defaults/.loom/.loom/nested"
+: > "$FIX/defaults/.loom/docs/guide.md"
+: > "$FIX/defaults/.loom/.loom/nested/page.md"
 cat > "$FIX/.repo/link-roots.json" <<'JSON'
 {
   "defaults/.loom": "",
   "defaults/docs": ".loom/docs",
-  "defaults/.claude/commands/loom": ".claude/commands/loom"
+  "defaults/.claude/commands/loom": ".claude/commands/loom",
+  "defaults/.loom/docs": ".loom/nested",
+  "defaults/elsewhere": ".loom/docs/deep"
 }
 JSON
 
 # The declaration parses, including the empty ("destination root") value.
 load_decl "$FIX/.repo/link-roots.json"
-assert_eq "link-roots.json yields three mappings" "3" "${#DECL_KEYS[@]}"
+assert_eq "link-roots.json yields five mappings" "5" "${#DECL_KEYS[@]}"
 assert_eq "an empty destination parses as the destination root" "" "${DECL_VALS[0]}"
 
 # The repo#208 finding itself: correct at the destination, broken in place.
@@ -368,12 +409,40 @@ assert_eq "defaults/docs/guide.md -> .loom/docs/troubleshooting.md resolves via 
 assert_eq "a template-tree link missing everywhere is still reported" "MISSING" \
     "$(resolve "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/gone.md")"
 
-# Longest-destination-first is load-bearing: the "" mapping would win otherwise
-# and send the target back to defaults/.loom/.loom/docs/, the original bug.
-assert_eq "the naive ''-first reverse candidate does not exist" "0" \
-    "$([[ -e "$FIX/defaults/.loom/.loom/docs/troubleshooting.md" ]] && echo 1 || echo 0)"
-assert_eq "the longest-first reverse candidate does exist" "1" \
-    "$([[ -e "$FIX/defaults/docs/troubleshooting.md" ]] && echo 1 || echo 0)"
+# --- Reverse-step ordering: an ATTRIBUTION rule, executed, not asserted about --
+#
+# .loom/docs/deep/x.md has three reverse candidates: defaults/elsewhere/x.md
+# (D'=".loom/docs/deep", exists), defaults/docs/deep/x.md (D'=".loom/docs",
+# exists) and defaults/.loom/.loom/docs/deep/x.md (D'="", absent). Flipping
+# rev_order's sort direction turns all three of the following red.
+assert_eq "rev_order returns declarations longest-destination-first" "4 1 0" \
+    "$(rev_order ".loom/docs/deep/x.md" | xargs)"
+assert_eq "the most specific reverse candidate is the one credited" \
+    "defaults/elsewhere/x.md" \
+    "$(resolve_src "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/deep/x.md")"
+# ...and the verdict is the same either way, because any existing candidate
+# resolves — the ordering cannot manufacture a MISSING.
+assert_eq "an absent reverse candidate is skipped rather than ending the search" \
+    "mapping defaults/.loom -> <dest root>" \
+    "$(resolve "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/deep/x.md")"
+
+# A link whose target IS a declared destination directory maps back to the tree
+# that installs it (rev_order's q == D' case).
+assert_eq "a link to a declared destination directory resolves to its tree" \
+    "defaults/docs" \
+    "$(resolve_src "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs")"
+
+# --- Forward step: the longest-prefix rule that DOES change the verdict -------
+#
+# defaults/.loom/docs/guide.md sits under two declared trees. Taking the longer
+# (defaults/.loom/docs -> .loom/nested) installs it to .loom/nested/guide.md, so
+# "page.md" resolves via defaults/.loom/.loom/nested/page.md. Taking the shorter
+# (defaults/.loom -> "") installs it to docs/guide.md and the link is MISSING.
+assert_eq "the forward step picks the longest declared tree containing the file" \
+    "mapping defaults/.loom/docs -> .loom/nested" \
+    "$(resolve "$FIX" "defaults/.loom/docs/guide.md" "page.md")"
+assert_eq "the shorter-prefix forward candidate genuinely does not resolve" "0" \
+    "$([[ -e "$FIX/defaults/.loom/docs/page.md" || -e "$FIX/docs/page.md" ]] && echo 1 || echo 0)"
 
 # Criterion 3: a declared mapping must not change non-template resolution.
 assert_eq "an in-place link outside any template tree still resolves in place" \
