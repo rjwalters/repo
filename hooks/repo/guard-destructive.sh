@@ -2873,6 +2873,16 @@ mark_expandable_dollars() {
 # itself performs when --git-dir/--work-tree are passed explicitly. The only
 # caller of this function is the stash pre-check block below; no other
 # consumer or test calls it directly, so widening the contract here is safe.
+#
+# repo#204 review: -C and --git-dir/GIT_DIR COMPOSE, and git applies -C first
+# no matter where it sits in the argument order -- a relative --git-dir /
+# GIT_DIR / --work-tree / GIT_WORK_TREE value is interpreted against the
+# post--C directory even when the flag precedes -C, and even when it arrives
+# as an env prefix. The first cut resolved the env-prefix pair against curcwd
+# BEFORE the -C loop ran, pinning it to the pre--C directory. Raw values are
+# now recorded during the loop and resolved once, after it, against the final
+# process cwd. (The matching caller-side gap -- probing git for the toplevel
+# with no -C at all -- is fixed in the pre-check block below.)
 # =============================================================================
 resolve_stash_cwd() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
@@ -2951,60 +2961,54 @@ resolve_stash_cwd() {
             # first. -c takes a key=value token and is skipped, not applied.
             if (toks[idx] == "git") {
                 gi = idx + 1
-                gitcwd = curcwd
-                gitdirarg = ""
-                worktreearg = ""
-                if (envgitdir_raw != "") {
-                    gdarg = expand_cd_arg(unmask_ws(envgitdir_raw), home)
-                    gdclass = strip_cd_quoting(gdarg)
-                    gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
-                }
-                if (envworktree_raw != "") {
-                    wtarg = expand_cd_arg(unmask_ws(envworktree_raw), home)
-                    wtclass = strip_cd_quoting(wtarg)
-                    worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
-                    gitcwd = worktreearg
-                }
+                # proccwd is the PROCESS cwd git actually runs in: only -C
+                # moves it, and -C chdirs immediately during option parsing.
+                # A relative --git-dir/--work-tree (or GIT_DIR/GIT_WORK_TREE)
+                # is therefore interpreted against the FINAL post--C cwd no
+                # matter where it sits in the argument order (repo#204 review;
+                # verified against git 2.43 for all three orders: env prefix,
+                # flag-before--C, flag-after--C). So the raw values are only
+                # RECORDED in this loop and resolved once the loop ends -- the
+                # earlier version resolved the env-prefix pair against curcwd
+                # before the -C loop ran, which pinned a relative GIT_DIR to
+                # the pre--C directory.
+                proccwd = curcwd
+                gitdir_raw = envgitdir_raw
+                worktree_raw = envworktree_raw
+                have_gitdir = (envgitdir_raw != "")
+                have_worktree = (envworktree_raw != "")
                 while (gi <= m) {
                     if (toks[gi] == "-C" && gi + 1 <= m) {
                         gcarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
                         gcclass = strip_cd_quoting(gcarg)
                         if (gcclass ~ /^\//) {
-                            gitcwd = gcarg
-                        } else if (gitcwd != "") {
-                            gitcwd = gitcwd "/" gcarg
+                            proccwd = gcarg
+                        } else if (proccwd != "") {
+                            proccwd = proccwd "/" gcarg
                         }
                         gi += 2
                         continue
                     }
                     if (toks[gi] == "-c" && gi + 1 <= m) { gi += 2; continue }
+                    # A command-line flag overrides the env prefix, mirroring
+                    # git own precedence; a later flag overrides an earlier one.
                     if (toks[gi] == "--git-dir" && gi + 1 <= m) {
-                        gdarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
-                        gdclass = strip_cd_quoting(gdarg)
-                        gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
+                        gitdir_raw = toks[gi + 1]; have_gitdir = 1
                         gi += 2
                         continue
                     }
                     if (toks[gi] ~ /^--git-dir=/) {
-                        gdarg = expand_cd_arg(unmask_ws(substr(toks[gi], 11)), home)
-                        gdclass = strip_cd_quoting(gdarg)
-                        gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
+                        gitdir_raw = substr(toks[gi], 11); have_gitdir = 1
                         gi += 1
                         continue
                     }
                     if (toks[gi] == "--work-tree" && gi + 1 <= m) {
-                        wtarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
-                        wtclass = strip_cd_quoting(wtarg)
-                        worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
-                        gitcwd = worktreearg
+                        worktree_raw = toks[gi + 1]; have_worktree = 1
                         gi += 2
                         continue
                     }
                     if (toks[gi] ~ /^--work-tree=/) {
-                        wtarg = expand_cd_arg(unmask_ws(substr(toks[gi], 13)), home)
-                        wtclass = strip_cd_quoting(wtarg)
-                        worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
-                        gitcwd = worktreearg
+                        worktree_raw = substr(toks[gi], 13); have_worktree = 1
                         gi += 1
                         continue
                     }
@@ -3012,6 +3016,23 @@ resolve_stash_cwd() {
                 }
                 if (gi + 1 <= m && toks[gi] == "stash" && \
                     (toks[gi + 1] == "pop" || toks[gi + 1] == "drop" || toks[gi + 1] == "clear")) {
+                    gitdirarg = ""
+                    worktreearg = ""
+                    if (have_gitdir) {
+                        gdarg = expand_cd_arg(unmask_ws(gitdir_raw), home)
+                        gdclass = strip_cd_quoting(gdarg)
+                        gitdirarg = (gdclass ~ /^\//) ? gdarg : (proccwd != "" ? proccwd "/" gdarg : gdarg)
+                    }
+                    if (have_worktree) {
+                        wtarg = expand_cd_arg(unmask_ws(worktree_raw), home)
+                        wtclass = strip_cd_quoting(wtarg)
+                        worktreearg = (wtclass ~ /^\//) ? wtarg : (proccwd != "" ? proccwd "/" wtarg : wtarg)
+                    }
+                    # An explicit work tree IS the directory the operation acts
+                    # on, so it wins over the process cwd for the effective-cwd
+                    # line; otherwise the post--C process cwd is what git infers
+                    # the work tree from.
+                    gitcwd = (worktreearg != "") ? worktreearg : proccwd
                     print gitcwd
                     print gitdirarg
                     print worktreearg
@@ -5207,6 +5228,20 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0
 
     _stash_toplevel=""
     _stash_common_parent=""
+    # Every `git --git-dir=…` probe below must run from the SAME directory the
+    # real command runs from (repo#204 review): git resolves --show-toplevel by
+    # cwd-based worktree inference whenever --work-tree/GIT_WORK_TREE is absent,
+    # so a bare `git --git-dir=… rev-parse --show-toplevel` answers for the
+    # GUARD process cwd, not for the command being judged. That silently
+    # allowed `GIT_DIR=<main>/.git git -C <main> stash pop` issued from a linked
+    # worktree — the toplevel came back as the guard cwd, never matched the
+    # main checkout common-dir parent, and fell through the collision branch.
+    # Threading the resolved cwd through -C makes the probe ask git the same
+    # question the command asks. A cwd that is not a directory makes `git -C`
+    # fail, leaving toplevel/common empty -> the cd-unresolved ask, which is
+    # the intended fail-safe (never a widened allow).
+    _stash_gitdir_cd=()
+    [[ -n "$_stash_effective_cwd" ]] && _stash_gitdir_cd=(-C "$_stash_effective_cwd")
     if [[ -n "$_stash_effective_gitdir" ]]; then
         # --git-dir / GIT_DIR override (repo#202). --git-dir names a .git
         # DIRECTORY, not a worktree path, so this resolves scope by querying
@@ -5220,13 +5255,13 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0
         if [[ -n "$_stash_effective_worktree" && -d "$_stash_effective_worktree" ]]; then
             _stash_toplevel=$(cd "$_stash_effective_worktree" 2>/dev/null && pwd -P) || _stash_toplevel=""
         elif [[ -e "$_stash_effective_gitdir" ]]; then
-            _stash_toplevel=$(git --git-dir="$_stash_effective_gitdir" rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
+            _stash_toplevel=$(git "${_stash_gitdir_cd[@]}" --git-dir="$_stash_effective_gitdir" rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
             [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
                 _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
         fi
 
         if [[ -e "$_stash_effective_gitdir" ]]; then
-            _stash_common=$(git --git-dir="$_stash_effective_gitdir" rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
+            _stash_common=$(git "${_stash_gitdir_cd[@]}" --git-dir="$_stash_effective_gitdir" rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
             if [[ -n "$_stash_common" ]]; then
                 case "$_stash_common" in
                     /*) : ;;
@@ -5254,7 +5289,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0
         # linked worktrees as git reports them — a collision needs at least one
         # other active worktree to race with.
         if [[ -n "$_stash_effective_gitdir" ]]; then
-            _stash_worktree_count=$(git --git-dir="$_stash_effective_gitdir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
+            _stash_worktree_count=$(git "${_stash_gitdir_cd[@]}" --git-dir="$_stash_effective_gitdir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
         else
             _stash_worktree_count=$(cd "$_stash_effective_cwd" 2>/dev/null && \
                 git worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
