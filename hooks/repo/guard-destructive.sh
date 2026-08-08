@@ -39,6 +39,7 @@
 #   Toggle (config key)          REPO_* env                     legacy LOOM_* env              default
 #   guards.readOnlyFastPath      REPO_GUARD_READONLY_FASTPATH   LOOM_GUARD_READONLY_FASTPATH   on
 #   guards.readOnlyFastPathExtra (config-only extend list)      —                              []
+#   guards.positionalMaskAllowlist (config-only extend list)    —                              []
 #   guards.sqlDdl                REPO_GUARD_SQL                 LOOM_GUARD_SQL                 on
 #   guards.cloudCli              REPO_GUARD_CLOUD               LOOM_GUARD_CLOUD               on
 #   guards.reversibleGh          REPO_GUARD_REVERSIBLE_GH       LOOM_GUARD_REVERSIBLE_GH       off (opt-in)
@@ -48,6 +49,14 @@
 #   guards.forceScope            REPO_FORCE_SCOPE               LOOM_FORCE_SCOPE               all
 #   (default-branch seam)        REPO_DEFAULT_BRANCH            LOOM_DEFAULT_BRANCH            resolved from git
 #   worktree.root (config key)   —                              LOOM_WORKTREE_ROOT             <repo>/.loom/worktrees
+#
+# positionalMaskAllowlist is a config-only array of command names (no single
+# env var makes sense for a list, mirroring readOnlyFastPathExtra above): each
+# entry masks that command's own quoted POSITIONAL arguments in the ASK-tier
+# working copy ONLY (never the catastrophic scan), so a read-only tool's own
+# search/dedup text is not misread as an ask-triggering phrase (#195). Absent
+# or empty (the default) is a no-op. grep/egrep/fgrep/rg can never be added,
+# regardless of config — see mask_ask_positional_args()'s header comment.
 #
 # On/off toggles accept 0/false/no and 1/true/yes. rmScope accepts
 # repo|off|permissive; forceScope accepts all|protected|off. Loom-compat
@@ -450,6 +459,71 @@ guard_cfg() {
         fi
     done
     printf 'unset'
+}
+
+# =============================================================================
+# Array-valued sibling of guard_cfg() above, for a `guards.<key>` that holds a
+# JSON array of strings rather than a scalar. Same dual-location resolution
+# and per-file "key ABSENT falls through, key PRESENT (even as []) wins"
+# contract as guard_cfg() — the first config file that actually DEFINES the
+# key wins outright, matching guard_cfg()'s "unset" sentinel semantics rather
+# than a naive "first non-empty array" scan. Each array element is echoed on
+# its own line. Best-effort: any jq failure (malformed JSON, non-array value)
+# yields no output and never trips the ERR trap.
+# =============================================================================
+guard_cfg_array() {
+    local key="$1" cfg has
+    for cfg in "$REPO_ROOT/.claude/skills/repo/config.json" "$REPO_ROOT/.loom/config.json"; do
+        [[ -n "$REPO_ROOT" && -f "$cfg" ]] || continue
+        has=$(jq -r --arg k "$key" '((.guards? // {}) | has($k))' "$cfg" 2>/dev/null) || has="false"
+        if [[ "$has" == "true" ]]; then
+            jq -r --arg k "$key" '(.guards[$k] // []) | .[]' "$cfg" 2>/dev/null
+            return 0
+        fi
+    done
+    return 0
+}
+
+# =============================================================================
+# ASK-tier positional-argument masking allowlist (guards.positionalMaskAllowlist,
+# #195) — resolved lazily (only invoked once mask_ask_positional_args() below
+# is about to run) and cached, mirroring sql_guard_enabled()'s lazy-config-read
+# discipline so the jq/array read never touches the hot path for the majority
+# of commands that don't reach the ASK-tier working-copy build. Builds an ERE
+# alternation of the configured command names, each ERE-metacharacter-escaped
+# so a config-supplied name containing a literal `.` (e.g.
+# "./.loom/scripts/check-duplicate.sh") can't accidentally widen the anchor
+# regex built from it.
+#
+# grep/egrep/fgrep/rg are UNCONDITIONALLY dropped here, even if a repo
+# configures them — see mask_ask_positional_args()'s header comment (below,
+# near strip_datasink_literals()) for the tier-specific reason this exclusion
+# must be preserved deliberately rather than lost by a flat pass-through.
+# =============================================================================
+_POSITIONAL_MASK_CMDRE_CACHE=""
+_POSITIONAL_MASK_CMDRE_DONE=""
+positional_mask_cmdre() {
+    if [[ -z "$_POSITIONAL_MASK_CMDRE_DONE" ]]; then
+        _POSITIONAL_MASK_CMDRE_DONE=1
+        local raw cmd
+        local -a escaped=()
+        raw=$(guard_cfg_array positionalMaskAllowlist)
+        if [[ -n "$raw" ]]; then
+            while IFS= read -r cmd; do
+                [[ -z "$cmd" ]] && continue
+                case "$cmd" in
+                    grep|egrep|fgrep|rg) continue ;;
+                esac
+                escaped+=("$(printf '%s' "$cmd" | sed -E 's/[][(){}.*+?^$|\\]/\\&/g')")
+            done <<< "$raw"
+        fi
+        if [[ ${#escaped[@]} -gt 0 ]]; then
+            local joined
+            joined=$(IFS='|'; printf '%s' "${escaped[*]}")
+            _POSITIONAL_MASK_CMDRE_CACHE="$joined"
+        fi
+    fi
+    printf '%s' "$_POSITIONAL_MASK_CMDRE_CACHE"
 }
 
 # =============================================================================
@@ -1730,6 +1804,113 @@ strip_datasink_literals() {
     }'
 }
 
+# Mask quoted POSITIONAL arguments (no preceding flag name) to a repo-
+# configurable allowlist of known non-executing commands/scripts (#195). Used
+# to build the ASK-tier working copy (COMMAND_ASK_SCAN) ONLY — see the call
+# site below strip_datasink_literals()'s invocation for that copy. This is
+# strip_literal_text()'s counterpart for POSITIONAL text: strip_literal_text()
+# only recognizes text following a NAMED flag (--body/-m/--title/--notes/
+# --comment); it has no effect on a script whose free-text arguments are
+# purely positional, e.g. `./scripts/check-duplicate.sh "TITLE"
+# "DESCRIPTION"` where DESCRIPTION happens to quote an ask-phrase. Such a
+# script never EXECUTES a positional argument — it only reads it as inert
+# search/dedup text — so masking a quoted argument immediately following the
+# configured command (optionally after short/long flags, e.g. `check-
+# duplicate.sh --include-merged-prs "..."`) can never blind ASK_PATTERNS (or
+# any other COMMAND_ASK_SCAN consumer) to a REAL invocation: a wrapper that
+# WRAPS the phrase and then executes it — `sh -c "git stash pop"`, `bash -c
+# '...'`, `eval "..."` — is never in the allowlist and stays fully visible.
+#
+# DELIBERATELY EXCLUDES grep/egrep/fgrep/rg — enforced by the caller
+# (positional_mask_cmdre() above drops them even when configured), not by
+# this function, which simply masks whatever command-name alternation it is
+# given. The reason lives with the caller: COMMAND_ASK_SCAN also feeds the SQL
+# DDL/DML check (SQL_DDL_PATTERN, below), which intentionally scans a
+# `grep '<pattern>' file` invocation's own quoted positional pattern for a
+# literal DDL phrase like "DROP TABLE" and denies, by design — masking grep's
+# own quoted argument here would blind that scan to text it is specifically
+# meant to catch. Adding grep/rg to the allowlist was tried and directly
+# regresses the "Fast path security" / SQL-DDL test coverage in
+# hooks/repo/tests/test-guard-destructive.sh. Extend the exclusion set only
+# for another read-only positional-arg consumer with NO competing raw-text
+# consumer elsewhere in this file (mirrors the vendored guard's own
+# extend-only convention for this allowlist).
+#
+# Only feeds COMMAND_ASK_SCAN, never the catastrophic scan (which keeps
+# reading raw $COMMAND/$COMMAND_NO_LITERAL_TEXT), so this can only NARROW an
+# ask, never suppress a hard deny.
+#
+# Masks EVERY quoted argument that directly, consecutively follows the
+# command+flags (separated only by whitespace) — not just the first — so a
+# multi-positional-arg script's whole argument list gets masked. Masking
+# stops at the first token that is not a quoted string (a bare filename,
+# `&&`, `|`, etc.), leaving anything after that boundary — including a real
+# ask-triggering invocation chained onto the same line — fully visible.
+#
+# $1 = command string to mask. $2 = '|'-joined, ERE-escaped allowlist of
+# command names (already filtered by positional_mask_cmdre()). The caller
+# only invokes this when $2 is non-empty; an absent/empty allowlist is a
+# no-op by construction (the anchor regex then never matches), matching the
+# "absent config is a no-op" default (#195 AC).
+mask_ask_positional_args() {
+    # cmdre is threaded through ENVIRON, NOT -v: gawk's -v assignment runs the
+    # value through the same C-style backslash-escape decoding as a string
+    # constant (so a caller-supplied "\." — the ERE-escaped literal dot
+    # positional_mask_cmdre() produces for a name like "check-duplicate.sh" —
+    # would be silently decoded back to a bare "." before the regex engine
+    # ever sees it, defeating the escaping and emitting a spurious "unknown
+    # escape sequence" warning). ENVIRON values are passed through verbatim.
+    printf '%s' "$1" | CMDRE_FOR_AWK="$2" awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        cmdre = ENVIRON["CMDRE_FOR_AWK"]
+        # Zero or more short/long flags between the command name and the
+        # first quoted positional argument (e.g.
+        # `check-duplicate.sh --include-merged-prs --issue 195`).
+        flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
+        anchor = "(^|[ \t\n;&|`(])(" cmdre ")" flagre "[ \t]+"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            out = out pre matched
+            # Mask every consecutive quoted positional argument immediately
+            # following the anchor (whitespace-separated). Stops at the first
+            # non-quote-starting token, so anything after the argument list
+            # (a pipe, &&, an unrelated command) is left fully visible.
+            while (1) {
+                qc = substr(rest, 1, 1)
+                if (qc != DQ && qc != SQ) break
+                endpos = 0
+                for (i = 2; i <= length(rest); i++) {
+                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                }
+                if (endpos == 0) break
+                inner = substr(rest, 2, endpos - 2)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    gsub(/./, "X", inner)
+                }
+                out = out qc inner qc
+                rest = substr(rest, endpos + 1)
+                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
+                    out = out substr(rest, 1, 1)
+                    rest = substr(rest, 2)
+                }
+            }
+            s = rest
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # Return 0 (success) if ANY quote-aware segment's command word is a shell binary
 # (sh/bash/dash/zsh/ksh/csh/tcsh/fish/pwsh, with or without a leading path).
 # GATES strip_datasink_literals(): when a shell could consume the command's data
@@ -1998,6 +2179,25 @@ fi
 if [[ "$COMMAND_NO_COMMENT" == *"echo"* || "$COMMAND_NO_COMMENT" == *"printf"* ]] && \
    [[ "$(command_has_shell_segment "$COMMAND_NO_COMMENT")" == "no" ]]; then
     COMMAND_ASK_SCAN=$(strip_datasink_literals "$COMMAND_ASK_SCAN")
+fi
+# Third narrowing: mask quoted POSITIONAL arguments of a repo-configured
+# command allowlist (guards.positionalMaskAllowlist, #195) — the ASK-tier
+# analog of the two named-flag/data-sink narrowings above, for tools whose
+# free-text arguments are purely positional rather than behind --body/-m/
+# echo (see mask_ask_positional_args()'s header comment, near
+# strip_datasink_literals() above). Gated on a quote character being present
+# at all (positional masking can only ever matter when there is a quoted
+# argument to mask), which keeps the config read off the hot path for the
+# many full-path commands that carry no quotes. positional_mask_cmdre() is
+# itself cached and resolves to an empty string on the (default) absent/
+# empty config, so this step is a true no-op on every repo that hasn't opted
+# in. Never feeds the catastrophic scan, so it can only NARROW an ask, never
+# miss a hard deny.
+if [[ "$COMMAND_NO_COMMENT" == *'"'* || "$COMMAND_NO_COMMENT" == *"'"* ]]; then
+    _POSITIONAL_MASK_CMDRE="$(positional_mask_cmdre)"
+    if [[ -n "$_POSITIONAL_MASK_CMDRE" ]]; then
+        COMMAND_ASK_SCAN=$(mask_ask_positional_args "$COMMAND_ASK_SCAN" "$_POSITIONAL_MASK_CMDRE")
+    fi
 fi
 
 # =============================================================================

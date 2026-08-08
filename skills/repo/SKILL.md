@@ -133,6 +133,23 @@ One deliberate divergence remains: `aws iam delete-role` is a hard **deny**
 here and an ask in the vendored copy, so the switch makes a Loom-managed repo
 stricter on IAM deletion rather than weaker.
 
+A second, narrower divergence (#195): the vendored guard's ASK-tier positional-
+argument masking (`mask_ask_positional_args()`) carries one hardcoded allowlist
+entry, `./.loom/scripts/check-duplicate.sh` — always masked, with no way to
+extend or disable it per repo. This guard ports the same masking mechanism but
+makes the allowlist a `guards.positionalMaskAllowlist` config array instead
+(empty/absent by default, so it is a no-op on every repo that hasn't opted
+in — see "Configuring per repo" below). It does **not** carry the vendored
+copy's hardcoded entry, since `check-duplicate.sh` is a Loom-specific script
+this repo doesn't ship: a repo that relies on the vendored copy's built-in
+masking for that script and switches to this guard must add it explicitly via
+config, or the switch is (by default) stricter for that one command — more
+asks, never fewer. grep/egrep/fgrep/rg can never be added to the allowlist
+here regardless of config, matching the vendored copy's own exclusion of them
+(see `mask_ask_positional_args()`'s header comment in `guard-destructive.sh`
+for why). Loom's vendored copy can adopt the same configurable mechanism to
+drop its hardcoded path (rjwalters/loom#5660).
+
 Precision features ported from Loom's guard: quote-aware command segmentation
 (a `|` inside quotes is not a pipe), literal-text redaction (a dangerous phrase
 quoted in `--body`/`-m`/`--title`/`--notes`/`--comment` values doesn't trip the
@@ -152,6 +169,7 @@ All toggles resolve: `REPO_*` env var (wins) → legacy `LOOM_*` env var →
 | Toggle | Env var (wins) | Legacy env var | Config key | Default |
 |--------|----------------|----------------|------------|---------|
 | Read-only fast path | `REPO_GUARD_READONLY_FASTPATH` | `LOOM_GUARD_READONLY_FASTPATH` | `guards.readOnlyFastPath` (+ extend-only `guards.readOnlyFastPathExtra`) | on |
+| ASK-tier positional-arg masking allowlist | — (config-only) | — | `guards.positionalMaskAllowlist` (array of command names; grep/egrep/fgrep/rg can never be added) | `[]` (no-op) |
 | SQL DDL/DML | `REPO_GUARD_SQL` | `LOOM_GUARD_SQL` | `guards.sqlDdl` | on |
 | Cloud CLI (mutating-verb asks + `az`/`gcloud` delete denies) | `REPO_GUARD_CLOUD` | `LOOM_GUARD_CLOUD` | `guards.cloudCli` | on |
 | Reversible-GitHub asks (`gh pr/issue close`, `gh label delete`) | `REPO_GUARD_REVERSIBLE_GH` | `LOOM_GUARD_REVERSIBLE_GH` | `guards.reversibleGh` | **off** (opt-in) |
