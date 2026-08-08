@@ -3634,6 +3634,32 @@ assert_allow "stash (#194): 'git -C <worktree> stash pop' from main does not ask
 assert_allow "stash (#194): 'git -C <main> stash list' stays read-only" \
     "git -C $STASH_MAIN stash list" "$STASH_WT"
 
+# repo#202 -- --git-dir/--work-tree flags and a leading GIT_DIR=/GIT_WORK_TREE=
+# assignment run, the two shapes that still reached the main checkout's stash
+# stack after #194's -C/cd threading landed.
+assert_ask "stash (#202): '--git-dir=/--work-tree=' (= form) from a worktree asks" \
+    "git --git-dir=$STASH_MAIN/.git --work-tree=$STASH_MAIN stash pop" "$STASH_WT"
+assert_ask "stash (#202): '--git-dir/--work-tree' (space-separated form) from a worktree asks" \
+    "git --git-dir $STASH_MAIN/.git --work-tree $STASH_MAIN stash drop" "$STASH_WT"
+assert_ask "stash (#202): '--git-dir=/--work-tree=' with stash clear asks" \
+    "git --git-dir=$STASH_MAIN/.git --work-tree=$STASH_MAIN stash clear" "$STASH_WT"
+assert_ask "stash (#202): leading GIT_DIR=/GIT_WORK_TREE= env-prefix from a worktree asks" \
+    "GIT_DIR=$STASH_MAIN/.git GIT_WORK_TREE=$STASH_MAIN git stash pop" "$STASH_WT"
+assert_ask "stash (#202): leading GIT_DIR=/GIT_WORK_TREE= env-prefix with stash drop asks" \
+    "GIT_DIR=$STASH_MAIN/.git GIT_WORK_TREE=$STASH_MAIN git stash drop" "$STASH_WT"
+assert_ask "stash (#202): leading GIT_DIR=/GIT_WORK_TREE= env-prefix with stash clear asks" \
+    "GIT_DIR=$STASH_MAIN/.git GIT_WORK_TREE=$STASH_MAIN git stash clear" "$STASH_WT"
+
+# Must NOT over-block: the worktree-local equivalents of both shapes still allow.
+assert_allow "stash (#202): '--git-dir=/--work-tree=' pointed at the worktree itself does not ask" \
+    "git --git-dir=$STASH_WT/.git --work-tree=$STASH_WT stash pop" "$STASH_MAIN"
+assert_allow "stash (#202): GIT_DIR=/GIT_WORK_TREE= pointed at the worktree itself does not ask" \
+    "GIT_DIR=$STASH_WT/.git GIT_WORK_TREE=$STASH_WT git stash pop" "$STASH_MAIN"
+assert_allow "stash (#202): '--git-dir=... stash list' stays read-only" \
+    "git --git-dir=$STASH_MAIN/.git --work-tree=$STASH_MAIN stash list" "$STASH_WT"
+assert_allow "stash (#202): GIT_DIR=... stash list stays read-only" \
+    "GIT_DIR=$STASH_MAIN/.git GIT_WORK_TREE=$STASH_MAIN git stash list" "$STASH_WT"
+
 echo ""
 
 # =========================================================================
@@ -3708,6 +3734,21 @@ assert_allow "stash (#194): -C at a worktree from a spaced main still does not a
     "git -C \"$STASHWS_WT\" stash pop" "$STASHWS_MAIN"
 assert_allow "stash (#194): stash list in a spaced main stays read-only" \
     "git stash list" "$STASHWS_MAIN"
+
+# repo#202 -- the same whitespace-in-a-quoted-value hazard, for --git-dir=/
+# --work-tree= and a GIT_DIR=/GIT_WORK_TREE= env-prefix, mirroring the -C cases
+# directly above (make_wt_confinement_repo_spaced(), same fixture #194 review
+# added).
+assert_ask "stash (#202): --git-dir=/--work-tree= with a DOUBLE-QUOTED path containing a space asks" \
+    "git --git-dir=\"$STASHWS_MAIN/.git\" --work-tree=\"$STASHWS_MAIN\" stash pop" "$STASHWS_WT"
+assert_ask "stash (#202): --git-dir=/--work-tree= with a SINGLE-QUOTED path containing a space asks" \
+    "git --git-dir='$STASHWS_MAIN/.git' --work-tree='$STASHWS_MAIN' stash pop" "$STASHWS_WT"
+assert_ask "stash (#202): GIT_DIR=/GIT_WORK_TREE= env-prefix with a DOUBLE-QUOTED path containing a space asks" \
+    "GIT_DIR=\"$STASHWS_MAIN/.git\" GIT_WORK_TREE=\"$STASHWS_MAIN\" git stash pop" "$STASHWS_WT"
+assert_allow "stash (#202): --git-dir=/--work-tree= at a worktree from a spaced main still does not ask" \
+    "git --git-dir=\"$STASHWS_WT/.git\" --work-tree=\"$STASHWS_WT\" stash pop" "$STASHWS_MAIN"
+assert_allow "stash (#202): --git-dir=... stash list in a spaced main stays read-only" \
+    "git --git-dir=\"$STASHWS_MAIN/.git\" stash list" "$STASHWS_WT"
 
 echo ""
 

@@ -2850,8 +2850,29 @@ mark_expandable_dollars() {
 # `git -C <path>` threading (repo#194): a `-C`/`-c` run before `stash` is
 # resolved the same way `parse_force_ops` already resolves it for force ops,
 # so `git -C <main-checkout> stash pop` run from a worktree cwd is caught
-# against the -C target rather than the worktree cwd. See the `toks[1] ==
+# against the -C target rather than the worktree cwd. See the `toks[idx] ==
 # "git"` block below.
+#
+# `--git-dir=`/`--work-tree=` and a leading `GIT_DIR=`/`GIT_WORK_TREE=`
+# assignment run (repo#202): two further shapes reach the MAIN checkout's
+# stash stack undetected. `git --git-dir=<main>/.git --work-tree=<main> stash
+# pop` matches the pre-check but this parser only recognised -C/-c, so it fell
+# back to the raw session cwd (the worktree) and the caller saw no reason to
+# ask. `GIT_DIR=<main>/.git GIT_WORK_TREE=<main> git stash pop` does not even
+# start with `cd`/`git` -- an assignment token precedes it -- so `toks[1] ==
+# "git"` above never fired at all. Fixed by (1) skipping a leading run of
+# `VAR=val` tokens before classifying a segment, capturing GIT_DIR/
+# GIT_WORK_TREE along the way, and (2) recognising --git-dir/--work-tree (both
+# `=`-joined and space-separated) in the same loop that already threads -C/-c.
+#
+# Output contract changed from one line to three (cwd / git-dir override /
+# work-tree override) so the caller can resolve --git-dir scope via
+# --git-common-dir rather than reusing the -C cd-and-rev-parse path verbatim --
+# --git-dir takes a .git directory, not a worktree path, and cd-ing into it
+# then asking git to "rev-parse --show-toplevel" is not the same operation git
+# itself performs when --git-dir/--work-tree are passed explicitly. The only
+# caller of this function is the stash pre-check block below; no other
+# consumer or test calls it directly, so widening the contract here is safe.
 # =============================================================================
 resolve_stash_cwd() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
@@ -2876,9 +2897,28 @@ resolve_stash_cwd() {
             seg = mask_ws(seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
-            if (toks[1] == "cd") {
-                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(unmask_ws(toks[2]), home)
+            # Skip a leading run of `VAR=val` assignment tokens (repo#202) so
+            # an env-prefixed invocation like `GIT_DIR=x GIT_WORK_TREE=y git
+            # stash pop` still classifies past the assignments to "git" below,
+            # instead of never matching toks[1] at all. Capture GIT_DIR/
+            # GIT_WORK_TREE while skipping -- a later command-line
+            # --git-dir/--work-tree flag on the same segment overrides these,
+            # mirroring git own env-vs-flag precedence.
+            envgitdir_raw = ""
+            envworktree_raw = ""
+            idx = 1
+            while (idx <= m && toks[idx] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                eqpos = index(toks[idx], "=")
+                vname = substr(toks[idx], 1, eqpos - 1)
+                vval = substr(toks[idx], eqpos + 1)
+                if (vname == "GIT_DIR") envgitdir_raw = vval
+                else if (vname == "GIT_WORK_TREE") envworktree_raw = vval
+                idx++
+            }
+            if (idx > m) continue   # nothing left but assignments
+            if (toks[idx] == "cd") {
+                if (idx + 1 <= m && toks[idx + 1] != "" && toks[idx + 1] != "-") {
+                    cdarg = expand_cd_arg(unmask_ws(toks[idx + 1]), home)
                     cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
@@ -2888,7 +2928,8 @@ resolve_stash_cwd() {
                 }
                 continue
             }
-            # `git [-C <path>] [-c k=v] … stash pop|drop|clear`.
+            # `[VAR=val ...] git [-C <path>] [-c k=v] [--git-dir(=)<path>]
+            # [--work-tree(=)<path>] … stash pop|drop|clear`.
             #
             # The -C threading is repo#194: git resolves -C against the process
             # cwd and then operates there, so `git -C <main-checkout> stash pop`
@@ -2908,9 +2949,22 @@ resolve_stash_cwd() {
             # Multiple -C options compose in git (each resolved relative to the
             # previous), which is why this loops rather than reading only the
             # first. -c takes a key=value token and is skipped, not applied.
-            if (toks[1] == "git") {
-                gi = 2
+            if (toks[idx] == "git") {
+                gi = idx + 1
                 gitcwd = curcwd
+                gitdirarg = ""
+                worktreearg = ""
+                if (envgitdir_raw != "") {
+                    gdarg = expand_cd_arg(unmask_ws(envgitdir_raw), home)
+                    gdclass = strip_cd_quoting(gdarg)
+                    gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
+                }
+                if (envworktree_raw != "") {
+                    wtarg = expand_cd_arg(unmask_ws(envworktree_raw), home)
+                    wtclass = strip_cd_quoting(wtarg)
+                    worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
+                    gitcwd = worktreearg
+                }
                 while (gi <= m) {
                     if (toks[gi] == "-C" && gi + 1 <= m) {
                         gcarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
@@ -2924,18 +2978,50 @@ resolve_stash_cwd() {
                         continue
                     }
                     if (toks[gi] == "-c" && gi + 1 <= m) { gi += 2; continue }
+                    if (toks[gi] == "--git-dir" && gi + 1 <= m) {
+                        gdarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
+                        gdclass = strip_cd_quoting(gdarg)
+                        gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
+                        gi += 2
+                        continue
+                    }
+                    if (toks[gi] ~ /^--git-dir=/) {
+                        gdarg = expand_cd_arg(unmask_ws(substr(toks[gi], 11)), home)
+                        gdclass = strip_cd_quoting(gdarg)
+                        gitdirarg = (gdclass ~ /^\//) ? gdarg : (gitcwd != "" ? gitcwd "/" gdarg : gdarg)
+                        gi += 1
+                        continue
+                    }
+                    if (toks[gi] == "--work-tree" && gi + 1 <= m) {
+                        wtarg = expand_cd_arg(unmask_ws(toks[gi + 1]), home)
+                        wtclass = strip_cd_quoting(wtarg)
+                        worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
+                        gitcwd = worktreearg
+                        gi += 2
+                        continue
+                    }
+                    if (toks[gi] ~ /^--work-tree=/) {
+                        wtarg = expand_cd_arg(unmask_ws(substr(toks[gi], 13)), home)
+                        wtclass = strip_cd_quoting(wtarg)
+                        worktreearg = (wtclass ~ /^\//) ? wtarg : (gitcwd != "" ? gitcwd "/" wtarg : wtarg)
+                        gitcwd = worktreearg
+                        gi += 1
+                        continue
+                    }
                     break
                 }
                 if (gi + 1 <= m && toks[gi] == "stash" && \
                     (toks[gi + 1] == "pop" || toks[gi + 1] == "drop" || toks[gi + 1] == "clear")) {
                     print gitcwd
+                    print gitdirarg
+                    print worktreearg
                     found = 1
                     exit
                 }
             }
         }
     }
-    END { if (!found) print curcwd }'
+    END { if (!found) { print curcwd; print ""; print "" } }'
 }
 
 _UNQUOTED_TARGET=""
@@ -5084,24 +5170,73 @@ fi
 # quote-aware via qsplit/mask_ws) decide scope. This gate only needs to be
 # permissive enough not to miss; being over-inclusive here costs a parser call,
 # never a wrong verdict.
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+#
+# repo#202: a leading `GIT_DIR=<path> GIT_WORK_TREE=<path>` assignment run
+# before `git` is a DIFFERENT parse shape — the command does not start with
+# `git` at all — so it needed its own alternative in this same pre-check
+# rather than a tweak to the existing one. `([A-Za-z_][A-Za-z0-9_]*=[^;&|[:space:]]*[[:space:]]+)*`
+# tolerates zero or more such assignments (any name, not just GIT_DIR/
+# GIT_WORK_TREE — resolve_stash_cwd only ACTS on the two it recognises, so
+# being permissive here again only costs a parser call, never a wrong verdict).
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0-9_]*=[^;&|[:space:]]*[[:space:]]+)*git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
+    _stash_effective_gitdir=""
+    _stash_effective_worktree=""
     if [[ -n "$CWD" ]]; then
-        _stash_effective_cwd=$(resolve_stash_cwd "$COMMAND_NO_COMMENT" "$CWD")
+        _stash_resolved=$(resolve_stash_cwd "$COMMAND_NO_COMMENT" "$CWD")
+        _stash_effective_cwd=$(printf '%s\n' "$_stash_resolved" | sed -n '1p')
+        _stash_effective_gitdir=$(printf '%s\n' "$_stash_resolved" | sed -n '2p')
+        _stash_effective_worktree=$(printf '%s\n' "$_stash_resolved" | sed -n '3p')
         [[ -z "$_stash_effective_cwd" ]] && _stash_effective_cwd="$CWD"
     fi
-    # Shell-accurate quote removal for cwd RESOLUTION only — resolve_stash_cwd()
-    # threads curcwd from the RAW cd argument (quotes intact), so unquote a COPY
-    # before resolving against the filesystem. An unterminated quote falls back
-    # to the raw value (today's verdict — ambiguous/ask), never widening to allow.
+    # Shell-accurate quote removal for cwd/gitdir/worktree RESOLUTION only —
+    # resolve_stash_cwd() threads these from the RAW argument (quotes intact),
+    # so unquote a COPY of each before resolving against the filesystem. An
+    # unterminated quote falls back to the raw value (today's verdict —
+    # ambiguous/ask), never widening to allow.
     if [[ "$_stash_effective_cwd" == *"'"* || "$_stash_effective_cwd" == *'"'* ]]; then
         strip_target_quoting "$_stash_effective_cwd" && _stash_effective_cwd="$_UNQUOTED_TARGET"
+    fi
+    if [[ "$_stash_effective_gitdir" == *"'"* || "$_stash_effective_gitdir" == *'"'* ]]; then
+        strip_target_quoting "$_stash_effective_gitdir" && _stash_effective_gitdir="$_UNQUOTED_TARGET"
+    fi
+    if [[ "$_stash_effective_worktree" == *"'"* || "$_stash_effective_worktree" == *'"'* ]]; then
+        strip_target_quoting "$_stash_effective_worktree" && _stash_effective_worktree="$_UNQUOTED_TARGET"
     fi
 
     _stash_toplevel=""
     _stash_common_parent=""
-    if [[ -n "$_stash_effective_cwd" && -d "$_stash_effective_cwd" ]]; then
+    if [[ -n "$_stash_effective_gitdir" ]]; then
+        # --git-dir / GIT_DIR override (repo#202). --git-dir names a .git
+        # DIRECTORY, not a worktree path, so this resolves scope by querying
+        # git directly through the override (--git-common-dir) instead of
+        # cd-ing into it and running the -C-style rev-parse below — cd-ing
+        # into a .git directory and asking for --show-toplevel is not the same
+        # operation git performs when --git-dir/--work-tree are passed
+        # explicitly. An explicit --work-tree/GIT_WORK_TREE (present in both
+        # of #202's reproduction shapes) is exactly what git itself would use
+        # for the toplevel side, so prefer it over asking git to guess one.
+        if [[ -n "$_stash_effective_worktree" && -d "$_stash_effective_worktree" ]]; then
+            _stash_toplevel=$(cd "$_stash_effective_worktree" 2>/dev/null && pwd -P) || _stash_toplevel=""
+        elif [[ -e "$_stash_effective_gitdir" ]]; then
+            _stash_toplevel=$(git --git-dir="$_stash_effective_gitdir" rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
+            [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
+                _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
+        fi
+
+        if [[ -e "$_stash_effective_gitdir" ]]; then
+            _stash_common=$(git --git-dir="$_stash_effective_gitdir" rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
+            if [[ -n "$_stash_common" ]]; then
+                case "$_stash_common" in
+                    /*) : ;;
+                    *) _stash_common="$_stash_effective_gitdir/$_stash_common" ;;
+                esac
+                [[ -d "$_stash_common" ]] && \
+                    _stash_common_parent=$(cd "$_stash_common/.." 2>/dev/null && pwd -P) || _stash_common_parent=""
+            fi
+        fi
+    elif [[ -n "$_stash_effective_cwd" && -d "$_stash_effective_cwd" ]]; then
         _stash_toplevel=$(cd "$_stash_effective_cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
         [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
             _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
@@ -5118,8 +5253,12 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+([^
         # cwd is a linked worktree, not the main checkout. Count the repo's
         # linked worktrees as git reports them — a collision needs at least one
         # other active worktree to race with.
-        _stash_worktree_count=$(cd "$_stash_effective_cwd" 2>/dev/null && \
-            git worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
+        if [[ -n "$_stash_effective_gitdir" ]]; then
+            _stash_worktree_count=$(git --git-dir="$_stash_effective_gitdir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
+        else
+            _stash_worktree_count=$(cd "$_stash_effective_cwd" 2>/dev/null && \
+                git worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || _stash_worktree_count=0
+        fi
         [[ "$_stash_worktree_count" =~ ^[0-9]+$ ]] || _stash_worktree_count=0
 
         # >=3 entries = the main checkout plus two or more linked worktrees, so
@@ -5127,11 +5266,12 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+([^
         if [[ "$_stash_worktree_count" -ge 3 ]]; then
             ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER agent's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $((_stash_worktree_count - 1)) linked worktrees are currently active. Use a per-worktree WIP ref instead of the shared stash stack; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
         fi
-    elif [[ "$_stash_effective_cwd" != "$CWD" ]]; then
-        # A `cd <dir>` prefix resolved to a target that does not exist or is not
-        # inside any git checkout — ambiguous. Fail toward asking rather than
-        # guessing (mirrors parse_force_ops' detached-HEAD fail-safe).
-        ask "Command requires confirmation: $COMMAND (the cd target for this stash operation could not be resolved to a git checkout, so scope cannot be determined — refusing to silently allow an ambiguous stash pop/drop/clear; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:cd-unresolved"
+    elif [[ "$_stash_effective_cwd" != "$CWD" || -n "$_stash_effective_gitdir" ]]; then
+        # A `cd <dir>` prefix, or a --git-dir/GIT_DIR override, resolved to a
+        # target that does not exist or is not inside any git checkout —
+        # ambiguous. Fail toward asking rather than guessing (mirrors
+        # parse_force_ops' detached-HEAD fail-safe).
+        ask "Command requires confirmation: $COMMAND (the cd/--git-dir target for this stash operation could not be resolved to a git checkout, so scope cannot be determined — refusing to silently allow an ambiguous stash pop/drop/clear; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:cd-unresolved"
     fi
 fi
 
