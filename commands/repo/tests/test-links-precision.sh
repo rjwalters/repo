@@ -37,6 +37,18 @@
 #   4  vendored/installer-managed files are reported but never edited in place
 #   5  a high false-positive rate is surfaced as its own finding
 #   6  the two real-world false positives no longer match the documented scan
+#   7  install-template trees resolve at their installed destination, declared
+#      per-repo in .repo/link-roots.json, opt-in and reported
+#   8  the documented forward/reverse mapping algorithm actually clears the
+#      repo#208 false positive without suppressing a real one
+#
+# Contract 7/8 exist for repo#208: a /repo:audit run against rjwalters/loom
+# reported 22 broken links, all 22 inside defaults/ — an install-template tree
+# whose links are written to resolve at the DESTINATION (defaults/.loom/CLAUDE.md
+# installs to <repo>/CLAUDE.md, defaults/docs/*.md to <repo>/.loom/docs/*.md).
+# Resolved in place they are all broken; resolved through the install mapping
+# they are all correct. A permanent 22-finding floor in the checker's own
+# critical class is the "teaches people to skim" failure again, one layer up.
 
 set -uo pipefail
 
@@ -182,6 +194,205 @@ else
         skip "audit.md does carry the span pre-strip (test is meaningful)" "audit.md not found"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "7. Install-template trees resolve at their destination"
+# ---------------------------------------------------------------------------
+
+assert_contains "install-template section exists" "$LINKS" \
+    "## Install-template trees"
+assert_contains "the mapping is declared per-repo, not hardcoded" "$LINKS" \
+    '`.repo/link-roots.json`'
+assert_contains "the declaration is a tree -> destination map" "$LINKS" \
+    '"defaults/docs": ".loom/docs"'
+assert_contains "an empty destination means the destination root" "$LINKS" \
+    'where `""` means the destination root'
+assert_contains "absent a declaration, resolution is unchanged" "$LINKS" \
+    "nothing in this section runs and"
+assert_contains "template trees are never inferred by name" "$LINKS" \
+    "No tree is ever treated as a"
+assert_contains "the forward step maps the linking file to its install path" \
+    "$LINKS" "The file's installed path is"
+assert_contains "the reverse step maps the target back to a source path" \
+    "$LINKS" "map it back to"
+assert_contains "reverse candidates are tried longest-destination-first" \
+    "$LINKS" 'longest `D'"'"'` first'
+assert_contains "longest-first is called out as load-bearing" "$LINKS" \
+    "load-bearing, not a tie-break"
+assert_contains "a link missing under all three bases is still reported" \
+    "$LINKS" "It adds a base; it never deletes a finding"
+assert_contains "the report names every base that was tried" "$LINKS" \
+    "MISSING (in place, repo root, and via"
+assert_contains "the mapping table is printed even with no findings" "$LINKS" \
+    "whether or not there were findings"
+assert_contains "a declared tree that resolved 0 links is itself a finding" \
+    "$LINKS" "resolved **0** links"
+assert_contains "mapping-resolved links are distinguishable from in-place" \
+    "$LINKS" "resolved via install mapping"
+assert_contains "a fix inside a template tree uses destination coordinates" \
+    "$LINKS" "must be written in **destination**"
+assert_contains "the 22-finding incident is recorded" "$LINKS" \
+    "All 22 findings in that run"
+
+if [[ -f "$AUDIT_MD" ]]; then
+    AUDIT="$(cat "$AUDIT_MD")"
+    assert_contains "audit.md folds in the mapping table" "$AUDIT" \
+        "Fold [[links]]' mapping table"
+    assert_contains "audit.md keeps unchanged behavior without a declaration" \
+        "$AUDIT" "With no declaration, resolution is"
+else
+    skip "audit.md folds in the mapping table" "audit.md not found"
+    skip "audit.md keeps unchanged behavior without a declaration" "audit.md not found"
+fi
+
+DOCS_MD="$CMD_DIR/docs.md"
+if [[ -f "$DOCS_MD" ]]; then
+    assert_contains "docs.md keeps the mapping annotation in its consolidated report" \
+        "$(cat "$DOCS_MD")" "resolved via install mapping"
+else
+    skip "docs.md keeps the mapping annotation" "docs.md not found"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "8. The documented mapping algorithm, executed against a fixture"
+# ---------------------------------------------------------------------------
+#
+# Not a grep: this implements links.md's three-base resolution exactly as
+# written and runs it over a temp tree shaped like rjwalters/loom's defaults/,
+# so the repo#208 false positive is reproduced and cleared for real.
+
+DECL_KEYS=()
+DECL_VALS=()
+
+norm() {  # <path> -> lexically normalized (targets need not exist)
+    local p="$1" part out=() parts
+    IFS='/' read -ra parts <<< "$p"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|'.') ;;
+            '..') if ((${#out[@]})) && [[ "${out[$((${#out[@]} - 1))]}" != ".." ]]; then
+                      out=("${out[@]:0:$((${#out[@]} - 1))}")
+                  else out+=(".."); fi ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    local IFS=/
+    printf '%s' "${out[*]:-}"
+}
+
+load_decl() {  # <.repo/link-roots.json path> — absent file = no declaration
+    DECL_KEYS=(); DECL_VALS=()
+    [[ -f "$1" ]] || return 0
+    local k v
+    while IFS=$'\t' read -r k v; do
+        DECL_KEYS+=("$k"); DECL_VALS+=("${v:-}")
+    done < <(sed -n 's/.*"\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p' "$1")
+}
+
+rev_order() {  # <installed target> -> declaration indices, longest destination first
+    local q="$1" i d out=()
+    for i in "${!DECL_VALS[@]}"; do
+        d="${DECL_VALS[$i]}"
+        if [[ -z "$d" || "$q" == "$d/"* ]]; then out+=("${#d}:$i"); fi
+    done
+    ((${#out[@]})) || return 0
+    printf '%s\n' "${out[@]}" | sort -t: -k1,1nr | cut -d: -f2
+}
+
+resolve() {  # <repo root> <file, repo-relative> <link target> -> base that resolved it
+    local root="$1" f="$2" p="$3" dir c i best=-1 bestlen=-1 T D rel installed idir q j T2 D2 cand
+    dir="$(dirname "$f")"; [[ "$dir" == "." ]] && dir=""
+    c="$(norm "${dir:+$dir/}$p")";  [[ -e "$root/$c" ]] && { printf 'in place';  return 0; }
+    c="$(norm "$p")";               [[ -e "$root/$c" ]] && { printf 'repo root'; return 0; }
+    for i in "${!DECL_KEYS[@]}"; do
+        T="${DECL_KEYS[$i]}"
+        if [[ "$f" == "$T/"* ]] && ((${#T} > bestlen)); then best=$i; bestlen=${#T}; fi
+    done
+    ((best < 0)) && { printf 'MISSING'; return 1; }
+    T="${DECL_KEYS[$best]}"; D="${DECL_VALS[$best]}"
+    rel="${f#"$T"/}"
+    installed="$(norm "${D:+$D/}$rel")"
+    idir="$(dirname "$installed")"; [[ "$idir" == "." ]] && idir=""
+    for q in "$(norm "${idir:+$idir/}$p")" "$(norm "$p")"; do
+        [[ -e "$root/$q" ]] && { printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
+        while read -r j; do
+            [[ -n "$j" ]] || continue
+            T2="${DECL_KEYS[$j]}"; D2="${DECL_VALS[$j]}"
+            if [[ -z "$D2" ]]; then cand="$(norm "$T2/$q")"
+            else cand="$(norm "$T2/${q#"$D2"/}")"; fi
+            [[ -e "$root/$cand" ]] && { printf 'mapping %s -> %s' "$T" "${D:-<dest root>}"; return 0; }
+        done < <(rev_order "$q")
+    done
+    printf 'MISSING'
+    return 1
+}
+
+FIX="$(mktemp -d "${TMPDIR:-/tmp}/links-roots.XXXXXX")"
+trap 'rm -rf "$FIX"' EXIT
+
+mkdir -p "$FIX/defaults/.loom" "$FIX/defaults/docs" "$FIX/docs" "$FIX/.repo"
+: > "$FIX/README.md"
+: > "$FIX/defaults/.loom/CLAUDE.md"
+: > "$FIX/defaults/docs/troubleshooting.md"
+: > "$FIX/defaults/docs/guide.md"
+: > "$FIX/docs/a.md"
+: > "$FIX/docs/b.md"
+cat > "$FIX/.repo/link-roots.json" <<'JSON'
+{
+  "defaults/.loom": "",
+  "defaults/docs": ".loom/docs",
+  "defaults/.claude/commands/loom": ".claude/commands/loom"
+}
+JSON
+
+# The declaration parses, including the empty ("destination root") value.
+load_decl "$FIX/.repo/link-roots.json"
+assert_eq "link-roots.json yields three mappings" "3" "${#DECL_KEYS[@]}"
+assert_eq "an empty destination parses as the destination root" "" "${DECL_VALS[0]}"
+
+# The repo#208 finding itself: correct at the destination, broken in place.
+assert_eq "the fixture reproduces the false positive in place" "0" \
+    "$([[ -e "$FIX/defaults/.loom/.loom/docs/troubleshooting.md" ]] && echo 1 || echo 0)"
+assert_eq "defaults/.loom/CLAUDE.md -> .loom/docs/troubleshooting.md resolves via mapping" \
+    "mapping defaults/.loom -> <dest root>" \
+    "$(resolve "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/troubleshooting.md")"
+
+# Non-empty destination, resolved against the destination root.
+assert_eq "defaults/docs/guide.md -> .loom/docs/troubleshooting.md resolves via mapping" \
+    "mapping defaults/docs -> .loom/docs" \
+    "$(resolve "$FIX" "defaults/docs/guide.md" ".loom/docs/troubleshooting.md")"
+
+# Criterion 4: missing under BOTH in-place and mapped resolution is still a finding.
+assert_eq "a template-tree link missing everywhere is still reported" "MISSING" \
+    "$(resolve "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/gone.md")"
+
+# Longest-destination-first is load-bearing: the "" mapping would win otherwise
+# and send the target back to defaults/.loom/.loom/docs/, the original bug.
+assert_eq "the naive ''-first reverse candidate does not exist" "0" \
+    "$([[ -e "$FIX/defaults/.loom/.loom/docs/troubleshooting.md" ]] && echo 1 || echo 0)"
+assert_eq "the longest-first reverse candidate does exist" "1" \
+    "$([[ -e "$FIX/defaults/docs/troubleshooting.md" ]] && echo 1 || echo 0)"
+
+# Criterion 3: a declared mapping must not change non-template resolution.
+assert_eq "an in-place link outside any template tree still resolves in place" \
+    "in place" "$(resolve "$FIX" "docs/a.md" "b.md")"
+assert_eq "a root-relative link outside any template tree still resolves at the root" \
+    "repo root" "$(resolve "$FIX" "docs/a.md" "README.md")"
+
+# Criterion 3, the other half: with NO declaration, every verdict is unchanged.
+load_decl "$FIX/.repo/does-not-exist.json"
+assert_eq "no declaration loads no mappings" "0" "${#DECL_KEYS[@]}"
+assert_eq "without a declaration the template link is reported, as before" "MISSING" \
+    "$(resolve "$FIX" "defaults/.loom/CLAUDE.md" ".loom/docs/troubleshooting.md")"
+assert_eq "without a declaration in-place resolution is unchanged" "in place" \
+    "$(resolve "$FIX" "docs/a.md" "b.md")"
+assert_eq "without a declaration root resolution is unchanged" "repo root" \
+    "$(resolve "$FIX" "docs/a.md" "README.md")"
+
+rm -rf "$FIX"
+trap - EXIT
 
 # ---------------------------------------------------------------------------
 echo ""
