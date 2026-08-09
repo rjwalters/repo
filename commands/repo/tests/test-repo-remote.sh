@@ -1002,6 +1002,57 @@ run_rr -- bogus ; assert_eq "unknown arg -> usage error (64)" "64" "$RR_RC"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- write_ssh_alias() concurrency (repo#213) --"
+# ---------------------------------------------------------------------------
+# repo-remote.sh can be `source`d without invoking main() (the
+# BASH_SOURCE[0]==$0 guard at the bottom of the file), so these tests call
+# write_ssh_alias() directly instead of going through the full `up` flow --
+# there is no need to mock aws/gcp just to exercise this one function.
+CONC_CFG="$SCRATCH/concurrent_ssh_config"
+rm -f "$CONC_CFG" "$CONC_CFG.lock"
+(
+  REPO_REMOTE_SSH_CONFIG="$CONC_CFG" bash -c "
+    source '$RR'
+    NAME=alpha
+    write_ssh_alias '10.0.0.1' >/dev/null
+  " &
+  P1=$!
+  REPO_REMOTE_SSH_CONFIG="$CONC_CFG" bash -c "
+    source '$RR'
+    NAME=beta
+    write_ssh_alias '10.0.0.2' >/dev/null
+  " &
+  P2=$!
+  wait "$P1" "$P2"
+)
+CONC_OUT="$(cat "$CONC_CFG" 2>/dev/null || true)"
+assert_contains "concurrent write_ssh_alias: first writer's block survives" "$CONC_OUT" "Host repo-remote-alpha"
+assert_contains "concurrent write_ssh_alias: second writer's block survives" "$CONC_OUT" "Host repo-remote-beta"
+assert_eq "concurrent write_ssh_alias: no leftover lock dir" "" "$( [[ -e "$CONC_CFG.lock" ]] && echo present )"
+
+# The temp file used for the read-modify-write swap must be created alongside
+# the target config (same directory as $cfg), not under the default $TMPDIR --
+# otherwise the final `mv` can degrade to a cross-filesystem copy-then-unlink,
+# exposing a window where a concurrent reader observes a partial file. Prove
+# it by pointing $TMPDIR at a directory that does not exist: if write_ssh_alias
+# ever fell back to `mktemp` under $TMPDIR, mktemp would fail loudly there and
+# the write would not happen.
+TMPDIR_BOGUS_DIR="$SCRATCH/nonexistent_tmpdir_$$"
+TMPDIR_TEST_CFG="$SCRATCH/tmpdir_test/ssh_config"
+mkdir -p "$(dirname "$TMPDIR_TEST_CFG")"
+TMPDIR_TEST_OUT="$(TMPDIR="$TMPDIR_BOGUS_DIR" REPO_REMOTE_SSH_CONFIG="$TMPDIR_TEST_CFG" bash -c "
+  source '$RR'
+  NAME=tmpdirtest
+  write_ssh_alias '10.0.0.9'
+" 2>&1)"
+TMPDIR_TEST_RC=$?
+assert_eq "write_ssh_alias succeeds with an unusable \$TMPDIR (temp file is created beside \$cfg)" "0" "$TMPDIR_TEST_RC"
+assert_not_contains "no mktemp-under-\$TMPDIR failure leaked into output" "$TMPDIR_TEST_OUT" "mktemp"
+assert_contains "the alias block was actually written despite the bogus \$TMPDIR" \
+  "$(cat "$TMPDIR_TEST_CFG" 2>/dev/null || true)" "Host repo-remote-tmpdirtest"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
