@@ -97,9 +97,46 @@ Known family members: Loom (`.loom/`), Anvil (`.anvil/`), Repo Skills
 metadata pattern. Report any metadata file found even if the tool is
 unrecognized.
 
+**Detect dev installs before comparing versions.** `install.sh --dev .`
+**symlinks** a tool's files directly into `.claude/` instead of copying them —
+the installed surface *is* the source clone, so stamped-version comparison is
+meaningless by construction: it cannot be stale, and it cannot become stale by
+the source moving ahead, because the "installed" files and the source files
+are the same inode. Detect this per tool, checking both signals (either one is
+sufficient — don't require both):
+
+- **Flag**: read `dev` (or the tool's equivalent field) from the metadata
+  file, e.g. Repo Skills' `install-metadata.json` carries `"dev": true`.
+- **Structural fallback**, for metadata predating the flag: test whether the
+  tool's primary installed file is a symlink, `[[ -L <path> ]]` — e.g. one of
+  the paths in the metadata's own `commands`/`installed_files` list. This is
+  the same check `resync-installed.sh` already uses to recognize a dev
+  destination and skip overwriting it (`scripts/repo/resync-installed.sh:317`,
+  `... symlinked (dev-mode install) ...`).
+
+A tool flagged dev by either check is **dev-mode** for the rest of this
+command: it skips the STALE/current comparison in step 2, gets its own report
+status in step 3, and is never offered an update in step 4.
+
 ### 2. Determine the latest version of each
 
-For each tool, prefer the local source clone recorded in the metadata:
+**Dev-mode tools (step 1) skip this comparison entirely** — do not run the
+stamped-version-vs-latest check below for them. Instead, check only whether
+the **source clone itself** is behind its own remote — that's the one
+meaningful staleness a dev install can have, since the install *is* the
+source:
+
+```bash
+git -C <source> fetch origin --quiet
+git -C <source> log --oneline HEAD..origin/HEAD | wc -l    # source clone itself behind?
+```
+
+A non-zero count is reported in step 3 as the *source clone* being behind
+(fixed with a plain `git -C <source> pull` on that clone) — never as the
+*install* being STALE, and never as grounds to offer step 4's update flow.
+
+For every non-dev tool, prefer the local source clone recorded in the
+metadata:
 
 ```bash
 git -C <source> fetch origin --quiet
@@ -121,7 +158,7 @@ TOOL PACKAGES
 |-------------|------------------|---------|-------------|
 | loom        | 0.9.1 (Jun 4)    | 0.10.6  | STALE       |
 | anvil       | 0.9.0 (Jul 1)    | 0.9.0   | current     |
-| repo-skills | 0.1.0 (Jul 14)   | 0.1.0   | current     |
+| repo-skills | 0.8.0 (Aug 9)    | —       | dev (symlinked to /Users/you/GitHub/repo) |
 | kicad-tools | 2.3.0 (May 20)   | ?       | source repo missing — clone it? |
 | some-tool   | 1.2.0 (Jun 30)   | ?       | sidecar missing — re-run installer? |
 ```
@@ -132,14 +169,41 @@ disk, while `sidecar missing` is the signature check above (installed here once,
 but the machine-local pointer is gone — typically deleted by pulling an
 untracking commit, repo#96).
 
+**A dev-mode tool (step 1) always gets its own `dev (symlinked to <source>)`
+status row — never `current`, never `STALE`.** `current` would only be a
+coincidence for a symlinked install (the files are the source, not a copy that
+happens to match it), and reporting it that way hides from the operator that
+this install is not an ordinary copy. Leave `Latest` as `—`: there is no
+"latest for this install" to compare against, only the source clone's own
+position relative to its remote. If step 2 found the source clone itself
+behind its remote, fold that into the same row instead of a separate STALE
+row, e.g.:
+
+```
+| repo-skills | 0.8.0 (Aug 9)    | —       | dev (symlinked; source clone 3 commits behind origin) |
+```
+
+That is actionable (`git -C <source> pull`) without implying the *install*
+needs — or can receive — an update.
+
 Where a changelog exists in the source repo, summarize what changed between
-the installed and latest versions.
+the installed and latest versions for non-dev tools.
 
 ### 4. Update (with confirmation)
 
-For each stale tool the user approves, update the source clone first, then run
-that tool's own update mechanism — its dedicated updater where it ships one,
-otherwise its installer. Never hand-copy files:
+**Never offer a dev-mode tool (step 1/3) an update here — not even when its
+source clone reports behind in step 3.** There is nothing to update: the
+installed files already are the source clone. Running an installer/updater
+over a dev install anyway would replace its symlinks with rendered copies,
+silently ending the live-editing setup `--dev` exists to provide, with no
+signal to the operator that it happened — exactly the harm this whole check
+exists to prevent. If the report showed the source clone behind its remote,
+the fix is a plain `git -C <source> pull` on that clone, run by the operator
+directly — outside this update flow, not through it.
+
+For each stale (non-dev) tool the user approves, update the source clone
+first, then run that tool's own update mechanism — its dedicated updater
+where it ships one, otherwise its installer. Never hand-copy files:
 
 ```bash
 git -C <source> pull --ff-only
