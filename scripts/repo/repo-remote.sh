@@ -656,9 +656,29 @@ aws_find_tagged() {  # echoes "<id> <state>" or empty
     | grep -v '^None' | head -n1
 }
 
+# aws_public_ip: echoes the instance's public IP (or the literal "None" when
+# AWS has not assigned one yet) on success. On an API-call failure (an
+# unfulfilled spot request, throttling, a transient AWS error, etc.) it
+# returns the underlying `aws` exit code and logs the captured stderr instead
+# of silently swallowing it -- repo#216: the two failure modes ("instance
+# exists but has no public IP yet" vs "the describe-instances call itself
+# failed") are NOT the same thing and must not be collapsed into the same
+# empty-string return the caller cannot tell apart. Callers that only care
+# about "no IP yet" can keep ignoring the exit status (an empty/"None" string
+# is still returned in that case); callers that want to distinguish an actual
+# API failure should check `$?`.
 aws_public_ip() {  # <instance-id>
-  aws ec2 describe-instances --instance-ids "$1" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null
+  local out rc errf
+  errf="$(mktemp)"
+  out="$(aws ec2 describe-instances --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>"$errf")"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log "aws ec2 describe-instances (public IP lookup for ${1}) failed: $(cat "$errf" 2>/dev/null)"
+  fi
+  rm -f "$errf"
+  printf '%s' "$out"
+  return "$rc"
 }
 
 # ── AWS: security group resolve-or-create + SSH ingress (repo#176) ─────────
@@ -935,11 +955,23 @@ aws_up() {
   fi
 
   aws ec2 wait instance-running --instance-ids "$iid" >/dev/null 2>&1 || true
-  local ip; ip="$(aws_public_ip "$iid")"
+  local ip
+  if ! ip="$(aws_public_ip "$iid")"; then
+    # aws_public_ip already logged the underlying API error; treat it the
+    # same as "no public IP yet" here rather than dying -- the instance is up
+    # and reachable state may still resolve on a later `status`/`up` run, and
+    # write_ssh_alias() below independently refuses to write a broken stanza
+    # for an empty/None IP either way (repo#216).
+    log "continuing with no public IP for ${iid} (see error above)"
+    ip=""
+  fi
   [[ "$ip" == "None" ]] && ip=""
 
   writeback_instance_id "$iid"
-  local alias; alias="$(write_ssh_alias "$ip")"
+  local alias
+  if ! alias="$(write_ssh_alias "$ip")"; then
+    log "SSH alias write for ${alias} was rejected (see error above); the SSH config was left untouched -- ssh ${alias} (or git-over-SSH via it) will not work until this is retried"
+  fi
 
   aws_check_reachability "$alias" "$ip"
 
@@ -1173,13 +1205,30 @@ release_ssh_alias_lock() {  # <cfg>
 
 # Write/refresh the one-word SSH alias so the connection is `ssh repo-remote-<name>`.
 # Honors REPO_REMOTE_SSH_CONFIG (default ~/.ssh/config) so tests never touch a
-# real config. Echoes the alias name.
+# real config. Echoes the alias name. Returns non-zero (without touching
+# $cfg) if the generated stanza fails validation -- see below.
 write_ssh_alias() {  # <ip>
   local ip="$1" alias="repo-remote-${NAME}"
   local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
   local key="${REPO_REMOTE_SSH_KEY:-~/.ssh/id_ed25519}"
   local user="${REPO_REMOTE_SSH_USER:-ubuntu}"
-  [[ -z "$ip" ]] && { printf '%s' "$alias"; return 0; }
+
+  # Treat empty, whitespace-only, and the literal "None" (the AWS CLI's
+  # `--output text` rendering of a null scalar -- see aws_public_ip()) as "no
+  # IP yet" identically: skip writing a stanza and return the alias
+  # unchanged. The bare `-z "$ip"` guard this replaces caught only the empty
+  # string, so a whitespace value or the literal "None" could slip through
+  # and produce a HostName-less stanza -- which OpenSSH does not skip, it
+  # refuses to parse the ENTIRE config file, taking every other Host block
+  # (and therefore git-over-SSH) down with it (repo#216).
+  local ip_trimmed="$ip"
+  ip_trimmed="${ip_trimmed#"${ip_trimmed%%[![:space:]]*}"}"
+  ip_trimmed="${ip_trimmed%"${ip_trimmed##*[![:space:]]}"}"
+  if [[ -z "$ip_trimmed" || "$ip_trimmed" == "None" ]]; then
+    printf '%s' "$alias"
+    return 0
+  fi
+  ip="$ip_trimmed"
 
   mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
   acquire_ssh_alias_lock "$cfg"
@@ -1206,6 +1255,22 @@ write_ssh_alias() {  # <ip>
     printf '    User %s\n' "$user"
     printf '    IdentityFile %s\n' "$key"
   } >>"$tmp"
+
+  # Validate the WRITTEN temp file is actually parseable before it ever
+  # replaces the real config -- `ssh -G` resolves/prints the effective config
+  # for the given host without connecting, so this is a pure syntax check
+  # (repo#216). A tightened value check above should make this unreachable
+  # in practice, but this is the backstop that closes the bug class
+  # regardless of which upstream path produced a bad value: a tool that
+  # edits ~/.ssh/config must never be able to leave it unparseable.
+  if ! ssh -G -F "$tmp" "$alias" >/dev/null 2>&1; then
+    log "generated SSH config block for '${alias}' (ip='${ip}') failed to parse -- leaving ${cfg} untouched"
+    rm -f "$tmp"
+    release_ssh_alias_lock "$cfg"
+    printf '%s' "$alias"
+    return 1
+  fi
+
   mv "$tmp" "$cfg"
   chmod 600 "$cfg" 2>/dev/null || true
   release_ssh_alias_lock "$cfg"
