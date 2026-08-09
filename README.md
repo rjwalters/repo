@@ -156,18 +156,18 @@ skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
 commands/repo/*.md           Command files installed to .claude/commands/repo/
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
+scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
-hooks/repo/tests/run.sh      Smoke suite covering both hooks (bash, no framework needed)
-hooks/repo/tests/test-guard-destructive.sh  Full guard regression suite (ported from Loom)
-hooks/repo/tests/test-session-start-handoff.sh  Handoff-hook suite (run.sh delegates to it)
-hooks/repo/tests/test-install-claude-md-markers.sh  CLAUDE.md marker-block regression suite
-hooks/repo/tests/test-shell-wrapper.sh  claude + codex shell wrapper suite (run.sh delegates to it)
-commands/repo/tests/test-branches-loss-check.sh  branches.md permanent-loss check suite (run.sh delegates)
-commands/repo/tests/test-repo-remote.sh  repo-remote.sh provisioning-contract suite (run.sh delegates)
-commands/repo/tests/test-verify-fix-persistence.sh  verify-after-write contract suite (run.sh delegates)
-commands/repo/tests/test-resync-installed.sh  resync-installed.sh suite (run.sh delegates)
-commands/repo/tests/test-installer-contract.sh  INSTALLER-CONTRACT.md C1-C8 conformance (run.sh delegates)
+hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inline smoke cases
+                             plus every delegated suite below. `pnpm test` runs it
+hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLAUDE.md
+                             markers, sidecar untracking, claude + codex shell wrappers
+commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
+                             provisioning, verify-after-write, early sync-and-switch, tidy
+                             KEEP tiers, C7 resync, installer contract, fork-network sweep,
+                             scrub/all/prune contract, links precision, guard equivalence
+                             (its case table lives in guard-equivalence-cases.txt)
 INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
