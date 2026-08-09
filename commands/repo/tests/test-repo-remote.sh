@@ -1053,6 +1053,95 @@ assert_contains "the alias block was actually written despite the bogus \$TMPDIR
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- write_ssh_alias() value guard + write-then-validate rollback (repo#216) --"
+# ---------------------------------------------------------------------------
+# repo#216: write_ssh_alias() previously only guarded `-z "$ip"`, so a
+# whitespace value or the literal "None" (the AWS CLI's `--output text`
+# rendering of a null scalar -- this suite's mock `aws` already defaults
+# MOCK_AWS_STATE to "None" for describe-instances) slipped through and wrote
+# a HostName-less stanza. OpenSSH does not skip a malformed stanza -- it
+# refuses to parse the WHOLE config file, breaking every other Host block
+# (and therefore git-over-SSH) in it.
+
+# (a) The literal string "None" is treated exactly like "no IP yet": no
+# stanza is written, the function still succeeds and echoes the alias name.
+NONE_CFG="$SCRATCH/none_ssh_config"
+rm -f "$NONE_CFG" "$NONE_CFG.lock"
+NONE_OUT="$(REPO_REMOTE_SSH_CONFIG="$NONE_CFG" bash -c "
+  source '$RR'
+  NAME=noneval
+  write_ssh_alias 'None'
+")"
+NONE_RC=$?
+assert_eq   "literal 'None' IP -> write_ssh_alias still succeeds" "0" "$NONE_RC"
+assert_eq   "literal 'None' IP -> alias name is echoed unchanged" "repo-remote-noneval" "$NONE_OUT"
+assert_eq   "literal 'None' IP -> no config file was created at all" "" "$( [[ -e "$NONE_CFG" ]] && echo present )"
+
+# (b) A whitespace-only IP is treated the same way.
+WS_CFG="$SCRATCH/ws_ssh_config"
+rm -f "$WS_CFG" "$WS_CFG.lock"
+WS_OUT="$(REPO_REMOTE_SSH_CONFIG="$WS_CFG" bash -c "
+  source '$RR'
+  NAME=wsval
+  write_ssh_alias '   '
+")"
+WS_RC=$?
+assert_eq   "whitespace-only IP -> write_ssh_alias still succeeds" "0" "$WS_RC"
+assert_eq   "whitespace-only IP -> alias name is echoed unchanged" "repo-remote-wsval" "$WS_OUT"
+assert_eq   "whitespace-only IP -> no config file was created at all" "" "$( [[ -e "$WS_CFG" ]] && echo present )"
+
+# (c) A pre-existing, valid config is left completely untouched when a
+# subsequent call is rejected by the value guard -- the write is a no-op,
+# not a rewrite-with-nothing-changed.
+PRE_CFG="$SCRATCH/pre_ssh_config"
+printf 'Host repo-remote-existing\n    HostName 203.0.113.50\n    User ubuntu\n' >"$PRE_CFG"
+PRE_BEFORE="$(cat "$PRE_CFG")"
+REPO_REMOTE_SSH_CONFIG="$PRE_CFG" bash -c "
+  source '$RR'
+  NAME=noneval2
+  write_ssh_alias 'None' >/dev/null
+"
+assert_eq "pre-existing valid config untouched by a rejected ('None') write" "$PRE_BEFORE" "$(cat "$PRE_CFG")"
+
+# (d) Write-then-validate backstop: even a non-empty, non-"None" value that
+# is not caught by the tightened value guard (e.g. an embedded newline that
+# would inject a bogus config line) must never be installed. This proves the
+# rollback closes the bug class generally, not just for the two reported
+# candidate values.
+INJ_CFG="$SCRATCH/inject_ssh_config"
+printf 'Host repo-remote-untouched\n    HostName 203.0.113.60\n    User ubuntu\n' >"$INJ_CFG"
+INJ_BEFORE="$(cat "$INJ_CFG")"
+INJ_OUT="$(REPO_REMOTE_SSH_CONFIG="$INJ_CFG" bash -c "
+  source '$RR'
+  NAME=inject
+  write_ssh_alias \$'10.0.0.1\nBogusDirective value'
+")"
+INJ_RC=$?
+assert_eq   "malformed value rejected by write-then-validate -> non-zero return" "1" "$INJ_RC"
+assert_eq   "malformed value rejected -> alias name is still echoed" "repo-remote-inject" "$INJ_OUT"
+assert_eq   "malformed value rejected -> pre-existing config completely untouched" "$INJ_BEFORE" "$(cat "$INJ_CFG")"
+assert_not_contains "malformed value rejected -> no lock dir left behind" \
+  "$( [[ -e "$INJ_CFG.lock" ]] && echo present )" "present"
+
+# (e) End-to-end: `up` against the mock `aws` (MOCK_AWS_STATE defaults its
+# describe-instances response to "None", exercising the exact value this
+# issue was filed about) must not write a broken stanza, and whatever ends
+# up in the SSH config (nothing, for a None IP) must remain parseable.
+E2E_CFG="$SCRATCH/e2e_ssh_config"
+rm -f "$E2E_CFG" "$E2E_CFG.lock"
+run_rr MOCK_AWS_NEW_ID=i-0e2enone REPO_REMOTE_SSH_CONFIG="$E2E_CFG" MOCK_AWS_STATE=None -- up --yes --json
+assert_eq   "up with a None public IP still succeeds" "0" "$RR_RC"
+if [[ -s "$E2E_CFG" ]]; then
+  assert_not_contains "up with a None public IP -> no HostName-less stanza written" \
+    "$(cat "$E2E_CFG")" $'HostName\n'
+  ssh -G -F "$E2E_CFG" "repo-remote-myrepo" >/dev/null 2>&1
+  assert_eq "up with a None public IP -> resulting SSH config still parses" "0" "$?"
+else
+  ok "up with a None public IP -> no SSH config file was written (nothing to parse)"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
