@@ -191,6 +191,27 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_KEYNAME_CHECK:-repo-remote-myrepo}"
       exit 0
     fi
+    # The public-IP lookup (aws_public_ip) is the THIRD distinct
+    # --instance-ids describe-instances shape, distinguished by its
+    # `PublicIpAddress` query projection. It needs its own branch so a test
+    # can inject an API-CALL FAILURE (repo#216): "the describe-instances call
+    # itself failed" (an unfulfilled spot request, throttling, a transient
+    # AWS error) is a genuinely different failure mode from "the call
+    # succeeded but AWS has not assigned an IP yet", and aws_public_ip() must
+    # let the caller tell them apart. Both knobs are opt-in, so every
+    # pre-existing test keeps falling through to the shared MOCK_AWS_STATE
+    # canned value below (which is how the succeeded-but-"None" case is
+    # driven).
+    if printf '%s' "$*" | grep -qF "Instances[0].PublicIpAddress"; then
+      if [[ "${MOCK_AWS_PUBLIC_IP_FAIL:-0}" == 1 ]]; then
+        echo "An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation: The instance ID '${MOCK_AWS_NEW_ID:-i-0newinstance}' does not exist" >&2
+        exit 254
+      fi
+      if [[ -n "${MOCK_AWS_PUBLIC_IP:-}" ]]; then
+        printf '%s\n' "$MOCK_AWS_PUBLIC_IP"
+        exit 0
+      fi
+    fi
     # --instance-ids (pinned lookup) vs --filters (tag find)
     if printf '%s' "$*" | grep -q -- '--instance-ids'; then
       echo "${MOCK_AWS_STATE:-None}"
@@ -276,6 +297,17 @@ chmod +x "$MOCK_BIN/curl"
 cat >"$MOCK_BIN/ssh" <<'MOCK'
 #!/usr/bin/env bash
 printf 'ssh %s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+# `ssh -G` is not a connection at all -- it is write_ssh_alias()'s pure
+# config-parse check on the candidate temp file (repo#216). MOCK_SSH_G_FAIL
+# fails ONLY that call, so a test can drive the write-then-validate rollback
+# (and aws_up()'s handling of a rejected alias write) without also breaking
+# the end-of-run reachability probe, which MOCK_SSH_FAIL still covers.
+for a in "$@"; do
+  if [[ "$a" == "-G" ]]; then
+    [[ "${MOCK_SSH_G_FAIL:-0}" == 1 ]] && exit 255
+    exit 0
+  fi
+done
 [[ "${MOCK_SSH_FAIL:-0}" == 1 ]] && exit 255
 exit 0
 MOCK
@@ -1139,6 +1171,92 @@ if [[ -s "$E2E_CFG" ]]; then
 else
   ok "up with a None public IP -> no SSH config file was written (nothing to parse)"
 fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- aws_public_ip() API-failure path + aws_up()'s handling of it (repo#216) --"
+# ---------------------------------------------------------------------------
+# The other half of repo#216: the section above covers the "describe-instances
+# SUCCEEDED but AWS has no IP assigned yet" path (the literal "None"). This
+# section covers the path the issue's own diagnosis flags as the more likely
+# real-world root cause -- the describe-instances CALL ITSELF failing (an
+# unfulfilled spot request, throttling, a transient AWS error). Before the fix
+# both collapsed into the same empty string with a swallowed stderr, so the
+# caller could not tell them apart; aws_public_ip() must now propagate the
+# `aws` exit code and surface the captured stderr, and aws_up() must degrade
+# gracefully (log + continue with no IP) rather than crash.
+
+# (f) Baseline for the contrast: a SUCCESSFUL call that yields no IP returns
+# 0 and the literal "None". This is the case that must stay distinguishable
+# from the failure below.
+IPNONE_ERR="$SCRATCH/ip_none.err"
+IPNONE_OUT="$(PATH="$MOCK_BIN:$PATH" MOCK_AWS_LOG=/dev/null MOCK_AWS_PUBLIC_IP=None bash -c "
+  source '$RR'
+  aws_public_ip i-0ipnone
+" 2>"$IPNONE_ERR")"
+IPNONE_RC=$?
+assert_eq   "aws_public_ip: successful call with no IP assigned -> exit 0" "0" "$IPNONE_RC"
+assert_eq   "aws_public_ip: successful call with no IP assigned -> echoes 'None'" "None" "$IPNONE_OUT"
+assert_not_contains "aws_public_ip: a successful call logs no API error" \
+  "$(cat "$IPNONE_ERR")" "failed:"
+
+# (g) An API-call FAILURE propagates the underlying `aws` exit code (254 from
+# the mock) instead of the 0 the old code returned, and the captured stderr
+# is surfaced rather than swallowed.
+IPFAIL_ERR="$SCRATCH/ip_fail.err"
+IPFAIL_OUT="$(PATH="$MOCK_BIN:$PATH" MOCK_AWS_LOG=/dev/null MOCK_AWS_PUBLIC_IP_FAIL=1 bash -c "
+  source '$RR'
+  aws_public_ip i-0ipfail
+" 2>"$IPFAIL_ERR")"
+IPFAIL_RC=$?
+assert_eq   "aws_public_ip: API failure propagates the aws exit code (not 0)" "254" "$IPFAIL_RC"
+assert_eq   "aws_public_ip: API failure is distinguishable from the succeeded-but-None case" \
+  "different" "$( [[ "$IPFAIL_RC" != "$IPNONE_RC" ]] && echo different || echo same )"
+assert_eq   "aws_public_ip: API failure echoes no IP" "" "$IPFAIL_OUT"
+assert_contains "aws_public_ip: API failure names the failing call and instance" \
+  "$(cat "$IPFAIL_ERR")" "public IP lookup for i-0ipfail"
+assert_contains "aws_public_ip: the swallowed aws stderr is surfaced" \
+  "$(cat "$IPFAIL_ERR")" "InvalidInstanceID.NotFound"
+
+# (h) End-to-end through aws_up(): a failed public-IP lookup is NON-fatal --
+# the instance is up and the IP may resolve on a later run -- so `up` must
+# log the degraded path and still succeed, and must not write a HostName-less
+# stanza off the back of the empty IP.
+IPFAIL_CFG="$SCRATCH/ipfail_ssh_config"
+rm -f "$IPFAIL_CFG" "$IPFAIL_CFG.lock"
+run_rr MOCK_AWS_NEW_ID=i-0ipfaile2e REPO_REMOTE_SSH_CONFIG="$IPFAIL_CFG" MOCK_AWS_PUBLIC_IP_FAIL=1 \
+  -- up --yes --json
+assert_eq   "up with a failed public-IP lookup still succeeds (non-fatal)" "0" "$RR_RC"
+assert_contains "up logs the underlying API error rather than swallowing it" \
+  "$RR_ERR" "public IP lookup for i-0ipfaile2e"
+assert_contains "up logs that it is continuing without a public IP" \
+  "$RR_ERR" "continuing with no public IP for i-0ipfaile2e"
+assert_contains "up still emits an up result after the degraded lookup" "$RR_OUT" '"action":"up"'
+assert_eq   "failed public-IP lookup -> no SSH config written for the empty IP" "" \
+  "$( [[ -s "$IPFAIL_CFG" ]] && echo present )"
+assert_contains "failed public-IP lookup -> the reachability probe is skipped, not failed" \
+  "$RR_ERR" "skipping the end-of-run SSH reachability check"
+
+# (i) The other new aws_up() branch: write_ssh_alias() returning non-zero (the
+# write-then-validate rollback) must be reported, not silently ignored -- and
+# must not abort the run either. MOCK_SSH_G_FAIL fails only write_ssh_alias()'s
+# `ssh -G` config-parse check, leaving the reachability probe working, so this
+# exercises the rejected-alias branch in isolation.
+REJ_CFG="$SCRATCH/reject_ssh_config"
+rm -f "$REJ_CFG" "$REJ_CFG.lock"
+printf 'Host repo-remote-preexisting\n    HostName 203.0.113.70\n    User ubuntu\n' >"$REJ_CFG"
+REJ_BEFORE="$(cat "$REJ_CFG")"
+run_rr MOCK_AWS_NEW_ID=i-0aliasrej REPO_REMOTE_SSH_CONFIG="$REJ_CFG" \
+  MOCK_AWS_PUBLIC_IP=203.0.113.71 MOCK_SSH_G_FAIL=1 -- up --yes --json
+assert_eq   "up with a rejected SSH alias write still succeeds (non-fatal)" "0" "$RR_RC"
+assert_contains "up reports that the SSH alias write was rejected" \
+  "$RR_ERR" "SSH alias write for repo-remote-myrepo was rejected"
+assert_contains "the rejection message names the alias the user would have used" \
+  "$RR_ERR" "ssh repo-remote-myrepo"
+assert_eq   "a rejected alias write leaves the pre-existing SSH config untouched" \
+  "$REJ_BEFORE" "$(cat "$REJ_CFG")"
+assert_eq   "a rejected alias write leaves no lock dir behind" "" \
+  "$( [[ -e "$REJ_CFG.lock" ]] && echo present )"
 
 # ---------------------------------------------------------------------------
 echo ""
