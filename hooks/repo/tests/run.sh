@@ -23,8 +23,9 @@
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
 # commands/repo/tests/test-resync-installed.sh,
-# commands/repo/tests/test-installer-contract.sh, and
-# commands/repo/tests/test-repo-scrub-forks.sh.
+# commands/repo/tests/test-installer-contract.sh,
+# commands/repo/tests/test-repo-scrub-forks.sh, and
+# commands/repo/tests/test-readme-layout-block.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -824,6 +825,42 @@ else
     PASS=$((PASS + GE_PASS))
     FAIL=$((FAIL + GE_FAIL))
     record_suite "test-guard-equivalence.sh" "$GE_PASS" "$GE_FAIL" "vendored-guard equivalence"
+fi
+
+# README.md's Repository layout block vs disk (repo#212): every row/glob's
+# leading path must resolve, and every hooks/commands test-*.sh file must be
+# covered by a row/glob, so the block cannot silently drift in either
+# direction the way it did across four PRs before repo#211's glob mitigation.
+# Same delegation shape as every suite above.
+echo
+echo "-- README Repository layout block vs disk (delegated suite) --"
+RL_TEST="$TESTS_DIR/../../../commands/repo/tests/test-readme-layout-block.sh"
+if [[ ! -f "$RL_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-readme-layout-block.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-readme-layout-block.sh" "$RL_TEST"
+else
+    RL_OUT="$(bash "$RL_TEST" 2>&1)"
+    RL_STATUS=$?
+    RL_PASS="$(suite_count Passed "$RL_OUT")"
+    RL_FAIL="$(suite_count Failed "$RL_OUT")"
+    if ! [[ "$RL_PASS" =~ ^[0-9]+$ && "$RL_FAIL" =~ ^[0-9]+$ ]]; then
+        RL_PASS=0
+        RL_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-readme-layout-block.sh" "$RL_STATUS"
+        strip_ansi "$RL_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RL_STATUS" -ne 0 || "$RL_FAIL" -ne 0 ]]; then
+        [[ "$RL_FAIL" -eq 0 ]] && RL_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-readme-layout-block.sh" "$RL_PASS" "$RL_FAIL" "$RL_STATUS"
+        strip_ansi "$RL_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-readme-layout-block.sh" "$RL_PASS"
+    fi
+    PASS=$((PASS + RL_PASS))
+    FAIL=$((FAIL + RL_FAIL))
+    record_suite "test-readme-layout-block.sh" "$RL_PASS" "$RL_FAIL" "layout block vs disk"
 fi
 
 echo
