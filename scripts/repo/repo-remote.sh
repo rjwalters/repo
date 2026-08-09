@@ -93,6 +93,11 @@
 #   REPO_REMOTE_IP_ECHO_URL    override the HTTPS echo service used for
 #                              current-IP detection (default:
 #                              checkip.amazonaws.com); see aws_resolve_ssh_cidr
+#   REPO_REMOTE_SSH_LOCK_TIMEOUT       seconds to wait for the write_ssh_alias
+#                                      lock before failing loudly (default 15;
+#                                      see "SSH alias lock" below, repo#213)
+#   REPO_REMOTE_SSH_LOCK_POLL_INTERVAL seconds between lock-acquisition
+#                                      retries (default 1)
 #
 set -uo pipefail
 
@@ -1116,6 +1121,56 @@ writeback_instance_id() {  # <instance-id>
   fi
 }
 
+# ── SSH alias lock (repo#213) ───────────────────────────────────────────────
+# write_ssh_alias()'s read-modify-write below (strip any existing "Host
+# <alias>" block from $cfg, then append a fresh one) is NOT safe against a
+# second, concurrent write_ssh_alias() call -- e.g. two overlapping
+# `/repo:remote` launches, or any other writer of the same $cfg. Each
+# invocation snapshots the file, appends its own block, and `mv`s its own copy
+# over $cfg -- last writer wins, silently dropping the other alias block. This
+# `mkdir`-based lock (the same POSIX-atomic primitive
+# .loom/scripts/worktree.sh uses for its own concurrency guard -- chosen there
+# because `flock` is unavailable on stock macOS, the same platform the
+# incident that motivated this fix was observed on) wraps the ENTIRE
+# read-modify-write, not just the final `mv`; locking only the `mv` would
+# still let two writers race the `awk` read and clobber each other's edits.
+REPO_REMOTE_SSH_LOCK_TIMEOUT="${REPO_REMOTE_SSH_LOCK_TIMEOUT:-15}"
+REPO_REMOTE_SSH_LOCK_POLL_INTERVAL="${REPO_REMOTE_SSH_LOCK_POLL_INTERVAL:-1}"
+
+# acquire_ssh_alias_lock <cfg> -- atomically creates "<cfg>.lock" (mkdir),
+# retrying until REPO_REMOTE_SSH_LOCK_TIMEOUT elapses. A lock left behind by a
+# process that no longer exists (stale, e.g. killed mid-write) is cleared once
+# and retried. Fails LOUDLY (die, non-zero exit) on timeout rather than
+# hanging forever or silently skipping the write.
+acquire_ssh_alias_lock() {  # <cfg>
+  local cfg="$1" lock="$1.lock"
+  local deadline=$(( $(date +%s) + REPO_REMOTE_SSH_LOCK_TIMEOUT ))
+  local stale_retry_done=0
+  while true; do
+    if mkdir "$lock" 2>/dev/null; then
+      echo "$$" >"$lock/owner.pid" 2>/dev/null || true
+      return 0
+    fi
+
+    local owner_pid=""
+    [[ -f "$lock/owner.pid" ]] && owner_pid="$(cat "$lock/owner.pid" 2>/dev/null || true)"
+    if [[ -n "$owner_pid" ]] && [[ "$stale_retry_done" -eq 0 ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+      rm -rf "$lock" 2>/dev/null || true
+      stale_retry_done=1
+      continue
+    fi
+
+    if [[ $(date +%s) -ge $deadline ]]; then
+      die 4 "timed out after ${REPO_REMOTE_SSH_LOCK_TIMEOUT}s waiting for the SSH config lock (${lock}) -- a concurrent repo-remote invocation may be writing ${cfg}; remove the lock dir manually if no such process is actually running"
+    fi
+    sleep "$REPO_REMOTE_SSH_LOCK_POLL_INTERVAL"
+  done
+}
+
+release_ssh_alias_lock() {  # <cfg>
+  rm -rf "$1.lock" 2>/dev/null || true
+}
+
 # Write/refresh the one-word SSH alias so the connection is `ssh repo-remote-<name>`.
 # Honors REPO_REMOTE_SSH_CONFIG (default ~/.ssh/config) so tests never touch a
 # real config. Echoes the alias name.
@@ -1127,7 +1182,14 @@ write_ssh_alias() {  # <ip>
   [[ -z "$ip" ]] && { printf '%s' "$alias"; return 0; }
 
   mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
-  local tmp; tmp="$(mktemp)"
+  acquire_ssh_alias_lock "$cfg"
+
+  # mktemp INSIDE $(dirname "$cfg") (never the default $TMPDIR) so the final
+  # `mv` below is guaranteed a same-filesystem atomic rename regardless of
+  # where $TMPDIR points -- a cross-filesystem mv degrades to
+  # copy-then-unlink, which exposes a window where a concurrent reader (e.g.
+  # ssh itself) could observe a partial file.
+  local tmp; tmp="$(mktemp "$(dirname "$cfg")/.ssh_config.XXXXXX")"
   # Strip any prior block for this alias, then append a fresh one.
   if [[ -f "$cfg" ]]; then
     awk -v a="Host $alias" '
@@ -1146,6 +1208,7 @@ write_ssh_alias() {  # <ip>
   } >>"$tmp"
   mv "$tmp" "$cfg"
   chmod 600 "$cfg" 2>/dev/null || true
+  release_ssh_alias_lock "$cfg"
   printf '%s' "$alias"
 }
 
@@ -1346,4 +1409,10 @@ main() {
   esac
 }
 
-main "$@"
+# Guard so this file can be `source`d (e.g. by the test suite, to call
+# write_ssh_alias() directly for the concurrency test in repo#213) without
+# also invoking main() -- mirrors the identical idiom in
+# .loom/scripts/lib/github-app-token.sh.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
+fi
