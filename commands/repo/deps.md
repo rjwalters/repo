@@ -442,6 +442,34 @@ decide whether each PR is **stale** (already satisfied by the manifest) or
    `^4.0.0` in `website`; had the PR targeted `4.1.10`, the `website` package
    would still have needed it — a single satisfied manifest is not enough.)
 
+5. **`github-actions`: each workflow file is its own manifest, and a matching
+   title is not enough to call a PR stale.** `github-actions` has no lockfile
+   and no package root — a single action name can appear verbatim across N
+   unrelated `.github/workflows/*.yml` files that were never conceptually
+   "packages," and each one drifts independently. The common source of that
+   drift is a **newly added** workflow file: it is authored against whatever
+   version was current when someone wrote it, not whatever version the rest
+   of the repo already bumped to. Never conclude "stale" from the PR title's
+   version pair alone — compare that PR's `pulls/<N>/files` against the pins
+   in **every** workflow file that declares the dependency before deciding.
+
+   Concrete case: PR #224 (the grouped `github-actions` PR) bumped
+   `actions/checkout` 4 → 7 in `.github/workflows/ci.yml` and merged first.
+   PR #236 also bumped `actions/checkout` 4 → 7 — but in
+   `.github/workflows/docker-build.yml`, a workflow file PR #235 had just
+   added, still pinned to `actions/checkout@v4`. Despite the identical
+   dependency, the identical version pair, and `ci.yml` on the base branch
+   already showing `@v7`, #236 was **not** stale: it fixed a workflow file
+   #224 never touched. Closing it as a duplicate would have left the new
+   Docker-build workflow pinned to a runtime GitHub had already deprecated —
+   the same class of deprecation #224 was merged to clear.
+
+**When in doubt, treat the PR as real, not stale.** The two failure modes are
+not symmetric: calling a real PR "stale" silently drops a pending upgrade —
+it vanishes from the report and never gets applied — while calling a stale PR
+"real" only re-merges a no-op, which is harmless. Given that asymmetry,
+resolve any ambiguity toward "real."
+
 A PR that is satisfied everywhere it is declared is **stale** — note it as
 `stale — already satisfied by manifest`. A stale PR is **excluded from the
 majors tally** even when its title/branch names a major-version bump: it
