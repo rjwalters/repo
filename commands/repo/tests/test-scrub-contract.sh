@@ -117,7 +117,13 @@ assert_contains "scrub.md names orphans as its posture precedent" "$SCRUB" "[[or
 # Report-only is the whole safety story: no fence may run a mutating git or gh
 # verb. A tool that can rewrite history on its own findings is a different
 # command with a different safety contract.
-SCRUB_BASH_FENCES="$(awk '/^```bash/{f=1;next} /^```/{f=0} f' "$SCRUB_MD")"
+#
+# Fence openers/closers are matched with optional leading whitespace, since a
+# fence nested inside a numbered list item (as every step-by-step
+# commands/repo/*.md writes fences) is indented. The opener and closer
+# patterns are kept in sync (both indentation-tolerant) so an indented opener
+# can't run unmatched against an anchored closer and swallow following prose.
+SCRUB_BASH_FENCES="$(awk '/^[[:space:]]*```bash/{f=1;next} /^[[:space:]]*```/{f=0} f' "$SCRUB_MD")"
 for verb in "filter-repo" "push --force" "gh issue delete" "gh issue edit" "gh pr edit" "git commit"; do
     assert_eq "no bash fence in scrub.md runs '$verb'" "0" \
         "$(printf '%s\n' "$SCRUB_BASH_FENCES" | grep -cF -- "$verb")"
@@ -299,7 +305,11 @@ assert_contains "safety rule 10 covers the prune" "$TIDY" \
 # The core safety property: nothing in tidy.md may show an `rm` inside
 # node_modules/, in any fence. The tier is defensible only because the package
 # manager decides what is unreferenced.
-TIDY_BASH_FENCES="$(awk '/^```bash/{f=1;next} /^```/{f=0} f' "$TIDY_MD")"
+#
+# See the SCRUB_BASH_FENCES comment above: opener/closer are both
+# indentation-tolerant so a fence nested in a list item (e.g. tidy.md's
+# `git ls-files` block) is not skipped.
+TIDY_BASH_FENCES="$(awk '/^[[:space:]]*```bash/{f=1;next} /^[[:space:]]*```/{f=0} f' "$TIDY_MD")"
 assert_eq "no bash fence in tidy.md runs rm against node_modules" "0" \
     "$(printf '%s\n' "$TIDY_BASH_FENCES" | grep -cE 'rm .*node_modules')"
 assert_eq "no bash fence in tidy.md hand-walks .pnpm" "0" \
