@@ -2679,6 +2679,54 @@ normalize_abs_path() {
     fi
 }
 
+# =============================================================================
+# _rm_scope_in_scope() — is an ABSOLUTE, already-normalized path inside the
+# guards.rmScope=repo containment area (repo root, worktree areas, or the
+# built-in ephemeral allowlist)?
+#
+# Factored out of the rm-scope target loop below (#239) so the SAME
+# containment test can be applied both to a target's fully-resolved ABS_PATH
+# AND to the statically-known prefix of a target whose path root is an
+# unexpanded shell variable — one definition of "in scope" so the two call
+# sites cannot drift apart. Only called from inside `rm_scope_repo_enabled`
+# branches; REPO_ROOT/_WT_ROOT are the script-global values resolved earlier.
+# =============================================================================
+_rm_scope_in_scope() {
+    local path="$1"
+    [[ -n "$path" ]] || return 1
+
+    if [[ -n "$REPO_ROOT" ]]; then
+        if [[ "$path" == "$REPO_ROOT" || "$path" == "$REPO_ROOT"/* ]]; then
+            return 0
+        fi
+        # The default in-repo worktrees dir is always in scope, even when an
+        # external worktree.root / LOOM_WORKTREE_ROOT is set.
+        if [[ "$path" == "$REPO_ROOT/.loom/worktrees" || "$path" == "$REPO_ROOT/.loom/worktrees"/* ]]; then
+            return 0
+        fi
+        # Configured/overridden worktree root (external volumes).
+        if [[ -z "${_WT_ROOT+x}" ]]; then
+            _WT_ROOT=$(resolve_worktree_root "$REPO_ROOT")
+        fi
+        if [[ -n "$_WT_ROOT" ]] && { [[ "$path" == "$_WT_ROOT" || "$path" == "$_WT_ROOT"/* ]]; }; then
+            return 0
+        fi
+    fi
+
+    # Built-in ephemeral allowlist: system temp roots + the Claude scratchpad.
+    # normalize_abs_path() is LEXICAL — it does NOT resolve symlinks — so on
+    # macOS both the symlink form (/tmp, /var/tmp, /var/folders) AND its
+    # /private target must be listed.
+    case "$path" in
+        /tmp/*|/private/tmp/*|\
+        /var/tmp/*|/private/var/tmp/*|\
+        /var/folders/*|/private/var/folders/*|\
+        */claude-*/*/scratchpad/*)
+            return 0 ;;
+    esac
+
+    return 1
+}
 
 # =============================================================================
 # Worktree-isolation guard toggle — default ON (rjwalters/repo#188, porting
@@ -4446,6 +4494,91 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
             esac
         fi
 
+        # -------------------------------------------------------------
+        # UNRESOLVED SHELL VARIABLE IN AN rm TARGET, under guards.rmScope=repo
+        # (#239). `target` still carries any `$VAR` reference the `~`/`$HOME`
+        # case above didn't expand — extract_rm_targets() is a tokenizer, not
+        # a shell evaluator. The CWD-relative fallback a few lines below
+        # silently reinterprets an unresolved token as "<CWD>/$target" — the
+        # ONE interpretation guaranteed to land inside the repo when cwd is
+        # inside it, regardless of what the variable actually expands to at
+        # runtime. That is the #239 regression: `rm -rf "$p"` at repo cwd,
+        # `$p` really pointing six directories outside the repo, silently
+        # ALLOWED because it happened to be unresolvable.
+        #
+        # Reuses mark_expandable_dollars() (the write-confinement helper
+        # above, #4921/#4927) so "which `$` would the real shell expand" has
+        # exactly one definition in this file. The POLICY is deliberately
+        # narrower than write-confinement's — see skills/repo/SKILL.md's
+        # `rmScope` row for the documented rationale — the "middle option":
+        #   (1) the variable IS the path root — nothing literal precedes the
+        #       first unexpanded `$` (`$p`, `$(mktemp -d)`, `/$X/evil`). This
+        #       guard cannot tell whether the runtime value is absolute or
+        #       relative, so it is ALWAYS denied when rmScope=repo — exactly
+        #       write confinement's own root-unresolved case.
+        #   (2) the variable is in a LATER directory component, with a real
+        #       literal path root before it (`build/$sub/out`,
+        #       `./cache/$name/tmp`). The root here IS known (literal, or
+        #       cwd when relative), so the KNOWN prefix — everything before
+        #       the first unexpanded `$`, trimmed to its directory — is
+        #       scope-tested on its own via _rm_scope_in_scope(): in scope ->
+        #       ALLOW (the rm stays inside the area rmScope=repo already
+        #       permits), not in scope / unusable -> DENY. This is the
+        #       OPPOSITE polarity from write confinement's equivalent case
+        #       (which denies an in-scope known prefix, because there the
+        #       risk is an escaping WRITE); here the risk is a DELETE landing
+        #       OUTSIDE the repo, so an in-scope known prefix is exactly the
+        #       evidence that risk did not materialize.
+        #   - a `$` only in the FINAL path component (`rm -rf out/$stamp`)
+        #       matches neither case: the directory is fully literal, so it
+        #       falls through UNCHANGED to the ordinary resolution below —
+        #       identical to today's behaviour, and to write confinement's
+        #       own "deliberately not denied" carve-out for the same shape.
+        #
+        # Gated on rm_scope_repo_enabled() so guards.rmScope=off/permissive
+        # stays byte-for-byte unchanged — no new denials appear when the
+        # feature is off (the existing CWD-relative fallback still applies).
+        # -------------------------------------------------------------
+        if [[ "$target" == *'$'* ]] && rm_scope_repo_enabled; then
+            mark_expandable_dollars "$target"
+            _rmarked="$_MARKED_TOKEN"
+            if [[ "$_rmarked" == *$'\001'* ]]; then
+                if [[ "$_rmarked" == $'\001'* || "$_rmarked" == /$'\001'* ]]; then
+                    # Case (1): path root unresolved.
+                    deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime under guards.rmScope=repo — it may point far outside the repo (the #239 regression: an unresolvable target at a repo cwd was silently treated as repo-relative). Unresolvable rm targets fail closed. Spell out the literal path, or unroll the loop so each rm target is a concrete string." "rm-scope-unresolved-var"
+                fi
+                _rdirpart=""
+                case "$_rmarked" in
+                    */*) _rdirpart="${_rmarked%/*}" ;;
+                esac
+                if [[ "$_rdirpart" == *$'\001'* ]]; then
+                    # Case (2): unresolved variable in a directory component,
+                    # with a known literal root. Build the effective path the
+                    # same way the resolution below does (cwd-joined when
+                    # relative), then test only the KNOWN prefix.
+                    _reff=""
+                    if [[ "$_rmarked" == /* ]]; then
+                        _reff="$_rmarked"
+                    elif [[ -n "$CWD" ]]; then
+                        _reff="$CWD/$_rmarked"
+                    fi
+                    _rknown="${_reff%%$'\001'*}"
+                    _rknown="${_rknown%/*}"
+                    # Normalize BEFORE judging: a `..` traversal in the known
+                    # prefix otherwise hands the test a prefix that is not
+                    # where the resolved path actually starts.
+                    [[ "$_rknown" == /* ]] && _rknown=$(normalize_abs_path "$_rknown")
+                    if [[ "$_rknown" != /* || "$_rknown" == "/" ]] || ! _rm_scope_in_scope "$_rknown"; then
+                        _rknown_desc="no usable known prefix"
+                        [[ "$_rknown" == /* && "$_rknown" != "/" ]] && _rknown_desc="known prefix '${_rknown}'"
+                        deny "BLOCKED: rm target '${target}' has an unexpanded shell variable in a directory component, and its ${_rknown_desc} is not verifiably inside repo scope under guards.rmScope=repo — this guard cannot tell where it resolves at runtime. Unresolvable rm targets fail closed. Spell out the literal path, or unroll the loop so each rm target is a concrete string." "rm-scope-unresolved-var"
+                    fi
+                    # Known prefix is in scope: this target is vetted, move on.
+                    continue
+                fi
+            fi
+        fi
+
         # Resolve path to absolute (raw — normalization happens next).
         ABS_PATH=""
         if [[ "$target" = /* ]]; then
@@ -4482,52 +4615,10 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
             # ephemeral allowlist. Default OFF preserves the permissive
             # behaviour byte-for-byte (rm_scope_repo_enabled() returns false).
             if rm_scope_repo_enabled; then
-                IN_SCOPE=false
-
-                # Repo + worktree areas. Prefix matches carry a trailing slash
-                # (or match the dir itself) so a sibling dir sharing a name
-                # prefix — e.g. "<repo>-sibling" vs "<repo>" — is NOT admitted.
-                if [[ -n "$REPO_ROOT" ]]; then
-                    if [[ "$ABS_PATH" == "$REPO_ROOT" || "$ABS_PATH" == "$REPO_ROOT"/* ]]; then
-                        IN_SCOPE=true
-                    fi
-                    # The default in-repo worktrees dir is always in scope, even
-                    # when an external worktree.root / LOOM_WORKTREE_ROOT is set.
-                    if [[ "$IN_SCOPE" == false ]] && \
-                       { [[ "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees" || "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees"/* ]]; }; then
-                        IN_SCOPE=true
-                    fi
-                    # Configured/overridden worktree root (external volumes).
-                    if [[ "$IN_SCOPE" == false ]]; then
-                        if [[ -z "${_WT_ROOT+x}" ]]; then
-                            _WT_ROOT=$(resolve_worktree_root "$REPO_ROOT")
-                        fi
-                        if [[ -n "$_WT_ROOT" ]] && \
-                           { [[ "$ABS_PATH" == "$_WT_ROOT" || "$ABS_PATH" == "$_WT_ROOT"/* ]]; }; then
-                            IN_SCOPE=true
-                        fi
-                    fi
-                fi
-
-                # Built-in ephemeral allowlist: system temp roots + the Claude
-                # scratchpad. normalize_abs_path() is LEXICAL — it does NOT
-                # resolve symlinks — so on macOS both the symlink form (/tmp,
-                # /var/tmp, /var/folders) AND its /private target must be listed.
-                # A bare temp root (/tmp, /private/tmp, …) is NOT matched here:
-                # those have no trailing component, so the catastrophic
-                # top-level deny above already handled bare /tmp, and a bare
-                # /private/tmp falls through to the out-of-scope deny.
-                if [[ "$IN_SCOPE" == false ]]; then
-                    case "$ABS_PATH" in
-                        /tmp/*|/private/tmp/*|\
-                        /var/tmp/*|/private/var/tmp/*|\
-                        /var/folders/*|/private/var/folders/*|\
-                        */claude-*/*/scratchpad/*)
-                            IN_SCOPE=true ;;
-                    esac
-                fi
-
-                if [[ "$IN_SCOPE" == false ]]; then
+                # Repo/worktree areas + the built-in ephemeral allowlist,
+                # via the SAME containment test the unresolved-variable
+                # handling above uses (#239) — one definition of "in scope".
+                if ! _rm_scope_in_scope "$ABS_PATH"; then
                     deny "BLOCKED: rm target outside repo scope (guards.rmScope=repo; set guards.rmScope:\"off\" in .claude/skills/repo/config.json to opt out): $ABS_PATH" "rm-scope-outside-repo"
                 fi
             fi
