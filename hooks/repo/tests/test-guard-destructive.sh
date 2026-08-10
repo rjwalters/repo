@@ -1064,6 +1064,64 @@ assert_deny_env "rmScope repo: force-push to main still blocked" \
 assert_deny_env "rmScope repo: gh repo delete still blocked" \
     "LOOM_RM_SCOPE=repo" "gh repo delete myrepo --yes" "$REPO_ROOT"
 
+# =========================================================================
+echo -e "${YELLOW}--- rm-scope unresolved shell variable in target (#239) ---${NC}"
+# =========================================================================
+#
+# guards.rmScope=repo's CWD-relative fallback used to silently reinterpret an
+# UNEXPANDED shell variable target ("$p") as repo-relative -- whatever `$p`
+# actually expands to at runtime (possibly far outside the repo) was never
+# consulted, so it always satisfied the in-scope check. This is the "middle
+# option" fix (documented in skills/repo/SKILL.md's rmScope row): deny only
+# when the variable IS the path root (nothing literal precedes the first
+# unexpanded `$`); a variable elsewhere with a statically-known, in-scope
+# literal root still passes.
+
+# ---- Case (1): path root unresolved -- ALWAYS denied under rmScope=repo. ----
+# The exact regression from the issue: cwd inside the repo, `$p` unexpanded,
+# would previously resolve (wrongly) to "<repo>/$p" and be admitted.
+assert_deny "rm-scope #239: rm -rf \"\$p\" at repo cwd denied (root-unresolved)" \
+    'rm -rf "$p"' "$REPO_ROOT"
+# The literal for-loop shape from the issue report (real newlines, as a
+# multi-line script/heredoc would present it -- a single-line "; do rm ...;
+# done" form is a separate, pre-existing extract_rm_targets segmentation gap
+# unrelated to #239: it never emits an rm target at all, so it is out of
+# scope here).
+assert_deny "rm-scope #239: for-loop rm -rf \"\$p\" denied (root-unresolved)" \
+    $'for p in ~/GitHub/*/target; do\n    rm -rf "$p"\ndone' "$REPO_ROOT"
+# Unquoted form of the same shape.
+assert_deny "rm-scope #239: rm -rf \$p (unquoted) denied (root-unresolved)" \
+    'rm -rf $p' "$REPO_ROOT"
+# Command substitution at the root is equally unresolvable.
+assert_deny "rm-scope #239: rm -rf \"\$(mktemp -d)\" denied (root-unresolved)" \
+    'rm -rf "$(mktemp -d)"' "$REPO_ROOT"
+# A variable immediately after a leading "/" -- the top-level directory name
+# itself is unknown, matching write-confinement's own root-unresolved case.
+assert_deny "rm-scope #239: rm -rf \"/\$X/evil\" denied (root-unresolved)" \
+    'rm -rf "/$X/evil"' "$REPO_ROOT"
+
+# ---- Case (2): variable in a later directory component. ----
+# Known prefix ("$REPO_ROOT/build-artifacts") is in scope -> allowed.
+assert_allow "rm-scope #239: rm -rf \"build-artifacts/\$sub/tmp\" allowed (known in-scope prefix)" \
+    'rm -rf "build-artifacts/$sub/tmp"' "$REPO_ROOT"
+# Known prefix ("/opt") is NOT in scope -> denied.
+assert_deny "rm-scope #239: rm -rf \"/opt/\$sub/tmp\" denied (known out-of-scope prefix)" \
+    'rm -rf "/opt/$sub/tmp"' "$REPO_ROOT"
+
+# ---- Not denied: a `$` only in the FINAL path component, or a literal `$`
+# ---- (single-quoted / escaped), keep today's existing (unaffected) treatment.
+assert_allow "rm-scope #239: rm -rf build-artifacts/tmp/\$stamp allowed (var only in final component)" \
+    'rm -rf build-artifacts/tmp/$stamp' "$REPO_ROOT"
+assert_allow "rm-scope #239: rm -rf 'literal-\$file' allowed (single-quoted \$ is literal, not a variable)" \
+    "rm -rf 'literal-\$file'" "$REPO_ROOT"
+
+# ---- guards.rmScope=off must NOT gain a new denial (byte-for-byte permissive
+# ---- behaviour preserved when the feature is off). ----
+RMSCOPE_UNRESOLVED_OFF_REPO=$(make_sql_repo '{"guards":{"rmScope":"off"}}')
+assert_allow "rm-scope #239: rm -rf \"\$p\" allowed when rmScope=off (feature disabled)" \
+    'rm -rf "$p"' "$RMSCOPE_UNRESOLVED_OFF_REPO"
+rm -rf "$RMSCOPE_UNRESOLVED_OFF_REPO"
+
 # Clean up rm-scope temp repos.
 for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
     [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"
