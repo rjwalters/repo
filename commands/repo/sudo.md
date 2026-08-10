@@ -227,10 +227,10 @@ belt-and-suspenders proof that the include wiring is sound:
 > fails open and these two writes run unchanged.
 >
 > **All four `rm` calls in this file** — step 3's (`--remove`)
-> `sudo rm -f "$DROPIN"` (uninstall, line ~164), this step's `rm -f "$TMP"`
-> (candidate-validation-failure cleanup, line ~258) and `rm -f "$TMP"`
-> (post-install cleanup, line ~265), and this step's `sudo rm -f "$DROPIN"`
-> (post-install rollback, line ~272). A separate guard, the repo-scoped `rm`
+> `sudo rm -f "$DROPIN"` (uninstall, line ~169), this step's `rm -f "$TMP"`
+> (candidate-validation-failure cleanup, line ~318) and `rm -f "$TMP"`
+> (post-install cleanup, line ~326), and this step's `sudo rm -f "$DROPIN"`
+> (post-install rollback, line ~333). A separate guard, the repo-scoped `rm`
 > guard (same `hooks/repo/guard-destructive.sh`, tag
 > `rm-scope-unresolved-var`), fails **closed** on all four for the same
 > underlying reason as the write guard above: `$DROPIN` and `$TMP` are each
@@ -257,17 +257,17 @@ belt-and-suspenders proof that the include wiring is sound:
 >
 > **What this means per call site, and the manual remedy for each:**
 >
-> - **Uninstall (`--remove`, step 3, line ~164)**: denied under default
+> - **Uninstall (`--remove`, step 3, line ~169)**: denied under default
 >   `guards.rmScope=repo`, so `--remove` cannot complete automatically.
 >   Manual remedy: from a host session (or any shell outside this guard) run
 >   `sudo rm -f /etc/sudoers.d/<user>-nopasswd`, then `sudo visudo -c` to
 >   confirm the removal didn't break anything.
-> - **Validation-failure cleanup (line ~258) and post-install cleanup (line
->   ~265), both `rm -f "$TMP"`**: denied the same way, but low-stakes —
+> - **Validation-failure cleanup (line ~318) and post-install cleanup (line
+>   ~326), both `rm -f "$TMP"`**: denied the same way, but low-stakes —
 >   `$TMP` is a `mktemp`-created scratch file in the OS temp directory that
 >   the OS reclaims eventually regardless. A denial here leaves harmless
 >   clutter, not a functional problem.
-> - **Post-install rollback (line ~272, `sudo rm -f "$DROPIN"`) — the serious
+> - **Post-install rollback (line ~333, `sudo rm -f "$DROPIN"`) — the serious
 >   case.** This runs when a candidate that already passed `visudo -cf` in
 >   isolation still fails the full-chain `sudo visudo -c` *after* being
 >   copied into `/etc/sudoers.d/`. If the guard denies this rollback, **the
