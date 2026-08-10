@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 (2026-08-10)
 
 - **Dependabot is configured, and the two repo-level security flags — which are a separate thing entirely — are on (#221).** Writing `.github/dependabot.yml` enables **version** updates only; CVE alerting and automatic security-fix PRs are independent repository settings, and this repo had a perfectly reasonable absence of both. `vulnerability-alerts` went 404 → 204 and `dependabot_security_updates` disabled → enabled, alerts first because they are the prerequisite. The config covers the two ecosystems the repo actually has and can act on: `github-actions` (grouped, majors included — reviewing CI action bumps individually is noise) and `docker` (ungrouped — one base image, and an Ubuntu LTS major rebuilds the `/repo:remote` dev container, so it earns its own reviewable PR). **npm is deliberately absent**: `package.json` is `private: true` with scripts only, all four dependency blocks null, and `pnpm-lock.yaml` is an empty lockfile (`importers: { .: {} }`) — there is nothing for Dependabot to update, and scaffolding it anyway would produce a permanently inert entry. Labels resolve to `tier:maintenance`; no `loom:` label is applied, because routing bot PRs into the Loom auto-merge pipeline is a repo-owner policy decision rather than a side effect of a hygiene command.
 
