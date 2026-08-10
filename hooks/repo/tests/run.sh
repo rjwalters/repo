@@ -26,6 +26,7 @@
 # commands/repo/tests/test-installer-contract.sh,
 # commands/repo/tests/test-repo-scrub-forks.sh,
 # commands/repo/tests/test-readme-layout-block.sh,
+# commands/repo/tests/test-skill-commands-table.sh,
 # commands/repo/tests/test-release-version-citation-check.sh, and
 # commands/repo/tests/test-changelog-merged-work-check.sh.
 #
@@ -863,6 +864,42 @@ else
     PASS=$((PASS + RL_PASS))
     FAIL=$((FAIL + RL_FAIL))
     record_suite "test-readme-layout-block.sh" "$RL_PASS" "$RL_FAIL" "layout block vs disk"
+fi
+
+# skills/repo/SKILL.md's "## Commands" table vs disk (repo#246): every
+# commands/repo/*.md must have a [[name]] row, and every row must name a command
+# that exists — the same per-item-enumeration drift the README layout block hit,
+# in the more externally visible artifact. Same delegation shape as every suite
+# above.
+echo
+echo "-- SKILL.md Commands table vs disk (delegated suite) --"
+ST_TEST="$TESTS_DIR/../../../commands/repo/tests/test-skill-commands-table.sh"
+if [[ ! -f "$ST_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-skill-commands-table.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-skill-commands-table.sh" "$ST_TEST"
+else
+    ST_OUT="$(bash "$ST_TEST" 2>&1)"
+    ST_STATUS=$?
+    ST_PASS="$(suite_count Passed "$ST_OUT")"
+    ST_FAIL="$(suite_count Failed "$ST_OUT")"
+    if ! [[ "$ST_PASS" =~ ^[0-9]+$ && "$ST_FAIL" =~ ^[0-9]+$ ]]; then
+        ST_PASS=0
+        ST_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-skill-commands-table.sh" "$ST_STATUS"
+        strip_ansi "$ST_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$ST_STATUS" -ne 0 || "$ST_FAIL" -ne 0 ]]; then
+        [[ "$ST_FAIL" -eq 0 ]] && ST_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-skill-commands-table.sh" "$ST_PASS" "$ST_FAIL" "$ST_STATUS"
+        strip_ansi "$ST_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-skill-commands-table.sh" "$ST_PASS"
+    fi
+    PASS=$((PASS + ST_PASS))
+    FAIL=$((FAIL + ST_FAIL))
+    record_suite "test-skill-commands-table.sh" "$ST_PASS" "$ST_FAIL" "SKILL.md Commands table vs disk"
 fi
 
 # release.md Phase 3.5's advisory version-citation check (repo#228): tracked

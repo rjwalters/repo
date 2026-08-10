@@ -168,7 +168,8 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              KEEP tiers, C7 resync, installer contract, fork-network sweep,
                              scrub/all/prune contract, links precision, guard equivalence
                              (its case table lives in guard-equivalence-cases.txt),
-                             README layout block vs disk
+                             README layout block vs disk, SKILL.md Commands
+                             table vs disk
 INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
