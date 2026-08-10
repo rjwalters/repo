@@ -27,6 +27,7 @@
 # commands/repo/tests/test-repo-scrub-forks.sh,
 # commands/repo/tests/test-readme-layout-block.sh,
 # commands/repo/tests/test-skill-commands-table.sh,
+# commands/repo/tests/test-sudo-rm-guard-contract.sh,
 # commands/repo/tests/test-release-version-citation-check.sh, and
 # commands/repo/tests/test-changelog-merged-work-check.sh.
 #
@@ -900,6 +901,44 @@ else
     PASS=$((PASS + ST_PASS))
     FAIL=$((FAIL + ST_FAIL))
     record_suite "test-skill-commands-table.sh" "$ST_PASS" "$ST_FAIL" "SKILL.md Commands table vs disk"
+fi
+
+# commands/repo/sudo.md's guard note — the DOC side, not just the guard side
+# (repo#249). repo#248 documented the rm-scope denial and pinned the behaviour
+# with two assert_deny cases in test-guard-destructive.sh, but nothing pinned the
+# note itself: it could be deleted or contradicted with the suite green, which is
+# the same one-way drift that produced repo#245. This suite asserts the note's
+# claims against a flattened (reflow-proof) copy AND re-drives the real hook with
+# sudo.md's own rm shapes. Same delegation shape as every suite above.
+echo
+echo "-- sudo.md guard note doc+behaviour contract (delegated suite) --"
+SU_TEST="$TESTS_DIR/../../../commands/repo/tests/test-sudo-rm-guard-contract.sh"
+if [[ ! -f "$SU_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-sudo-rm-guard-contract.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-sudo-rm-guard-contract.sh" "$SU_TEST"
+else
+    SU_OUT="$(bash "$SU_TEST" 2>&1)"
+    SU_STATUS=$?
+    SU_PASS="$(suite_count Passed "$SU_OUT")"
+    SU_FAIL="$(suite_count Failed "$SU_OUT")"
+    if ! [[ "$SU_PASS" =~ ^[0-9]+$ && "$SU_FAIL" =~ ^[0-9]+$ ]]; then
+        SU_PASS=0
+        SU_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-sudo-rm-guard-contract.sh" "$SU_STATUS"
+        strip_ansi "$SU_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SU_STATUS" -ne 0 || "$SU_FAIL" -ne 0 ]]; then
+        [[ "$SU_FAIL" -eq 0 ]] && SU_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-sudo-rm-guard-contract.sh" "$SU_PASS" "$SU_FAIL" "$SU_STATUS"
+        strip_ansi "$SU_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-sudo-rm-guard-contract.sh" "$SU_PASS"
+    fi
+    PASS=$((PASS + SU_PASS))
+    FAIL=$((FAIL + SU_FAIL))
+    record_suite "test-sudo-rm-guard-contract.sh" "$SU_PASS" "$SU_FAIL" "sudo.md guard note vs guard"
 fi
 
 # release.md Phase 3.5's advisory version-citation check (repo#228): tracked

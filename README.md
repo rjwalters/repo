@@ -169,7 +169,7 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              scrub/all/prune contract, links precision, guard equivalence
                              (its case table lives in guard-equivalence-cases.txt),
                              README layout block vs disk, SKILL.md Commands
-                             table vs disk
+                             table vs disk, sudo.md guard note vs the guard
 INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
