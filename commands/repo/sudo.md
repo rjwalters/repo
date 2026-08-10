@@ -165,6 +165,12 @@ header from step 1) — never touch other files in `/etc/sudoers.d/`.
    sudo visudo -c
    ```
 
+   > **This `rm` is denied under stock configuration** (`guards.rmScope=repo`,
+   > tag `rm-scope-unresolved-var`) — the whole `--remove` flow is one denied
+   > call, so it is entirely non-functional wherever the guard hook is wired.
+   > See the **Guard note** in step 5 for the full rule, why spelling `$DROPIN`
+   > out literally does not help, and what the operator should do instead.
+
 4. Confirm the effect: a subsequent `sudo` now prompts for a password again
    (`sudo -n true` should fail). Report done.
 
@@ -198,12 +204,16 @@ denied by the very file it is trying to remove. Validating `$TMP` first makes
 that failure mode impossible; the post-install full-chain check is then only a
 belt-and-suspenders proof that the include wiring is sound:
 
-> **Guard note — these two writes are denied inside a Loom-managed repo
-> session, by design.** The worktree-write-confinement guard
-> (`hooks/repo/guard-destructive.sh`, tag
-> `worktree-write-confinement-unresolved-var`) fails **closed** on any Bash
-> write whose target is an unexpanded shell variable, because it cannot tell
-> where the write will land. Both writes below are exactly that shape:
+> **Guard note — both of this step's writes *and* every `rm` this command
+> makes are denied by `hooks/repo/guard-destructive.sh`, by design.** Two
+> **independent** rules are in play, with **different triggers**. Read both:
+> the escape hatch that makes the write denials tolerable does **not** cover
+> the delete denials.
+>
+> **(a) The two writes — tag `worktree-write-confinement-unresolved-var`.**
+> Worktree write confinement fails **closed** on any Bash write whose target
+> is an unexpanded shell variable, because it cannot tell where the write will
+> land. Both writes below are exactly that shape:
 >
 > - `} > "$TMP"` — `$TMP` holds `$(mktemp)`, a command substitution the guard's
 >   same-command variable resolution can never substitute (it only resolves a
@@ -214,10 +224,41 @@ belt-and-suspenders proof that the include wiring is sound:
 >   (`/etc/sudoers.d/$(id -un)-nopasswd`), so it cannot be spelled literally in
 >   this file at all.
 >
-> The deny is keyed to whether **any** managed worktree exists in the
+> This deny is keyed to whether **any** managed worktree exists in the
 > repository, not to whether the current session is inside one, so it fires
-> from the main checkout too. With zero managed worktrees the guard fails open
-> and this step runs unchanged.
+> from the main checkout too. With zero managed worktrees this rule fails open
+> and both writes run unchanged.
+>
+> **(b) Every `rm` — tag `rm-scope-unresolved-var`.** Since #244, the
+> `guards.rmScope=repo` scope check also fails **closed** on an `rm` target
+> whose path root is an unexpanded shell variable, for the same
+> can't-tell-where-it-lands reason (a delete is not recoverable). All four of
+> this command's `rm` calls are that shape:
+>
+> | Where | Call | Consequence when denied |
+> |---|---|---|
+> | step 3, `--remove` | `sudo rm -f "$DROPIN"` | uninstall is entirely non-functional |
+> | step 5, candidate failed `visudo -cf` | `rm -f "$TMP"` | stale 0440 temp file left behind (harmless) |
+> | step 5, after a successful install | `rm -f "$TMP"` | stale 0440 temp file left behind (harmless) |
+> | step 5, **post-install rollback** | `sudo rm -f "$DROPIN"` | **an unrolled-back drop-in stays live in `/etc/sudoers.d/`** |
+>
+> **The delete trigger is broader than the write trigger.** This is the part
+> most easily missed: `rm`-scope is decided by **configuration only** —
+> `guards.rmScope` in `.claude/skills/repo/config.json`, or the
+> `REPO_RM_SCOPE` / `LOOM_RM_SCOPE` env overrides — and its default is `repo`.
+> There is **no worktree condition at all**, so the zero-managed-worktrees
+> situation that makes (a) fail open changes nothing here. Nor does leaving
+> the repo: the rule fires from any cwd, including one that is not a git
+> repository, wherever the hook is wired. Under stock configuration these four
+> `rm` calls are denied, full stop.
+>
+> **Spelling `$DROPIN` out literally does not help.** A fully-resolved
+> `sudo rm -f /etc/sudoers.d/<user>-nopasswd` is denied too — just under a
+> different tag (`rm-scope-outside-repo`), because `/etc/sudoers.d/` is
+> outside the repo under *any* resolution. Better variable resolution could
+> only move the denial from one rule to the other, so there is no rewrite of
+> these calls that satisfies `rmScope=repo`. (Narrowing the rule was evaluated
+> and rejected for exactly this reason; see #245.)
 >
 > **Do not "fix" this by hardcoding a predictable temp path.** `mktemp`'s
 > atomic `O_EXCL` creation is load-bearing here: the candidate is `chmod
@@ -227,12 +268,44 @@ belt-and-suspenders proof that the include wiring is sound:
 > `visudo -cf` and the `cp` — turning a guard-friendliness tweak into a
 > root-policy TOCTOU hole. A guard denial is strictly the safer failure.
 >
-> **What to do when it is denied**: stop and run the step from a host session
-> — a plain shell/SSH login, or any Claude session outside a Loom-managed
-> checkout — where this guard is not installed. Never route around it by
-> switching tools, weakening the temp path, or disabling
-> `guards.worktreeIsolation` / `REPO_GUARD_WORKTREE_ISOLATION` to push the
-> write through; those escape hatches are the operator's call, not the
+> **Operator remedy — a denied *delete* is not as harmless as a denied
+> *write*.** A denied write means nothing was written; a denied delete can
+> mean something is still installed that shouldn't be:
+>
+> - **Post-install rollback (step 5).** If `sudo visudo -c` fails *after* the
+>   `cp`, the drop-in is already live policy and the `sudo rm -f "$DROPIN"`
+>   meant to undo it is denied — the command exits non-zero with the drop-in
+>   **still in place**. Do not treat "no change made" as true in that case.
+>   Remove it by hand from a host session, and confirm sudo still works before
+>   closing your last privileged shell:
+>
+>   ```bash
+>   sudo rm -f "/etc/sudoers.d/$(id -un)-nopasswd"
+>   sudo visudo -c && sudo true
+>   ```
+>
+>   The candidate was already `visudo -cf`-validated in isolation before the
+>   `cp`, so a syntax error in *this* file is not a plausible cause and `sudo`
+>   should still function — but keep a root shell (`sudo -i`) open until you
+>   have proven that, since a broken `/etc/sudoers` chain fails closed and can
+>   cost you `sudo` on the box entirely.
+> - **`--remove` (step 3).** Nothing is left half-done — the drop-in is simply
+>   still installed. Run the same manual removal above from a host session.
+> - **`rm -f "$TMP"` (step 5).** Cosmetic only: a `0440` temp file survives in
+>   `$TMPDIR`. Its contents are just the candidate sudoers line — nothing
+>   secret — and the OS reaps `$TMPDIR` eventually; delete it by hand if you
+>   care.
+>
+> **What to do when any of these is denied**: stop and run the step from a
+> host session — a plain shell/SSH login, or any Claude session where this
+> guard hook is not wired — rather than reshaping the command. Note the
+> asymmetry when choosing that session: for (a) a checkout with no managed
+> worktrees is enough, but for (b) only an un-wired session (or an
+> operator-set `rmScope`) escapes the rule. Never route around it by switching
+> tools, weakening the temp path, or disabling
+> `guards.worktreeIsolation` / `REPO_GUARD_WORKTREE_ISOLATION` (writes) or
+> `guards.rmScope` / `REPO_RM_SCOPE` / `LOOM_RM_SCOPE` (deletes) to push the
+> operation through; those escape hatches are the operator's call, not the
 > agent's.
 
 ```bash
@@ -266,8 +339,10 @@ rm -f "$TMP"
 
 # Belt-and-suspenders: full-chain re-check proves the include wiring too. If it
 # somehow fails, remove the drop-in and exit non-zero — never leave an
-# unvalidated or broken file in place. (This rollback is now reliable because
-# the file was already known-valid before it landed.)
+# unvalidated or broken file in place. (This rollback does not have to fight a
+# broken sudo, because the file was already known-valid before it landed — but
+# it IS denied by guards.rmScope=repo; see the Guard note above for the manual
+# removal the operator must run if this branch is ever taken.)
 if ! sudo visudo -c; then
   sudo rm -f "$DROPIN"
   echo "post-install validation failed — removed ${DROPIN}, no change made" >&2
@@ -279,9 +354,16 @@ The order is load-bearing: the candidate is syntax-checked with
 `visudo -cf "$TMP"` **before** the `cp`, so a malformed drop-in never becomes
 live policy and the rollback never has to fight a broken sudo. The post-install
 `visudo -c` is the final full-chain gate; if it fails for **any** reason the
-drop-in is deleted and the command exits non-zero — there is no path in which a
-failed-validation file survives, and no path in which an unvalidated file goes
-live even momentarily.
+drop-in is deleted and the command exits non-zero — no path leaves a
+failed-validation file behind, and no path lets an unvalidated file go live
+even momentarily.
+
+That last guarantee is a property of the *script*, not of the *session*: where
+the guard hook is wired, the rollback `sudo rm -f "$DROPIN"` is denied
+(`rm-scope-unresolved-var`) and the drop-in survives a failed post-install
+check even though the message says otherwise. Treat the "removed …, no change
+made" line as a claim to verify, not a fact — see the Guard note above for the
+manual removal.
 
 ### 6. Verify and report
 

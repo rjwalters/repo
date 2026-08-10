@@ -1122,8 +1122,43 @@ assert_allow "rm-scope #239: rm -rf \"\$p\" allowed when rmScope=off (feature di
     'rm -rf "$p"' "$RMSCOPE_UNRESOLVED_OFF_REPO"
 rm -rf "$RMSCOPE_UNRESOLVED_OFF_REPO"
 
+# ---- /repo:sudo's own rm calls (#245): the documented consequence of the
+# ---- #239/#244 fix above. commands/repo/sudo.md runs `rm -f "$TMP"` (temp
+# ---- candidate cleanup) and `sudo rm -f "$DROPIN"` (the --remove uninstall
+# ---- flow AND the post-install rollback). All are root-unresolved, so all
+# ---- are denied. #245's resolution was to DOCUMENT that in sudo.md's guard
+# ---- note rather than narrow the rule; these cases pin the behaviour the
+# ---- note describes so the two cannot drift apart silently.
+assert_deny "rm-scope #245: sudo.md rollback/--remove 'sudo rm -f \"\$DROPIN\"' denied" \
+    'sudo rm -f "$DROPIN"' "$REPO_ROOT"
+assert_deny "rm-scope #245: sudo.md candidate cleanup 'rm -f \"\$TMP\"' denied" \
+    'rm -f "$TMP"' "$REPO_ROOT"
+# Resolving $DROPIN could not rescue it — /etc/sudoers.d/ is outside the repo
+# under ANY resolution, so a fully-literal target is denied too, just by the
+# ordinary out-of-repo rule. This is why #245's "narrow the rm rule" option was
+# rejected: better variable resolution only swaps which rule denies.
+assert_deny "rm-scope #245: literal /etc/sudoers.d drop-in denied (out-of-repo rule, not unresolved-var)" \
+    'sudo rm -f /etc/sudoers.d/someuser-nopasswd' "$REPO_ROOT"
+
+# The rm-scope trigger is CONFIG-ONLY. Bash-tool write confinement fires only
+# when a managed worktree exists in the repository, so sudo.md's sibling WRITE
+# of the same variables fails open in a repo with none — but rm_scope_repo_
+# enabled() has no worktree condition, so the deletes still fail closed there.
+# That asymmetry is the substance of #245 and is why "run it where there are no
+# managed worktrees" is NOT an escape hatch for the rm side.
+RMSCOPE_SUDO_REPO=$(make_sql_repo '{}')
+assert_deny "rm-scope #245: 'sudo rm -f \"\$DROPIN\"' still denied with zero managed worktrees (config-only trigger)" \
+    'sudo rm -f "$DROPIN"' "$RMSCOPE_SUDO_REPO"
+assert_allow "rm-scope #245: sibling write 'sudo cp \"\$TMP\" \"\$DROPIN\"' allowed with zero managed worktrees (write side fails open)" \
+    'sudo cp "$TMP" "$DROPIN"' "$RMSCOPE_SUDO_REPO"
+# The operator's documented opt-out still restores both shapes.
+assert_allow_env "rm-scope #245: 'sudo rm -f \"\$DROPIN\"' allowed when REPO_RM_SCOPE=off" \
+    "REPO_RM_SCOPE=off" 'sudo rm -f "$DROPIN"' "$RMSCOPE_SUDO_REPO"
+assert_allow_env "rm-scope #245: literal drop-in path allowed when REPO_RM_SCOPE=off" \
+    "REPO_RM_SCOPE=off" 'sudo rm -f /etc/sudoers.d/someuser-nopasswd' "$RMSCOPE_SUDO_REPO"
+
 # Clean up rm-scope temp repos.
-for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
+for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO" "$RMSCOPE_SUDO_REPO"; do
     [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"
 done
 

@@ -234,6 +234,22 @@ This policy only applies while `guards.rmScope=repo` is active — with
 `rmScope:"off"`/`"permissive"` the legacy CWD-relative fallback is unchanged,
 so the opt-out stays byte-for-byte permissive.
 
+**Known affected caller: `/repo:sudo` (#245).** `commands/repo/sudo.md`'s four
+`rm` calls — `rm -f "$TMP"` (temp-candidate cleanup) and `sudo rm -f "$DROPIN"`
+(the `--remove` uninstall flow and the post-install rollback) — are all
+root-unresolved targets, so all four are denied under the default
+`rmScope=repo`. Resolving the variables would not help: `$DROPIN` is
+`/etc/sudoers.d/<user>-nopasswd`, outside the repo under any resolution, so it
+would only trade `rm-scope-unresolved-var` for `rm-scope-outside-repo`. Note
+also that this trigger is **config-only** — unlike the Bash-tool
+write-confinement category, which fires only when a managed worktree exists in
+the repository, `rm_scope_repo_enabled()` consults `guards.rmScope` /
+`LOOM_RM_SCOPE` / `REPO_RM_SCOPE` and nothing else, so a repo with zero managed
+worktrees does **not** escape it. That asymmetry, and the operator's manual
+remedy when the rollback is the denied step (an installed drop-in survives a
+failed post-install `visudo -c`), are documented in that command's own guard
+note; keep the two in sync when this policy changes.
+
 The full stable interface (input/output contract, exit semantics, every env
 name) is documented in the hook's own header — downstream tools (e.g. Loom's
 installer) gate on it via this repo's release version.
