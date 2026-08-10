@@ -357,6 +357,71 @@ the repo exposes (API, CLI, protocol, config, file formats):
 Use conventional-commit prefixes (`feat`/`fix`/`chore`…) as input. Recommend a
 level and **ask the user to confirm or override.**
 
+## Phase 3.5 — Version-citation check (advisory)
+
+Now that the bump level is confirmed and `$NEW` (the version this run is
+cutting) is known, check tracked markdown prose for citations of a version
+that has **neither shipped** (no `## <version>` section in `CHANGELOG.md`)
+**nor is the one about to ship** — that citation is either a stale/broken
+reference or an honest forward reference nobody circled back to resolve once
+the version actually shipped (repo#215, repo#228: `README.md` said "That was
+not true before 0.9.0" and `SKILL.md` said "as of 0.9.0 it holds" while
+`VERSION` was still `0.8.1` and neither guess was yet confirmed correct).
+**Advisory only — report and continue, never block the release.** No-op if
+`CHANGELOG.md` is absent, matching Phase 1.5.
+
+```bash
+if [ ! -f CHANGELOG.md ]; then
+  echo "(no CHANGELOG.md — skipping version-citation check)"
+else
+  # This repo's own header-citation STYLE, derived from CHANGELOG.md itself:
+  # does ANY header carry a leading 'v' (`## v1.2.3`)? If none do, this repo's
+  # own version vocabulary is bare ("1.2.3"), and a prose citation written
+  # WITH a leading 'v' ("since v0.10.0") is very likely naming something
+  # ELSE's release history, not this repo's — a real false-positive class: a
+  # workspace whose own docs extensively discuss a DIFFERENT tool's version
+  # history (e.g. "removed in v0.10.0" naming an embedded orchestrator, not
+  # this repo) would otherwise get flagged on every one of those references.
+  # If this repo's own headers DO sometimes carry a 'v', both forms count as
+  # this repo's own vocabulary.
+  V_PREFIX=""
+  grep -Eq '^##[[:space:]]+v[0-9]' CHANGELOG.md && V_PREFIX='v?'
+
+  # Version-boundary phrasing that plausibly cites a version's ship status.
+  # Anchoring the scan to this phrase list — rather than a bare
+  # \d+\.\d+\.\d+ scan over all markdown — is what keeps dependency pins
+  # ("loom 0.18.0"), image tags ("ubuntu:24.04"), and lockfile fields
+  # ("lockfileVersion: '9.0'") out of the results: none of them are written
+  # with this phrasing, and the two-dot/one-dot shapes of the latter two don't
+  # match the X.Y.Z pattern below regardless.
+  LEADIN='(before|since|after|until|prior to|as of|as early as|starting (in|with)|introduced in|added in|removed in|deprecated (in|since)|available (since|as of)|released in|shipped in|requires( at least)?)'
+
+  FOUND=0
+  for f in $(git ls-files '*.md' | grep -v -x 'CHANGELOG.md'); do
+    while IFS=: read -r lineno match; do
+      ver="$(printf '%s' "$match" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+')"
+      [ "$ver" = "$NEW" ] && continue   # the version being cut is never flagged
+      # Reuse Phase 1.5's exact header-matching regex (bracket-optional,
+      # leading-'v'-optional, dots escaped literal) so the two checks can
+      # never disagree about what counts as a "shipped" version header.
+      ver_re="$(printf '%s' "$ver" | sed 's/\./\\./g')"
+      if grep -Eq "^##[[:space:]]+v?\[?${ver_re}\]?([[:space:]]|\$)" CHANGELOG.md; then
+        continue   # shipped — CHANGELOG.md already has a section for it
+      fi
+      echo "  CITED-UNSHIPPED: $f:$lineno: \"$match\""
+      FOUND=1
+    done < <(grep -inoE "${LEADIN}[[:space:]]+${V_PREFIX}[0-9]+\.[0-9]+\.[0-9]+" "$f")
+  done
+  [ "$FOUND" = 0 ] && echo "ok: no prose cites an unshipped, non-target version"
+fi
+```
+
+If any `CITED-UNSHIPPED:` line prints, surface it to the operator — it's either
+a stale/broken reference worth fixing now, or a legitimate forward reference to
+a release that hasn't happened yet (leave it; it resolves itself once that
+version ships, the way repo#215's two sentences did when 0.9.0 was cut). Either
+way this check is **advisory**: report and continue — never block Phase 4.
+
 ## Phase 4 — Draft the CHANGELOG
 
 > Seam `pre-changelog-style` fires before drafting — run any bound policy steps

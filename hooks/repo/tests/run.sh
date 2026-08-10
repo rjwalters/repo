@@ -24,8 +24,9 @@
 # commands/repo/tests/test-tidy-keep-tiers.sh,
 # commands/repo/tests/test-resync-installed.sh,
 # commands/repo/tests/test-installer-contract.sh,
-# commands/repo/tests/test-repo-scrub-forks.sh, and
-# commands/repo/tests/test-readme-layout-block.sh.
+# commands/repo/tests/test-repo-scrub-forks.sh,
+# commands/repo/tests/test-readme-layout-block.sh, and
+# commands/repo/tests/test-release-version-citation-check.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -861,6 +862,40 @@ else
     PASS=$((PASS + RL_PASS))
     FAIL=$((FAIL + RL_FAIL))
     record_suite "test-readme-layout-block.sh" "$RL_PASS" "$RL_FAIL" "layout block vs disk"
+fi
+
+# release.md Phase 3.5's advisory version-citation check (repo#228): tracked
+# markdown prose citing a version with no CHANGELOG.md section and not the
+# version being cut. Same delegation shape as every suite above.
+echo
+echo "-- release.md version-citation check (delegated suite) --"
+VC_TEST="$TESTS_DIR/../../../commands/repo/tests/test-release-version-citation-check.sh"
+if [[ ! -f "$VC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-release-version-citation-check.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-release-version-citation-check.sh" "$VC_TEST"
+else
+    VC_OUT="$(bash "$VC_TEST" 2>&1)"
+    VC_STATUS=$?
+    VC_PASS="$(suite_count Passed "$VC_OUT")"
+    VC_FAIL="$(suite_count Failed "$VC_OUT")"
+    if ! [[ "$VC_PASS" =~ ^[0-9]+$ && "$VC_FAIL" =~ ^[0-9]+$ ]]; then
+        VC_PASS=0
+        VC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-release-version-citation-check.sh" "$VC_STATUS"
+        strip_ansi "$VC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$VC_STATUS" -ne 0 || "$VC_FAIL" -ne 0 ]]; then
+        [[ "$VC_FAIL" -eq 0 ]] && VC_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-release-version-citation-check.sh" "$VC_PASS" "$VC_FAIL" "$VC_STATUS"
+        strip_ansi "$VC_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-release-version-citation-check.sh" "$VC_PASS"
+    fi
+    PASS=$((PASS + VC_PASS))
+    FAIL=$((FAIL + VC_FAIL))
+    record_suite "test-release-version-citation-check.sh" "$VC_PASS" "$VC_FAIL" "release.md Phase 3.5 citation check"
 fi
 
 echo
