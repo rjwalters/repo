@@ -25,8 +25,9 @@
 # commands/repo/tests/test-resync-installed.sh,
 # commands/repo/tests/test-installer-contract.sh,
 # commands/repo/tests/test-repo-scrub-forks.sh,
-# commands/repo/tests/test-readme-layout-block.sh, and
-# commands/repo/tests/test-release-version-citation-check.sh.
+# commands/repo/tests/test-readme-layout-block.sh,
+# commands/repo/tests/test-release-version-citation-check.sh, and
+# commands/repo/tests/test-changelog-merged-work-check.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -896,6 +897,41 @@ else
     PASS=$((PASS + VC_PASS))
     FAIL=$((FAIL + VC_FAIL))
     record_suite "test-release-version-citation-check.sh" "$VC_PASS" "$VC_FAIL" "release.md Phase 3.5 citation check"
+fi
+
+# release.md Phase 5 step 2's advisory merged-work coverage check (repo#229):
+# a merged PR since the last tag whose #N appears nowhere in the CHANGELOG.md
+# entry Phase 5 step 1 just inserted. Same delegation shape as every suite
+# above.
+echo
+echo "-- release.md merged-work coverage check (delegated suite) --"
+MW_TEST="$TESTS_DIR/../../../commands/repo/tests/test-changelog-merged-work-check.sh"
+if [[ ! -f "$MW_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-changelog-merged-work-check.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-changelog-merged-work-check.sh" "$MW_TEST"
+else
+    MW_OUT="$(bash "$MW_TEST" 2>&1)"
+    MW_STATUS=$?
+    MW_PASS="$(suite_count Passed "$MW_OUT")"
+    MW_FAIL="$(suite_count Failed "$MW_OUT")"
+    if ! [[ "$MW_PASS" =~ ^[0-9]+$ && "$MW_FAIL" =~ ^[0-9]+$ ]]; then
+        MW_PASS=0
+        MW_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-changelog-merged-work-check.sh" "$MW_STATUS"
+        strip_ansi "$MW_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$MW_STATUS" -ne 0 || "$MW_FAIL" -ne 0 ]]; then
+        [[ "$MW_FAIL" -eq 0 ]] && MW_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-changelog-merged-work-check.sh" "$MW_PASS" "$MW_FAIL" "$MW_STATUS"
+        strip_ansi "$MW_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-changelog-merged-work-check.sh" "$MW_PASS"
+    fi
+    PASS=$((PASS + MW_PASS))
+    FAIL=$((FAIL + MW_FAIL))
+    record_suite "test-changelog-merged-work-check.sh" "$MW_PASS" "$MW_FAIL" "release.md Phase 5 merged-work coverage check"
 fi
 
 echo

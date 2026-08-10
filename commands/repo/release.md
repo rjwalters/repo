@@ -514,7 +514,68 @@ Once approved:
    The `pre-apply` seam therefore needs **no** change for the fold: it fires
    before this insert, after drafting is complete, so it never observes an
    un-folded entry regardless of how the string was assembled.
-2. **Show the version-bearing files** the tool will touch, then bump. Dispatch on
+2. **Merged-work coverage check (advisory).** Cross-reference merged PRs since
+   the last tag against the entry just inserted above — the forward-looking
+   sibling of Phase 1.5's retrospective gate. Phase 1.5 catches a *shipped* tag
+   that turns out to be missing an entry; by then the release is already out
+   and the range is cold. This catches the same kind of gap *before* it ships:
+   work that merged into this range but never made it into the entry at all
+   (repo#229 — at v0.9.0, `aws_create()` shipped with `KeyName: None` (#182)
+   and `down` could terminate a repurposed fleet host's disk with no guard
+   (#171), and neither had a CHANGELOG line until the operator asked for the
+   range to be re-checked by hand). **Advisory only — report and continue,
+   never block**, matching Phase 1.5's and Phase 3.5's posture: plenty of
+   merged commits legitimately have no entry (a `docs:` fix, a dependency
+   bump, a revert pair), so the check must not let bookkeeping commits
+   dominate the list.
+
+   ```bash
+   # $last is the same previous-tag reference Phase 3 captured; HEAD here is
+   # still pre-tag (Phase 6 cuts the tag), so the range is exactly "everything
+   # unshipped a moment ago". Scope to the conventional-commit prefixes most
+   # likely to need a changelog line — feat/fix/security in scope by default,
+   # docs/chore/test/build NOT in scope. This default is what keeps a
+   # `docs: update WORK_LOG` commit, or a Dependabot `build(deps): …` bump,
+   # off the list without a single one of them being special-cased by name.
+   FILTER='^(feat|fix|security)(\(|:)'
+
+   FOUND=0
+   for sha in $(git log "${last}..HEAD" --format='%H'); do
+     subject="$(git log -1 --format='%s' "$sha")"
+     echo "$subject" | grep -Eq "$FILTER" || continue
+     # Same grep -oE '#[0-9]+' key the Unreleased fold's dedup step (above)
+     # uses, applied here to the FULL commit message rather than just the
+     # subject's trailing PR number — a squash-merge body commonly carries a
+     # "Closes #NNN" naming the ORIGINATING issue, which is what this repo's
+     # own entries usually cite (the issue number), not the merge's own PR
+     # number. A commit is counted as logged if ANY number it references
+     # already appears in CHANGELOG.md.
+     nums="$(git log -1 --format='%B' "$sha" | grep -oE '#[0-9]+' | tr -d '#' | sort -u)"
+     [ -n "$nums" ] || continue   # no #N anywhere — nothing to cross-reference (e.g. a local/rebased commit)
+     logged=0
+     for n in $nums; do
+       grep -Eq "#${n}([^0-9]|\$)" CHANGELOG.md && { logged=1; break; }
+     done
+     [ "$logged" = 1 ] && continue
+     echo "  UNLOGGED: $subject"
+     FOUND=1
+   done
+   [ "$FOUND" = 0 ] && echo "ok: every in-scope merged PR is referenced in this release's CHANGELOG entry"
+   ```
+
+   For each `UNLOGGED:` line, confirm with the operator, one at a time: draft
+   a bullet for it now (folding it into the entry just inserted, the same
+   move as a Phase 1.5 backfill) or confirm it's intentionally unlogged. Two
+   things commonly explain a legitimate confirm-and-move-on: the PR is cited
+   in `CHANGELOG.md` under the *issue* it closed rather than under its own PR
+   number (a real gap in this check — the git history carries the mapping
+   only when the squash-merge body happens to include a `Closes #N` line; when
+   it doesn't, no automated cross-reference can find it), or the change is
+   real but genuinely not release-note-worthy (an internal-only refactor typed
+   `fix:`, a security-classified doc tweak). Either answer is fine — this is
+   report-and-confirm only, never a blocker, and it runs once per release
+   regardless of how many items it finds.
+3. **Show the version-bearing files** the tool will touch, then bump. Dispatch on
    the detected tool; each branch must produce a version commit **and** tag:
 
    ```bash
@@ -588,7 +649,7 @@ Once approved:
      still holds the old version; with it, a `bump:` that doesn't take fails the
      release instead of shipping a stale tag — the same guarantee `pyproject`
      gives on a zero-substitution rewrite.
-3. **Verify**: re-read the version and confirm the tag exists
+4. **Verify**: re-read the version and confirm the tag exists
    (`git tag --sort=-v:refname | head -1`). For cargo, `cargo check --workspace`.
    Also confirm the `## Unreleased` fold (Phase 4) actually landed: grep the
    freshly-written `CHANGELOG.md` for any surviving `## Unreleased` heading and
