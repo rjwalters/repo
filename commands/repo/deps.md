@@ -199,13 +199,14 @@ entry). Before referencing **any** label, read its description and confirm a
 bot may apply it:
 
 ```bash
-# Labels a bot may NOT apply — refuse every one of these
+# Labels reserved for a specific party — refuse every one of these, and name
+# the party in the report
 gh api repos/OWNER/REPO/labels --paginate \
-  --jq '.[] | select(.description // "" | test("Applied by: humans")) | "REFUSE: \(.name) — \(.description)"'
+  --jq '.[] | select(.description // "" | test("Applied by:")) | "REFUSE: \(.name) — reserved for \(((.description // "") | capture("Applied by: (?<party>[^.]+)").party // "unknown party") | sub(" only\\s*$"; "")) — \(.description)"'
 
 # Remaining candidates
 gh api repos/OWNER/REPO/labels --paginate \
-  --jq '.[] | select((.description // "" | test("Applied by: humans")) | not) | .name'
+  --jq '.[] | select((.description // "" | test("Applied by:")) | not) | .name'
 ```
 
 Two details that matter in that jq: `.description // ""` is **required** — a
@@ -219,14 +220,27 @@ exhausted) rate-limit bucket from REST.
 Rules:
 
 - The label must **exist**. Existence alone is not enough.
-- **Refuse any label whose description reserves it for humans** — look for the
-  literal substring `Applied by: humans` (Loom repos use exactly this
-  convention, e.g. `external`: *"Non-collaborator submission; needs maintainer
-  approval before curation. Applied by: humans only."*). Having Dependabot
-  apply such a label violates the label's own contract.
+- **Refuse any label whose description reserves it for a party** — look for
+  the literal substring `Applied by:`, not just `Applied by: humans`. The
+  convention reserves labels for parties other than humans too — e.g.
+  `loom:evaluating`: *"Champion is evaluating this proposal (claim label,
+  stale after 15m). Applied by: Champion only."* is exactly as off-limits to
+  Dependabot as a human-reserved label: it is a claim label with staleness
+  semantics owned by a specific actor, and Dependabot applying it would feed
+  automation that acts on that claim. Having Dependabot apply *any*
+  `Applied by:` label violates that label's own contract, regardless of which
+  party it names.
+- Report which party each refused label is reserved for (e.g. "REFUSE:
+  loom:evaluating — reserved for Champion").
 - **Never create a label** to solve this. No `gh label create`, ever. If no
   suitable label exists, scaffold the config **without** a `labels:` key and
-  say so in the report.
+  say so in the report. This refuse-by-default posture is intentionally
+  stricter than necessary — it can pass over a label that a repo owner would
+  in fact consider fine for Dependabot to apply (e.g. an `Applied by: <bot>`
+  label meant for automation) — but the safe fallback of no `labels:` key
+  costs nothing, while silently applying a reserved label can violate its
+  contract. If a repo wants a bot-applied label used here, that is a policy
+  call for a human to make explicitly, not something this check should infer.
 - A maintenance/chore-tier label (e.g. `tier:maintenance`, `dependencies`,
   `chore`) is the usual right answer when one is present and unrestricted.
 
@@ -490,7 +504,8 @@ natural wrong assumption, and it is safety-relevant:
    `dependabot.yml` says nothing about whether CVE alerting is on. Report
    UNKNOWN (not `disabled`) when the token can't read the setting.
 3. **Never create a label**, and never reference one whose description reserves
-   it for humans (`Applied by: humans`). No suitable label → no `labels:` key.
+   it for any party (`Applied by: <party>` — humans, Champion, a bot, …). No
+   suitable label → no `labels:` key.
 4. **Scaffold only detected ecosystems** — no fixed template, no guessing. Zero
    detected means nothing to scaffold.
 5. **Never scaffold against an installer-owned manifest** — a manifest under a
