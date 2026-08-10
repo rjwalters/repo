@@ -211,14 +211,21 @@ the work is already in flight and usually changes the user's choice.
 ### 5. File the approved issues
 
 For each approved, non-UNKNOWN candidate, write the body to a scratch file and
-POST it through REST:
+POST it through REST. **Use a literal, spelled-out scratch path — never a
+shell variable — as the `>` redirect target and the `--input` argument.** In a
+Loom-managed repo the destructive-write guard denies a write whose target is
+an unexpanded shell variable outright, because it cannot statically resolve
+where the write lands and a variable-rooted path might resolve inside a repo
+with live worktrees (#4921/#4178); a literal path sidesteps that ambiguity
+entirely, so do not "clean this back up" into `$BODY` / `$PAYLOAD` variables
+for readability. Prefer the session's own scratchpad directory when the
+agent has one (it is both literal and guaranteed outside every repo);
+otherwise spell out a `/tmp/...` path directly:
 
 ```bash
-BODY="${TMPDIR:-/tmp}/followup-body.md"
-PAYLOAD="${TMPDIR:-/tmp}/followup-payload.json"
-
-# 1. Write the issue body to "$BODY" using your own file-write capability —
-#    NOT a shell heredoc (see below). Content is the usual shape:
+# 1. Write the issue body to a literal scratch path using your own
+#    file-write capability — NOT a shell heredoc (see below). Content is the
+#    usual shape:
 #      ## Context
 #      <where this came up in the session / repro>
 #
@@ -226,10 +233,10 @@ PAYLOAD="${TMPDIR:-/tmp}/followup-payload.json"
 #      - [ ] …
 
 # 2. Build the create payload, then POST it (REST `core` pool, not GraphQL).
-jq -n --arg t "<title>" --rawfile b "$BODY" \
-  '{title: $t, body: $b, labels: []}' > "$PAYLOAD"
+jq -n --arg t "<title>" --rawfile b /tmp/followup-body.md \
+  '{title: $t, body: $b, labels: []}' > /tmp/followup-payload.json
 
-gh api --method POST "repos/<slug>/issues" --input "$PAYLOAD" --jq '.html_url'
+gh api --method POST "repos/<slug>/issues" --input /tmp/followup-payload.json --jq '.html_url'
 ```
 
 Two reasons this is the documented form rather than
@@ -251,12 +258,13 @@ it `[]` here, per the labeling note below.
 
 Print the resulting issue URLs. For near-matches the user chose to comment on
 instead of file, use the same REST shape (`gh issue comment` is GraphQL-backed
-too):
+too) and the same literal-scratch-path rule as above — never a `$BODY` /
+`$PAYLOAD` variable as the write target:
 
 ```bash
-jq -n --rawfile b "$BODY" '{body: $b}' > "$PAYLOAD"
-gh api --method POST "repos/<slug>/issues/<n>/comments" --input "$PAYLOAD" \
-  --jq '.html_url'
+jq -n --rawfile b /tmp/followup-body.md '{body: $b}' > /tmp/followup-payload.json
+gh api --method POST "repos/<slug>/issues/<n>/comments" \
+  --input /tmp/followup-payload.json --jq '.html_url'
 ```
 
 Leave UNKNOWN / skipped candidates unfiled and list them so nothing is silently
