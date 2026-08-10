@@ -1,0 +1,29 @@
+version: 2
+
+# Scaffolded by /repo:deps. Ecosystems here are the ones actually present and
+# repo-owned: package.json is scripts-only (no dependency blocks, empty
+# pnpm-lock.yaml), so npm is deliberately absent — there is nothing for
+# Dependabot to update there.
+updates:
+  # Low risk individually; reviewing each bump separately is noise, so group
+  # everything including majors. As of scaffolding, checkout/setup-node/
+  # action-setup are all v4 and CI warns they target the deprecated Node 20 —
+  # the grouped major bump is what clears that annotation.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["tier:maintenance"]
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]
+
+  # Ungrouped on purpose: there is one base image, and an Ubuntu LTS major
+  # (24.04 -> 26.04) rebuilds the /repo:remote dev container. That deserves its
+  # own reviewable PR rather than being folded into a batch.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["tier:maintenance"]
