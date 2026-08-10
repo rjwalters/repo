@@ -1100,6 +1100,15 @@ assert_deny "rm-scope #239: rm -rf \"\$(mktemp -d)\" denied (root-unresolved)" \
 assert_deny "rm-scope #239: rm -rf \"/\$X/evil\" denied (root-unresolved)" \
     'rm -rf "/$X/evil"' "$REPO_ROOT"
 
+# ---- commands/repo/sudo.md's exact rm shapes (#245) -- pinned so a future
+# ---- guard change can't silently alter this without the test failing. Both
+# ---- are root-unresolved (the variable IS the whole target), so they are
+# ---- denied the same way regardless of caller.
+assert_deny "rm-scope #245: sudo.md's sudo rm -f \"\$DROPIN\" denied (root-unresolved)" \
+    'sudo rm -f "$DROPIN"' "$REPO_ROOT"
+assert_deny "rm-scope #245: sudo.md's rm -f \"\$TMP\" denied (root-unresolved)" \
+    'rm -f "$TMP"' "$REPO_ROOT"
+
 # ---- Case (2): variable in a later directory component. ----
 # Known prefix ("$REPO_ROOT/build-artifacts") is in scope -> allowed.
 assert_allow "rm-scope #239: rm -rf \"build-artifacts/\$sub/tmp\" allowed (known in-scope prefix)" \

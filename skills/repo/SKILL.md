@@ -234,6 +234,16 @@ This policy only applies while `guards.rmScope=repo` is active — with
 `rmScope:"off"`/`"permissive"` the legacy CWD-relative fallback is unchanged,
 so the opt-out stays byte-for-byte permissive.
 
+**Affected caller: `commands/repo/sudo.md` (#245).** All four `rm` calls in
+that command (`sudo rm -f "$DROPIN"` and `rm -f "$TMP"`, each root-unresolved
+— the variable is the entire target) are denied under the default
+`guards.rmScope=repo`. Unlike the write-confinement guard's own affected
+caller note in the same file, this trigger is **config-only and defaults to
+`repo`** — it has no "only when a managed worktree exists" carve-out, so it
+is not avoided by running outside a Loom-managed checkout the way the write
+denials are. See the "Guard note" in `commands/repo/sudo.md` for the
+per-call-site manual remedy.
+
 The full stable interface (input/output contract, exit semantics, every env
 name) is documented in the hook's own header — downstream tools (e.g. Loom's
 installer) gate on it via this repo's release version.
