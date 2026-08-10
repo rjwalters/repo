@@ -4,7 +4,7 @@
 # the /repo:* commands (bash, git, gh, shellcheck, ripgrep, jq) plus the Claude
 # Code CLI. Auth tokens (gh, claude) are injected at container-run time via the
 # environment — never baked into this image and never committed.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
