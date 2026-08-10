@@ -360,6 +360,33 @@ gh pr diff <N>
 gh pr checks <N>
 ```
 
+#### CI status caveat — green only means what CI actually exercises
+
+**Scaffolding an ecosystem's Dependabot config does not imply the repo's CI
+exercises that ecosystem's artifact.** `/repo:deps` scaffolds an ecosystem
+purely from manifest presence (Safety Rule 4) — it never checks whether any CI
+job builds or runs what that manifest produces. A bot PR's "CI status" is only
+as meaningful as what CI does with the changed files: a `npm`/`cargo`/`pip`
+bump that CI compiles and tests is well-verified by green; a `docker`-ecosystem
+bump (base-image or layer change) is verified by green only if some job
+actually runs `docker build`. This generalizes to any ecosystem whose
+artifact CI neither builds nor runs — Terraform providers with no `terraform
+plan` job, a Helm chart with no `helm template`/lint step, etc.
+
+Before reporting a PR's CI status as reassuring, check whether the repo's
+workflows actually build/run that ecosystem's artifact (`grep` the
+`.github/workflows/*.yml` for the relevant command — `docker build`,
+`terraform plan`, …). If they don't, report the PR's CI as **green but
+unverifiable by this repo's checks** rather than plain "green" — e.g. a
+`docker`-ecosystem PR when no workflow runs `docker build` against the
+Dockerfile it touches. (As of this writing this repo's own `docker` entry —
+the root `Dockerfile` — is covered: `.github/workflows/docker-build.yml` runs
+`docker build .` on any PR/push touching it, `paths:`-filtered off unrelated
+PRs — added in response to issue #231, after the first docker Dependabot PR
+merged on a green check that had built nothing. Re-check this note against
+the workflow files each run rather than trusting this parenthetical, since
+either side of it can drift.)
+
 #### Stale check — compare the PR's target against the manifest on the base branch
 
 **Dependabot's open PRs go stale after any bulk-update merge.** Its scan runs

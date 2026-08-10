@@ -1,0 +1,47 @@
+name: Docker build
+
+# Builds the root Dockerfile (the /repo:remote dev-container image) on any PR
+# or push to main that touches it. Before this workflow, `.github/workflows/
+# ci.yml` never built the image — it only runs `pnpm test` — so the first
+# docker-ecosystem Dependabot PR (#223, `FROM ubuntu:24.04` -> `ubuntu:26.04`)
+# merged on green CI that had exercised none of the Dockerfile's layers
+# (apt package availability, the GitHub CLI apt repo, the Claude Code
+# installer). See issue #231.
+#
+# `paths:`-filtered so this costs nothing on the overwhelming majority of PRs
+# that don't touch the Dockerfile — kept as its own workflow file (rather than
+# folded into ci.yml's `test` job) because the two have unrelated trigger
+# conditions: ci.yml's suite runs unconditionally on every push/PR, this job
+# should not.
+#
+# No push/registry step — this only proves the image *builds*, matching the
+# issue's "docker build ." acceptance criterion. Publishing is out of scope.
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker-build.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker-build.yml"
+
+concurrency:
+  group: docker-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: docker build (Dockerfile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: docker build .
+        run: docker build .
