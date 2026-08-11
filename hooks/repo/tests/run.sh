@@ -28,8 +28,9 @@
 # commands/repo/tests/test-readme-layout-block.sh,
 # commands/repo/tests/test-skill-commands-table.sh,
 # commands/repo/tests/test-sudo-rm-guard-contract.sh,
-# commands/repo/tests/test-release-version-citation-check.sh, and
-# commands/repo/tests/test-changelog-merged-work-check.sh.
+# commands/repo/tests/test-release-version-citation-check.sh,
+# commands/repo/tests/test-changelog-merged-work-check.sh, and
+# commands/repo/tests/test-work-log-docs-pr-self-loop.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1008,6 +1009,42 @@ else
     PASS=$((PASS + MW_PASS))
     FAIL=$((FAIL + MW_FAIL))
     record_suite "test-changelog-merged-work-check.sh" "$MW_PASS" "$MW_FAIL" "release.md Phase 5 merged-work coverage check"
+fi
+
+# WORK_LOG.md's docs-PR self-loop contract (repo#151, repo#263): the Guide's
+# document-maintenance phase must never record its OWN merged PRs, because that
+# manufactures the "new content" signal justifying the next docs PR, forever.
+# Asserts against the produced artifact, so a docs PR carrying such a line turns
+# its own CI run red. Same delegation shape as every suite above.
+echo
+echo "-- WORK_LOG.md docs-PR self-loop contract (delegated suite) --"
+SL_TEST="$TESTS_DIR/../../../commands/repo/tests/test-work-log-docs-pr-self-loop.sh"
+if [[ ! -f "$SL_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-work-log-docs-pr-self-loop.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-work-log-docs-pr-self-loop.sh" "$SL_TEST"
+else
+    SL_OUT="$(bash "$SL_TEST" 2>&1)"
+    SL_STATUS=$?
+    SL_PASS="$(suite_count Passed "$SL_OUT")"
+    SL_FAIL="$(suite_count Failed "$SL_OUT")"
+    if ! [[ "$SL_PASS" =~ ^[0-9]+$ && "$SL_FAIL" =~ ^[0-9]+$ ]]; then
+        SL_PASS=0
+        SL_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-work-log-docs-pr-self-loop.sh" "$SL_STATUS"
+        strip_ansi "$SL_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SL_STATUS" -ne 0 || "$SL_FAIL" -ne 0 ]]; then
+        [[ "$SL_FAIL" -eq 0 ]] && SL_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-work-log-docs-pr-self-loop.sh" "$SL_PASS" "$SL_FAIL" "$SL_STATUS"
+        strip_ansi "$SL_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-work-log-docs-pr-self-loop.sh" "$SL_PASS"
+    fi
+    PASS=$((PASS + SL_PASS))
+    FAIL=$((FAIL + SL_FAIL))
+    record_suite "test-work-log-docs-pr-self-loop.sh" "$SL_PASS" "$SL_FAIL" "WORK_LOG.md docs-PR self-loop contract"
 fi
 
 echo
