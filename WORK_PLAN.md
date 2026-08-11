@@ -1,28 +1,22 @@
 # Work Plan
 
-Prioritized roadmap generated from current GitHub label state, maintained
-automatically by the Guide triage agent. Regenerated whenever label state
-changes; see WORK_LOG.md for what has already shipped.
+Prioritized roadmap generated from current GitHub label state, maintained automatically by the Guide triage agent. Regenerated whenever label state changes; do not hand-edit the generated region below.
 
 <!-- guide:plan-body:start -->
 ## Urgent
 
 _No issues currently marked `loom:urgent`._
 
-## Ready
+## Ready for Implementation
 
-_No issues currently marked `loom:issue` (human/Champion-approved, awaiting a Builder)._
+_No issues currently marked `loom:issue`._
 
 ## Proposed
 
-- **#145**: tidy: offer package-manager-native pruning of orphaned node_modules content (pnpm prune / npm prune) *(curated)*
-- **#168**: The canonical destructive-command guard never runs in a Loom-managed repo *(curated)*
+- **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
+- **#252**: Stranded-drop-in claim in sudo.md's guard note is reasoned, never exercised *(curated)*
 
-## Epics
+## Active Epics
 
-_No open `loom:epic` issues._
-
-## Needs triage
-
-_No open issues awaiting Curator._
+_No open epics._
 <!-- guide:plan-body:end -->
