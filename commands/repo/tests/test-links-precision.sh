@@ -496,8 +496,22 @@ assert_contains "the declaration file is named" "$LINKS" \
     '`.repo/link-siblings.json`'
 assert_contains "the declaration file is distinct from link-roots.json" "$LINKS" \
     "a **different** file from"
-assert_contains "the declaration shape is a parent + siblings list" "$LINKS" \
-    '"siblings": ["notes", "kicad-tools", "anvil"]'
+assert_contains "the declaration shape is a flat name-to-location map" "$LINKS" \
+    '"notes": "../notes",'
+assert_contains "the shape matches link-roots.json's own flat-map convention" \
+    "$LINKS" "the same flat-map **shape** as \`link-roots.json\`"
+assert_contains "a nested sibling location can be declared" "$LINKS" \
+    '`"archive": "../notes/archive"`'
+assert_contains "the old parent+siblings shape could not express a nested sibling" \
+    "$LINKS" 'shape could not express at'
+assert_contains "bases 1-2 are restricted to non-escaping candidates" "$LINKS" \
+    "resolve only candidates that stay inside the repo toplevel"
+assert_contains "escape detection is lexical, never realpath/readlink -f" "$LINKS" \
+    "resolving symlinks (\`realpath\`/\`readlink -f\`) would deport"
+assert_contains "the longest declared sibling location wins the match" "$LINKS" \
+    "pick the sibling whose location is the **longest**"
+assert_contains "crediting the shorter sibling would misreport a nested absence" \
+    "$LINKS" "target that actually belongs to a longer, absent nested sibling reports"
 assert_contains "absent a declaration, behavior is unchanged" "$LINKS" \
     "out-of-repo links are handled exactly as they are today"
 assert_contains "siblings are never inferred from directory name/shape" "$LINKS" \
@@ -523,62 +537,115 @@ assert_contains "the repo#268 worked example is present" "$LINKS" \
 assert_contains "the worked example's unverifiable outcome is not a false positive" \
     "$LINKS" "not a false positive"
 
+if [[ -f "$DOCS_MD" ]]; then
+    assert_contains "docs.md folds in the sibling-repo table/annotation" \
+        "$(cat "$DOCS_MD")" "resolved via sibling repo"
+    assert_contains "docs.md keeps the sibling-absent annotation distinct from MISSING" \
+        "$(cat "$DOCS_MD")" "sibling repo not present — unverifiable"
+else
+    skip "docs.md folds in the sibling-repo table/annotation" "docs.md not found"
+    skip "docs.md keeps the sibling-absent annotation distinct from MISSING" "docs.md not found"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "10. The documented sibling-repo algorithm, executed against a fixture"
 # ---------------------------------------------------------------------------
 #
 # Not a grep: implements links.md's sibling-repo resolution exactly as written
-# and runs it over a temp two-repo workspace shaped like the issue's worked
-# example (`../../notes/sessions/<date>.md` citing a sibling repo), covering
-# the three acceptance-criteria outcomes: working link, broken link (sibling
-# present), unverifiable link (sibling absent).
+# — including the base-1/base-2 escape restriction and the longest-matching-
+# location rule — and runs it over a temp two-repo workspace shaped like the
+# issue's worked example (`../../notes/sessions/<date>.md` citing a sibling
+# repo), covering:
+#   (a) a working sibling-repo link
+#   (b) a broken link into a present sibling (real MISSING, not suppressed)
+#   (c) a link into a sibling that isn't checked out at all (unverifiable)
+#   (d) repo#270: a PRESENT sibling's valid citation, run through the FULL
+#       ordered resolution (bases 1-2, restricted, then the sibling base) —
+#       must attribute to the sibling base, not resolve as "in place". This
+#       is the case that reproduces repo#270: dirname(F)/P for this citation
+#       normalizes to a path that also exists on disk one level above the
+#       repo root, so an implementation that checks base 1 for existence
+#       without the escape restriction resolves it "in place" and never
+#       reaches this base — reordering (removing) the restriction in
+#       resolve_ordered() below turns this specific assertion red.
+#   (e) repo#270: a declared sibling nested inside another declared sibling's
+#       location, where the OUTER sibling is checked out but the NESTED one
+#       is not — matching the shorter, present outer location would silently
+#       report the nested sibling's absence as MISSING; matching the longest
+#       (nested) location correctly reports it unverifiable instead.
 
-SIB_PARENT=""
-SIB_LIST=()
+SIB_NAMES=()
+SIB_LOCS=()
 
 load_sib_decl() {  # <.repo/link-siblings.json path> — absent file = no declaration
-    SIB_PARENT=""; SIB_LIST=()
+    SIB_NAMES=(); SIB_LOCS=()
     [[ -f "$1" ]] || return 0
-    SIB_PARENT="$(sed -n 's/.*"parent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1)"
-    local raw
-    raw="$(sed -n 's/.*"siblings"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' "$1" | head -1)"
-    # Split a `"a", "b", "c"` fragment into array entries.
-    while IFS= read -r entry; do
-        entry="${entry//\"/}"; entry="$(echo "$entry" | xargs)"
-        [[ -n "$entry" ]] && SIB_LIST+=("$entry")
-    done < <(printf '%s\n' "$raw" | tr ',' '\n')
+    local k v tab
+    # A literal tab in the replacement (see load_decl's note in section 8):
+    # BSD/macOS sed emits a bare "t" for `\t`, defeating the IFS=$'\t' split.
+    tab=$'\t'
+    while IFS="$tab" read -r k v; do
+        SIB_NAMES+=("$k"); SIB_LOCS+=("${v:-}")
+    done < <(sed -n "s/.*\"\([^\"]*\)\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1${tab}\2/p" "$1")
 }
 
-sib_is_declared() {  # <name> -> 0 if declared, 1 otherwise
-    local n="$1" s
-    for s in "${SIB_LIST[@]}"; do [[ "$s" == "$n" ]] && return 0; done
-    return 1
+sib_match_longest() {  # <normalized target Q> -> declared-sibling index, longest location wins
+    local q="$1" i loc best=-1 bestlen=-1
+    for i in "${!SIB_LOCS[@]}"; do
+        loc="$(norm "${SIB_LOCS[$i]}")"
+        if [[ "$q" == "$loc" || "$q" == "$loc/"* ]] && ((${#loc} > bestlen)); then
+            best=$i; bestlen=${#loc}
+        fi
+    done
+    ((best >= 0)) && printf '%s' "$best"
 }
 
 # <repo root> <file, repo-relative> <link target> -> sibling-repo verdict.
 # Assumes the caller already tried the two-base (and install-mapping) bases
 # and they failed — this is purely the fourth base from links.md.
 sib_resolve() {
-    local root="$1" f="$2" p="$3" dir q sib rest
+    local root="$1" f="$2" p="$3" dir q idx name loc subpath
     dir="$(dirname "$f")"; [[ "$dir" == "." ]] && dir=""
     q="$(norm "${dir:+$dir/}$p")"
-    [[ -n "$SIB_PARENT" ]] || { printf 'MISSING'; return 1; }
-    local pnorm; pnorm="$(norm "$SIB_PARENT")"
-    [[ "$q" == "$pnorm/"* ]] || { printf 'MISSING'; return 1; }
-    rest="${q#"$pnorm"/}"
-    sib="${rest%%/*}"
-    sib_is_declared "$sib" || { printf 'MISSING'; return 1; }
-    local subpath="${rest#*/}"
-    if [[ -d "$root/$SIB_PARENT/$sib" ]]; then
-        if [[ -e "$root/$SIB_PARENT/$sib/$subpath" ]]; then
-            printf 'resolved via sibling repo %s' "$sib"; return 0
+    idx="$(sib_match_longest "$q")"
+    [[ -n "$idx" ]] || { printf 'MISSING'; return 1; }
+    name="${SIB_NAMES[$idx]}"; loc="$(norm "${SIB_LOCS[$idx]}")"
+    if [[ "$q" == "$loc" ]]; then subpath=""; else subpath="${q#"$loc"/}"; fi
+    if [[ -d "$root/$loc" ]]; then
+        if [[ -z "$subpath" || -e "$root/$loc/$subpath" ]]; then
+            printf 'resolved via sibling repo %s' "$name"; return 0
         else
-            printf 'MISSING (sibling %s present, file not found)' "$sib"; return 1
+            printf 'MISSING (sibling %s present, file not found)' "$name"; return 1
         fi
     else
-        printf 'sibling repo not present -- unverifiable (%s)' "$sib"; return 1
+        printf 'sibling repo not present -- unverifiable (%s)' "$name"; return 1
     fi
+}
+
+# <repo root> <file, repo-relative> <link target> -> the FULL documented
+# order: base 1 (in place), base 2 (repo root), each restricted to
+# non-escaping candidates, then the sibling base for an escaping candidate.
+# This is what proves the repo#270 ordering bug is fixed: without the
+# `$c1 != ../*` guards below, an escaping-but-existing target would resolve
+# "in place" here exactly like the shipped bug, and case (d) would go red.
+resolve_ordered() {
+    local root="$1" f="$2" p="$3" dir c1 c2
+    dir="$(dirname "$f")"; [[ "$dir" == "." ]] && dir=""
+    c1="$(norm "${dir:+$dir/}$p")"
+    if [[ "$c1" != ".." && "$c1" != "../"* ]] && [[ -e "$root/$c1" ]]; then
+        printf 'in place'; return 0
+    fi
+    c2="$(norm "$p")"
+    if [[ "$c2" != ".." && "$c2" != "../"* ]] && [[ -e "$root/$c2" ]]; then
+        printf 'repo root'; return 0
+    fi
+    if [[ "$c1" == ".." || "$c1" == "../"* ]]; then
+        sib_resolve "$root" "$f" "$p"
+        return $?
+    fi
+    printf 'MISSING'
+    return 1
 }
 
 SFIX="$(mktemp -d "${TMPDIR:-/tmp}/links-siblings.XXXXXX")"
@@ -586,24 +653,28 @@ trap 'rm -rf "$SFIX"' EXIT
 
 # workspace/
 #   repo-a/docs/strategy.md          <- the file with the citations
-#   repo-a/.repo/link-siblings.json  <- parent=.. siblings=[notes, kicad-tools]
+#   repo-a/.repo/link-siblings.json  <- flat {"<name>": "<location>"} map
 #   notes/sessions/2026-07-30.md     <- exists: the working-link case
 #   (notes/sessions/2026-06-01.md does NOT exist: the broken-link case)
 #   (kicad-tools/ does NOT exist at all: the unverifiable case)
+#   (notes/archive/ does NOT exist: the nested, not-checked-out sibling case
+#    — nested under the PRESENT "notes" location, per the issue's example)
 mkdir -p "$SFIX/repo-a/docs" "$SFIX/repo-a/.repo" "$SFIX/notes/sessions"
 : > "$SFIX/notes/sessions/2026-07-30.md"
+: > "$SFIX/repo-a/docs/present.md"
 cat > "$SFIX/repo-a/.repo/link-siblings.json" <<'JSON'
 {
-  "parent": "..",
-  "siblings": ["notes", "kicad-tools"]
+  "notes": "../notes",
+  "kicad-tools": "../kicad-tools",
+  "archive": "../notes/archive"
 }
 JSON
 
 load_sib_decl "$SFIX/repo-a/.repo/link-siblings.json"
-assert_eq "link-siblings.json parses the declared parent" ".." "$SIB_PARENT"
-assert_eq "link-siblings.json parses two declared siblings" "2" "${#SIB_LIST[@]}"
+assert_eq "link-siblings.json parses three declared siblings" "3" "${#SIB_NAMES[@]}"
+assert_eq "the flat map's first location parses" "../notes" "${SIB_LOCS[0]}"
 
-# (a) a working sibling-repo relative link.
+# (a) a working sibling-repo relative link, the fourth base in isolation.
 assert_eq "a working sibling-repo link resolves" \
     "resolved via sibling repo notes" \
     "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-07-30.md")"
@@ -620,6 +691,48 @@ assert_eq "a link into an absent sibling checkout is unverifiable, not MISSING" 
     "sibling repo not present -- unverifiable (kicad-tools)" \
     "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../kicad-tools/docs/setup.md")"
 
+# --- repo#270 case (d): the ORDERING bug — a present sibling's valid citation
+# must attribute to the sibling base, not silently resolve "in place" ---------
+#
+# docs/strategy.md's dirname(F)/P for this exact target normalizes to
+# "../notes/sessions/2026-07-30.md", which — one level above repo-a's own
+# root — is exactly where the sibling checkout put the file. An unrestricted
+# base 1 would find it there and report "in place"; the documented fix skips
+# base 1 for an escaping candidate regardless of what happens to exist there.
+assert_eq "an ordinary in-repo link still resolves in place through the full order" \
+    "in place" \
+    "$(resolve_ordered "$SFIX/repo-a" "docs/strategy.md" "present.md")"
+assert_eq "an in-repo target that is genuinely missing is a normal MISSING, never the sibling base" \
+    "MISSING" \
+    "$(resolve_ordered "$SFIX/repo-a" "docs/strategy.md" "gone.md")"
+assert_eq "a present sibling's valid citation attributes to the sibling base, not in place" \
+    "resolved via sibling repo notes" \
+    "$(resolve_ordered "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-07-30.md")"
+
+# --- repo#270 case (e): longest-declared-location matching against a nested,
+# not-checked-out sibling — verdict must be unverifiable, not MISSING --------
+#
+# "notes" (../notes) is checked out; "archive" (../notes/archive), nested
+# inside it, is not. A citation into the nested sibling matches BOTH declared
+# locations as a path-prefix; crediting the shorter, present "notes" would
+# check for the file under the (present) notes checkout and report a false
+# MISSING. Matching the longest ("archive") correctly identifies that ITS
+# declared location is the one that is absent.
+Q_NESTED="$(norm "docs/../../notes/archive/old-notes.md")"
+IDX_NESTED="$(sib_match_longest "$Q_NESTED")"
+assert_eq "the nested, more specific sibling location wins over its present parent" \
+    "archive" "${SIB_NAMES[$IDX_NESTED]}"
+assert_eq "a nested, not-checked-out sibling is unverifiable, not MISSING" \
+    "sibling repo not present -- unverifiable (archive)" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/archive/old-notes.md")"
+# Sanity: an unrelated citation still inside the present "notes" checkout
+# (not under the nested "archive" path) is unaffected by the longest-match
+# rule and still matches "notes".
+Q_PLAIN="$(norm "docs/../../notes/sessions/2026-07-30.md")"
+IDX_PLAIN="$(sib_match_longest "$Q_PLAIN")"
+assert_eq "an unrelated citation still matches the shorter 'notes' location" \
+    "notes" "${SIB_NAMES[$IDX_PLAIN]}"
+
 # A sibling name that isn't declared is out of scope for this check entirely —
 # still MISSING (unchanged two-base outcome), not a new unverifiable status.
 mkdir -p "$SFIX/unrelated"
@@ -630,8 +743,7 @@ assert_eq "an undeclared sibling name is not treated as a workspace citation" \
 # Absent the declaration file, out-of-repo resolution is unchanged: MISSING,
 # same as it is today with no sibling-repo awareness at all.
 load_sib_decl "$SFIX/repo-a/.repo/does-not-exist.json"
-assert_eq "no declaration loads no parent" "" "$SIB_PARENT"
-assert_eq "no declaration loads no siblings" "0" "${#SIB_LIST[@]}"
+assert_eq "no declaration loads no sibling locations" "0" "${#SIB_NAMES[@]}"
 assert_eq "without a declaration a sibling link reports MISSING, as before" \
     "MISSING" \
     "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-07-30.md")"
