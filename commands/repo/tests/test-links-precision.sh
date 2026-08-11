@@ -49,6 +49,26 @@
 # Resolved in place they are all broken; resolved through the install mapping
 # they are all correct. A permanent 22-finding floor in the checker's own
 # critical class is the "teaches people to skim" failure again, one layer up.
+#
+#   9  a relative link that resolves OUTSIDE the repo root — a citation into a
+#      sibling repo in a multi-repo workspace — is checked against an opt-in
+#      `.repo/link-siblings.json` declaration (parent + allowed sibling names)
+#      before being reported, adding a fourth resolution base
+#  10  the documented sibling-repo algorithm actually clears repo#268's worked
+#      example: a working sibling link resolves, a broken one (sibling present,
+#      file gone) is a real MISSING finding, and a link into a sibling that
+#      isn't checked out locally at all is reported as its own distinct status
+#      — "sibling repo not present — unverifiable" — never folded into MISSING
+#
+# Contract 9/10 exist for repo#268: in a multi-repo workspace where docs cite
+# sibling-repo files by relative path (e.g. a strategy doc linking
+# `../../notes/sessions/<date>.md`), those citations resolved outside the repo
+# root and so were invisible to the two-base and install-mapping checks above
+# — the load-bearing links were the least-checked ones. The fix mirrors the
+# install-mapping precedent: opt-in, absent-by-default, additive, and every
+# failure mode gets its own row rather than one bucket that hides which is
+# which — same discipline [[update-tools]] uses for "source repo missing" vs.
+# "sidecar missing".
 
 set -uo pipefail
 
@@ -461,6 +481,162 @@ assert_eq "without a declaration root resolution is unchanged" "repo root" \
     "$(resolve "$FIX" "docs/a.md" "README.md")"
 
 rm -rf "$FIX"
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "9. Sibling-repo relative links are documented"
+# ---------------------------------------------------------------------------
+
+assert_contains "sibling-repo section exists" "$LINKS" \
+    "## Sibling-repo relative links"
+assert_contains "out-of-repo resolution is described" "$LINKS" \
+    "resolves **outside the repo root**"
+assert_contains "the declaration file is named" "$LINKS" \
+    '`.repo/link-siblings.json`'
+assert_contains "the declaration file is distinct from link-roots.json" "$LINKS" \
+    "a **different** file from"
+assert_contains "the declaration shape is a parent + siblings list" "$LINKS" \
+    '"siblings": ["notes", "kicad-tools", "anvil"]'
+assert_contains "absent a declaration, behavior is unchanged" "$LINKS" \
+    "out-of-repo links are handled exactly as they are today"
+assert_contains "siblings are never inferred from directory name/shape" "$LINKS" \
+    "No sibling is ever inferred from a directory"
+assert_contains "a present, resolving sibling gets its own status" "$LINKS" \
+    "resolved via sibling repo"
+assert_contains "an absent sibling checkout gets its own distinct status" "$LINKS" \
+    "sibling repo not present — unverifiable"
+assert_contains "the distinct-row rationale cites update-tools' failure modes" "$LINKS" \
+    "different failure modes"
+assert_contains "update-tools is cited by name and step" "$LINKS" \
+    "[[update-tools]] step 3"
+assert_contains "folding sibling-absent into MISSING is named as the failure to avoid" \
+    "$LINKS" '"sibling absent" into `MISSING`'
+assert_contains "a present sibling with a missing target is still a real finding" \
+    "$LINKS" "sibling \`notes\` present, file not found"
+assert_contains "a link missing under every base is still reported" "$LINKS" \
+    "Never fold the third row into the first two"
+assert_contains "a declared-but-unused sibling is reported as a question" "$LINKS" \
+    "as a question, not silently"
+assert_contains "the repo#268 worked example is present" "$LINKS" \
+    "### Worked example"
+assert_contains "the worked example's unverifiable outcome is not a false positive" \
+    "$LINKS" "not a false positive"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "10. The documented sibling-repo algorithm, executed against a fixture"
+# ---------------------------------------------------------------------------
+#
+# Not a grep: implements links.md's sibling-repo resolution exactly as written
+# and runs it over a temp two-repo workspace shaped like the issue's worked
+# example (`../../notes/sessions/<date>.md` citing a sibling repo), covering
+# the three acceptance-criteria outcomes: working link, broken link (sibling
+# present), unverifiable link (sibling absent).
+
+SIB_PARENT=""
+SIB_LIST=()
+
+load_sib_decl() {  # <.repo/link-siblings.json path> — absent file = no declaration
+    SIB_PARENT=""; SIB_LIST=()
+    [[ -f "$1" ]] || return 0
+    SIB_PARENT="$(sed -n 's/.*"parent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1)"
+    local raw
+    raw="$(sed -n 's/.*"siblings"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' "$1" | head -1)"
+    # Split a `"a", "b", "c"` fragment into array entries.
+    while IFS= read -r entry; do
+        entry="${entry//\"/}"; entry="$(echo "$entry" | xargs)"
+        [[ -n "$entry" ]] && SIB_LIST+=("$entry")
+    done < <(printf '%s\n' "$raw" | tr ',' '\n')
+}
+
+sib_is_declared() {  # <name> -> 0 if declared, 1 otherwise
+    local n="$1" s
+    for s in "${SIB_LIST[@]}"; do [[ "$s" == "$n" ]] && return 0; done
+    return 1
+}
+
+# <repo root> <file, repo-relative> <link target> -> sibling-repo verdict.
+# Assumes the caller already tried the two-base (and install-mapping) bases
+# and they failed — this is purely the fourth base from links.md.
+sib_resolve() {
+    local root="$1" f="$2" p="$3" dir q sib rest
+    dir="$(dirname "$f")"; [[ "$dir" == "." ]] && dir=""
+    q="$(norm "${dir:+$dir/}$p")"
+    [[ -n "$SIB_PARENT" ]] || { printf 'MISSING'; return 1; }
+    local pnorm; pnorm="$(norm "$SIB_PARENT")"
+    [[ "$q" == "$pnorm/"* ]] || { printf 'MISSING'; return 1; }
+    rest="${q#"$pnorm"/}"
+    sib="${rest%%/*}"
+    sib_is_declared "$sib" || { printf 'MISSING'; return 1; }
+    local subpath="${rest#*/}"
+    if [[ -d "$root/$SIB_PARENT/$sib" ]]; then
+        if [[ -e "$root/$SIB_PARENT/$sib/$subpath" ]]; then
+            printf 'resolved via sibling repo %s' "$sib"; return 0
+        else
+            printf 'MISSING (sibling %s present, file not found)' "$sib"; return 1
+        fi
+    else
+        printf 'sibling repo not present -- unverifiable (%s)' "$sib"; return 1
+    fi
+}
+
+SFIX="$(mktemp -d "${TMPDIR:-/tmp}/links-siblings.XXXXXX")"
+trap 'rm -rf "$SFIX"' EXIT
+
+# workspace/
+#   repo-a/docs/strategy.md          <- the file with the citations
+#   repo-a/.repo/link-siblings.json  <- parent=.. siblings=[notes, kicad-tools]
+#   notes/sessions/2026-07-30.md     <- exists: the working-link case
+#   (notes/sessions/2026-06-01.md does NOT exist: the broken-link case)
+#   (kicad-tools/ does NOT exist at all: the unverifiable case)
+mkdir -p "$SFIX/repo-a/docs" "$SFIX/repo-a/.repo" "$SFIX/notes/sessions"
+: > "$SFIX/notes/sessions/2026-07-30.md"
+cat > "$SFIX/repo-a/.repo/link-siblings.json" <<'JSON'
+{
+  "parent": "..",
+  "siblings": ["notes", "kicad-tools"]
+}
+JSON
+
+load_sib_decl "$SFIX/repo-a/.repo/link-siblings.json"
+assert_eq "link-siblings.json parses the declared parent" ".." "$SIB_PARENT"
+assert_eq "link-siblings.json parses two declared siblings" "2" "${#SIB_LIST[@]}"
+
+# (a) a working sibling-repo relative link.
+assert_eq "a working sibling-repo link resolves" \
+    "resolved via sibling repo notes" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-07-30.md")"
+
+# (b) a broken link to a sibling repo that IS checked out — a real finding,
+#     not suppressed just because it crosses a repo boundary.
+assert_eq "a broken link into a present sibling is a real MISSING finding" \
+    "MISSING (sibling notes present, file not found)" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-06-01.md")"
+
+# (c) a link into a sibling repo that is NOT checked out — must be reported as
+#     unverifiable, never as a false-positive MISSING.
+assert_eq "a link into an absent sibling checkout is unverifiable, not MISSING" \
+    "sibling repo not present -- unverifiable (kicad-tools)" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../kicad-tools/docs/setup.md")"
+
+# A sibling name that isn't declared is out of scope for this check entirely —
+# still MISSING (unchanged two-base outcome), not a new unverifiable status.
+mkdir -p "$SFIX/unrelated"
+assert_eq "an undeclared sibling name is not treated as a workspace citation" \
+    "MISSING" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../unrelated/x.md")"
+
+# Absent the declaration file, out-of-repo resolution is unchanged: MISSING,
+# same as it is today with no sibling-repo awareness at all.
+load_sib_decl "$SFIX/repo-a/.repo/does-not-exist.json"
+assert_eq "no declaration loads no parent" "" "$SIB_PARENT"
+assert_eq "no declaration loads no siblings" "0" "${#SIB_LIST[@]}"
+assert_eq "without a declaration a sibling link reports MISSING, as before" \
+    "MISSING" \
+    "$(sib_resolve "$SFIX/repo-a" "docs/strategy.md" "../../notes/sessions/2026-07-30.md")"
+
+rm -rf "$SFIX"
 trap - EXIT
 
 # ---------------------------------------------------------------------------

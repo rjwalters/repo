@@ -253,6 +253,113 @@ into — a silent regression this command would then report as healthy. When the
 two coordinate systems disagree about what the fix is, report it instead of
 editing.
 
+## Sibling-repo relative links
+
+A relative link that resolves **outside the repo root** is not automatically
+broken. In a multi-repo workspace where the documentation discipline is "cite,
+don't restate", docs cite files in checked-out sibling repos this way — e.g. a
+strategy doc linking `[session note](../../notes/sessions/2026-07-30.md)` to a
+working-session note in a sibling checkout. These citations are the
+load-bearing provenance trail behind a decision, so this repo treats them as a
+fourth resolution base rather than silently skipping them or flagging every one
+as broken.
+
+### The declaration
+
+Read the mapping from `.repo/link-siblings.json` — a **different** file from
+[[links]]'s own `link-roots.json` (that one maps a tree inside this repo to a
+destination inside this repo; this one maps a workspace-relative sibling name
+to nothing more than "yes, this is a citable sibling"), same `.repo/`
+convention as [[release]]'s policy file and [[scrub]]'s allowlist:
+
+```json
+{
+  "parent": "..",
+  "siblings": ["notes", "kicad-tools", "anvil"]
+}
+```
+
+`parent` is this repo's workspace parent, relative to the repo root (almost
+always `".."` — the directory that contains this repo's checkout and its
+siblings). `siblings` is the allowed list of sibling repo names directly under
+`parent`. A relative link whose first out-of-repo path component is not in this
+list is out of scope for this check entirely — not reported as broken, not
+reported as unverifiable, simply not a workspace citation this repo recognizes.
+**Absent the file — or given an empty `siblings` list — nothing in this section
+runs and out-of-repo links are handled exactly as they are today**, under the
+existing two-base rule alone. No sibling is ever inferred from a directory
+name or shape, same discipline as `.repo/link-roots.json`'s "no tree is ever
+treated as a template by inference from its name".
+
+### Resolution order
+
+A link target `P` in file `F` that fails the two-base resolution (and the
+install-mapping base, where declared) is checked against a **fourth base**
+before being reported:
+
+1. Resolve `P` against `dirname(F)` with normal `..`-climbing path arithmetic
+   to get a normalized target `Q`, which may climb above the repo root.
+2. If `Q` does not fall under the declared `parent` directory, or its first
+   path component under `parent` is not in the declared `siblings` list, this
+   base does not apply — report as before.
+3. If `Q` falls under a declared sibling **and that sibling checkout exists on
+   disk** (`parent/<sibling>` is present), validate `Q` exactly like an
+   internal link: exists -> resolved via sibling repo `<sibling>`; missing -> a
+   normal broken-link finding, not a false positive — the sibling *is* here, so
+   a missing target means the citation is genuinely stale.
+4. If `Q` falls under a declared sibling **and that sibling checkout does not
+   exist on disk** (no `parent/<sibling>` on this machine), the link is
+   unverifiable, not broken — this machine cannot tell whether the target
+   exists. Report it as **`sibling repo not present — unverifiable`**, a
+   distinct status from `MISSING`. This is the same "different failure modes
+   get different rows" discipline [[update-tools]] uses for `source repo
+   missing` vs. `sidecar missing` (see [[update-tools]] step 3) — folding
+   "sibling absent" into `MISSING` would turn every machine without every
+   sibling checked out into a wall of permanent false positives.
+
+### Report
+
+Sibling-repo links get their own status values, distinguishable at a glance
+from `MISSING`:
+
+```
+| Line | Target | Status |
+|------|--------|--------|
+| 12 | ../../notes/sessions/2026-07-30.md | resolved via sibling repo `notes` |
+| 45 | ../../notes/sessions/2026-06-01.md | MISSING (sibling `notes` present, file not found — renamed?) |
+| 61 | ../../kicad-tools/docs/setup.md | sibling repo not present — unverifiable (declared, no checkout at `../kicad-tools`) |
+```
+
+Never fold the third row into the first two — a machine without every sibling
+checked out would otherwise show permanent false-positive noise on every run,
+the exact "precision is itself a finding" failure this checker already guards
+against for install-mapping.
+
+### It adds a base; it never deletes a finding
+
+Same rule as install-template trees: a link that resolves under none of the
+bases tried is still reported, at the same severity it would carry anywhere
+else. A declared sibling that resolved 0 links, or whose `parent/<sibling>`
+path is declared but never referenced, is reported the same way a
+zero-resolution `link-roots.json` entry is — as a question, not silently
+ignored.
+
+### Worked example
+
+A strategy doc at `workspace/repo-a/docs/strategy.md` links
+`[session note](../../notes/sessions/2026-07-30.md)`. Resolved against the
+file's own directory that is `workspace/notes/sessions/2026-07-30.md` —
+outside `repo-a`'s root entirely, so the two-base rule alone reports it
+`MISSING`. With `repo-a/.repo/link-siblings.json` declaring
+`{"parent": "..", "siblings": ["notes"]}`:
+
+- If `workspace/notes/` is checked out and the session file exists, the link
+  resolves via sibling repo `notes` — not a finding.
+- If `workspace/notes/` is checked out but the file is gone (renamed, deleted),
+  it's a genuine `MISSING` finding — the provenance trail really is broken.
+- If `workspace/notes/` is not checked out on this machine at all, the link is
+  `sibling repo not present — unverifiable` — not a false positive.
+
 ## Interaction
 
 Group findings by source file:
