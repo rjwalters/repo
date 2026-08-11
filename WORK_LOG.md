@@ -4,6 +4,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-11
 
+- **PR #260**: docs: Guide document maintenance update
 - **PR #259**: docs: Guide document maintenance update
 - **Issue #249** (closed): No test pins sudo.md's guard note — #245's doc side can be deleted with the suite green
 - **PR #256**: test(repo): pin sudo.md's guard note against the guard it describes
