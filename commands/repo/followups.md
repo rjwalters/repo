@@ -17,11 +17,15 @@ Repo Skills / kicad-tools).
 Unlike every other `/repo:*` command, which scans repo / git / filesystem
 state, this one mines the **conversation**: the deferred work and discovered
 bugs that only exist in the session's context. Filing is outward-facing — for
-upstream targets it writes into *other people's* repos — so this command is in
-the same "always confirm first" class as `release`, `remote`, and
-`update-tools`, never the auto-apply behavior of the hygiene commands.
-**Confirmation is the default and only mode; there is no `--ask` flag because
-there is nothing to opt into.**
+upstream targets it writes into *other people's* repos, usually public ones —
+so this command is in the same "always confirm first" class as `release`,
+`remote`, and `update-tools`, never the auto-apply behavior of the hygiene
+commands. **Confirmation is the default and only mode; there is no `--ask` flag
+because there is nothing to opt into.**
+
+Mining a private session and publishing into a public repo is a visibility
+boundary crossing, so every cross-repo candidate is scrubbed at authoring time
+against [[scrub]]'s detection classes before it is ever proposed — see step 3b.
 
 ## Usage
 
@@ -182,6 +186,88 @@ requests** (the search returns both, per the note above):
   number), but on a PR the comment lands in that PR's conversation rather than
   on a standalone issue, so confirm that's what the user wants.
 
+### 3b. Scrub cross-repo candidates before they are proposed
+
+Candidates are mined from a **private working session**; every target that is
+not this repo is someone else's repo, usually a **public** one. That is a
+visibility boundary crossing, and it happens at *authoring* time — by the time
+a body reaches the confirmation table in step 4 the sensitive value is already
+written into it. In a live run (2026-08-11) the drafted upstream bodies carried
+the consumer org/repo name, exact fleet sizes, and per-session operational
+counts, and came out only because the operator happened to read them before
+approving.
+
+Filing is also the point of no return. Per [[scrub]]'s removability table an
+issue body is `removable-by-deletion` — editing it leaves the original in
+`userContentEdits`, publicly queryable — and a PR comment is `permanent`. There
+is no post-filing redaction that actually removes anything, so the scrub has to
+happen here, before the set is proposed.
+
+**Scope: every candidate whose target repo is not this repo.** That is each
+upstream target from step 2, plus any UNKNOWN once the user names a slug for
+it. `--here` keeps only this-repo targets and therefore **skips this step
+entirely** — filing into the repo the session is already working in crosses no
+boundary. A `--repo <tool>` run is still cross-repo and is in scope.
+
+Resolve each distinct target's visibility once, and carry it into step 4's
+`Vis` column:
+
+```bash
+gh repo view <slug> --json visibility --jq '.visibility | ascii_downcase'
+```
+
+**Reuse [[scrub]]'s detection classes — do not restate them here.** Read every
+candidate's title and body against the **Detection classes** table in [[scrub]]
+— credentials, cloud resource IDs, identity, affiliated entities,
+network topology — and apply that command's per-class triage as written there,
+including the affiliated-entity names and aliases it reads from this repo's
+`.repo/scrub.toml` (absent that file, that one class has nothing to match on,
+and the rest still apply). This step deliberately adds no rules of its own to
+those classes and keeps no second copy of them — two copies drift, and the
+copy living in the consuming command is the one nobody updates. Two things
+differ from a [[scrub]] run: the surface is **unpublished draft text** rather
+than the repo, and a finding is **rewritten before the draft is shown**, not
+merely reported.
+
+Three classes are specific to session-mined text and exist only in a draft, so
+[[scrub]]'s table does not cover them:
+
+| Session-specific class | Examples | Rewrite as |
+|---|---|---|
+| Consumer identity | the consumer org/repo slug and its aliases, branch/worktree names, machine paths (`/Users/<name>/…`, `/home/<name>/…`), hostnames, account names | "a consumer repo"; a repo-relative path |
+| Environment fingerprint | fleet/pool/agent counts, token-pool size, per-session operational counts, timings precise enough to identify the host | drop, or go qualitative — "repeatedly", "on a busy multi-agent host" |
+| Session identifiers | session / run / sweep IDs, agent or terminal names, transcript paths, issue and PR numbers belonging to a private repo | drop |
+
+**The bar follows the target's visibility**, which is why step 4 shows it:
+
+- **public** — the full bar above. Every word is world-readable and permanent.
+- **private** — a lower bar, not an exemption: the reader set is still not this
+  session's. Credentials and third-party identity never travel; an environment
+  fingerprint usually may.
+- **unknown** — a visibility lookup that failed is treated as **public**. Fail
+  closed; an unresolved target is never given the private bar by default.
+
+**Preferred citation style for a public target: point at the value, never quote
+it.** When a candidate genuinely has to reference something sensitive, cite it
+by `path:line` in a file the *receiving* maintainer can open — their own repo's
+tree — and describe the value's shape instead of reproducing it:
+
+```
+Prefer:  the fallback path is hardcoded at scripts/spawn.sh:212 rather than read from config
+Avoid:   the fallback path is hardcoded as "/Users/<name>/work/<org>-infra/bin/spawn"
+```
+
+This is the same posture [[scrub]] takes with its own findings — report the
+location and the class, never the value — and it keeps the body actionable:
+the maintainer opens the line in their own checkout. When the value lives only
+in the consumer's tree, which the maintainer cannot open, name the file's
+**role** ("the consumer's installed metadata file") rather than its path.
+
+A candidate that cannot be written at all without a sensitive value is **not
+quietly dropped and not filed as drafted** — carry it into step 4 marked `HOLD
+— needs redaction` and let the user decide, exactly as an UNKNOWN target is
+surfaced rather than guessed at.
+
 ### 4. Report the proposed set and confirm
 
 Present the full proposal and get explicit approval before touching any repo:
@@ -189,18 +275,27 @@ Present the full proposal and get explicit approval before touching any repo:
 ```
 FOLLOW-UPS FROM THIS SESSION
 ============================
-| # | Target repo        | Title                              | Dedup                   |
-|---|--------------------|------------------------------------|-------------------------|
-| 1 | rjwalters/repo     | orphans check misses nested dirs   | NEW                     |
-| 2 | rjwalters/loom     | worktree.sh fails on detached HEAD | near #217 (issue, flag) |
-| 3 | rjwalters/repo     | followups dedup also matches PRs   | near #99 (PR, flag)     |
-| 4 | rjwalters/anvil    | (docs gap) …                       | NEW                     |
-| 5 | UNKNOWN            | kicad-tools DRC false positive     | ask — no slug           |
+| # | Target repo        | Vis     | Title                              | Dedup                   |
+|---|--------------------|---------|------------------------------------|-------------------------|
+| 1 | rjwalters/repo     | public  | orphans check misses nested dirs   | NEW                     |
+| 2 | rjwalters/loom     | public  | worktree.sh fails on detached HEAD | near #217 (issue, flag) |
+| 3 | rjwalters/repo     | public  | followups dedup also matches PRs   | near #99 (PR, flag)     |
+| 4 | rjwalters/anvil    | public  | (docs gap) …                       | NEW                     |
+| 5 | UNKNOWN            | unknown | kicad-tools DRC false positive     | ask — no slug           |
 ```
 
-For each proposed issue show the target repo, title, a body preview (context /
-repro / suggested acceptance criteria), and dedup status. Then confirm which to
-file. **If `--dry-run` was passed, stop here — file nothing.**
+For each proposed issue show the target repo, its visibility, title, a body
+preview (context / repro / suggested acceptance criteria), and dedup status.
+Then confirm which to file. **If `--dry-run` was passed, stop here — file
+nothing.**
+
+The `Vis` column is step 3b's resolved visibility — `public`, `private`, or
+`unknown` — and it is what tells the user (and anyone reading the transcript
+later) which scrub bar each row was held to. Show the **scrubbed** body in the
+preview, note which rows were rewritten, and mark any `HOLD — needs redaction`
+row so an unscrubbable candidate is decided on rather than skimmed past. A row
+targeting this repo still shows its visibility but carries no scrub obligation
+(step 3b skips it) — say so rather than leaving the cell blank.
 
 The `Dedup` column carries step 3's classification: `NEW`, a flagged
 near-match, or `ask` for an unresolved target. A flagged near-match may resolve
@@ -287,3 +382,10 @@ Filed issues are triaged like any other afterward — this command does not appl
    bodies as files (`--rawfile` / `--input`), never as inline heredocs. The
    `gh issue list` / `gh issue create` forms are GraphQL-backed and fail on
    exactly the busy multi-agent repos this command is most useful in.
+6. **Scrub before proposing, not before filing** — every candidate targeting
+   another repo is scrubbed at authoring time (step 3b) against [[scrub]]'s
+   detection classes plus the session-specific ones, and a target whose
+   visibility cannot be resolved is treated as public. An issue body is only
+   `removable-by-deletion` and a PR comment is `permanent`, so there is no
+   after-the-fact fix — the operator noticing in the confirmation table is a
+   backstop, never the mechanism.
