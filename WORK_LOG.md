@@ -4,6 +4,10 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-11
 
+- **Issue #265** (closed): followups: add an anti-PII scrub step for candidates filed to public upstream repos
+- **PR #266**: docs(followups): scrub cross-repo candidates before proposing them
+- **Issue #263** (closed): Guide document-maintenance infinite docs-PR loop has recurred — the #151/#153 fix was reverted by a Loom resync
+- **PR #264**: test(repo): fail CI when WORK_LOG.md records a Guide docs-maintenance PR
 - **PR #261**: docs: Guide document maintenance update
 - **PR #260**: docs: Guide document maintenance update
 - **PR #259**: docs: Guide document maintenance update
