@@ -29,8 +29,9 @@
 # commands/repo/tests/test-skill-commands-table.sh,
 # commands/repo/tests/test-sudo-rm-guard-contract.sh,
 # commands/repo/tests/test-release-version-citation-check.sh,
-# commands/repo/tests/test-changelog-merged-work-check.sh, and
-# commands/repo/tests/test-work-log-docs-pr-self-loop.sh.
+# commands/repo/tests/test-changelog-merged-work-check.sh,
+# commands/repo/tests/test-work-log-docs-pr-self-loop.sh, and
+# commands/repo/tests/test-followups-scrub-step.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1045,6 +1046,42 @@ else
     PASS=$((PASS + SL_PASS))
     FAIL=$((FAIL + SL_FAIL))
     record_suite "test-work-log-docs-pr-self-loop.sh" "$SL_PASS" "$SL_FAIL" "WORK_LOG.md docs-PR self-loop contract"
+fi
+
+# /repo:followups' pre-filing anti-PII scrub step (repo#265): the command mines
+# a private session and files into other, usually public, repos — so every
+# cross-repo candidate must be scrubbed at authoring time, against scrub.md's
+# detection classes by reference rather than a second copy of them. Prose
+# contract, same delegation shape as every suite above.
+echo
+echo "-- followups pre-filing scrub step (delegated suite) --"
+FS_TEST="$TESTS_DIR/../../../commands/repo/tests/test-followups-scrub-step.sh"
+if [[ ! -f "$FS_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-followups-scrub-step.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-followups-scrub-step.sh" "$FS_TEST"
+else
+    FS_OUT="$(bash "$FS_TEST" 2>&1)"
+    FS_STATUS=$?
+    FS_PASS="$(suite_count Passed "$FS_OUT")"
+    FS_FAIL="$(suite_count Failed "$FS_OUT")"
+    if ! [[ "$FS_PASS" =~ ^[0-9]+$ && "$FS_FAIL" =~ ^[0-9]+$ ]]; then
+        FS_PASS=0
+        FS_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-followups-scrub-step.sh" "$FS_STATUS"
+        strip_ansi "$FS_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$FS_STATUS" -ne 0 || "$FS_FAIL" -ne 0 ]]; then
+        [[ "$FS_FAIL" -eq 0 ]] && FS_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-followups-scrub-step.sh" "$FS_PASS" "$FS_FAIL" "$FS_STATUS"
+        strip_ansi "$FS_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-followups-scrub-step.sh" "$FS_PASS"
+    fi
+    PASS=$((PASS + FS_PASS))
+    FAIL=$((FAIL + FS_FAIL))
+    record_suite "test-followups-scrub-step.sh" "$FS_PASS" "$FS_FAIL" "followups pre-filing scrub step"
 fi
 
 echo
