@@ -54,6 +54,21 @@ directory or the repo root, and both conventions are in active use:
 1. the directory of the file containing the link
 2. the repo root
 
+**Both bases resolve only candidates that stay inside the repo toplevel.**
+Normalize `dirname(F)/P` (base 1) and `P` (base 2) lexically — collapse `.`
+and `..` path components without touching the filesystem, never
+`realpath`/`readlink -f` — and check whether the normalized result still
+begins with `..`. A candidate that does is not tried as base 1 or base 2 at
+all, even when a file happens to exist at that escaping path on disk: it is
+handed to the sibling-repo base (see **Sibling-repo relative links** below)
+instead. An escaping candidate that resolves anyway is a citation into
+another repo silently reported as if it were in place — undisclosed proof it
+crossed a repo boundary, exactly the gap this restriction closes. Detection
+must stay lexical: resolving symlinks (`realpath`/`readlink -f`) would deport
+a symlinked directory that stays inside the repo to the sibling base by
+mistake, since a symlink target can differ from its lexical path without the
+link itself ever leaving the repo.
+
 Report the link only when the target is missing under **both**. State which
 base resolved it when the answer is not the file's own directory, so a reader
 can tell a convention from a coincidence. Silently assuming the file's own
@@ -147,6 +162,12 @@ first that resolves:
 1. **In place** — `dirname(F)/P`.
 2. **Repo root** — `P`.
 3. **Install mapping** — only when `F` sits under a declared template tree.
+
+Bases 1 and 2 apply only to a candidate that stays inside the repo toplevel —
+the same lexical escape-detection rule from the two-base section above. A
+candidate that still begins with `..` after normalization skips both bases
+and falls through to base 3 (if `F` sits under a declared template tree) and
+then to the sibling-repo base, exactly as it does outside a template tree.
 
 The third base takes two steps, because the destination layout does not exist in
 this repo:
@@ -268,50 +289,69 @@ as broken.
 
 Read the mapping from `.repo/link-siblings.json` — a **different** file from
 [[links]]'s own `link-roots.json` (that one maps a tree inside this repo to a
-destination inside this repo; this one maps a workspace-relative sibling name
-to nothing more than "yes, this is a citable sibling"), same `.repo/`
-convention as [[release]]'s policy file and [[scrub]]'s allowlist:
+destination inside this repo; this one maps a sibling name to a location
+outside this repo), same `.repo/` convention as [[release]]'s policy file and
+[[scrub]]'s allowlist, and the same flat-map **shape** as `link-roots.json`
+itself:
 
 ```json
 {
-  "parent": "..",
-  "siblings": ["notes", "kicad-tools", "anvil"]
+  "notes": "../notes",
+  "kicad-tools": "../kicad-tools",
+  "anvil": "../anvil"
 }
 ```
 
-`parent` is this repo's workspace parent, relative to the repo root (almost
-always `".."` — the directory that contains this repo's checkout and its
-siblings). `siblings` is the allowed list of sibling repo names directly under
-`parent`. A relative link whose first out-of-repo path component is not in this
-list is out of scope for this check entirely — not reported as broken, not
-reported as unverifiable, simply not a workspace citation this repo recognizes.
-**Absent the file — or given an empty `siblings` list — nothing in this section
-runs and out-of-repo links are handled exactly as they are today**, under the
-existing two-base rule alone. No sibling is ever inferred from a directory
+Keys are sibling names, used in disclosures. Values are each sibling's
+**location**, relative to this repo's root — almost always `"../<name>"`, the
+directory that contains this repo's checkout and its siblings. A location need
+not be a direct child of the workspace parent: `"archive": "../notes/archive"`
+declares a sibling nested inside another sibling's own checkout, which the
+earlier `{"parent": "..", "siblings": [names]}` shape could not express at
+all — every declared sibling there had to be `parent`'s direct child. A
+relative link whose normalized target does not fall under any declared
+location is out of scope for this check entirely — not reported as broken,
+not reported as unverifiable, simply not a workspace citation this repo
+recognizes. **Absent the file — or given an empty object — nothing in this
+section runs and out-of-repo links are handled exactly as they are today**,
+under the existing two-base rule alone. No sibling is ever inferred from a directory
 name or shape, same discipline as `.repo/link-roots.json`'s "no tree is ever
 treated as a template by inference from its name".
 
 ### Resolution order
 
-A link target `P` in file `F` that fails the two-base resolution (and the
-install-mapping base, where declared) is checked against a **fourth base**
-before being reported:
+Bases 1-2 (and the install-mapping base 3, where declared) resolve only
+candidates that stay inside the repo toplevel — see the escape-detection rule
+under **What It Checks** above. A link target `P` in file `F` whose base-1
+candidate escapes (normalizes to a path that still begins with `..`) is
+checked against this **fourth base** before being reported. An in-repo
+candidate that simply fails every earlier base — genuinely missing, never
+escaping — is a normal `MISSING` finding and never reaches this section; that
+is what keeps this base from re-litigating ordinary broken links.
 
-1. Resolve `P` against `dirname(F)` with normal `..`-climbing path arithmetic
-   to get a normalized target `Q`, which may climb above the repo root.
-2. If `Q` does not fall under the declared `parent` directory, or its first
-   path component under `parent` is not in the declared `siblings` list, this
-   base does not apply — report as before.
-3. If `Q` falls under a declared sibling **and that sibling checkout exists on
-   disk** (`parent/<sibling>` is present), validate `Q` exactly like an
-   internal link: exists -> resolved via sibling repo `<sibling>`; missing -> a
-   normal broken-link finding, not a false positive — the sibling *is* here, so
-   a missing target means the citation is genuinely stale.
-4. If `Q` falls under a declared sibling **and that sibling checkout does not
-   exist on disk** (no `parent/<sibling>` on this machine), the link is
-   unverifiable, not broken — this machine cannot tell whether the target
-   exists. Report it as **`sibling repo not present — unverifiable`**, a
-   distinct status from `MISSING`. This is the same "different failure modes
+1. Normalize `dirname(F)/P` lexically to get `Q` — the same escaping
+   candidate bases 1-2 declined to resolve. `Q` is recomputed here rather than
+   reused, since whether a given link reaches this base at all depends on
+   that same escape check.
+2. Match `Q` against the declared sibling **locations**, each normalized the
+   same lexical way, and pick the sibling whose location is the **longest**
+   matching path-prefix of `Q` — the most specific declared sibling wins, the
+   same "longest wins" discipline as `link-roots.json`'s reverse step (see
+   **Install-template trees** above). There it is only an attribution rule;
+   here it changes the verdict: crediting a shorter, present sibling for a
+   target that actually belongs to a longer, absent nested sibling reports
+   the nested sibling's absence as a false `MISSING` in this repo instead of
+   the correct `unverifiable`. If no declared location matches, this base
+   does not apply — report as before.
+3. If the matched sibling's declared **location exists on disk** as a
+   directory, validate `Q` exactly like an internal link: exists -> resolved
+   via sibling repo `<name>`; missing -> a normal broken-link finding, not a
+   false positive — the sibling *is* here, so a missing target means the
+   citation is genuinely stale.
+4. If the matched sibling's declared **location does not exist on disk**, the
+   link is unverifiable, not broken — this machine cannot tell whether the
+   target exists. Report it as **`sibling repo not present — unverifiable`**,
+   a distinct status from `MISSING`. This is the same "different failure modes
    get different rows" discipline [[update-tools]] uses for `source repo
    missing` vs. `sidecar missing` (see [[update-tools]] step 3) — folding
    "sibling absent" into `MISSING` would turn every machine without every
@@ -339,19 +379,20 @@ against for install-mapping.
 
 Same rule as install-template trees: a link that resolves under none of the
 bases tried is still reported, at the same severity it would carry anywhere
-else. A declared sibling that resolved 0 links, or whose `parent/<sibling>`
-path is declared but never referenced, is reported the same way a
+else. A declared sibling that resolved 0 links, or whose declared location is
+present on disk but never referenced, is reported the same way a
 zero-resolution `link-roots.json` entry is — as a question, not silently
 ignored.
 
 ### Worked example
 
 A strategy doc at `workspace/repo-a/docs/strategy.md` links
-`[session note](../../notes/sessions/2026-07-30.md)`. Resolved against the
+`[session note](../../notes/sessions/2026-07-30.md)`. Normalized against the
 file's own directory that is `workspace/notes/sessions/2026-07-30.md` —
-outside `repo-a`'s root entirely, so the two-base rule alone reports it
+outside `repo-a`'s root entirely, so base 1 does not apply (the candidate
+escapes) and, absent a sibling declaration, the two-base rule alone reports it
 `MISSING`. With `repo-a/.repo/link-siblings.json` declaring
-`{"parent": "..", "siblings": ["notes"]}`:
+`{"notes": "../notes"}`:
 
 - If `workspace/notes/` is checked out and the session file exists, the link
   resolves via sibling repo `notes` — not a finding.
