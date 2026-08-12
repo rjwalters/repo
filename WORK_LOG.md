@@ -4,7 +4,6 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-12
 
-- **PR #277**: docs: Guide document maintenance update
 - **Issue #272** (closed): /repo:followups: warn before filing to a public upstream from a confidential/pre-disclosure repo (firewall-aware confirm)
 - **PR #275**: docs(followups): warn when a confidential source repo files to a public target
 - **Issue #273** (closed): repo:all stage 2: no path for a diverged default branch — middle stages run against stale upstream state
