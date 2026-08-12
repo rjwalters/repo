@@ -15,7 +15,6 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **PR #271**: fix: restrict sibling-repo link resolution to non-escaping bases
 - **Issue #268** (closed): repo:links — validate sibling-repo relative links (../<repo>/... citations)
 - **PR #269**: feat(links): validate sibling-repo relative links against a workspace declaration
-- **PR #267**: docs: Guide document maintenance update
 - **Issue #265** (closed): followups: add an anti-PII scrub step for candidates filed to public upstream repos
 - **PR #266**: docs(followups): scrub cross-repo candidates before proposing them
 - **Issue #263** (closed): Guide document-maintenance infinite docs-PR loop has recurred — the #151/#153 fix was reverted by a Loom resync
