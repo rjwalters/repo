@@ -40,6 +40,23 @@
 #      the "avoid" example is the quoted one
 #   7  a safety rule records the constraint
 #   8  scrub.md still provides what followups.md now depends on
+#
+# repo#272 extends this file with the source-confidentiality warning (step
+# 3c): the source repo's own CLAUDE.md can declare itself confidential /
+# pre-disclosure, and that combines with 3b's already-resolved target `Vis`
+# to produce a distinct, louder — but still purely advisory — warning in step
+# 4. Two more ways this can rot, on top of the ones above:
+#
+#   - Step 3c gets built as a hard block instead of advisory, which breaks
+#     the "confirm, never auto-apply" posture the rest of the command holds.
+#   - The new warning replaces the `Vis` column instead of adding to it, or
+#     an ambiguous/missing CLAUDE.md silently suppresses the warning instead
+#     of failing closed (warn when in doubt; the sole exception is a CLAUDE.md
+#     that does not exist at all — no file, no signal).
+#
+#   9  a source-confidentiality sub-step (3c) exists, sits after 3b and
+#      before 4, is advisory-only, fails closed on ambiguity (not on a
+#      missing file), and step 4's warning is additive to 3b's `Vis` column
 
 set -uo pipefail
 
@@ -282,6 +299,67 @@ done
 assert_contains "scrub.md still classes issue bodies removable-by-deletion" "$SCRUB" \
     "removable-by-deletion"
 assert_contains "scrub.md still reads .repo/scrub.toml" "$SCRUB" '`.repo/scrub.toml`'
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "9. Source-repo confidentiality warning (step 3c, repo#272)"
+# ---------------------------------------------------------------------------
+
+SOURCE_STEP_LN="$(grep -nE '^### 3c\.' "$FOLLOWUPS_MD" | head -1 | cut -d: -f1)"
+
+if [[ -n "$SOURCE_STEP_LN" ]]; then
+    ok "a source-confidentiality step heading exists (### 3c.)"
+else
+    no "a source-confidentiality step heading exists (### 3c.)" \
+        "no '### 3c.' heading in followups.md"
+fi
+
+if [[ -n "$SOURCE_STEP_LN" && -n "$SCRUB_STEP_LN" && -n "$CONFIRM_LN" ]]; then
+    assert_eq "step 3c follows step 3b" "yes" \
+        "$([[ "$SCRUB_STEP_LN" -lt "$SOURCE_STEP_LN" ]] && echo yes || echo no)"
+    assert_eq "step 3c precedes the confirmation table (step 4)" "yes" \
+        "$([[ "$SOURCE_STEP_LN" -lt "$CONFIRM_LN" ]] && echo yes || echo no)"
+else
+    no "step 3c ordering is checkable" "3c=$SOURCE_STEP_LN 3b=$SCRUB_STEP_LN 4=$CONFIRM_LN"
+fi
+
+# The confidentiality phrases named in the issue must all be present.
+for phrase in "confidential" "do not disclose" "before a provisional is filed" \
+              "pre-disclosure"; do
+    assert_contains "step 3c names the confidentiality phrase: $phrase" "$FOLLOWUPS" "$phrase"
+done
+
+assert_contains "step 3c reads the source repo's own CLAUDE.md" "$FOLLOWUPS" \
+    "this repo's root \`CLAUDE.md\`"
+assert_contains "step 3c honors a structured opt-in in .repo/scrub.toml" "$FOLLOWUPS" \
+    "structured opt-in in \`.repo/scrub.toml\`"
+
+# Fail-closed on ambiguity, but NOT on an absent file — these are opposite
+# outcomes and a single grep can't tell them apart, so pin both directions.
+assert_contains "step 3c fails closed on ambiguous matches (warn when in doubt)" \
+    "$FOLLOWUPS" "When in doubt, warn"
+assert_contains "a missing CLAUDE.md is the one case that does NOT warn" "$FOLLOWUPS" \
+    "missing** \`CLAUDE.md\`"
+
+# The warning must be additive to Vis, not a replacement — and advisory-only,
+# matching the rest of the command's confirm-first posture.
+assert_contains "the step-4 warning is additive to the Vis column, not a replacement" \
+    "$FOLLOWUPS" "additive to the \`Vis\` column, not"
+assert_contains "the warning text appears above the confirmation table" "$FOLLOWUPS" \
+    "SOURCE REPO LOOKS CONFIDENTIAL"
+assert_contains "the warning is explicitly advisory-only" "$FOLLOWUPS" \
+    "**purely advisory**"
+assert_contains "the warning never blocks filing" "$FOLLOWUPS" \
+    "it never blocks filing and never auto-redacts"
+
+# It must cross-reference 3b's Vis resolution rather than re-deriving target
+# visibility from scratch — same anti-duplication property as step 3b's own
+# reuse of scrub.md's classes.
+assert_contains "step 3c/4 reuses 3b's resolved Vis rather than re-deriving it" \
+    "$FOLLOWUPS" "3b's already-resolved"
+
+assert_contains "safety rule 7 covers the source-confidentiality warning" "$FOLLOWUPS" \
+    "7. **Warn, never block, on a confidential source filing to a public target**"
 
 # ---------------------------------------------------------------------------
 echo ""
