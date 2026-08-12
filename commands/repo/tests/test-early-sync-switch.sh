@@ -141,6 +141,32 @@ early_sync_eligible() {
     fi
 }
 
+# diverged_on_default <repo> -> DIVERGED | NOT_DIVERGED
+#   Mirrors the SECOND, independent detection all.md's stage 2 adds alongside
+#   early_sync_eligible() — the case the first check's `current != default`
+#   guard discards without inspecting further: already on the default branch,
+#   with local commits it hasn't pushed AND commits upstream it doesn't have.
+#   Mutually exclusive with ELIGIBLE: this one requires current == default.
+diverged_on_default() {
+    local r="$1" current default ahead_of_origin_default behind_origin_default
+    current=$(git -C "$r" symbolic-ref --short HEAD 2>/dev/null) || current=""
+    git -C "$r" fetch origin --quiet 2>/dev/null
+    default=$(git -C "$r" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+
+    [ -n "$current" ] || { echo NOT_DIVERGED; return; }
+    [ -n "$default" ] || { echo NOT_DIVERGED; return; }
+    [ "$current" = "$default" ] || { echo NOT_DIVERGED; return; }
+    [ -z "$(git -C "$r" status --porcelain)" ] || { echo NOT_DIVERGED; return; }
+
+    ahead_of_origin_default=$(git -C "$r" rev-list --count "origin/$default..HEAD")
+    behind_origin_default=$(git -C "$r" rev-list --count "HEAD..origin/$default")
+    if [ "$ahead_of_origin_default" -gt 0 ] && [ "$behind_origin_default" -gt 0 ]; then
+        echo DIVERGED
+    else
+        echo NOT_DIVERGED
+    fi
+}
+
 # behind_default <repo> -> N   (the count the eligibility check computes)
 behind_default() {
     local r="$1" default
@@ -368,6 +394,63 @@ advance_default 2
 git_quiet "$C" fetch origin
 assert_eq "on default and behind it -> INELIGIBLE" "INELIGIBLE" "$(early_sync_eligible "$C")"
 assert_eq "still on default, nothing attempted" "main" "$(git -C "$C" symbolic-ref --short HEAD)"
+# Behind-only, no local commits: this is the adjacent-but-distinct case the
+# new detection must NOT flag. Not diverged — merely stale.
+assert_eq "on default and merely behind -> NOT_DIVERGED (not the new case)" \
+    "NOT_DIVERGED" "$(diverged_on_default "$C")"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- on the default branch AND diverged: the shape this issue exists for --"
+# ---------------------------------------------------------------------------
+# repo#273: already on the default branch, with N unpushed local commits AND M
+# commits that landed on origin/default mid-session (other agents, in the
+# motivating live run). early_sync_eligible() no-ops here (current == default
+# fails its first condition) — that's the silent no-op this test guards
+# against. diverged_on_default() must surface it as its own, distinct outcome.
+C="$(new_clone diverged-on-default)"
+printf 'local unpushed change 1\n' >> "$C/README.md"
+git_quiet "$C" add -A
+git_quiet "$C" commit -m "local commit 1 (unpushed)"
+printf 'local unpushed change 2\n' >> "$C/README.md"
+git_quiet "$C" add -A
+git_quiet "$C" commit -m "local commit 2 (unpushed)"
+advance_default 3
+git_quiet "$C" fetch origin
+
+assert_eq "still on the default branch" "main" "$(git -C "$C" symbolic-ref --short HEAD)"
+assert_eq "on-default-and-diverged -> INELIGIBLE (current == default excludes it)" \
+    "INELIGIBLE" "$(early_sync_eligible "$C")"
+assert_eq "the clone is ahead of origin/main by its unpushed commits" "2" \
+    "$(git -C "$C" rev-list --count 'origin/main..HEAD')"
+assert_eq "the clone is behind origin/main by the upstream commits" "3" \
+    "$(git -C "$C" rev-list --count 'HEAD..origin/main')"
+assert_eq "on-default-and-diverged -> DIVERGED, distinct from the plain no-op" \
+    "DIVERGED" "$(diverged_on_default "$C")"
+# Read-only, same as early_sync_eligible: detecting it must not move HEAD.
+HEAD_BEFORE="$(git -C "$C" rev-parse HEAD)"
+diverged_on_default "$C" >/dev/null
+assert_eq "detecting divergence does not move HEAD" "$HEAD_BEFORE" "$(git -C "$C" rev-parse HEAD)"
+
+# Not the same as the fully-pushed-and-behind ELIGIBLE case either: that one
+# requires current != default, so a clone that reaches it can never also
+# report DIVERGED.
+ELIGIBLE_C="$(new_clone eligible-is-not-diverged)"
+git_quiet "$ELIGIBLE_C" checkout -b feature/not-diverged
+git_quiet "$ELIGIBLE_C" push -u origin feature/not-diverged
+advance_default 2
+git_quiet "$ELIGIBLE_C" fetch origin
+assert_eq "sanity: this fixture is the fully-pushed ELIGIBLE shape" "ELIGIBLE" \
+    "$(early_sync_eligible "$ELIGIBLE_C")"
+assert_eq "the motivating ELIGIBLE clone (on a feature branch) is NOT diverged-on-default" \
+    "NOT_DIVERGED" "$(diverged_on_default "$ELIGIBLE_C")"
+
+# A dirty tree defers the divergence detection exactly like eligibility, for
+# the same reason: nothing here should reason about a state mid-edit.
+printf 'uncommitted edit\n' >> "$C/README.md"
+assert_eq "a dirty tree suppresses the divergence detection" "NOT_DIVERGED" "$(diverged_on_default "$C")"
+git_quiet "$C" checkout -- README.md
+assert_eq "cleaning up restores the DIVERGED detection" "DIVERGED" "$(diverged_on_default "$C")"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -546,6 +629,22 @@ else
 fi
 assert_contains "all.md documents the unset-origin/HEAD escape hatch" \
     "$ALL" 'git remote set-head origin --auto'
+
+# repo#273: the second, independent detection for the on-default-and-diverged
+# case, so the next reader doesn't have to rediscover why the first check
+# "did nothing" there.
+assert_contains "all.md documents the diverged_on_default detection" \
+    "$ALL" 'diverged_on_default=yes'
+assert_contains "all.md names the second detection as independent, not a change to eligible" \
+    "$ALL" 'A second, independent detection'
+assert_contains "all.md's eligibility table gains a row for the diverged-on-default shape" \
+    "$ALL" 'Already on the default branch, and diverged from `origin/<default>`'
+assert_contains "all.md reports the divergence before Docs runs, even without --ask" \
+    "$ALL" 'Report it before Docs runs, even under the default (non-`--ask`) form'
+assert_contains "all.md's diverged-on-default report names the invisible upstream commits" \
+    "$ALL" "later stages won't see"
+assert_contains "all.md's --ask resolution for diverged-on-default reuses reset.md's own wording" \
+    "$ALL" 'report the divergence (`git log --oneline @{u}..HEAD` and `HEAD..@{u}`) and ask how to proceed. Do not rebase or force anything on your own.'
 
 RESET="$(flatten "$RESET_MD")"
 assert_contains "reset.md names the two halves" \

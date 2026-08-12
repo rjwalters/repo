@@ -94,6 +94,22 @@ if [ -n "$current" ] && [ -n "$default" ] && [ "$current" != "$default" ] \
     eligible=yes
   fi
 fi
+
+# A second, independent detection — not a change to the block above. It
+# covers exactly the case the first block's `current != default` guard
+# discards without inspecting further: already on the default branch, with
+# local commits it hasn't pushed AND commits upstream it doesn't have. The
+# two are mutually exclusive: this one requires current == default, so it can
+# never also set eligible=yes.
+diverged_on_default=no
+if [ -n "$current" ] && [ -n "$default" ] && [ "$current" = "$default" ] \
+   && [ -z "$(git status --porcelain)" ]; then
+  ahead_of_origin_default=$(git rev-list --count "origin/$default..HEAD")
+  behind_origin_default=$(git rev-list --count "HEAD..origin/$default")
+  if [ "$ahead_of_origin_default" -gt 0 ] && [ "$behind_origin_default" -gt 0 ]; then
+    diverged_on_default=yes
+  fi
+fi
 ```
 
 Every condition must hold, and each one rules out a distinct way the early
@@ -106,6 +122,7 @@ switch could lose work or fail:
 | Working tree clean (`git status --porcelain` empty) | A dirty tree would have to be stashed to switch, and this run ends on the default branch, so there is no natural point to pop it back |
 | Branch **has an upstream** and is **0 commits ahead of it** | This is the literal "no unpushed commits". A branch that was **never pushed** has no upstream and is **not** eligible — treat it exactly like unpushed commits |
 | Branch is behind `origin/<default>` by at least one commit | If it isn't behind, the checkout is already current and switching buys nothing |
+| **Already on the default branch, and diverged from `origin/<default>`** (ahead **and** behind) | Not part of `eligible` — `current != default` already excludes it above — but not a silent no-op either. It fails this table's first row and is handled separately as `diverged_on_default`, below |
 
 Being ahead of the *default branch* is **not** disqualifying — a pushed PR
 branch normally is. The unpushed-work test is against the branch's own
@@ -141,10 +158,31 @@ leaves the run where it started — report them as the distinct outcomes they ar
   from its upstream — rather than reporting a clean no-op. Stage 7 still
   surfaces it again with [[reset]]'s own divergence handling.
 
-**If `eligible=no`**, this stage is a no-op: say nothing, and run the remaining
-stages exactly as before, with Reset in full at the end. Unpushed work on the
-working branch, a dirty tree, and an already-on-default run all land here, and
-none of them behave any differently than they did before this check existed.
+**If `eligible=no`** and `diverged_on_default=no`, this stage is a no-op: say
+nothing, and run the remaining stages exactly as before, with Reset in full at
+the end. Unpushed work on the working branch, a dirty tree, and an
+already-on-default-but-merely-behind run all land here, and none of them
+behave any differently than they did before this check existed.
+
+**If `diverged_on_default=yes`**, this is the shape this issue exists for: the
+checkout is already on the default branch, so there is no branch to switch
+to — but Scrub, Docs, Tidy, and Update tools are still about to run against a
+copy that is blind to `$behind_origin_default` upstream commits, exactly as if
+it had failed to switch off a stale feature branch. Report it before Docs
+runs, even under the default (non-`--ask`) form — this is a finding, not a
+fix, so it doesn't need permission to say:
+
+```
+Reset: main has diverged from origin/main — 2 unpushed commits, 3 upstream commits later stages won't see; resolve first or continue
+```
+
+Under `--ask`, offer to resolve it rather than only reporting it — but this is
+the same operator decision [[reset]] step 4 already gates its diverged-local-
+default-branch case behind, not a new one: report the divergence (`git log
+--oneline @{u}..HEAD` and `HEAD..@{u}`) and ask how to proceed. Do not rebase
+or force anything on your own. If the user declines to resolve now, continue
+the run unchanged — the finding was already reported, and stage 7 surfaces the
+same divergence again with [[reset]]'s own handling.
 
 ### 3. Scrub (see [[scrub]])
 
