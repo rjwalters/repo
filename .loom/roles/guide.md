@@ -1436,6 +1436,79 @@ Append entries for newly merged PRs and newly closed issues not yet recorded
 # can never drift apart.
 GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
 
+# #279 BUG, DO NOT REINTRODUCE: PR #278's first commit recorded a WORK_LOG
+# entry for #277 — itself a Guide docs-maintenance PR — even though
+# GUIDE_DOCS_PR_EXCLUDE, applied correctly, excludes it. The exclusion
+# expression on origin/main was already correct at the time (fixed by #153,
+# well before this incident); the leading hypothesis is that the SESSION that
+# produced #278's first commit was working from a STALE local copy of this
+# file, predating that fix. This repo's primary checkout has repeatedly been
+# observed dozens of commits behind origin/main with no automatic pull before
+# a role's instructions are loaded (see check-main-freshness.sh's header) —
+# so a Guide session can silently load an outdated GUIDE_DOCS_PR_EXCLUDE.
+#
+# Structural fix: before this expression is used to compute `new_prs` below,
+# re-verify it against origin/main's CURRENT copy of this file and prefer
+# origin's value on any mismatch — do not trust the locally-loaded value
+# unconditionally. Mirrors the fetch-and-diff-against-origin pattern
+# curator.md's "Multi-phase sweep dependency check" already uses for the
+# identical staleness problem in a different role, and fails safe exactly
+# like check-main-freshness.sh: any git/network failure (offline, no `git`
+# repo, `origin/main` unreachable) just falls back to the locally-loaded
+# value with a warning — it NEVER blocks Document Maintenance. When the local
+# value already matches origin's, this is a silent no-op (no warning).
+#
+# Keep this as a standalone `preflight_refresh_docs_pr_exclude() { ... }`
+# function (single level of `{`/`}`, no nested braces at column 0): the
+# regression suite (commands/repo/tests/test-work-log-docs-pr-self-loop.sh)
+# extracts THIS function body out of THIS file with the same
+# `awk '/^name\(\) \{/{f=1} f{print} f && /^\}/{exit}'` pattern already used
+# for `update_work_log()`, so the prompt and the test can never drift apart.
+preflight_refresh_docs_pr_exclude() {
+  # $1 = the GUIDE_DOCS_PR_EXCLUDE value already loaded into this session.
+  # Echoes (via stdout) the value to actually use: origin/main's current
+  # value if it differs from $1, otherwise $1 unchanged. Any warning/note
+  # goes to stderr so callers can capture stdout cleanly with `$(...)`.
+  local loaded="$1"
+
+  # Bounded fetch so a hung network can't stall Document Maintenance —
+  # mirrors check-main-freshness.sh's `timeout 5 git fetch`. On any failure
+  # (offline, auth, rate-limit, no `timeout` binary) fall through to whatever
+  # refs/remotes/origin/main is already known locally, possibly stale.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 git fetch origin main --quiet >/dev/null 2>&1 || true
+  else
+    git fetch origin main --quiet >/dev/null 2>&1 || true
+  fi
+
+  local origin_guide_md
+  origin_guide_md="$(git show origin/main:.loom/roles/guide.md 2>/dev/null || true)"
+  if [ -z "$origin_guide_md" ]; then
+    echo "NOTE: could not read origin/main:.loom/roles/guide.md (offline, unreachable, or no git repo here) — proceeding with the locally-loaded GUIDE_DOCS_PR_EXCLUDE value." >&2
+    printf '%s' "$loaded"
+    return 0
+  fi
+
+  local origin_value
+  origin_value="$(printf '%s\n' "$origin_guide_md" | grep -m1 '^GUIDE_DOCS_PR_EXCLUDE=' | sed -E "s/^GUIDE_DOCS_PR_EXCLUDE='(.*)'\$/\1/")"
+  if [ -z "$origin_value" ]; then
+    echo "NOTE: origin/main:.loom/roles/guide.md has no single-line GUIDE_DOCS_PR_EXCLUDE assignment — proceeding with the locally-loaded value." >&2
+    printf '%s' "$loaded"
+    return 0
+  fi
+
+  if [ "$origin_value" != "$loaded" ]; then
+    echo "WARNING (#279): the locally-loaded GUIDE_DOCS_PR_EXCLUDE differs from origin/main's current value. Using origin/main's value for this run — re-sync .loom/roles/guide.md before the next tick." >&2
+    printf '%s' "$origin_value"
+    return 0
+  fi
+
+  # Already matches origin — silent no-op, no warning.
+  printf '%s' "$loaded"
+}
+
+GUIDE_DOCS_PR_EXCLUDE="$(preflight_refresh_docs_pr_exclude "$GUIDE_DOCS_PR_EXCLUDE")"
+
 update_work_log() {
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /

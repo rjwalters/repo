@@ -288,7 +288,8 @@ echo "4. Fault injection: the detection actually fires on a fresh occurrence"
 # assert the new number is reported.
 
 FIXTURE_LOG="$(mktemp)"
-trap 'rm -f "$FIXTURE_LOG"' EXIT
+PREFLIGHT_SANDBOX="$(mktemp -d)"
+trap 'rm -f "$FIXTURE_LOG"; rm -rf "$PREFLIGHT_SANDBOX"' EXIT
 cat > "$FIXTURE_LOG" <<'FIXTURE'
 # Work Log
 
@@ -320,6 +321,118 @@ if [[ "$CLEAN_HITS" -eq 0 ]]; then
 else
     no "a normal feature-PR entry is not flagged" \
         "the detection matched PR #256, which is an ordinary merged PR"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "5. Pre-flight freshness check refreshes a stale GUIDE_DOCS_PR_EXCLUDE (#279)"
+# ---------------------------------------------------------------------------
+# #279: PR #278's first commit recorded a WORK_LOG entry for #277 (a Guide
+# docs-maintenance PR) even though GUIDE_DOCS_PR_EXCLUDE, applied correctly,
+# excludes it — the leading hypothesis is a STALE local guide.md was loaded
+# for that session. guide.md's Step 2 now calls
+# `preflight_refresh_docs_pr_exclude()` before computing `new_prs`, to
+# re-verify the locally-loaded expression against origin/main's current copy
+# of this file and prefer origin's value on mismatch. This section extracts
+# that function VERBATIM from the vendored guide.md and exercises its
+# fetch/diff logic directly against hermetic local git fixtures (no real
+# network) — independent of a live Guide session, per #279's Test Plan.
+
+if [[ ! -f "$GUIDE_MD" ]]; then
+    skip "pre-flight check no-ops when local already matches origin" \
+        "no vendored Guide role at $GUIDE_MD (Loom not installed here)"
+    skip "pre-flight check prefers origin's value on mismatch" \
+        "no vendored Guide role at $GUIDE_MD (Loom not installed here)"
+    skip "pre-flight check fails safe when origin is unreachable" \
+        "no vendored Guide role at $GUIDE_MD (Loom not installed here)"
+elif ! command -v git >/dev/null 2>&1; then
+    skip "pre-flight check no-ops when local already matches origin" "git not available"
+    skip "pre-flight check prefers origin's value on mismatch" "git not available"
+    skip "pre-flight check fails safe when origin is unreachable" "git not available"
+else
+    # Extract the function body verbatim (single level of {}, no nested braces
+    # at column 0) — the same awk shape already used for update_work_log().
+    PREFLIGHT_FUNC="$(awk '/^preflight_refresh_docs_pr_exclude\(\) \{/{f=1} f{print} f && /^\}/{exit}' "$GUIDE_MD")"
+
+    if [[ -z "$PREFLIGHT_FUNC" ]]; then
+        no "pre-flight check no-ops when local already matches origin" \
+            "no preflight_refresh_docs_pr_exclude() function found in $GUIDE_MD"
+        no "pre-flight check prefers origin's value on mismatch" \
+            "no preflight_refresh_docs_pr_exclude() function found in $GUIDE_MD"
+        no "pre-flight check fails safe when origin is unreachable" \
+            "no preflight_refresh_docs_pr_exclude() function found in $GUIDE_MD"
+    else
+        FUNC_FILE="$PREFLIGHT_SANDBOX/preflight_func.sh"
+        printf '%s\n' "$PREFLIGHT_FUNC" > "$FUNC_FILE"
+
+        # A real (but fully local/hermetic) "origin" — a bare repo seeded with
+        # a fixture guide.md carrying its own GUIDE_DOCS_PR_EXCLUDE line, plus
+        # a "local" working repo whose only remote is that bare repo. No
+        # network call ever leaves the sandbox.
+        ORIGIN_BARE="$PREFLIGHT_SANDBOX/origin.git"
+        SEED_DIR="$PREFLIGHT_SANDBOX/seed"
+        LOCAL_DIR="$PREFLIGHT_SANDBOX/local"
+
+        seed_origin() { # <origin-exclude-expr>
+            rm -rf "$ORIGIN_BARE" "$SEED_DIR"
+            git init -q --bare "$ORIGIN_BARE"
+            git init -q "$SEED_DIR"
+            mkdir -p "$SEED_DIR/.loom/roles"
+            {
+                printf "GUIDE_DOCS_PR_EXCLUDE='%s'\n" "$1"
+            } > "$SEED_DIR/.loom/roles/guide.md"
+            git -C "$SEED_DIR" -c user.email=test@example.com -c user.name=test add -A
+            git -C "$SEED_DIR" -c user.email=test@example.com -c user.name=test commit -q -m seed
+            git -C "$SEED_DIR" branch -M main
+            git -C "$SEED_DIR" push -q "$ORIGIN_BARE" main
+        }
+
+        run_preflight() { # <loaded-value> <origin-remote-url>
+            rm -rf "$LOCAL_DIR"
+            git init -q "$LOCAL_DIR"
+            git -C "$LOCAL_DIR" remote add origin "$2"
+            (cd "$LOCAL_DIR" && source "$FUNC_FILE" && preflight_refresh_docs_pr_exclude "$1")
+        }
+
+        SAME_EXPR="expr-unchanged"
+        DIFFERENT_EXPR="expr-from-origin-updated"
+
+        # --- Case A: local already matches origin -> silent no-op ----------
+        seed_origin "$SAME_EXPR"
+        A_STDOUT="$(run_preflight "$SAME_EXPR" "$ORIGIN_BARE" 2>"$PREFLIGHT_SANDBOX/a.stderr")"
+        A_STDERR="$(cat "$PREFLIGHT_SANDBOX/a.stderr")"
+        if [[ "$A_STDOUT" == "$SAME_EXPR" && -z "$A_STDERR" ]]; then
+            ok "pre-flight check no-ops when local already matches origin"
+        else
+            no "pre-flight check no-ops when local already matches origin" \
+                "expected stdout='$SAME_EXPR' with no stderr; got stdout='$A_STDOUT' stderr='$A_STDERR'"
+        fi
+
+        # --- Case B: local is stale -> origin's value wins, with a warning --
+        seed_origin "$DIFFERENT_EXPR"
+        B_STDOUT="$(run_preflight "$SAME_EXPR" "$ORIGIN_BARE" 2>"$PREFLIGHT_SANDBOX/b.stderr")"
+        B_STDERR="$(cat "$PREFLIGHT_SANDBOX/b.stderr")"
+        if [[ "$B_STDOUT" == "$DIFFERENT_EXPR" ]] && grep -q 'WARNING' <<<"$B_STDERR"; then
+            ok "pre-flight check prefers origin's value on mismatch"
+        else
+            no "pre-flight check prefers origin's value on mismatch" \
+                "expected stdout='$DIFFERENT_EXPR' with a WARNING on stderr; got stdout='$B_STDOUT' stderr='$B_STDERR'"
+        fi
+
+        # --- Case C: origin unreachable -> fail safe, keep the loaded value --
+        # A local filesystem path that does not exist fails fast (no real
+        # network round-trip) and leaves no refs/remotes/origin/main behind,
+        # exercising the exact "offline" fallback path.
+        C_STDOUT="$(run_preflight "$SAME_EXPR" "$PREFLIGHT_SANDBOX/does-not-exist.git" 2>"$PREFLIGHT_SANDBOX/c.stderr")"
+        C_EXIT=$?
+        C_STDERR="$(cat "$PREFLIGHT_SANDBOX/c.stderr")"
+        if [[ "$C_STDOUT" == "$SAME_EXPR" && "$C_EXIT" -eq 0 ]] && grep -q 'NOTE' <<<"$C_STDERR"; then
+            ok "pre-flight check fails safe when origin is unreachable"
+        else
+            no "pre-flight check fails safe when origin is unreachable" \
+                "expected stdout='$SAME_EXPR', exit 0, and a NOTE on stderr; got stdout='$C_STDOUT' exit=$C_EXIT stderr='$C_STDERR'"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
