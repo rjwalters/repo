@@ -285,6 +285,106 @@ assert_contains "scrub.md still reads .repo/scrub.toml" "$SCRUB" '`.repo/scrub.t
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "9. Source-repo confidentiality warning (step 3c, repo#272)"
+# ---------------------------------------------------------------------------
+# repo#272: step 3b resolves whether the TARGET is public; nothing resolved
+# whether the SOURCE (this repo, the private session being mined) has
+# declared itself off-limits. Step 3c closes that gap with a distinct, louder
+# warning — additive to the Vis column, purely advisory, fail-closed on an
+# ambiguous/unreadable CLAUDE.md.
+
+SOURCE_STEP_LN="$(grep -nE '^### 3c\.' "$FOLLOWUPS_MD" | head -1 | cut -d: -f1)"
+
+if [[ -n "$SOURCE_STEP_LN" ]]; then
+    ok "a source-confidentiality step heading exists (### 3c.)"
+else
+    no "a source-confidentiality step heading exists (### 3c.)" \
+        "no '### 3c.' heading in followups.md"
+fi
+
+if [[ -n "$SCRUB_STEP_LN" && -n "$SOURCE_STEP_LN" && -n "$CONFIRM_LN" && -n "$FILE_LN" ]]; then
+    assert_eq "3c follows the scrub step (3b)" "yes" \
+        "$([[ "$SCRUB_STEP_LN" -lt "$SOURCE_STEP_LN" ]] && echo yes || echo no)"
+    assert_eq "3c precedes the confirmation table (step 4)" "yes" \
+        "$([[ "$SOURCE_STEP_LN" -lt "$CONFIRM_LN" ]] && echo yes || echo no)"
+    assert_eq "3c precedes filing (step 5)" "yes" \
+        "$([[ "$SOURCE_STEP_LN" -lt "$FILE_LN" ]] && echo yes || echo no)"
+else
+    no "step 3c ordering is checkable" \
+        "3b=$SCRUB_STEP_LN 3c=$SOURCE_STEP_LN 4=$CONFIRM_LN 5=$FILE_LN"
+fi
+
+# 3c must combine with 3b's already-resolved Vis, not re-derive target
+# visibility itself.
+assert_contains "3c reuses 3b's already-resolved target visibility" "$FOLLOWUPS" \
+    "**Scope: only when step 3b has already resolved a target's visibility as"
+assert_contains "3c composes with the fail-closed unknown-as-public case" "$FOLLOWUPS" \
+    "fail-closed unknown-treated-as-public case"
+assert_contains "3c states it does not re-derive target visibility" "$FOLLOWUPS" \
+    "already-resolved visibility rather than re-deriving it"
+
+# Detection: CLAUDE.md keyword scan.
+assert_contains "3c scans this repo's root CLAUDE.md" "$FOLLOWUPS" \
+    "This repo's root \`CLAUDE.md\`"
+for phrase in "do not disclose" "provisional is filed" "pre-disclosure"; do
+    assert_contains "3c names confidentiality phrase: $phrase" "$FOLLOWUPS" "$phrase"
+done
+assert_contains "3c allows an explicit firewall/embargo convention" "$FOLLOWUPS" \
+    "firewall/embargo"
+
+# Detection: structured .repo/scrub.toml opt-in (optional per the issue, but
+# once documented it must be a real cross-reference to scrub.md's schema,
+# not a second copy of it).
+assert_contains "3c documents a structured .repo/scrub.toml opt-in" "$FOLLOWUPS" \
+    "**A structured opt-in in \`.repo/scrub.toml\`**"
+assert_contains "3c names the [source] table" "$FOLLOWUPS" "\`[source]\` table"
+assert_contains "3c names the confidential = true flag" "$FOLLOWUPS" \
+    "confidential = true"
+assert_contains "scrub.md documents the [source] table as its schema home" "$SCRUB" \
+    "\`[source]\` table with"
+assert_contains "scrub.md attributes the flag's consumer to followups step 3c" \
+    "$SCRUB" "step 3c"
+
+# No CLAUDE.md at all -> no signal, no warning (test plan edge case).
+assert_contains "no CLAUDE.md and no opt-in means no signal" "$FOLLOWUPS" \
+    "opt-in → no"
+assert_contains "the absence rationale is stated" "$FOLLOWUPS" \
+    "has never said anything about disclosure"
+
+# Ambiguous/unreadable CLAUDE.md must NOT suppress the warning (fail closed,
+# mirroring step 3b's unresolved-visibility convention).
+assert_contains "ambiguous/unreadable CLAUDE.md does not suppress the warning" \
+    "$FOLLOWUPS" "ambiguous, unreadable, or only partially"
+assert_contains "3c states the fail-closed rule in those words" "$FOLLOWUPS" \
+    "when in doubt, warn"
+assert_contains "an unrelated-context hit is an acceptable false positive" \
+    "$FOLLOWUPS" "acceptable false positive"
+
+# The warning itself: distinct, additive to Vis, purely advisory.
+assert_contains "the distinct warning text is present" "$FOLLOWUPS" \
+    "source repo looks confidential"
+assert_contains "the warning names filing to a PUBLIC repo" "$FOLLOWUPS" \
+    "filing to a PUBLIC repo"
+assert_contains "the warning is additive to Vis, not a replacement" "$FOLLOWUPS" \
+    "additive to the \`Vis\` column, not a replacement for it"
+assert_contains "3c is purely advisory in those words" "$FOLLOWUPS" \
+    "Purely advisory — never blocks, never auto-redacts."
+
+# Step 4's table/preamble must actually carry the warning, not just 3c.
+assert_matches "step 4's example shows the warning banner" "$FOLLOWUPS" \
+    '^⚠️ source repo looks confidential'
+assert_contains "step 4 explains the banner is step 3c's warning" "$FOLLOWUPS" \
+    "is step 3c's warning"
+
+# Safety rule 7 records the constraint, and the pre-existing rules 1-6 (already
+# checked above) must survive the insertion.
+assert_contains "safety rule 7 covers the source-confidentiality warning" "$FOLLOWUPS" \
+    "7. **Warn on source/target confidentiality mismatch, never block on it**"
+assert_contains "rule 7 states advisory-only, never blocks, never auto-redacts" \
+    "$FOLLOWUPS" "it never blocks filing and never"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

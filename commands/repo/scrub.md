@@ -279,6 +279,13 @@ affiliated-entity names and aliases for this repo. Absent the file, the
 affiliated-entity class simply does not run — it has nothing to match on, and
 guessing at org names from the remote URL produces noise.
 
+An optional `[source]` table with `confidential = true` is a structured,
+unambiguous alternative to prose keyword-matching a repo's `CLAUDE.md` for a
+confidentiality/pre-disclosure signal — [[followups]] step 3c reads it (in
+addition to `CLAUDE.md`) when deciding whether to warn before filing a
+candidate to a public target. This command itself does not act on the flag;
+it is documented here because this is the schema's home file.
+
 ## Report
 
 Group by class, then by severity, consistent with [[audit]]'s critical/warn/info

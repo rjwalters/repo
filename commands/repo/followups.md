@@ -268,11 +268,77 @@ quietly dropped and not filed as drafted** — carry it into step 4 marked `HOLD
 — needs redaction` and let the user decide, exactly as an UNKNOWN target is
 surfaced rather than guessed at.
 
+### 3c. Detect source-repo confidentiality
+
+Step 3b resolves whether the **target** is public. It says nothing about
+whether the **source** — this repo, the private session being mined — has
+declared itself off-limits for public disclosure. A repo whose own
+`CLAUDE.md` opens with a firewall rule like *"Nothing here reaches a public
+surface before a provisional is filed"* can pass 3b's scrub cleanly on every
+candidate: no credential, no cloud resource ID, no third-party identity. The
+leak in that case is not a sensitive token — it is the act of filing
+*anywhere public at all*. That mismatch needs a **distinct, louder** warning,
+not silence inside an otherwise-clean scrub result.
+
+**Scope: only when step 3b has already resolved a target's visibility as
+`public`** (including the fail-closed unknown-treated-as-public case). A
+source-confidential signal paired with an all-private-target run has nothing
+to warn about, so skip this step entirely for such a run.
+
+**Detect the signal, once per run, from either of two sources — either one is
+sufficient:**
+
+- **This repo's root `CLAUDE.md`.** Scan its text for confidentiality
+  phrases — "confidential", "do not disclose", "private", "before a
+  provisional is filed", "pre-disclosure" — or an explicit firewall/embargo
+  convention stated in the operator's own words. This is prose
+  pattern-matching, not a parser: treat any of these phrases as a hit,
+  regardless of surrounding context.
+- **A structured opt-in in `.repo/scrub.toml`** (the same per-repo config
+  file step 3b already reads for the affiliated-entities allowlist — see
+  [[scrub]] "Allowlist and configuration"). A `[source]` table with
+  `confidential = true` is an explicit, unambiguous signal, and is preferred
+  over prose matching when present — it cannot misfire on an unrelated use of
+  the word "confidential" the way a keyword scan can.
+
+**No `CLAUDE.md` at the repo root and no `.repo/scrub.toml` opt-in → no
+signal, no warning.** There is nothing to detect a confidentiality claim
+from, and a repo that has never said anything about disclosure is not
+evidence that it should have.
+
+**A `CLAUDE.md` that exists but is ambiguous, unreadable, or only partially
+scannable does not suppress the warning.** This mirrors step 3b's own
+"unresolved visibility fails closed to public" rule: when in doubt, warn.
+Treating "could not tell" the same as "confirmed non-confidential" would
+recreate exactly the gap this step exists to close.
+
+A confidentiality phrase appearing in an unrelated context (e.g. a docs
+section describing someone else's NDA) is an acceptable false positive —
+this step is advisory-only, so an occasional over-warn costs a glance at the
+confirmation table, never a blocked filing.
+
+**When source-looks-confidential and step 3b's resolved `Vis` is `public` for
+a row, surface a distinct warning in step 4's table/preamble** — additive to
+the existing `Vis` column, never a replacement for it, and reusing 3b's
+already-resolved visibility rather than re-deriving it:
+
+```
+⚠️ source repo looks confidential — filing to a PUBLIC repo
+```
+
+**Purely advisory — never blocks, never auto-redacts.** This step does not
+change dedup, does not change 3b's scrub, and does not stop `--dry-run` or a
+confirmed filing from proceeding. It adds one more fact to the confirmation
+the user already has to read before approving — the same "confirm, never
+auto-apply" posture as the rest of this command.
+
 ### 4. Report the proposed set and confirm
 
 Present the full proposal and get explicit approval before touching any repo:
 
 ```
+⚠️ source repo looks confidential — filing to a PUBLIC repo
+
 FOLLOW-UPS FROM THIS SESSION
 ============================
 | # | Target repo        | Vis     | Title                              | Dedup                   |
@@ -296,6 +362,15 @@ preview, note which rows were rewritten, and mark any `HOLD — needs redaction`
 row so an unscrubbable candidate is decided on rather than skimmed past. A row
 targeting this repo still shows its visibility but carries no scrub obligation
 (step 3b skips it) — say so rather than leaving the cell blank.
+
+The `⚠️ source repo looks confidential — filing to a PUBLIC repo` banner above
+is step 3c's warning — shown once, above the table, whenever this repo looks
+confidential (per 3c) **and** at least one row's already-resolved `Vis` is
+`public`. It is additive to the `Vis` column, not a replacement for it: `Vis`
+still reports each row's target visibility on its own, and the banner adds
+the fact that the *source* considers itself off-limits. Omit the banner
+entirely when 3c found no source-confidentiality signal, or when every row's
+`Vis` is `private`.
 
 The `Dedup` column carries step 3's classification: `NEW`, a flagged
 near-match, or `ask` for an unresolved target. A flagged near-match may resolve
@@ -389,3 +464,10 @@ Filed issues are triaged like any other afterward — this command does not appl
    `removable-by-deletion` and a PR comment is `permanent`, so there is no
    after-the-fact fix — the operator noticing in the confirmation table is a
    backstop, never the mechanism.
+7. **Warn on source/target confidentiality mismatch, never block on it** —
+   when this repo looks confidential (step 3c: a `CLAUDE.md` signal or a
+   `.repo/scrub.toml` opt-in) and a target's resolved visibility is public,
+   surface a distinct warning in step 4 additive to the `Vis` column. An
+   unreadable or ambiguous `CLAUDE.md` never suppresses the warning — when in
+   doubt, warn. This is purely advisory: it never blocks filing and never
+   auto-redacts, leaving the disclosure decision with the user.
