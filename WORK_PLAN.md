@@ -43,6 +43,7 @@ _None._
 
 Issues carrying `loom:curated`.
 
+- **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
 - **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
 - **#252**: Stranded-drop-in claim in sudo.md's guard note is reasoned, never exercised *(curated)*
 
@@ -64,7 +65,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
