@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-12
 
+- **Issue #279** (closed): Guide: GUIDE_DOCS_PR_EXCLUDE apparently not applied when PR #278's WORK_LOG entry for self-referential PR #277 was first written
+- **PR #280**: fix(guide): re-verify GUIDE_DOCS_PR_EXCLUDE against origin/main before use
 - **Issue #272** (closed): /repo:followups: warn before filing to a public upstream from a confidential/pre-disclosure repo (firewall-aware confirm)
 - **PR #275**: docs(followups): warn when a confidential source repo files to a public target
 - **Issue #273** (closed): repo:all stage 2: no path for a diverged default branch — middle stages run against stale upstream state
