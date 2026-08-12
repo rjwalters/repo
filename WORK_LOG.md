@@ -2,8 +2,20 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-08-12
+
+- **Issue #272** (closed): /repo:followups: warn before filing to a public upstream from a confidential/pre-disclosure repo (firewall-aware confirm)
+- **PR #275**: docs(followups): warn when a confidential source repo files to a public target
+- **Issue #273** (closed): repo:all stage 2: no path for a diverged default branch — middle stages run against stale upstream state
+- **PR #274**: fix(repo): detect diverged default branch in /repo:all stage 2
+
 ### 2026-08-11
 
+- **Issue #270** (closed): bug: /repo:links' "resolved via sibling repo" disclosure is unreachable when the sibling checkout is present
+- **PR #271**: fix: restrict sibling-repo link resolution to non-escaping bases
+- **Issue #268** (closed): repo:links — validate sibling-repo relative links (../<repo>/... citations)
+- **PR #269**: feat(links): validate sibling-repo relative links against a workspace declaration
+- **PR #267**: docs: Guide document maintenance update
 - **Issue #265** (closed): followups: add an anti-PII scrub step for candidates filed to public upstream repos
 - **PR #266**: docs(followups): scrub cross-repo candidates before proposing them
 - **Issue #263** (closed): Guide document-maintenance infinite docs-PR loop has recurred — the #151/#153 fix was reverted by a Loom resync
