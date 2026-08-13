@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Repo Skills installer — copy skills into a target repository's .claude/ directory.
+# Repo Skills installer — copy skills into a target repository's .claude/
+# (Claude Code) and .agents/skills/ (OpenAI Codex CLI) directories.
 #
 # Usage: ./install.sh [OPTIONS] [/path/to/target-repo]
 #
 # Options:
 #   --skills=a,b,c    Install only these commands (default: all)
+#   --no-codex        Skip the Codex-side skill surface (.agents/skills/repo/)
+#                     and install only the Claude Code surface. Default: both
 #   --dev             Symlink source files instead of copying (for dogfooding);
 #                     allows installing into the source repo itself
 #   --list            List available commands and exit
@@ -127,6 +130,14 @@ source "$SOURCE_ROOT/lib/render.sh"
 # shellcheck source=lib/metadata.sh
 source "$SOURCE_ROOT/lib/metadata.sh"
 
+# The Codex-side skill surface (.agents/skills/repo/) — paths, the ownership
+# marker, and the one SKILL.md emitter, shared with uninstall.sh and the resync
+# for the same one-writer reason. lib/codex-skill.sh's header records how the
+# target format was confirmed against Codex's and the Agent Skills spec's own
+# documentation (repo#285).
+# shellcheck source=lib/codex-skill.sh
+source "$SOURCE_ROOT/lib/codex-skill.sh"
+
 INSTALL_DATE="$(date -u +%Y-%m-%d)"
 REPO_OWNER="OWNER"
 REPO_NAME="REPO"
@@ -142,8 +153,11 @@ DRY_RUN=false
 YES=false
 DEV=false
 SHELL_WRAPPER=false
+CODEX=true
+# Appended to the closing success line once the Codex surface is actually written.
+CODEX_HINT=""
 
-usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 list_commands() {
   for f in "$SOURCE_ROOT"/commands/repo/*.md; do
@@ -154,6 +168,7 @@ list_commands() {
 for arg in "$@"; do
   case "$arg" in
     --skills=*)      SKILLS_FILTER="${arg#--skills=}" ;;
+    --no-codex)      CODEX=false ;;
     --dev)           DEV=true ;;
     --list)          list_commands; exit 0 ;;
     --dry-run)       DRY_RUN=true ;;
@@ -220,6 +235,21 @@ SESSIONSTART_SOURCES=(startup resume)
 
 SETTINGS_JSON="$TARGET/.claude/settings.json"
 
+# Codex-side destinations. Declared here, next to the Claude-side constants and
+# ahead of the --dry-run enumeration, so listing and doing read from the same
+# values and cannot drift.
+CODEX_SKILL_DIR="$TARGET/$CODEX_SKILL_REL"
+CODEX_SKILL_MD="$CODEX_SKILL_DIR/SKILL.md"
+
+# `.agents/skills/` is a shared, standardized namespace (Codex scans it for
+# EVERY skill in the repo, whoever wrote them), so — unlike `.claude/skills/repo`
+# and `.claude/commands/repo`, which this installer alone populates — a
+# same-named directory here may legitimately be someone else's hand-authored
+# skill. Prove ownership via the marker before writing over it.
+codex_target_is_foreign() {
+  [[ -f "$CODEX_SKILL_MD" ]] && ! codex_skill_is_managed "$CODEX_SKILL_MD"
+}
+
 echo ""
 info "Repo Skills v$VERSION ($COMMIT) → $TARGET"
 [[ "$DEV" == true ]] && info "Dev mode: symlinking source files (edits are live)"
@@ -242,8 +272,19 @@ if [[ "$DRY_RUN" == true ]]; then
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
   done <<<"$COMMANDS"
+  if [[ "$CODEX" != true ]]; then
+    echo "  (--no-codex given — the $CODEX_SKILL_REL/ Codex surface is skipped)"
+  elif codex_target_is_foreign; then
+    echo "  (skipped — $CODEX_SKILL_REL/SKILL.md exists and is not managed by Repo Skills)"
+  else
+    echo "  $TARGET/$CODEX_SKILL_REL/SKILL.md (Codex skill: canonical body, Codex-native frontmatter)"
+    echo "  $TARGET/$CODEX_SKILL_REL/install-metadata.json"
+    while IFS= read -r cmd; do
+      echo "  $TARGET/$CODEX_REFERENCES_REL/$cmd.md"
+    done <<<"$COMMANDS"
+  fi
   if [[ "$DEV" == true ]]; then
-    echo "  $TARGET/.gitignore (.claude/ entry; CLAUDE.md skipped in dev mode)"
+    echo "  $TARGET/.gitignore (.claude/ entry$([[ "$CODEX" == true ]] && echo " + $CODEX_SKILL_REL/ entry"); CLAUDE.md skipped in dev mode)"
     if claude_md_has_block; then
       echo "  $TARGET/CLAUDE.md (existing REPO-SKILLS block is orphaned/stale — would offer removal)"
     fi
@@ -540,7 +581,63 @@ install_file "$SOURCE_ROOT/scripts/repo/resync-installed.sh" \
 chmod +x "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/scripts/resync-installed.sh"
 
-# 3f. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
+# 3f. Codex-side skill surface (.agents/skills/repo/). Codex CLI discovers
+# skills by scanning `.agents/skills` from the cwd up to the repo root, in the
+# open Agent Skills format — a directory holding SKILL.md plus optional
+# references/ — so this is a repo-scoped install that needs no config file and
+# no write outside the target. lib/codex-skill.sh's header records how that
+# format was confirmed and which single adaptation it forces (the `name` must be
+# a lowercase slug matching its directory, which "Repo Skills" is not).
+#
+# The BODY is the canonical skills/repo/SKILL.md, and the references/ files are
+# the same commands/repo/*.md Claude Code registers as /repo:<verb> — one
+# procedure body per workflow, packaged for a second runtime rather than
+# rewritten for it.
+#
+# SKILL.md is generated (never symlinked) even under --dev, because the whole
+# point of the Codex copy is frontmatter a symlink to the source would not have.
+# The references/ files follow the normal install_file rules, so --dev still
+# gives live per-command edits.
+if [[ "$CODEX" != true ]]; then
+  info "Skipping the Codex skill surface at $CODEX_SKILL_REL/ (--no-codex)"
+elif codex_target_is_foreign; then
+  warning "$CODEX_SKILL_REL/SKILL.md exists but carries no Repo Skills marker, so it is"
+  warning "someone else's skill sharing the name 'repo'. Leaving it and everything beside"
+  warning "it untouched — the Claude Code surface installed normally. Move or rename that"
+  warning "skill and re-run to install the Codex surface too, or pass --no-codex to silence this."
+else
+  mkdir -p "$TARGET/$CODEX_REFERENCES_REL"
+  CODEX_SKILL_TMP="$(mktemp)"
+  if codex_skill_render "$SOURCE_ROOT/skills/repo/SKILL.md" "$COMMANDS" >"$CODEX_SKILL_TMP"; then
+    assert_no_placeholders "$CODEX_SKILL_TMP" "$CODEX_SKILL_REL/SKILL.md"
+    mv "$CODEX_SKILL_TMP" "$CODEX_SKILL_MD"
+    success "Installed $CODEX_SKILL_REL/SKILL.md"
+  else
+    rm -f "$CODEX_SKILL_TMP"
+    error "Could not render $CODEX_SKILL_REL/SKILL.md: skills/repo/SKILL.md has no 'description' in its frontmatter, which the Agent Skills format requires."
+  fi
+
+  while IFS= read -r cmd; do
+    install_file "$SOURCE_ROOT/commands/repo/$cmd.md" \
+      "$TARGET/$CODEX_REFERENCES_REL/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md"
+  done <<<"$COMMANDS"
+  success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') command procedures into $CODEX_REFERENCES_REL/"
+
+  # Same tracked-metadata emitter and same C5 guarantees as the Claude surface,
+  # so the Codex surface is self-describing and the resync can tell an install
+  # that predates it from one the operator declined with --no-codex. There is
+  # deliberately no SECOND machine-local sidecar: the sidecar's only job is to
+  # point at the source clone, one pointer per install is enough, and a second
+  # gitignored-and-untracked file would double the C6 bookkeeping for no extra
+  # information.
+  metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
+    "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" \
+    >"$CODEX_SKILL_DIR/install-metadata.json"
+  success "Wrote $CODEX_SKILL_REL/install-metadata.json"
+  CODEX_HINT=" In Codex CLI the same workflows are the \`$CODEX_SKILL_SLUG\` skill (\`/skills\`, or type \`\$$CODEX_SKILL_SLUG\`)."
+fi
+
+# 3g. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
 # to the HUMAN before Claude starts (the SessionStart hook above is the half
 # Claude itself sees). This is the one thing install.sh writes outside the
 # target repo, so unlike every step above it is opt-in and defensive: a
@@ -612,9 +709,20 @@ if [[ "$DEV" == true ]]; then
     { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""; echo "# Repo Skills dev-mode symlinks (machine-local, do not commit)"; echo ".claude/"; } >>"$GITIGNORE"
     success "Added .claude/ to .gitignore"
   fi
+  # The Codex surface is half symlinks too (references/), so it is machine-local
+  # in dev mode for the same reason and gets the same treatment. Scoped to this
+  # package's own directory rather than all of .agents/skills/, which other tools
+  # and the consumer share.
+  if [[ "$CODEX" == true ]] \
+    && { [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$CODEX_SKILL_REL/" "$GITIGNORE"; }; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
+      echo "# Repo Skills dev-mode Codex surface (machine-local, do not commit)"
+      echo "$CODEX_SKILL_REL/"; } >>"$GITIGNORE"
+    success "Added $CODEX_SKILL_REL/ to .gitignore"
+  fi
   reconcile_orphaned_block
   echo ""
-  success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code."
+  success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code.$CODEX_HINT"
   exit 0
 fi
 
@@ -650,7 +758,7 @@ if dest_is_gitignored; then
   warning "files is not what you want). The /repo:* commands still work in-session."
   reconcile_orphaned_block
   echo ""
-  success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code."
+  success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code.$CODEX_HINT"
   exit 0
 fi
 
@@ -687,4 +795,4 @@ fi
 rm -f "$BLOCK_FILE"
 
 echo ""
-success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code."
+success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code.$CODEX_HINT"

@@ -1,8 +1,8 @@
 # Repo
 
-**General-purpose repository skills for Claude Code.**
+**General-purpose repository skills for Claude Code and OpenAI Codex CLI.**
 
-Repo is a collection of skills for keeping any git repository healthy and productive — auditing hygiene, tidying clutter, and launching cloud dev sessions with the repo ready to go. Skills install into a target repository (the consumer repo) and are invoked from Claude Code as `/repo:<command>`.
+Repo is a collection of skills for keeping any git repository healthy and productive — auditing hygiene, tidying clutter, and launching cloud dev sessions with the repo ready to go. Skills install into a target repository (the consumer repo) and are invoked from Claude Code as `/repo:<command>`, or from Codex CLI as the `repo` skill (see [Codex packaging](#codex-packaging-agentsskillsrepo)).
 
 **Sibling projects:** [Loom](https://github.com/rjwalters/loom) orchestrates AI development workers around a forge. [Anvil](https://github.com/rjwalters/anvil) orchestrates long-form artifact creation. Repo is the toolbox both of them assume: generic repository hygiene and environment skills that work in any repo. All three can be installed side by side.
 
@@ -79,9 +79,34 @@ The same `--shell-wrapper` opt-in installs a **second**, independent marker-boun
 
 Both blocks are installed, previewed, backed up, and removed together under the single `--shell-wrapper` opt-in — same idempotency and backup discipline as the `claude` wrapper above. `uninstall.sh` removes the Codex block too.
 
+## Codex packaging (`.agents/skills/repo/`)
+
+> **Not the same thing as the operator wrapper above.** That section is a shell convenience for a human launching `codex` — argv handling, nothing else. This section is how Codex *discovers the workflows themselves*. The two are independent: you get this one by default, and the wrapper only with `--shell-wrapper`.
+
+Every install writes a second, Codex-native copy of the same workflows alongside the Claude Code one:
+
+```
+.agents/skills/repo/SKILL.md              # the skill Codex discovers
+.agents/skills/repo/references/<verb>.md  # one procedure per command
+.agents/skills/repo/install-metadata.json # version/commit, same shape as the Claude side
+```
+
+Codex CLI scans `.agents/skills` in every directory from your working directory up to the repository root and loads each `SKILL.md` it finds, using the open [Agent Skills](https://agentskills.io) format. So this is a plain repo-scoped install: **no config file, no manifest registration, and nothing written outside the target repo.** After installing, `/skills` (or typing `$repo`) in Codex shows the skill, and Codex can also select it on its own when a request matches its `description`. Skip it with `./install.sh --no-codex <repo>`.
+
+**One canonical body, two runtime wrappers.** The Codex `SKILL.md` body *is* [`skills/repo/SKILL.md`](skills/repo/SKILL.md), and each `references/<verb>.md` *is* the same `commands/repo/<verb>.md` file Claude Code registers as `/repo:<verb>` — copied, not rewritten. Only the frontmatter is generated, because the two runtimes want different frontmatter:
+
+| Frontmatter | Claude Code copy | Codex copy | Why |
+|---|---|---|---|
+| `name` | `"Repo Skills"` | `repo` | The Agent Skills spec requires a lowercase `a-z0-9-` slug that matches the skill's directory name. This repo's canonical value is neither, so the Codex copy is rendered with a conforming one rather than shipped broken |
+| `description` | verbatim | verbatim | The field both runtimes match against to decide when to use the skill — genuinely runtime-neutral |
+| `domain` | top-level key | under `metadata:` | An inert grouping tag this repo invented; the spec has a `metadata` map for exactly that, so it goes there instead of as an unknown top-level key |
+| `type`, `user-invocable` | present | dropped | These name Claude Code's own two install targets (`.claude/skills/` vs `.claude/commands/`) and mean nothing to Codex's discovery — see [`skills/README.md`](skills/README.md) § "Frontmatter field reference" |
+
+**Ownership.** Unlike `.claude/skills/repo/`, the `.agents/skills/` namespace is *shared* — Codex loads every skill any tool or person puts there. So the installer writes only `.agents/skills/repo/`, marks what it wrote, and refuses to overwrite a same-named skill it did not write; `uninstall.sh` applies the same test before removing anything, prunes the shared parent directories only when it emptied them, and leaves sibling skills alone. `.claude/skills/repo/scripts/resync-installed.sh` refreshes the Codex surface too and reports drift in it — but only when it is already installed, so a repo that declined it never has it added behind the operator's back.
+
 ## Installation
 
-The installer copies the skill files into a target repository's `.claude/` directory, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
+The installer copies the skill files into a target repository's `.claude/` (Claude Code) and `.agents/skills/` (Codex CLI) directories, wires the guard hook into `.claude/settings.json`, and appends a marker-bounded section to its `CLAUDE.md`.
 
 ```bash
 # Install everything into the current directory
@@ -92,6 +117,9 @@ The installer copies the skill files into a target repository's `.claude/` direc
 
 # Install only specific skills
 ./install.sh --skills=reset,remote ~/projects/my-app
+
+# Claude Code only — skip the Codex skill surface (see "Codex packaging" above)
+./install.sh --no-codex ~/projects/my-app
 
 # Preview without writing
 ./install.sh --dry-run ~/projects/my-app
@@ -143,6 +171,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
+- `.agents/skills/repo/` — the Codex skill: `SKILL.md`, `references/<verb>.md` (one per command), and its own `install-metadata.json`. Written by default, skipped with `--no-codex`; only this directory is touched, never a sibling skill under the shared `.agents/skills/` namespace, and never a same-named skill this installer did not write. See "Codex packaging" above
 - `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
@@ -155,8 +184,10 @@ Opt-in only, and outside the target repository: with `--shell-wrapper`, your she
 skills/README.md             Frontmatter/structure contract for skills/*/SKILL.md — which fields are
                              runtime-neutral vs. Claude-specific, and the canonical-source/thin-alias
                              pattern skills/repo/SKILL.md + commands/repo/*.md demonstrate
-skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
-commands/repo/*.md           Command files installed to .claude/commands/repo/
+skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/ (Claude Code) and,
+                             with Codex-native frontmatter, to .agents/skills/repo/ (Codex CLI)
+commands/repo/*.md           Command files installed to .claude/commands/repo/ and, unchanged,
+                             to .agents/skills/repo/references/
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
@@ -165,7 +196,8 @@ hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to
 hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inline smoke cases
                              plus every delegated suite below. `pnpm test` runs it
 hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLAUDE.md
-                             markers, sidecar untracking, claude + codex shell wrappers
+                             markers, sidecar untracking, Codex skill surface,
+                             claude + codex shell wrappers
 commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
                              provisioning, verify-after-write, early sync-and-switch, tidy
                              KEEP tiers, C7 resync, installer contract, fork-network sweep,
@@ -181,6 +213,9 @@ uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
 lib/render.sh                Template-variable rendering shared by install.sh/resync-installed.sh
 lib/metadata.sh              The C5/C6 tracked-vs-sidecar metadata shape, same two callers
+lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): paths, ownership marker,
+                             and the one SKILL.md emitter shared by install/uninstall/resync. Its header
+                             records how the target format was confirmed against Codex's own docs
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 ```
 

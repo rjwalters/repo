@@ -20,7 +20,13 @@
 # meaning. Additive fields do NOT bump it. Consumers compare the installed
 # `layout_version` against the source's to decide whether a plain resync is
 # enough or the installer has to be re-run.
-REPO_SKILLS_LAYOUT_VERSION=1
+#
+# 1 -> 2 (repo#285): the install gained a second destination root, the Codex
+# skill surface at `.agents/skills/repo/`. A resync deliberately will not create
+# it (it refreshes what is installed; it does not adopt new surfaces), so an
+# install still at layout 1 needs the installer re-run to pick it up — which is
+# exactly what the mismatch warning tells the operator.
+REPO_SKILLS_LAYOUT_VERSION=2
 
 # metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list>
 #
