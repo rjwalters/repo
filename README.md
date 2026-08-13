@@ -152,6 +152,9 @@ Opt-in only, and outside the target repository: with `--shell-wrapper`, your she
 ## Repository layout
 
 ```
+skills/README.md             Frontmatter/structure contract for skills/*/SKILL.md — which fields are
+                             runtime-neutral vs. Claude-specific, and the canonical-source/thin-alias
+                             pattern skills/repo/SKILL.md + commands/repo/*.md demonstrate
 skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/
 commands/repo/*.md           Command files installed to .claude/commands/repo/
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
@@ -187,6 +190,8 @@ lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapp
 2. Add a `[[<name>]]` row to the commands table in `skills/repo/SKILL.md`.
 3. Add a row to the Skills table in this README.
 4. Keep it **general**: no org-specific hostnames, project names, branch names, or infrastructure paths. If a check needs configuration, read it from the consumer repo (e.g. its `.env` or `CLAUDE.md`), never hardcode it.
+
+See [`skills/README.md`](skills/README.md) for which of the frontmatter fields above are runtime-neutral vs. Claude-Code-specific, and for `skills/repo/SKILL.md` + `commands/repo/*.md` documented as the canonical "one canonical source, thin per-runtime alias" example other repos/runtimes should replicate.
 
 ## License
 
