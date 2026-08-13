@@ -284,7 +284,7 @@ if [[ "$DRY_RUN" == true ]]; then
     done <<<"$COMMANDS"
   fi
   if [[ "$DEV" == true ]]; then
-    echo "  $TARGET/.gitignore (.claude/ entry$([[ "$CODEX" == true ]] && echo " + $CODEX_SKILL_REL/ entry"); CLAUDE.md skipped in dev mode)"
+    echo "  $TARGET/.gitignore (.claude/ entry$([[ "$CODEX" == true ]] && ! codex_target_is_foreign && echo " + $CODEX_SKILL_REL/ entry"); CLAUDE.md skipped in dev mode)"
     if claude_md_has_block; then
       echo "  $TARGET/CLAUDE.md (existing REPO-SKILLS block is orphaned/stale — would offer removal)"
     fi
@@ -713,7 +713,12 @@ if [[ "$DEV" == true ]]; then
   # in dev mode for the same reason and gets the same treatment. Scoped to this
   # package's own directory rather than all of .agents/skills/, which other tools
   # and the consumer share.
-  if [[ "$CODEX" == true ]] \
+  #
+  # Gated on the same ownership check every other Codex write site uses: when
+  # .agents/skills/repo/ is someone else's hand-authored skill we installed
+  # nothing there, so ignoring it would hide THEIR files from git under a
+  # comment claiming a surface we do not own.
+  if [[ "$CODEX" == true ]] && ! codex_target_is_foreign \
     && { [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$CODEX_SKILL_REL/" "$GITIGNORE"; }; then
     { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
       echo "# Repo Skills dev-mode Codex surface (machine-local, do not commit)"

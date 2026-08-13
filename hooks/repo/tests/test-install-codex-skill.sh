@@ -204,7 +204,8 @@ SRC_NAME="$(fm "$SRC_SKILL" name)"
 if [[ ! "$SRC_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     ok "the canonical source name is not a legal slug (so the render is load-bearing)"
 else
-    ok "the canonical source name is already a legal slug (render is a no-op adaptation)"
+    no "the canonical source name is not a legal slug (so the render is load-bearing)" \
+       "source name [$SRC_NAME] is now a legal slug — the name adaptation this suite pins looks unnecessary; re-justify or drop it deliberately"
 fi
 
 assert_eq "description is copied verbatim from the canonical source" \
@@ -330,6 +331,32 @@ OUT5B="$(HOME="$FAKE_HOME" bash "$UNINSTALL_SH" -y "$T5" 2>&1)"
 assert_eq       "foreign: uninstall leaves the .agents tree untouched" \
                 "$FOREIGN_FP" "$(fingerprint "$T5/.agents")"
 assert_contains "foreign: uninstall says what it left"       "$OUT5B" "Left $CODEX_REL/ in place"
+
+# The mirror of T11's happy-path dev gitignore entry: --dev must not ignore a
+# directory it just declined to write. Ignoring someone else's skill would hide
+# THEIR future files from git status, under a comment claiming a surface we do
+# not own.
+T5C="$(new_target foreign-dev)"
+mkdir -p "$T5C/$CODEX_REL"
+printf -- '---\nname: repo\ndescription: hand authored by the consumer\n---\n\nMY OWN CONTENT\n' \
+    > "$T5C/$CODEX_REL/SKILL.md"
+FOREIGN_DEV_FP="$(fingerprint "$T5C/.agents")"
+
+OUT5C="$(HOME="$FAKE_HOME" bash "$INSTALL_SH" --dry-run --dev "$T5C" 2>&1)"
+assert_contains     "foreign+dev: --dry-run says the Codex surface is skipped" \
+                    "$OUT5C" "is not managed by Repo Skills"
+assert_not_contains "foreign+dev: --dry-run does not promise a $CODEX_REL/ gitignore entry" \
+                    "$OUT5C" "+ $CODEX_REL/ entry"
+
+OUT5D="$(install_into "$T5C" --dev)"; RC5D=$?
+assert_eq           "foreign+dev: install still exits 0"        "0" "$RC5D"
+assert_contains     "foreign+dev: install explains the skip"    "$OUT5D" "carries no Repo Skills marker"
+assert_eq           "foreign+dev: the .agents tree is untouched" \
+                    "$FOREIGN_DEV_FP" "$(fingerprint "$T5C/.agents")"
+assert_contains     "foreign+dev: .claude/ is still gitignored" \
+                    "$(cat "$T5C/.gitignore" 2>/dev/null)" ".claude/"
+assert_not_contains "foreign+dev: the foreign skill dir is NOT added to .gitignore" \
+                    "$(cat "$T5C/.gitignore" 2>/dev/null)" "$CODEX_REL/"
 
 # ---------------------------------------------------------------------------
 echo ""
