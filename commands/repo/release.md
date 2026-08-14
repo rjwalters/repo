@@ -599,6 +599,14 @@ Once approved:
    files **plus `CHANGELOG.md`**, commit, and `git tag -a "v$NEW" -m "v$NEW"` —
    match the repo's existing commit/tag convention (check `git log` and `git tag`).
 
+   That `-a` matters beyond style: it's what makes the tag **annotated**, and
+   Phase 6's `git push --follow-tags` only pushes annotated tags. The
+   self-committing branches above (`version.sh`, `cargo-release`, `bumpversion`,
+   `bump2version`, `poetry`, `npm`) own their own tag creation and are free to
+   create a plain, **lightweight** tag (e.g. a `version.sh` that runs bare `git
+   tag "v$NEW"`) — Phase 6 can't assume otherwise, and treats that possibility
+   explicitly rather than trusting `--follow-tags` to have pushed it.
+
    The `pyproject` branch rewrites only the `version` line **inside** the
    `[project]` table and leaves every other line byte-identical. Four details
    are load-bearing, each guarding a failure this branch would otherwise cause:
@@ -679,12 +687,28 @@ After an explicit yes:
 git push origin "$(git symbolic-ref --short HEAD)" --follow-tags
 ```
 
-If a release workflow exists (`.github/workflows/release.yml`, typically
-triggered on Release creation rather than tag push), create a GitHub Release so
-it fires; use the CHANGELOG entry as the notes:
+`--follow-tags` pushes only **annotated** tags, not lightweight ones (see the
+note on the `-a` flag in Phase 5 step 3 above). Don't assume the tag actually
+made it to the remote — verify, and fall back to an explicit push when it
+didn't:
 
 ```bash
-gh release create "v$NEW" --title "v$NEW" --notes-file <(sed -n "/^## \[\?$NEW/,/^## /p" CHANGELOG.md)
+if ! git ls-remote --exit-code --tags origin "refs/tags/v$NEW" >/dev/null 2>&1; then
+  echo "v$NEW did not travel with --follow-tags (likely a lightweight tag) — pushing it explicitly"
+  git push origin "v$NEW"
+fi
+```
+
+If a release workflow exists (`.github/workflows/release.yml`, typically
+triggered on Release creation rather than tag push), create a GitHub Release so
+it fires; use the CHANGELOG entry as the notes. `gh release create` can hit a
+brief propagation-lag race even immediately after the tag is confirmed on the
+remote above — give it one short retry before treating it as a real failure:
+
+```bash
+gh release create "v$NEW" --title "v$NEW" --notes-file <(sed -n "/^## \[\?$NEW/,/^## /p" CHANGELOG.md) \
+  || { echo "gh release create failed — retrying once after a short pause (tag-propagation lag)"; sleep 10; \
+       gh release create "v$NEW" --title "v$NEW" --notes-file <(sed -n "/^## \[\?$NEW/,/^## /p" CHANGELOG.md); }
 ```
 
 Otherwise the tag push alone completes the release.
