@@ -3483,6 +3483,47 @@ assert_deny_tag 'write-confinement (#293): a backtick in the token refuses resol
     "V=\"$WTC_MAIN\"; cp /tmp/src.txt \"\$V/\`whoami\`/evil.sh\"" "$WTC_WT" \
     "worktree-write-confinement-unresolved-var"
 
+# ---- (d2) The same bar, enforced on the ASSIGNMENT RHS (repo#293 review).
+# ---- The cases above only put the command substitution in the WRITE-TARGET
+# ---- token, which dequote_expandable() refuses. The RHS is the other half:
+# ---- a value is only resolvable when it is a STATIC LITERAL, and before the
+# ---- review fix "static" was tested on the value's FIRST BYTE only. A
+# ---- backtick embedded mid-RHS was therefore stored as a proven literal and
+# ---- the write ALLOWED — a live worktree-isolation escape, since a bare
+# ---- backtick pair leaves no `$` in the resolved token for the #4921
+# ---- backstop to catch. record_assign() now poisons any RHS carrying a
+# ---- backtick or a `$` anywhere, so every shape below falls back to the
+# ---- fail-closed literal treatment. ----
+assert_deny_tag 'write-confinement (#293): backtick command substitution in the assignment RHS denies' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# The unquoted spelling of the same bypass — reachable before this PR too, and
+# the shape that proves the fix lives in the shared resolver, not in the new
+# quote-aware entry point.
+assert_deny_tag 'write-confinement (#293): backtick in the RHS, unquoted use, denies' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; cp /tmp/src.txt \$V/pwned.sh" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Unquoted RHS spelling — the backtick is not hidden behind an outer quote
+# pair, so this pins the check to the raw value rather than the stripped one.
+assert_deny_tag 'write-confinement (#293): backtick in an unquoted RHS denies' \
+    "V=$WTC_WT/\`echo evil\`/x; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# The `$(...)` spelling used to be caught only incidentally (its literal `$`
+# survived into the resolved token and re-tripped the #4921 backstop). Pinned
+# here so it is caught deliberately, at capture time, alongside the backtick.
+assert_deny_tag 'write-confinement (#293): non-leading $(...) in the assignment RHS denies' \
+    "V=\"$WTC_WT/\$(echo evil)/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Non-leading bare `$OTHER` in the RHS — the same leading-byte blind spot.
+assert_deny_tag 'write-confinement (#293): non-leading $OTHER in the assignment RHS denies' \
+    "V=\"$WTC_WT/\$OTHER/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Poisoning is STICKY: a later clean assignment to the same name must not
+# launder a value that was already proven non-static.
+assert_deny_tag 'write-confinement (#293): a clean reassignment does not un-poison a non-static RHS' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; V=\"$WTC_WT\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+
 # ---- (e) The fail-closed backstop itself is additive, not removed: BOTH
 # ---- unresolved-var shapes still deny under their own tag. ----
 assert_deny_tag 'write-confinement (#293): root-unknown shape still fails closed (#4921)' \

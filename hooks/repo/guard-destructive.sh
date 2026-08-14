@@ -4075,11 +4075,49 @@ extract_write_targets() {
     # SAME value is not a conflict and still resolves normally -- quotes are
     # stripped above, before the comparison, so a bare and a quoted spelling of
     # one value compare equal.
+    #
+    # A NON-STATIC RHS POISONS THE VARIABLE TOO (repo#293 review): resolution is
+    # only ever sound when the recorded value is a STATIC LITERAL — a value the
+    # real shell would hand to the write idiom byte-for-byte, with nothing left
+    # for it to expand. Before this check, "static" was enforced only by
+    # a test inside resolve_var_core() on the FIRST character, which caught
+    # `A=$B/x` and `A=$(pwd)/x` but nothing embedded further in. That left a
+    # live fail-open bypass on this catastrophic-tier guard:
+    #
+    #     V="<worktree>/`echo evil`/x"; cp /tmp/y "$V/pwned.sh"
+    #
+    # was ALLOWED — the backtick command substitution sits mid-value, so the
+    # leading-byte test never saw it, the value was stored as if it were a
+    # proven literal, and the downstream #4921 unresolved-`$` backstop found no
+    # `$` in the resolved token to trip on (a bare backtick pair carries none).
+    # The `$(...)` spelling happened to be caught only incidentally, because its
+    # literal `$` survived substitution into the final token. Relying on that
+    # accident is not a safety property.
+    #
+    # So the eligibility bar is now enforced where the value is CAPTURED, not
+    # where it is consumed, and over the WHOLE string rather than its first
+    # byte: any RHS containing a backtick or a `$` ANYWHERE is poisoned to
+    # AMBIG and never becomes a resolvable literal. This is checked against the
+    # RAW word (before the outer quote pair is stripped), so no spelling of the
+    # quoting can hide an expansion character from it. Deliberately blunt, and
+    # deliberately on the conservative side of the "ambiguity never widens a
+    # deny" contract this file states elsewhere: poisoning only ever routes the
+    # token back to the pre-#4881 literal treatment, which fails CLOSED under
+    # `worktree-write-confinement-unresolved-var`. A value containing a `$` the
+    # shell would NOT expand (single-quoted, backslash-escaped) is refused here
+    # as well — that costs a resolution this guard was never entitled to make,
+    # and re-deriving "which `$` would bash expand" in a third place is exactly
+    # the drift the mark_expandable_dollars() header warns is itself a bypass.
     function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
         eqpos = index(word, "=")
         if (eqpos < 2) return
         vname = substr(word, 1, eqpos - 1)
         vval = substr(word, eqpos + 1)
+        # Non-static RHS -> poison, never store. Checked on the raw value.
+        if (index(vval, BQ) > 0 || index(vval, "$") > 0) {
+            varmap[vname] = AMBIG
+            return
+        }
         vlen = length(vval)
         if (vlen >= 2) {
             c1 = substr(vval, 1, 1)
