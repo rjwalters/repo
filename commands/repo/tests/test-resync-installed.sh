@@ -144,6 +144,25 @@ DRY_INSTALL="$( cd "$TGT" && HOME="$FAKE_HOME" bash "$SRC/install.sh" --dry-run 
 assert_contains "install.sh --dry-run lists the resync script as a planned write" \
     "$DRY_INSTALL" "scripts/resync-installed.sh"
 
+# repo#298: SKILL.md/README.md/scrub.md all document repo-scrub-forks.sh as
+# installed to .claude/skills/repo/scripts/, so install.sh must actually copy
+# it there (and the resync plan must know about it) — same shape as the
+# resync-installed.sh assertions above.
+SCRUB_INSTALLED="$TGT/.claude/skills/repo/scripts/repo-scrub-forks.sh"
+assert_file "install.sh installs repo-scrub-forks.sh into the skill scripts dir" "$SCRUB_INSTALLED"
+if [[ -x "$SCRUB_INSTALLED" ]]; then ok "the installed repo-scrub-forks.sh copy is executable"; else no "the installed repo-scrub-forks.sh copy is executable"; fi
+
+assert_contains "install.sh copies scripts/repo/repo-scrub-forks.sh" \
+    "$INSTALL_SH" "scripts/repo/repo-scrub-forks.sh"
+assert_contains "install.sh --dry-run enumerates repo-scrub-forks.sh" \
+    "$INSTALL_SH" '.claude/skills/repo/scripts/repo-scrub-forks.sh"'
+assert_contains "install.sh --dry-run lists repo-scrub-forks.sh as a planned write" \
+    "$DRY_INSTALL" "scripts/repo-scrub-forks.sh"
+
+RESYNC_SRC_BODY="$(cat "$RESYNC_SRC")"
+assert_contains "resync-installed.sh's plan includes repo-scrub-forks.sh" \
+    "$RESYNC_SRC_BODY" 'plan "scripts/repo/repo-scrub-forks.sh"'
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- a fresh install is already in sync --"
