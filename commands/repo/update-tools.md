@@ -317,20 +317,28 @@ Land each tool's bump as its own commit:
 
 1. **Isolate the installer's footprint.** Snapshot the working tree *before*
    running the installer so a pre-existing dirty tree is never folded into the
-   update commit:
+   update commit. **Use a literal, spelled-out scratch path — never a
+   `$(mktemp)`-assigned shell variable — as the `>` redirect target.** In a
+   Loom-managed repo the destructive-write guard denies a write whose target
+   is an unexpanded shell variable outright, because it cannot statically
+   resolve where the write lands (fail-closed, #4921/#4178); a literal path
+   sidesteps that ambiguity entirely, so do not "clean this back up" into
+   `$pre`/`$post`/`$changed` variables for readability. Prefer the session's
+   own scratchpad directory when the agent has one; otherwise spell out a
+   `/tmp/...` path directly:
 
    ```bash
-   pre=$(mktemp); post=$(mktemp)
-   git -C <this-repo> status --porcelain | sed 's/^...//' | sort > "$pre"
+   git -C <this-repo> status --porcelain | sed 's/^...//' | sort > /tmp/update-tools-pre.txt
    # ... run the tool's installer (step 4, above) ...
-   git -C <this-repo> status --porcelain | sed 's/^...//' | sort > "$post"
+   git -C <this-repo> status --porcelain | sed 's/^...//' | sort > /tmp/update-tools-post.txt
    # Paths the installer actually changed = post minus pre:
-   comm -13 "$pre" "$post" > changed.txt
+   comm -13 /tmp/update-tools-pre.txt /tmp/update-tools-post.txt > /tmp/update-tools-changed.txt
    ```
 
-   Stage **only** those paths (`git -C <this-repo> add -- $(cat changed.txt)`),
-   never `git add -A`. If `changed.txt` is empty the installer was a no-op —
-   report "already current" and skip the commit for that tool.
+   Stage **only** those paths
+   (`git -C <this-repo> add -- $(cat /tmp/update-tools-changed.txt)`), never
+   `git add -A`. If `/tmp/update-tools-changed.txt` is empty the installer was
+   a no-op — report "already current" and skip the commit for that tool.
 
 2. **Commit + land on the default branch, without committing straight to it:**
 
