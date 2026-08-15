@@ -34,13 +34,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 RSF="$REPO_ROOT/scripts/repo/repo-scrub-forks.sh"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 if [[ ! -f "$RSF" ]]; then
     echo "FATAL: repo-scrub-forks.sh not found at $RSF" >&2
@@ -53,20 +50,6 @@ fi
 
 SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
-
-# ---------------------------------------------------------------------------
-# Assertion helpers (same shape as test-repo-remote.sh / test-check-duplicate.sh)
-# ---------------------------------------------------------------------------
-ok() { TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1)); printf "  ${GREEN}PASS${NC}: %s\n" "$1"; }
-no() {
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-assert_eq()           { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi; }
-assert_contains()     { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3] in [$2]"; fi; }
-assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present in [$2]"; fi; }
 
 # ---------------------------------------------------------------------------
 # Fixture encoding helpers — MUST match the encoding used inside the stub gh

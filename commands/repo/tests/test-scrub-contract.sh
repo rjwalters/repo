@@ -50,15 +50,10 @@ TIDY_MD="$CMD_DIR/tidy.md"
 SKILL_MD="$REPO_ROOT/skills/repo/SKILL.md"
 README_MD="$REPO_ROOT/README.md"
 
-PASS=0
-FAIL=0
-SKIP=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 for f in "$SCRUB_MD" "$ALL_MD" "$TIDY_MD" "$SKILL_MD" "$README_MD"; do
     if [[ ! -f "$f" ]]; then
@@ -70,39 +65,6 @@ done
 SCRUB="$(cat "$SCRUB_MD")"
 ALL="$(cat "$ALL_MD")"
 TIDY="$(cat "$TIDY_MD")"
-
-# ---------------------------------------------------------------------------
-# Assertion helpers
-# ---------------------------------------------------------------------------
-
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-skip() {  # <label> <reason>
-    SKIP=$((SKIP + 1))
-    printf "  ${YELLOW}SKIP${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3]"; fi
-}
-assert_not_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present"; fi
-}
-assert_matches() {  # <label> <haystack> <ere>
-    if printf '%s\n' "$2" | grep -qE -- "$3"; then ok "$1"; else no "$1" "no match for /$3/"; fi
-}
 
 # ---------------------------------------------------------------------------
 echo "1. Command surface and report-only posture"
