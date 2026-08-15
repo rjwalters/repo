@@ -17,7 +17,8 @@
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
 # test-install-sidecar-untracking.sh, test-install-codex-skill.sh,
-# test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
+# test-skill-parity.sh, test-shell-wrapper.sh,
+# commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
 # commands/repo/tests/test-early-sync-switch.sh,
@@ -413,6 +414,43 @@ else
     PASS=$((PASS + CX_PASS))
     FAIL=$((FAIL + CX_FAIL))
     record_suite "test-install-codex-skill.sh" "$CX_PASS" "$CX_FAIL" "Codex skill surface"
+fi
+
+# Cross-runtime skill-INVOCATION parity (repo#286): distinct from the
+# install-PLACEMENT suite above — asserts that Claude's `/repo:followups`
+# alias mechanism (frontmatter + fixed discovery path) and Codex's skill-body
+# "Command procedures" pointer both resolve to the identical
+# skills/repo/SKILL.md-derived workflow body, not just that install.sh wrote
+# matching bytes. Same delegation shape as every suite above.
+echo
+echo "-- cross-runtime skill-invocation parity (delegated suite) --"
+SP_TEST="$TESTS_DIR/test-skill-parity.sh"
+if [[ ! -f "$SP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-skill-parity.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-skill-parity.sh" "$SP_TEST"
+else
+    SP_OUT="$(bash "$SP_TEST" 2>&1)"
+    SP_STATUS=$?
+    SP_PASS="$(suite_count Passed "$SP_OUT")"
+    SP_FAIL="$(suite_count Failed "$SP_OUT")"
+    if ! [[ "$SP_PASS" =~ ^[0-9]+$ && "$SP_FAIL" =~ ^[0-9]+$ ]]; then
+        SP_PASS=0
+        SP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-skill-parity.sh" "$SP_STATUS"
+        strip_ansi "$SP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$SP_STATUS" -ne 0 || "$SP_FAIL" -ne 0 ]]; then
+        [[ "$SP_FAIL" -eq 0 ]] && SP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-skill-parity.sh" "$SP_PASS" "$SP_FAIL" "$SP_STATUS"
+        strip_ansi "$SP_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-skill-parity.sh" "$SP_PASS"
+    fi
+    PASS=$((PASS + SP_PASS))
+    FAIL=$((FAIL + SP_FAIL))
+    record_suite "test-skill-parity.sh" "$SP_PASS" "$SP_FAIL" "Claude/Codex invocation parity"
 fi
 
 # install.sh --shell-wrapper / uninstall.sh's shell `claude` wrapper (repo#35).
