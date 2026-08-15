@@ -1723,6 +1723,46 @@ parse_force_ops() {
 # --force origin main…"` / `git commit -m "…"` hard-denied even though nothing
 # executes, and (#3756) the analogous ask-tier false ask where an ask-phrase like
 # `gh issue close` quoted inside a `--comment`/`--body` value prompted for
+# -----------------------------------------------------------------------------
+# mask_flag_cat_heredocs() (#317): a PRE-PASS that runs before the `$(`-floor
+# below. That floor (a quoted flag value is redacted ONLY when it carries no
+# `$(`/backtick anywhere) is a hard safety requirement — the #72 regression
+# (`gh issue comment 1 --body "text $(rm -rf /) more"`) proves a smuggled
+# substitution inside a --body value really does execute and must keep
+# denying. But the floor also caught this repo's OWN recommended multi-line
+# `--body`/`-m` idiom, `--body "$(cat <<'EOF' … EOF)"` — provably INERT
+# because a single-quoted (or backslash-escaped) heredoc delimiter disables
+# ALL expansion inside the body, so `cat` only ever echoes the literal text;
+# the false positive that blocked filing #317 itself.
+#
+# mask_flag_cat_heredocs() recognizes exactly that one shape and blanks ONLY
+# the heredoc BODY (never the opener/delimiter/closing-paren syntax) before
+# the flag-value regex below ever runs, so by the time the `$(`-floor reads
+# the span, the only text left is `$(cat <<'DELIM'`, the delimiter line, and
+# `)` — none of which can carry a dangerous phrase. Every other `$(` shape
+# (bare/unquoted delimiter, no heredoc at all, a body that itself carries a
+# nested `$(`/backtick) is left completely untouched by this pre-pass, so the
+# existing floor still applies to it unchanged.
+#
+# Recognized shape, ALL FOUR conditions required:
+#   (1) the opener line ends with `<flag> <openquote>$(cat <<[-]<delimquote>DELIM<delimquote>`
+#       (flag drawn from the same text-carrying allowlist as `re` below);
+#   (2) the delimiter is QUOTED (`'DELIM'` or `"DELIM"`) — an UNQUOTED/bare
+#       delimiter is expansion-capable, so the shell WOULD expand a `$(...)`
+#       inside such a body, and this shape is deliberately NOT recognized;
+#   (3) a later line (optionally TAB-stripped for the `<<-` form) equals the
+#       delimiter exactly, closing the heredoc inside this same buffer;
+#   (4) the line immediately after the delimiter is `)` followed by the SAME
+#       opening quote character, so nothing chained after the heredoc inside
+#       `$( … )` is masked away.
+# Safety floor within the shape itself: if the body carries its OWN `$(` or
+# backtick ANYWHERE, the whole span is left unmasked — even though shell
+# semantics say a quoted-delimiter body is never expanded, this deliberately
+# does NOT trust that: it mirrors the exact "any `$(`/backtick anywhere
+# disables redaction" floor used everywhere else in this file, so a nested
+# substitution inside the body still reaches the raw catastrophic scan and
+# still denies (see the "#317 safety" regression tests).
+# -----------------------------------------------------------------------------
 # confirmation despite no such command actually being run.
 #
 # Safety floor preserved two ways:
@@ -1803,6 +1843,67 @@ dequote_inert_spans() {
 
 strip_literal_text() {
     printf '%s' "$1" | awk '
+    # Mask the body of a `<flag> "$(cat <<QUOTED_DELIM … DELIM\n)"` heredoc
+    # (#317). See the header comment above for the four conditions and why
+    # each is load-bearing, and for the nested-`$(`/backtick safety floor.
+    # Body bytes are replaced 1:1 with "X" so the buffer keeps its byte
+    # offsets and line count; the opener line, the delimiter line and
+    # everything outside the body are left untouched.
+    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform, unsafe) {
+        if (index(s, "<<") == 0) return s
+        nl = split(s, lines, "\n")
+        for (i = 1; i <= nl; i++) {
+            line = lines[i]
+            # (2) opener must END the line and carry a QUOTED delimiter.
+            if (match(line, /<<-?["'"'"'][A-Za-z0-9_]+["'"'"'][ \t]*$/) == 0) continue
+            dashform = (substr(line, RSTART + 2, 1) == "-")
+            delim = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?/, "", delim)
+            sub(/[ \t]*$/, "", delim)
+            dq = substr(delim, 1, 1)
+            if (substr(delim, length(delim), 1) != dq) continue   # quotes must match
+            delim = substr(delim, 2, length(delim) - 2)
+            if (delim == "") continue
+            # (1) …immediately preceded by <flag> <openquote>$(cat.
+            pre = substr(line, 1, RSTART - 1)
+            if (pre !~ /(^|[ \t])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*["'"'"']\$\([ \t]*cat[ \t]+$/) continue
+            oq = ""
+            for (j = length(pre); j >= 1; j--) {
+                if (substr(pre, j, 2) == "$(") { oq = substr(pre, j - 1, 1); break }
+            }
+            if (oq != DQ && oq != SQ) continue
+            # (3) the block must be CLOSED inside this buffer.
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                if (dashform) sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            # (4) the substitution must close IMMEDIATELY after the delimiter
+            #     line — `)` + the same opening quote — so nothing chained
+            #     after the heredoc inside `$( … )` is masked away.
+            if (closeat == nl) continue
+            if (substr(lines[closeat + 1], 1, 2) != ")" oq) continue
+            # Safety floor: a body carrying its OWN `$(`/backtick anywhere is
+            # NOT masked, so a nested substitution still reaches the raw scan
+            # and still denies (never widen past the provably-inert shape).
+            unsafe = 0
+            for (j = i + 1; j < closeat; j++) {
+                if (index(lines[j], "$(") > 0 || index(lines[j], "`") > 0) { unsafe = 1; break }
+            }
+            if (unsafe) continue
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
+                gsub(/./, "X", body)
+                lines[j] = body
+            }
+            i = closeat
+        }
+        s = lines[1]
+        for (i = 2; i <= nl; i++) s = s "\n" lines[i]
+        return s
+    }
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
@@ -1826,7 +1927,16 @@ strip_literal_text() {
     # byte-for-byte identical to the previous behaviour.
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
-        s = buf
+        # PRE-PASS (#317): blank the body of a `<flag> "$(cat <<QDELIMQ … )"`
+        # heredoc before the quoted-span redaction below runs. It has to
+        # happen here rather than inside the loop because `re`'"'"'s quoted-span
+        # classes ([^"]* / [^'"'"']*) stop at the first quote character, and a
+        # heredoc body is free to contain raw quotes (prose routinely does) —
+        # so the span match alone cannot see such a value whole. Masking
+        # first also means the `$(`-floor below needs no exception: by the
+        # time the loop reads this span, the only text left inside it is
+        # `$(cat <<QDELIMQ`, the delimiter, and `)`.
+        s = mask_flag_cat_heredocs(buf)
         out = ""
         while (match(s, re)) {
             pre     = substr(s, 1, RSTART - 1)

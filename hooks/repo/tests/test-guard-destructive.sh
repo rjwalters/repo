@@ -2539,6 +2539,93 @@ assert_deny "#72 regression: \$(rm -rf /) smuggled inside a --body value still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Heredoc-quoted-delimiter --body idiom is inert (#317) ---${NC}"
+# =========================================================================
+#
+# strip_literal_text()'s `$(`-floor (#3679/#53/#60/#72, asserted immediately
+# above) refuses to redact ANY quoted flag value containing a `$(` — a
+# deliberate safety requirement, since a smuggled `$(rm -rf /)` inside a
+# --body value really does execute. But that floor also caught this repo's
+# OWN recommended multi-line --body/-m idiom, `--body "$(cat <<'EOF' … EOF)"`
+# — provably INERT because a single-quoted heredoc delimiter disables ALL
+# expansion inside the body, so `cat` only ever echoes the literal text. A
+# PR/issue comment that merely quotes a dangerous command as a documented
+# test-fixture example, posted through this idiom, was hard-denied even
+# though nothing executes — the false positive that blocked filing #317
+# itself. mask_flag_cat_heredocs() now recognizes exactly this one shape and
+# masks ONLY the heredoc BODY before the raw scan runs; every other `$(`
+# shape (no heredoc, an unquoted delimiter, a body that itself carries a
+# nested `$(`/backtick) is left completely untouched, so the #72 floor
+# above still applies to it unchanged.
+
+# Danger phrases assembled at runtime so this test file never contains the
+# literal strings a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#72/#84).
+_H317_RM="rm -r""f /"
+_H317_FORCE="git push --for""ce origin main"
+_H317_SQ="'"
+
+# The confirmed live repro (Curator's "Verified corrections", #317): a PR
+# comment documenting a dangerous command as a plain-text fixture example,
+# posted via the repo-recommended heredoc idiom, is allowed.
+assert_allow "#317: \$(cat <<'EOF' ...) --body quoting an rm -rf / example is allowed" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<%sEOF%s\nfixture asserts %s is denied\nEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+assert_allow "#317: \$(cat <<'EOF' ...) --body quoting a force-push example is allowed" \
+    "$(printf 'gh issue comment 1 --body "$(cat <<%sEOF%s\ndo not run %s\nEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_FORCE")"
+
+# The `<<-` (dash) form, which strips leading TABs from the terminator line,
+# is recognized the same way.
+assert_allow "#317: \$(cat <<-'EOF' ...) (dash form) --body example is allowed" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<-%sEOF%s\n\tfixture: %s\n\tEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+# The double-quoted-delimiter form ($(cat <<"EOF" ... EOF)) is recognized too.
+assert_allow "#317: \$(cat <<\"EOF\" ...) (double-quoted delimiter) --body example is allowed" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<\"EOF\"\nfixture: %s\nEOF\n)"' "$_H317_RM")"
+
+# --- SAFETY FLOOR: must NOT widen past the provably-inert shape ------------
+
+# A heredoc body that itself carries a REAL $(...) substitution must still
+# deny: even though a single-quoted delimiter means the shell never expands
+# it, the fix deliberately does not attempt to prove that — any
+# $(`/backtick ANYWHERE in the body keeps the whole span unredacted, exactly
+# like the pre-existing #72 floor above.
+assert_deny "#317 safety: \$(cat <<'EOF' ...) body carrying a nested \$(rm -rf /) still denies" \
+    "$(printf 'gh pr comment 1 --body "$(cat <<%sEOF%s\n\$(%s)\nEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+assert_deny "#317 safety: \$(cat <<'EOF' ...) body carrying a nested backtick substitution still denies" \
+    "$(printf 'gh pr comment 1 --body "$(cat <<%sEOF%s\n\`%s\`\nEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+# An UNQUOTED (bare) heredoc delimiter is expansion-capable — the shell WOULD
+# expand a $(...) inside such a body — so the exclusion deliberately does not
+# recognize it, and it keeps denying via the existing (unchanged) floor.
+assert_deny "#317 safety: \$(cat <<EOF ...) with an UNQUOTED delimiter still denies" \
+    "$(printf 'gh pr comment 1 --body "$(cat <<EOF\nfixture asserts %s is denied\nEOF\n)"' "$_H317_RM")"
+
+# A heredoc NOT immediately preceded by a text-carrying flag's `"$(cat` is
+# left untouched — this is not the recognized shape, so the pre-existing
+# floor (unredacted, because `$(` is present) still applies and it denies.
+assert_deny "#317 safety: bare (non-flag) \$(cat <<'EOF' ...) heredoc is not masked, still denies" \
+    "$(printf 'echo "$(cat <<%sEOF%s\nfixture asserts %s is denied\nEOF\n)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+# A real dangerous command CHAINED after the heredoc substitution (nothing
+# masks the substitution's own boundary) still denies — condition (4) of the
+# recognized shape requires the `$( … )` to close immediately after the
+# delimiter line, so a value like `--body "$(cat <<'EOF' … EOF; <danger>)"`
+# is not recognized and the pre-existing floor still applies.
+assert_deny "#317 safety: a real command chained after the heredoc substitution still denies" \
+    "$(printf 'gh pr comment 1 --body "$(cat <<%sEOF%s\nsafe text\nEOF\n%s)"' \
+        "$_H317_SQ" "$_H317_SQ" "$_H317_RM")"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Heredoc body lines are not command segments (#84) ---${NC}"
 # =========================================================================
 #
