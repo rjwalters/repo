@@ -19,20 +19,20 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#286**: Add cross-runtime parity test for the repo-followups workflow (Claude vs Codex)
+_None._
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#312**: Auditor: worktree-write-confinement denied writes that appear outside its protected region
-- **#307**: Extract shared PASS/FAIL/assert test helpers duplicated across 22 repo test files
+- **#320**: Auditor: guard-decision telemetry — force-op:detached ask fires on scratch /tmp clone reset --hard
+- **#317**: Guard false-positive: catastrophic rm pattern matches quoted example text inside gh pr comment bodies
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#315**: fix(guard): persist resolved worktree roots in write-confinement deny telemetry
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -61,11 +61,11 @@ _None._
 |------|-------|
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 3 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
