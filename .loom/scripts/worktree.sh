@@ -66,6 +66,18 @@ else
     loom_record_worktree_removal() { :; }
 fi
 
+# Shared "create a managed worktree" primitives (issue #304): the concurrency
+# lock, the .loom-managed sentinel writer, and the .mcp.json symlink +
+# info/exclude bookkeeping. pr-worktree.sh and docs-worktree.sh source the
+# same file so all three "managed worktree" creators share ONE implementation
+# instead of three independently-drifting copies. Sourced unconditionally,
+# same as lib/worktree-root.sh and lib/default-branch.sh above — this file
+# ships alongside worktree.sh in the same install/upgrade, so (unlike the
+# purely-diagnostic worktree-removal-log.sh) there is no safe degraded mode
+# to fall back to.
+# shellcheck source=lib/managed-worktree.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/managed-worktree.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -111,146 +123,49 @@ print_warning() {
 # $BRANCH_NAME at call time. Do NOT call this for directories that are not
 # registered git worktrees (the orphan-debris case) — those must be left
 # sentinel-less so cleanup tooling keeps refusing them.
+#
+# Thin wrapper over the shared loom_wt_write_sentinel() (lib/managed-worktree.sh,
+# issue #304) — kept as a distinct named function because
+# test-worktree-sentinel-reinvoke.sh statically greps for `write_loom_sentinel`
+# call sites to verify every re-invocation path writes the sentinel.
 write_loom_sentinel() {
     local wt="$1"
-    cat > "$wt/.loom-managed" <<EOF
-# Loom-managed worktree marker
-# Created by .loom/scripts/worktree.sh
-# Issue: $ISSUE_NUMBER
-# Branch: $BRANCH_NAME
-# Removing this file makes Loom treat the worktree as user-owned and refuse
-# to clean it up automatically.
-EOF
+    loom_wt_write_sentinel "$wt" "worktree.sh" \
+        "# Issue: $ISSUE_NUMBER
+# Branch: $BRANCH_NAME"
 }
 
 # --------------------------------------------------------------------------
 # Concurrency lock (issue #3380)
 # --------------------------------------------------------------------------
 #
-# `git worktree add` is not safe to run concurrently against the same repo —
-# parallel invocations contend on the per-worktree administrative dir
-# (`.git/worktrees/issue-N/`) and on git's repo-global locks. The observed
-# failure mode in busy shepherd sessions is multi-minute hangs (10-20 min)
-# while a peer process holds an `index.lock` it will never release.
+# The lock primitives (repo-global `mkdir`-based lock around `git worktree
+# add`) now live in lib/managed-worktree.sh (issue #304), shared with
+# pr-worktree.sh and docs-worktree.sh. The wrappers below preserve
+# worktree.sh's own call-site names/signatures (issue-number-first argument,
+# JSON_OUTPUT-aware warning suppression) so the rest of this script — and the
+# tests that grep for `_worktree_lock_path` / `acquire_worktree_lock` /
+# `release_worktree_lock` in error/recovery output — need no changes.
 #
-# We use a POSIX-atomic `mkdir`-based lock primitive — `flock` is not
-# available on stock macOS, so `mkdir` is the only portable atomic
-# file-system operation we can rely on.
-#
-# Lock scope is **repo-global** (`.loom/locks/worktree-add/`). The original
-# per-issue design was tried first but failed under concurrent invocations
-# with different issue numbers: `git worktree add` mutates the repo-global
-# `.git/config.lock` (writing the new branch's upstream configuration), and
-# concurrent processes race with the diagnostic:
-#
-#   error: could not lock config file .git/config: File exists
-#   error: unable to write upstream branch configuration
-#
-# A repo-global lock serializes the entire `git worktree add` call so this
-# race cannot happen. The cost — two builders on different issues no longer
-# parallelize through the helper — is acceptable because (a) `git worktree
-# add` itself is short relative to the rest of an issue's lifecycle, and
-# (b) parallel hangs that hold an `index.lock` for 10-20 minutes are the
-# very problem this PR fixes.
-#
-# The lock path uses the same name (`worktree-<id>/`) the per-issue version
-# used so its layout matches `.loom/locks/issue-<N>/`. The "id"
-# here is the constant string "add"; per-issue accounting still lives in the
-# `owner.json` body for debugging visibility.
-#
-# Tunables (env vars, documented in show_help):
-#   LOOM_WORKTREE_LOCK_TIMEOUT       — seconds to wait (default 600 = 10min,
-#                                      sized to cover worst-case cold-clone
-#                                      submodule init on heavy repos)
-#   LOOM_WORKTREE_LOCK_POLL_INTERVAL — seconds between poll attempts (default 2)
-
-LOOM_WORKTREE_LOCK_TIMEOUT="${LOOM_WORKTREE_LOCK_TIMEOUT:-600}"
-LOOM_WORKTREE_LOCK_POLL_INTERVAL="${LOOM_WORKTREE_LOCK_POLL_INTERVAL:-2}"
-
-# Resolve the locks directory to the canonical git common dir so worktrees
-# and the main workspace all share the same lock namespace. Falls back to the
-# current dir for the rare case where we're not yet inside a repo (tests).
-_worktree_locks_dir() {
-    local common
-    common=$(git rev-parse --git-common-dir 2>/dev/null || true)
-    if [[ -n "$common" ]]; then
-        # git-common-dir may be returned as a relative path; resolve it.
-        local abs_common
-        abs_common=$(cd "$common" 2>/dev/null && pwd) || abs_common="$common"
-        echo "$(dirname "$abs_common")/.loom/locks"
-    else
-        echo ".loom/locks"
-    fi
-}
+# Tunables (env vars, documented in show_help): LOOM_WORKTREE_LOCK_TIMEOUT
+# (default 600s) / LOOM_WORKTREE_LOCK_POLL_INTERVAL (default 2s) — both
+# defined in lib/managed-worktree.sh.
 
 _worktree_lock_path() {
-    # The argument is the issue number — accepted for owner-metadata logging
-    # only. The lock itself is repo-global; see the design note above.
-    echo "$(_worktree_locks_dir)/worktree-add"
+    # The argument is the issue number — accepted for signature compatibility
+    # only. The lock itself is repo-global; see lib/managed-worktree.sh.
+    loom_wt_lock_path
 }
-
-# Returns 0 if lock acquired, non-zero otherwise. Sets WORKTREE_LOCK_HOLDER_PID
-# on timeout failure so the caller can include it in error output.
-WORKTREE_LOCK_HOLDER_PID=""
 
 acquire_worktree_lock() {
     local issue="$1"
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    local locks_dir
-    locks_dir="$(_worktree_locks_dir)"
-
-    mkdir -p "$locks_dir" 2>/dev/null || true
-
-    local deadline=$(( $(date +%s) + LOOM_WORKTREE_LOCK_TIMEOUT ))
-    local stale_retry_done=0
-
-    while true; do
-        if mkdir "$lock" 2>/dev/null; then
-            # Lock acquired; record owner metadata for debugging.
-            cat > "$lock/owner.json" <<EOF
-{
-  "issue": $issue,
-  "owner_pid": $$,
-  "script": "worktree.sh",
-  "acquired_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-            return 0
-        fi
-
-        # Lock exists. Check whether the owner is still alive; if not, clear
-        # it once and retry (stale-lock recovery).
-        local owner_pid=""
-        if [[ -f "$lock/owner.json" ]]; then
-            owner_pid=$(awk -F'[ ,]+' '/owner_pid/ {gsub(/[^0-9]/,"",$3); print $3; exit}' "$lock/owner.json" 2>/dev/null)
-        fi
-
-        if [[ -n "$owner_pid" ]] && [[ "$stale_retry_done" -eq 0 ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree lock from dead PID $owner_pid — cleaning up"
-            fi
-            rm -rf "$lock" 2>/dev/null || true
-            stale_retry_done=1
-            continue
-        fi
-
-        if [[ $(date +%s) -ge $deadline ]]; then
-            WORKTREE_LOCK_HOLDER_PID="$owner_pid"
-            return 1
-        fi
-
-        sleep "$LOOM_WORKTREE_LOCK_POLL_INTERVAL"
-    done
+    loom_wt_acquire_lock "$issue" "worktree.sh" "$JSON_OUTPUT"
 }
 
 release_worktree_lock() {
     local issue="$1"
     [[ -z "$issue" ]] && return 0
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    [[ -d "$lock" ]] || return 0
-    rm -rf "$lock" 2>/dev/null || true
+    loom_wt_release_lock
 }
 
 # cleanup_partial_worktree_state <issue>
@@ -2485,40 +2400,16 @@ if _try_worktree_add; then
         cd - > /dev/null
     fi
 
-    # Resolve the info/exclude path that applies to this worktree. Running
-    # `git rev-parse --git-path info/exclude` from inside the worktree returns
-    # the correct file for whatever git layout is in play (info/exclude is a
-    # common-dir path, so worktrees inherit the main repo's .git/info/exclude;
-    # asking git rather than hardcoding a path keeps us correct across layouts).
-    # Entries appended here keep `git add -A` from staging the created symlinks
-    # even when the repo's .gitignore rules don't match a symlink (the classic
-    # `node_modules/` dir-rule-vs-symlink hazard from #3528).
-    #
-    # Resolved (and the helper below defined) BEFORE the root node_modules
-    # symlink section so that section can call it too (#5474) — it used to be
-    # defined only after that section, so the root node_modules symlink (and
-    # the .mcp.json symlink further below) never got an exclude entry unless
-    # the consumer repo's .gitignore happened to use the slashless
-    # `node_modules` form (a `node_modules/` trailing-slash rule only matches
-    # directories, not the symlink `worktree.sh` creates here).
-    WORKTREE_INFO_EXCLUDE=$(cd "$ABS_WORKTREE_PATH" 2>/dev/null \
-        && git rev-parse --git-path info/exclude 2>/dev/null)
-    if [[ -n "$WORKTREE_INFO_EXCLUDE" && "$WORKTREE_INFO_EXCLUDE" != /* ]]; then
-        # git rev-parse may return a path relative to the worktree cwd; anchor it.
-        WORKTREE_INFO_EXCLUDE="$ABS_WORKTREE_PATH/$WORKTREE_INFO_EXCLUDE"
-    fi
-
-    # Idempotently append a path to the worktree's info/exclude. Safe to call
-    # repeatedly (grep -qxF guards against duplicate lines) and best-effort
-    # (a missing exclude file just means git tracked the ignore elsewhere).
+    # Idempotently append a path to the worktree's info/exclude. Entries
+    # appended here keep `git add -A` from staging the created symlinks even
+    # when the repo's .gitignore rules don't match a symlink (the classic
+    # `node_modules/` dir-rule-vs-symlink hazard from #3528/#5474). Delegates
+    # to the shared loom_wt_append_exclude() (lib/managed-worktree.sh, #304),
+    # which resolves `git rev-parse --git-path info/exclude` itself on every
+    # call — kept as a local one-arg wrapper (rather than rewriting every call
+    # site below to pass $ABS_WORKTREE_PATH) purely for call-site brevity.
     _append_worktree_exclude() {
-        local entry="$1"
-        if [[ -z "$WORKTREE_INFO_EXCLUDE" ]]; then
-            return 0
-        fi
-        mkdir -p "$(dirname "$WORKTREE_INFO_EXCLUDE")" 2>/dev/null || true
-        grep -qxF "$entry" "$WORKTREE_INFO_EXCLUDE" 2>/dev/null \
-            || echo "$entry" >> "$WORKTREE_INFO_EXCLUDE" 2>/dev/null || true
+        loom_wt_append_exclude "$ABS_WORKTREE_PATH" "$1"
     }
 
     # Symlink node_modules from main workspace if available
@@ -2617,9 +2508,12 @@ if _try_worktree_add; then
         done < <(echo "$LOOM_WORKTREE_LINKPATHS_CFG" | jq -r '.worktree.linkPaths[]? // empty' 2>/dev/null)
     fi
 
-    # Symlink .mcp.json from main workspace if available
-    # .mcp.json is gitignored so it's invisible from worktree git roots,
-    # which prevents Claude Code from discovering MCP server config
+    # Symlink .mcp.json from main workspace if available. .mcp.json is
+    # gitignored so it's invisible from worktree git roots, which prevents
+    # Claude Code from discovering MCP server config. Delegates to the shared
+    # loom_wt_symlink_mcp_json() (lib/managed-worktree.sh, #304), also used by
+    # pr-worktree.sh and docs-worktree.sh, so all three worktree creators
+    # symlink + exclude-bookkeep it identically.
     MAIN_MCP_JSON="$MAIN_WORKSPACE_DIR/.mcp.json"
     WORKTREE_MCP_JSON="$ABS_WORKTREE_PATH/.mcp.json"
 
@@ -2628,8 +2522,7 @@ if _try_worktree_add; then
             print_info "Symlinking .mcp.json from main workspace..."
         fi
 
-        if ln -s "$MAIN_MCP_JSON" "$WORKTREE_MCP_JSON" 2>/dev/null; then
-            _append_worktree_exclude ".mcp.json"
+        if loom_wt_symlink_mcp_json "$MAIN_WORKSPACE_DIR" "$ABS_WORKTREE_PATH"; then
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_success ".mcp.json symlinked"
             fi

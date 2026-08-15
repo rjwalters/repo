@@ -50,12 +50,32 @@ if [[ -x "$PR_WORKTREE_SH" ]]; then
 else
     fail "pr-worktree.sh missing or not executable at $PR_WORKTREE_SH"
 fi
-assert_grep "Loom-managed worktree marker" "$PR_WORKTREE_SH" \
-    "pr-worktree.sh writes the sentinel marker"
+# Issue #304 moved the sentinel-write body out of pr-worktree.sh's own source
+# and into the shared lib/managed-worktree.sh (loom_wt_write_sentinel()), so a
+# plain grep of pr-worktree.sh for "Loom-managed worktree marker" no longer
+# proves anything -- assert the delegation instead, then exercise the real
+# shared function to prove it still emits that text.
+assert_grep "loom_wt_write_sentinel" "$PR_WORKTREE_SH" \
+    "pr-worktree.sh delegates to the shared loom_wt_write_sentinel() (lib/managed-worktree.sh, #304)"
+assert_grep "lib/managed-worktree\.sh" "$PR_WORKTREE_SH" \
+    "pr-worktree.sh sources the shared managed-worktree lib"
 assert_grep "# PR: " "$PR_WORKTREE_SH" \
     "pr-worktree.sh records PR number in sentinel (mirrors worktree.sh issue convention)"
 assert_grep "worktrees/pr-" "$PR_WORKTREE_SH" \
     "pr-worktree.sh uses .loom/worktrees/pr-<N>/ convention"
+
+MANAGED_WT_LIB="$SCRIPTS_DIR/lib/managed-worktree.sh"
+if [[ -f "$MANAGED_WT_LIB" ]]; then
+    SENTINEL_TMP=$(mktemp -d /tmp/loom-pr-sentinel-check.XXXXXX)
+    # shellcheck source=/dev/null
+    source "$MANAGED_WT_LIB"
+    loom_wt_write_sentinel "$SENTINEL_TMP" "pr-worktree.sh" "# PR: 999"
+    assert_grep "Loom-managed worktree marker" "$SENTINEL_TMP/.loom-managed" \
+        "the shared sentinel writer pr-worktree.sh delegates to emits the marker text"
+    rm -rf "$SENTINEL_TMP"
+else
+    fail "lib/managed-worktree.sh missing — pr-worktree.sh's sentinel helper cannot be verified"
+fi
 
 # --- Test 2: merge-pr.sh uses strict regex and recognizes pr-<N> path ---
 echo ""

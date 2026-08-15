@@ -142,21 +142,25 @@ if ! DEFAULT_BRANCH="$(cd "$REPO_ROOT" && loom_default_branch)"; then
     exit 1
 fi
 
+# Shared "create a managed worktree" primitives (#304): the repo-global
+# concurrency lock around `git worktree add` (previously present ONLY in
+# worktree.sh, see #3380), the .loom-managed sentinel writer, and the
+# .mcp.json symlink + info/exclude bookkeeping.
+# shellcheck source=lib/managed-worktree.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/managed-worktree.sh"
+
 WORKTREE_PATH="$WORKTREE_ROOT_DIR/docs-guide"
 
 # Write the sentinel that authorizes writes inside this worktree (and cleanup of
 # it). Written on every path, before any content mutation, so a tick that dies
-# midway still leaves a worktree the guards recognize.
+# midway still leaves a worktree the guards recognize. Thin wrapper over the
+# shared loom_wt_write_sentinel() (lib/managed-worktree.sh, #304).
 write_sentinel() {
-    cat > "$WORKTREE_PATH/.loom-managed" <<EOF
-# Loom-managed worktree marker
-# Created by .loom/scripts/docs-worktree.sh
-# Purpose: Guide role Document Maintenance phase (WORK_LOG / WORK_PLAN / README)
-# Branch: $BRANCH_NAME
-# Removing this file makes Loom treat the worktree as user-owned and refuse
-# to clean it up automatically -- and makes the worktree-isolation guards deny
-# writes inside it, which breaks the Document Maintenance phase.
-EOF
+    loom_wt_write_sentinel "$WORKTREE_PATH" "docs-worktree.sh" \
+        "# Purpose: Guide role Document Maintenance phase (WORK_LOG / WORK_PLAN / README)
+# Branch: $BRANCH_NAME" \
+        "# -- and makes the worktree-isolation guards deny writes inside it, which
+# breaks the Document Maintenance phase."
 }
 
 mkdir -p "$WORKTREE_ROOT_DIR"
@@ -189,12 +193,29 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     fi
 else
     print_info "Creating docs worktree at $WORKTREE_PATH"
+    # Serialize `git worktree add` against every other Loom worktree creator
+    # in this repo (worktree.sh's issue-<N> worktrees, pr-worktree.sh's
+    # pr-<N> worktrees) via the shared repo-global lock
+    # (lib/managed-worktree.sh, #304/#3380). Without this, a Guide docs tick
+    # landing alongside a Doctor/Judge PR checkout can race on git's
+    # repo-global `.git/config.lock` and hang for 10-20 minutes holding an
+    # `index.lock` a peer process never releases.
+    if ! loom_wt_acquire_lock "docs-guide" "docs-worktree.sh"; then
+        print_error "Timed out waiting for the worktree-creation lock (holder PID: ${WORKTREE_LOCK_HOLDER_PID:-unknown})"
+        print_info "Lock dir: $(loom_wt_lock_path)"
+        exit 1
+    fi
+    trap 'loom_wt_release_lock' EXIT INT TERM
+
     # --detach first (never fails on a pre-existing branch ref); the branch is
     # created by the checkout -B below.
     if ! git -C "$REPO_ROOT" worktree add --detach "$WORKTREE_PATH" "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
         print_error "Failed to create worktree at $WORKTREE_PATH"
         exit 1
     fi
+
+    loom_wt_release_lock
+    trap - EXIT INT TERM
     write_sentinel
 fi
 
@@ -205,11 +226,9 @@ if ! git -C "$WORKTREE_PATH" checkout -B "$BRANCH_NAME" "origin/$DEFAULT_BRANCH"
     exit 1
 fi
 
-# Symlink .mcp.json so MCP servers work in the docs worktree (same pattern as
-# worktree.sh / pr-worktree.sh).
-if [[ -f "$REPO_ROOT/.mcp.json" && ! -e "$WORKTREE_PATH/.mcp.json" ]]; then
-    ln -s "$REPO_ROOT/.mcp.json" "$WORKTREE_PATH/.mcp.json" 2>/dev/null || true
-fi
+# Symlink .mcp.json so MCP servers work in the docs worktree, with the same
+# info/exclude bookkeeping worktree.sh does (so `git add -A` never stages it).
+loom_wt_symlink_mcp_json "$REPO_ROOT" "$WORKTREE_PATH" || true
 
 # Prune local docs branches from earlier ticks that already merged. `-d`
 # (not `-D`) refuses anything unmerged, so an in-flight docs PR is never
