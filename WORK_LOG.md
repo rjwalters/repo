@@ -4,6 +4,10 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #326** (closed): Consolidate 5 near-identical toggle-resolution functions in guard-destructive.sh
+- **PR #328**: refactor(guard): consolidate toggle-resolution into shared helpers
+- **Issue #320** (closed): Auditor: guard-decision telemetry — force-op:detached ask fires on scratch /tmp clone reset --hard
+- **PR #323**: fix(guard): skip force-op:detached ask for out-of-tree scratch clones
 - **Issue #317** (closed): Guard false-positive: catastrophic rm pattern matches quoted example text inside gh pr comment bodies
 - **PR #322**: fix(guard): recognize quoted-delimiter heredoc $(cat <<'EOF) bodies as inert text
 - **Issue #307** (closed): Extract shared PASS/FAIL/assert test helpers duplicated across 22 repo test files
