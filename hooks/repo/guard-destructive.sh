@@ -4861,9 +4861,51 @@ extract_write_targets() {
                 }
             }
 
+            # STDOUT-REDIRECTION EXCLUSION (#340) -- exactly the same
+            # rationale and shape as the STDIN-REDIRECTION EXCLUSION directly
+            # above, mirrored for `>`/`>>` instead of `<`. A trailing
+            # redirect on a `tee`/`sed -i`/`cp`/`mv` segment (the
+            # `curl ... | sudo tee /usr/share/keyrings/foo.gpg >/dev/null`
+            # apt-keyring idiom repo#29 fixed to allow) is an OPERATOR, not a
+            # tee/sed/cp/mv operand -- but the loops below previously had no
+            # exclusion for it, so the bare `>`/`>>` token (or its consumed
+            # next token, for the bare-operator form) was scanned as a
+            # literal tee/sed/cp/mv argument and cwd-joined into a phantom
+            # target (`<repo>/>/dev/null`), triggering a false
+            # worktree-confinement DENY even though `/dev/null` (or any
+            # other absolute, out-of-repo redirect target) is not a write
+            # into the repo at all. The REAL `>`/`>>` scan below (the
+            # existing "`>`/`>>`  redirection" block) still runs over every
+            # token unfiltered and correctly resolves the redirect target on
+            # its own -- this exclusion only stops the tee/sed/cp/mv loops
+            # from ALSO misreading the same bytes as one of their own idiom
+            # operands.
+            #
+            # Token-boundary test, matching the REAL `>`/`>>` scan below
+            # exactly (mtoks[], not toks[], so a `>` that is only quoted DATA
+            # can never match as an operator here either):
+            #   `>` / `>>` / `2>` (bare, optionally fd-prefixed) consumes the
+            #               NEXT non-empty, non-`&...` token (dup-to-fd `>&1`
+            #               targets no file and is left unmarked).
+            #   `>file` / `2>>file` (attached, optionally fd-prefixed)
+            #               consumes only itself.
+            delete stdout_redir
+            for (j = 1; j <= m; j++) {
+                mt = mtoks[j]
+                if (mt == "") continue
+                if (mt ~ /^[0-9]*>>?$/) {
+                    stdout_redir[j] = 1
+                    if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
+                        stdout_redir[j+1] = 1
+                    }
+                } else if (mt ~ /^[0-9]*>>?[^ \t&]/) {
+                    stdout_redir[j] = 1
+                }
+            }
+
             if (toks[1] == "tee") {
                 for (j = 2; j <= m; j++) {
-                    if (j in stdin_redir) continue
+                    if (j in stdin_redir || j in stdout_redir) continue
                     if (toks[j] == "" || toks[j] ~ /^-/) continue
                     print curcwd SEP resolve_var(toks[j])
                 }
@@ -4872,7 +4914,7 @@ extract_write_targets() {
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
-                    if (j in stdin_redir) continue
+                    if (j in stdin_redir || j in stdout_redir) continue
                     if (toks[j] ~ /^-i/) has_i = 1
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
@@ -4886,7 +4928,7 @@ extract_write_targets() {
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
-                    if (j in stdin_redir) continue
+                    if (j in stdin_redir || j in stdout_redir) continue
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
                     nf++

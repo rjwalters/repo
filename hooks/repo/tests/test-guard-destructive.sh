@@ -3738,6 +3738,43 @@ assert_allow "write-confinement: relative write inside the worktree itself allow
 assert_allow "write-confinement: write to unrelated /tmp scratch allows" \
     "echo x > /tmp/wtc-scratch-$$.txt" "$WTC_WT"
 
+# ---- Issue #340: `tee <target> >/dev/null` (and the equivalent spaced
+# ---- `> /dev/null`) must allow exactly like `tee <target>` alone, even
+# ---- though a sibling managed worktree exists elsewhere in the repo (the
+# ---- WTC fixture above). Without this fixture the false-DENY never
+# ---- reproduces — the CI-only "repo#29: curl | sudo tee /usr/share/... is
+# ---- allowed" case earlier in this file runs with no sibling worktree on
+# ---- disk, so the worktree-confinement branch this section exercises never
+# ---- activates there. Root cause: the `tee` target-extraction loop scanned
+# ---- every token after `tee`, including a trailing `>`/`>>` redirect
+# ---- operator token, as if it were a literal tee argument — cwd-joining it
+# ---- into a phantom `<repo>/>/dev/null` write target.
+assert_allow "issue #340: tee /tmp/x.gpg (no trailing redirect) allows" \
+    "tee /tmp/wtc-340-x.gpg" "$WTC_WT"
+assert_allow "issue #340: tee /tmp/x.gpg >/dev/null (attached redirect) allows" \
+    "tee /tmp/wtc-340-x.gpg >/dev/null" "$WTC_WT"
+assert_allow "issue #340: tee /tmp/x.gpg > /dev/null (spaced redirect) allows" \
+    "tee /tmp/wtc-340-x.gpg > /dev/null" "$WTC_WT"
+assert_allow "issue #340: sudo tee /usr/share/keyrings/foo.gpg >/dev/null (piped) allows" \
+    "curl -fsSL https://example.com/foo.gpg | sudo tee /usr/share/keyrings/foo.gpg >/dev/null" "$WTC_WT"
+assert_allow "issue #340: cat f | tee /usr/share/x.gpg >/dev/null allows" \
+    "cat /tmp/wtc-340-in.gpg | tee /usr/share/wtc-340-x.gpg >/dev/null" "$WTC_WT"
+# Same false-DENY, but from the MAIN CHECKOUT's own cwd (the issue's exact
+# repro condition — the phantom relative `>/dev/null` target then joins with
+# curcwd == the main checkout itself, so the confinement check misreads it as
+# "a write resolving into the main checkout while a worktree exists
+# elsewhere" and denies).
+assert_allow "issue #340: tee /tmp/x.gpg >/dev/null run from the main checkout's own cwd allows" \
+    "tee /tmp/wtc-340-x.gpg >/dev/null" "$WTC_MAIN"
+# The confinement protection itself must still hold: a genuine write INTO the
+# main checkout is still denied even with a trailing `>/dev/null` tacked on —
+# the redirect-operator exclusion must not widen into "skip the tee target
+# entirely when a redirect follows it".
+assert_deny_tag "issue #340: tee <main checkout target> >/dev/null still denies" \
+    "tee $WTC_MAIN/evil.sh >/dev/null" "$WTC_WT" "worktree-write-confinement"
+assert_deny_tag "issue #340: cat f | sudo tee <main checkout target> >/dev/null still denies" \
+    "cat /tmp/wtc-340-in.gpg | sudo tee $WTC_MAIN/evil.sh >/dev/null" "$WTC_WT" "worktree-write-confinement"
+
 # ---- Fail-open: no managed worktree exists anywhere for this repo -> allow,
 # ---- exactly the guard-worktree-paths.sh contract this block mirrors. ----
 WTC_NOWT=$(mktemp -d 2>/dev/null)
