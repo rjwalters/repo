@@ -30,8 +30,9 @@
 # commands/repo/tests/test-sudo-rm-guard-contract.sh,
 # commands/repo/tests/test-release-version-citation-check.sh,
 # commands/repo/tests/test-changelog-merged-work-check.sh,
-# commands/repo/tests/test-work-log-docs-pr-self-loop.sh, and
-# commands/repo/tests/test-followups-scrub-step.sh.
+# commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
+# commands/repo/tests/test-followups-scrub-step.sh, and
+# commands/repo/tests/test-all-orphans-stage.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1117,6 +1118,42 @@ else
     PASS=$((PASS + FS_PASS))
     FAIL=$((FAIL + FS_FAIL))
     record_suite "test-followups-scrub-step.sh" "$FS_PASS" "$FS_FAIL" "followups pre-filing scrub step"
+fi
+
+# /repo:all's ownership of Audit-surfaced orphaned files (repo#301): a tracked,
+# unreferenced file surfaced in stage 1 had no stage that acted on it and no
+# deferred line in the final summary, so a correct finding could leave the run
+# silently. Fixtures exercise the documented tracked-ness check against real
+# repositories; the rest is a prose contract, same delegation shape as above.
+echo
+echo "-- /repo:all orphaned-file stage ownership (delegated suite) --"
+OS_TEST="$TESTS_DIR/../../../commands/repo/tests/test-all-orphans-stage.sh"
+if [[ ! -f "$OS_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-all-orphans-stage.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-all-orphans-stage.sh" "$OS_TEST"
+else
+    OS_OUT="$(bash "$OS_TEST" 2>&1)"
+    OS_STATUS=$?
+    OS_PASS="$(suite_count Passed "$OS_OUT")"
+    OS_FAIL="$(suite_count Failed "$OS_OUT")"
+    if ! [[ "$OS_PASS" =~ ^[0-9]+$ && "$OS_FAIL" =~ ^[0-9]+$ ]]; then
+        OS_PASS=0
+        OS_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-all-orphans-stage.sh" "$OS_STATUS"
+        strip_ansi "$OS_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$OS_STATUS" -ne 0 || "$OS_FAIL" -ne 0 ]]; then
+        [[ "$OS_FAIL" -eq 0 ]] && OS_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-all-orphans-stage.sh" "$OS_PASS" "$OS_FAIL" "$OS_STATUS"
+        strip_ansi "$OS_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-all-orphans-stage.sh" "$OS_PASS"
+    fi
+    PASS=$((PASS + OS_PASS))
+    FAIL=$((FAIL + OS_FAIL))
+    record_suite "test-all-orphans-stage.sh" "$OS_PASS" "$OS_FAIL" "/repo:all orphan stage ownership"
 fi
 
 echo

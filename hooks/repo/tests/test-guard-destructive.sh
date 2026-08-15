@@ -3366,6 +3366,181 @@ rm -rf "$(dirname "$WTC_TAG_LOG")"
 assert_deny 'write-confinement: unexpanded $VAR write target fails closed' \
     'echo x > $DEST' "$WTC_WT"
 
+# =========================================================================
+# QUOTED same-command $VAR resolution (rjwalters/repo#293)
+# =========================================================================
+# The #4881 resolver already substitutes a variable assigned a STATIC literal
+# earlier in the same command, but only when the write-target token starts
+# with a bare `$`. qsplit() preserves quote characters verbatim, so the
+# canonical builder spelling -- `WORKTREE_ABS="<wt>"; cp x
+# "$WORKTREE_ABS/rtl/y"` -- arrived quoted, missed the resolver, and hard
+# denied with the `worktree-write-confinement-unresolved-var` tag even though
+# it is a routine worktree-confined write. The unquoted spelling of the very
+# same command has always resolved and allowed; these cases pin the two
+# spellings to the same verdict.
+#
+# The security-critical half is the DENY group: resolution must feed the
+# ORDINARY confinement test, so proving a variable holds a main-checkout
+# literal denies with the plain `worktree-write-confinement` tag rather than
+# allowing. And every shape that cannot be proven static must keep failing
+# closed with the unresolved-var tag.
+
+# Assert a deny AND the exact decision-log tag it was recorded under — the
+# distinction between "resolved, then denied by the normal containment test"
+# (worktree-write-confinement) and "never resolved, fail-closed backstop"
+# (worktree-write-confinement-unresolved-var) is the whole point of these
+# cases, and assert_deny alone cannot see it.
+assert_deny_tag() {
+    local description="$1" cmd="$2" cwd="$3" want_tag="$4"
+    TOTAL=$((TOTAL + 1))
+    local logdir log out decision got_tag
+    logdir=$(mktemp -d 2>/dev/null)
+    log="$logdir/decisions.log"
+    out=$(make_input "$cmd" "$cwd" | \
+        env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$log" "$GUARD" 2>&1) || true
+    decision=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // ""' 2>/dev/null)
+    got_tag=$(tail -1 "$log" 2>/dev/null | jq -r '.pattern' 2>/dev/null)
+    rm -rf "$logdir"
+    if [[ "$decision" == "deny" && "$got_tag" == "$want_tag" ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (cwd: $cwd)"
+        echo -e "       Expected: deny / tag '$want_tag'"
+        echo -e "       Got: '$decision' / tag '$got_tag'"
+    fi
+}
+
+# ---- (a) The motivating example from the issue body, in every spelling. ----
+assert_allow 'write-confinement (#293): $VAR holding a worktree literal, fully-quoted use, allows' \
+    "WORKTREE_ABS=\"$WTC_WT\"
+cp /tmp/generated.v \"\$WORKTREE_ABS/rtl/generated.v\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): same command on ONE line with `;` allows' \
+    "WORKTREE_ABS=\"$WTC_WT\"; cp /tmp/generated.v \"\$WORKTREE_ABS/rtl/generated.v\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): braced "${VAR}/..." spelling allows' \
+    "V=\"$WTC_WT\"; cp /tmp/src.txt \"\${V}/scratch.txt\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): partially-quoted "$VAR"/rest spelling allows' \
+    "V=\"$WTC_WT\"; cp /tmp/src.txt \"\$V\"/scratch.txt" "$WTC_WT"
+assert_allow 'write-confinement (#293): unquoted assignment + quoted use allows' \
+    "V=$WTC_WT; cp /tmp/src.txt \"\$V/scratch.txt\"" "$WTC_WT"
+# Every write idiom routes through the same resolve_var() call, so each one
+# gets the quote-aware treatment.
+assert_allow 'write-confinement (#293): quoted "$VAR" redirect target allows' \
+    "V=\"$WTC_WT\"; echo x > \"\$V/scratch.txt\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): quoted "$VAR" tee target allows' \
+    "V=\"$WTC_WT\"; echo x | tee \"\$V/scratch.txt\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): quoted "$VAR" sed -i target allows' \
+    "V=\"$WTC_WT\"; sed -i s/a/b/ \"\$V/scratch.txt\"" "$WTC_WT"
+assert_allow 'write-confinement (#293): quoted "$VAR" mv target allows' \
+    "V=\"$WTC_WT\"; mv /tmp/src.txt \"\$V/scratch.txt\"" "$WTC_WT"
+
+# ---- (b) Resolution feeds the ORDINARY containment test — a variable proven
+# ---- to hold a main-checkout literal must still DENY, and under the plain
+# ---- tag, not the unresolved-var backstop. ----
+assert_deny_tag 'write-confinement (#293): quoted "$VAR" resolving into the main checkout denies' \
+    "V=\"$WTC_MAIN\"; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement"
+assert_deny_tag 'write-confinement (#293): quoted "$VAR" redirect into the main checkout denies' \
+    "V=\"$WTC_MAIN\"; echo x > \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement"
+assert_deny_tag 'write-confinement (#293): resolved literal with `..` escaping into main denies' \
+    "V=\"$WTC_WT/../../..\"; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement"
+
+# ---- (c) Anything not provably a static literal still fails CLOSED, with the
+# ---- unresolved-var tag unchanged. ----
+assert_deny_tag 'write-confinement (#293): $(pwd)-derived RHS stays unresolvable' \
+    "V=\$(pwd)/x; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement-unresolved-var"
+assert_deny_tag 'write-confinement (#293): RHS referencing another variable stays unresolvable' \
+    "V=\"\$OTHER/x\"; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement-unresolved-var"
+assert_deny_tag 'write-confinement (#293): a variable never assigned in the block stays unresolvable' \
+    "cp /tmp/src.txt \"\$OTHER/evil.sh\"" "$WTC_WT" "worktree-write-confinement-unresolved-var"
+assert_deny_tag 'write-confinement (#293): conflicting reassignment poisons the variable' \
+    "V=\"$WTC_WT\"; V=\"$WTC_MAIN\"; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+assert_deny_tag 'write-confinement (#293): ${VAR:-default} is not a bare reference, stays unresolvable' \
+    "cp /tmp/src.txt \"\${V:-$WTC_MAIN}/evil.sh\"" "$WTC_WT" "worktree-write-confinement-unresolved-var"
+# The issue body's SECOND example. `tmp=$(mktemp -d)` is command
+# substitution, which Acceptance Criterion 3 (and the #4921 header comment's
+# invariants) explicitly require to keep failing closed: no static literal
+# exists to resolve, so the destination is genuinely unknowable. Pinned as a
+# DENY on purpose — resolving it would be the rejected "general shell
+# evaluator" option, not this change.
+assert_deny_tag 'write-confinement (#293): $(mktemp -d)-derived target stays unresolvable' \
+    "cd $WTC_WT
+tmp=\$(mktemp -d); cp rtl/generated.v \"\$tmp/\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+
+# ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
+# ---- where bash would NOT expand the `$`, or where a backtick hides a
+# ---- component the guard cannot see. ----
+# Single-quoted / backslash-escaped `$V` is a file literally NAMED `$V` in the
+# acting worktree — the pre-existing #4382/#4921 carve-out, unchanged.
+assert_allow 'write-confinement (#293): single-quoted $VAR stays a literal filename' \
+    "V=\"$WTC_WT\"; cp /tmp/src.txt '\$V/scratch.txt'" "$WTC_WT"
+assert_allow 'write-confinement (#293): backslash-escaped \$VAR stays a literal filename' \
+    "V=\"$WTC_MAIN\"; cp /tmp/src.txt \"\\\$V/scratch.txt\"" "$WTC_WT"
+assert_deny_tag 'write-confinement (#293): a backtick in the token refuses resolution' \
+    "V=\"$WTC_MAIN\"; cp /tmp/src.txt \"\$V/\`whoami\`/evil.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+
+# ---- (d2) The same bar, enforced on the ASSIGNMENT RHS (repo#293 review).
+# ---- The cases above only put the command substitution in the WRITE-TARGET
+# ---- token, which dequote_expandable() refuses. The RHS is the other half:
+# ---- a value is only resolvable when it is a STATIC LITERAL, and before the
+# ---- review fix "static" was tested on the value's FIRST BYTE only. A
+# ---- backtick embedded mid-RHS was therefore stored as a proven literal and
+# ---- the write ALLOWED — a live worktree-isolation escape, since a bare
+# ---- backtick pair leaves no `$` in the resolved token for the #4921
+# ---- backstop to catch. record_assign() now poisons any RHS carrying a
+# ---- backtick or a `$` anywhere, so every shape below falls back to the
+# ---- fail-closed literal treatment. ----
+assert_deny_tag 'write-confinement (#293): backtick command substitution in the assignment RHS denies' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# The unquoted spelling of the same bypass — reachable before this PR too, and
+# the shape that proves the fix lives in the shared resolver, not in the new
+# quote-aware entry point.
+assert_deny_tag 'write-confinement (#293): backtick in the RHS, unquoted use, denies' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; cp /tmp/src.txt \$V/pwned.sh" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Unquoted RHS spelling — the backtick is not hidden behind an outer quote
+# pair, so this pins the check to the raw value rather than the stripped one.
+assert_deny_tag 'write-confinement (#293): backtick in an unquoted RHS denies' \
+    "V=$WTC_WT/\`echo evil\`/x; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# The `$(...)` spelling used to be caught only incidentally (its literal `$`
+# survived into the resolved token and re-tripped the #4921 backstop). Pinned
+# here so it is caught deliberately, at capture time, alongside the backtick.
+assert_deny_tag 'write-confinement (#293): non-leading $(...) in the assignment RHS denies' \
+    "V=\"$WTC_WT/\$(echo evil)/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Non-leading bare `$OTHER` in the RHS — the same leading-byte blind spot.
+assert_deny_tag 'write-confinement (#293): non-leading $OTHER in the assignment RHS denies' \
+    "V=\"$WTC_WT/\$OTHER/x\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+# Poisoning is STICKY: a later clean assignment to the same name must not
+# launder a value that was already proven non-static.
+assert_deny_tag 'write-confinement (#293): a clean reassignment does not un-poison a non-static RHS' \
+    "V=\"$WTC_WT/\`echo evil\`/x\"; V=\"$WTC_WT\"; cp /tmp/src.txt \"\$V/pwned.sh\"" "$WTC_WT" \
+    "worktree-write-confinement-unresolved-var"
+
+# ---- (e) The fail-closed backstop itself is additive, not removed: BOTH
+# ---- unresolved-var shapes still deny under their own tag. ----
+assert_deny_tag 'write-confinement (#293): root-unknown shape still fails closed (#4921)' \
+    'echo x > $DEST' "$WTC_WT" "worktree-write-confinement-unresolved-var"
+assert_deny_tag 'write-confinement (#293): unknown-directory-component shape still fails closed (#4921)' \
+    'echo x > ./$A/evil.sh' "$WTC_WT" "worktree-write-confinement-unresolved-var"
+
+# ---- (f) The `cd <literal>` + $VAR-free relative write shape, in both
+# ---- quoted and unquoted spellings, resolves through the existing
+# ---- cd-tracking and stays confined. ----
+assert_allow 'write-confinement (#293): cd <worktree literal> + relative write allows' \
+    "cd $WTC_WT && cp /tmp/generated.v rtl/generated.v" "$WTC_MAIN"
+assert_allow 'write-confinement (#293): cd "<worktree literal>" (quoted) + relative write allows' \
+    "cd \"$WTC_WT\" && cp /tmp/generated.v rtl/generated.v" "$WTC_MAIN"
+assert_deny_tag 'write-confinement (#293): cd <main literal> + relative write still denies' \
+    "cd $WTC_MAIN && cp /tmp/generated.v evil.sh" "$WTC_WT" "worktree-write-confinement"
+
 # ---- Allow cases: writes that stay inside the acting worktree, or land
 # ---- somewhere this guard does not protect. ----
 assert_allow "write-confinement: absolute write inside the worktree itself allows" \

@@ -266,6 +266,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
+  echo "  $TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/resync-installed.sh"
   echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
@@ -569,6 +570,15 @@ install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
   "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" "scripts/repo/repo-remote.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/scripts/repo-remote.sh"
+
+# 3d-2. Fork-network sweep script for /repo:scrub --forks. Same colocation +
+# chmod rationale as repo-remote.sh above: SKILL.md, README.md, and
+# commands/repo/scrub.md all document it as installed to
+# .claude/skills/repo/scripts/, so it must actually ship there (repo#298).
+install_file "$SOURCE_ROOT/scripts/repo/repo-scrub-forks.sh" \
+  "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" "scripts/repo/repo-scrub-forks.sh"
+chmod +x "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" 2>/dev/null || true
+success "Installed .claude/skills/repo/scripts/repo-scrub-forks.sh"
 
 # 3e. Consumer-side resync script — requirement C7 of INSTALLER-CONTRACT.md.
 # Same colocation + chmod rationale as the scripts above. This is what lets a

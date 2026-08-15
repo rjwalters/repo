@@ -35,6 +35,15 @@
 #      literal out-of-repo target, both multi-line if-blocks as they really
 #      appear, the write/rm asymmetry at zero managed worktrees, and the
 #      rmScope=off opt-out
+#   7  behaviour (repo#252): the note's "stays installed" claim about a denied
+#      post-install rollback, exercised instead of reasoned — sudo.md's real
+#      rollback block is driven through the real hook AND through a gate that
+#      models Claude Code's handling of the verdict, against a stand-in
+#      drop-in: denied it survives, and (the control that makes that
+#      non-vacuous) the identical block with rmScope=off deletes it. Plus the
+#      two consequences that only show up once it is run — the deny blocks the
+#      whole call, so the block's own `exit 1` never fires, and stranding
+#      requires the `cp` to have landed in an earlier, separate call.
 #
 # REFLOW-PROOFING: every prose assertion runs against a FLATTENED copy of the
 # note — blockquote markers stripped, lines folded to one, whitespace squeezed.
@@ -63,17 +72,32 @@
 # was applied to a scratch copy of commands/ + hooks/, run, then reverted:
 #
 #   doc side   flip the WRAPPED "defaults to `repo`" claim to `off`      1 fail
-#   doc side   delete the whole step 5 guard note blockquote            28 fails
+#   doc side   delete the whole step 5 guard note blockquote            33 fails
 #   doc side   rewrite the uninstall remedy to the `"$DROPIN"` form      1 fail
 #   doc side   add a fifth `rm` to a fence ("all four" claim)            2 fails
 #   doc side   drop the `rm-scope-outside-repo` tag name from the note   1 fail
-#   guard side rm_scope_repo_enabled() forced false (guard narrowed)     9 fails
-#   guard side rename the rm-scope-unresolved-var tag in the guard       7 fails
+#   doc side   soften the rollback bullet back to "the deny blocks only
+#              the `rm` itself" (repo#252)                               1 fail
+#   doc side   upgrade the unreproduced trigger to "a known hazard",
+#              i.e. drop the reasoned-vs-observed marker (repo#252)      1 fail
+#   guard side rm_scope_repo_enabled() forced false (guard narrowed)    16 fails
+#   guard side rename the rm-scope-unresolved-var tag in the guard       9 fails
 #   control    re-wrap the WHOLE note to 95 cols (pure reflow)           0 fails
 #
-# The last row is the point of the flattening: a pure reflow must NOT go red.
+# (The counts for the first five rows predate section 8 and were re-derived for
+# the three rows section 8 moved; the control was re-run too. Wrapping for that
+# control must break on WORD boundaries only — a wrapper that also breaks on
+# hyphens splits `guard-destructive.sh` mid-token and legitimately goes red,
+# which is the documented tolerance boundary, not a flattener bug.)
+#
+# The "pure reflow" row is the point of the flattening: it must NOT go red.
 # The "uninstall remedy" row is why both remedy sites are asserted separately —
 # a single "appears somewhere" check stayed green through that injection.
+# The "rm_scope_repo_enabled() forced false" row is also what proves section 8
+# is not vacuously green: with the guard narrowed, the rollback is allowed
+# through, the stand-in drop-in is deleted, and every "stays installed"
+# assertion goes red — i.e. the section fails exactly when the note's claim
+# stops being true, which is the only reason to have it.
 
 set -uo pipefail
 
@@ -499,6 +523,214 @@ assert_decision "REPO_RM_SCOPE=off (env): sudo rm -f \"\$DROPIN\" allowed" \
     "allow" "$NOWT_REPO" 'sudo rm -f "$DROPIN"' REPO_RM_SCOPE=off
 assert_decision "LOOM_RM_SCOPE=off (legacy env): rm -f \"\$TMP\" allowed" \
     "allow" "$NOWT_REPO" 'rm -f "$TMP"' LOOM_RM_SCOPE=off
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "8. Behaviour: a denied rollback really does strand the drop-in (repo#252)"
+# ---------------------------------------------------------------------------
+# The note's most consequential claim — "the drop-in stays installed" when the
+# post-install rollback `sudo rm -f "$DROPIN"` is denied — was reasoned from how
+# sudoers.d and the guard work and never exercised (repo#252). It is the one
+# claim an operator ACTS on, since it tells them a live root grant is sitting in
+# /etc/sudoers.d/ and must be removed by hand, so "nobody has run this" is the
+# wrong state for it to be in.
+#
+# WHAT IS REPRODUCED HERE, AND WHAT IS NOT. The note's claim is conditional:
+# *given* that the post-install `sudo visudo -c` fails, a denied rollback leaves
+# the drop-in installed. This section reproduces the consequent end to end and
+# takes the antecedent as given (a shimmed `visudo` that exits non-zero). It
+# deliberately does NOT try to produce a real `visudo -cf`-passes /
+# `visudo -c`-fails divergence: that means installing a real drop-in and
+# breaking a real sudoers chain, i.e. risking `sudo` on the host — the exact
+# hazard repo#252 says not to trigger. Nothing here reads, writes, or removes
+# anything under /etc; the `sudo` shim below refuses outright if it is ever
+# handed a real system path, so that constraint is enforced, not just intended.
+#
+# HOW IT IS EXERCISED. `gate_run` models what Claude Code actually does with the
+# hook's verdict: on `deny` the tool call is blocked and the command NEVER runs;
+# otherwise it runs. Both cases drive the SAME command string — sudo.md's real
+# rollback block, extracted above byte-for-byte, with `DROPIN` bound to a
+# stand-in file — against the SAME freshly-installed stand-in. The only variable
+# is the guard's verdict:
+#
+#   default `guards.rmScope=repo`  -> deny  -> block never runs -> file SURVIVES
+#   `REPO_RM_SCOPE=off` (opt-out)  -> allow -> block runs       -> file DELETED
+#
+# The second case is what makes the first non-vacuous: the identical block does
+# remove the file when it is allowed to run, so "the file is still there" in the
+# first case is caused by the denial and by nothing else.
+SHIM_BIN="$SCRATCH/shims"
+mkdir -p "$SHIM_BIN"
+cat > "$SHIM_BIN/sudo" <<'SHIM'
+#!/usr/bin/env bash
+# Test shim: runs the wrapped command UNPRIVILEGED. The tripwire comes first —
+# this harness must never touch real host policy, so a real system path is a
+# hard refusal rather than something to escalate.
+for _a in "$@"; do
+    case "$_a" in
+        /etc/*|/private/etc/*)
+            echo "TEST SHIM REFUSED: real system path in sudo args: $_a" >&2
+            exit 99
+            ;;
+    esac
+done
+exec "$@"
+SHIM
+cat > "$SHIM_BIN/visudo" <<'SHIM'
+#!/usr/bin/env bash
+# Test shim: stands in for the post-install full-chain check FAILING, which is
+# the precondition of the rollback under test. Reads and writes nothing.
+echo "visudo: simulated full-chain failure (test shim)" >&2
+exit 1
+SHIM
+chmod +x "$SHIM_BIN/sudo" "$SHIM_BIN/visudo"
+
+DROPIN_STANDIN="$SCRATCH/fake-sudoers.d/alice-nopasswd"
+mkdir -p "$(dirname "$DROPIN_STANDIN")"
+STANDIN_CONTENT='# Installed by /repo:sudo (rjwalters/repo) — see .claude/commands/repo/sudo.md
+alice ALL=(ALL) NOPASSWD: ALL'
+install_standin() {
+    # rm first: the stand-in is left at 0440 like a real drop-in, so a second
+    # `>` redirect onto a surviving file would fail with "Permission denied"
+    # and quietly reuse the previous run's file.
+    rm -f "$DROPIN_STANDIN"
+    printf '%s\n' "$STANDIN_CONTENT" > "$DROPIN_STANDIN"
+    chmod 440 "$DROPIN_STANDIN"
+}
+
+# gate_run <cwd> <command> [ENV=VAL ...]
+# Guard verdict first, then the consequence — deny blocks the call outright.
+# Sets GATE_EXECUTED (0/1), GATE_STATUS (the command's status; 1 for a blocked
+# call, as Claude Code reports a blocked tool call as an error) and GATE_OUTPUT
+# (merged stdout+stderr; empty when blocked, since nothing ran).
+GATE_EXECUTED=0
+GATE_STATUS=0
+GATE_OUTPUT=""
+gate_run() {
+    local cwd="$1" cmd="$2"; shift 2
+    guard_run "$cwd" "$cmd" "$@"
+    if [[ "$GUARD_DECISION" == "deny" ]]; then
+        GATE_EXECUTED=0
+        GATE_STATUS=1
+        GATE_OUTPUT=""
+        return 0
+    fi
+    GATE_EXECUTED=1
+    GATE_OUTPUT="$(cd "$cwd" && PATH="$SHIM_BIN:$PATH" bash -c "$cmd" 2>&1)"
+    GATE_STATUS=$?
+}
+
+# The real rollback block, with DROPIN bound in the SAME command string — the
+# shape repo#252 already confirmed same-command variable resolution does not
+# rescue. Binding it is what keeps execution confined to the stand-in: the
+# executed `rm` can only ever name this scratch path.
+ROLLBACK_VS_STANDIN="DROPIN=\"$DROPIN_STANDIN\"
+$ROLLBACK_BLOCK"
+
+if [[ -z "$ROLLBACK_BLOCK" ]]; then
+    no "denied rollback strands the stand-in drop-in" \
+        "ROLLBACK_BLOCK is empty — could not extract the rollback block from $SUDO_MD to drive this case"
+    no "allowed rollback (rmScope=off control) removes the stand-in drop-in" \
+        "ROLLBACK_BLOCK is empty — control case cannot run either"
+else
+    # 8a. Default posture: the guard denies, so the block never runs and the
+    # drop-in is still installed afterwards. This IS the note's claim.
+    install_standin
+    gate_run "$REPO_ROOT" "$ROLLBACK_VS_STANDIN"
+    assert_eq "denied rollback: guard verdict is deny" "deny" "$GUARD_DECISION"
+    case "$GUARD_TAG" in
+        rm-scope-unresolved-var | rm-scope-outside-repo)
+            ok "denied rollback: denial comes from an rm-scope rule ($GUARD_TAG)" ;;
+        *)
+            no "denied rollback: denial comes from an rm-scope rule" \
+                "got tag [${GUARD_TAG:-<none>}], want rm-scope-unresolved-var or rm-scope-outside-repo" ;;
+    esac
+    assert_eq "denied rollback: the block never executes" "0" "$GATE_EXECUTED"
+    if [[ -f "$DROPIN_STANDIN" ]]; then
+        ok "denied rollback: the drop-in stays installed (file still present)"
+        assert_eq "denied rollback: the stranded drop-in is byte-for-byte unchanged" \
+            "$STANDIN_CONTENT" "$(cat "$DROPIN_STANDIN")"
+    else
+        no "denied rollback: the drop-in stays installed (file still present)" \
+            "stand-in is GONE after a denied call — the note's 'stays installed' claim would be wrong"
+        no "denied rollback: the stranded drop-in is byte-for-byte unchanged" \
+            "stand-in is GONE, nothing to compare"
+    fi
+    # The note used to add "even though the command reports failure and exits
+    # non-zero". Exercising it shows that is not what the operator sees: the
+    # deny blocks the WHOLE call, so the re-check, the rm, the echo and the
+    # `exit 1` all never happen. The step's own failure message is absent.
+    if [[ "$GATE_OUTPUT" == *"post-install validation failed"* ]]; then
+        no "denied rollback: the block's own failure message never appears" \
+            "got output [$GATE_OUTPUT] — a blocked call should produce none of the block's output"
+    else
+        ok "denied rollback: the block's own failure message never appears"
+    fi
+
+    # 8b. Control — same block, same file, guard opted out. If this does not go
+    # green, 8a proves nothing: it would mean the block cannot delete the file
+    # under any verdict.
+    install_standin
+    gate_run "$REPO_ROOT" "$ROLLBACK_VS_STANDIN" REPO_RM_SCOPE=off
+    assert_eq "rmScope=off control: guard verdict is allow" "allow" "$GUARD_DECISION"
+    assert_eq "rmScope=off control: the block executes" "1" "$GATE_EXECUTED"
+    if [[ -f "$DROPIN_STANDIN" ]]; then
+        no "rmScope=off control: the same block DOES delete the drop-in" \
+            "stand-in survived an ALLOWED run — the deny in 8a is not what saved it, and 8a is vacuous"
+    else
+        ok "rmScope=off control: the same block DOES delete the drop-in"
+    fi
+    assert_eq "rmScope=off control: the block exits non-zero as documented" "1" "$GATE_STATUS"
+    assert_contains "rmScope=off control: the block emits its own failure message" \
+        "$GATE_OUTPUT" "post-install validation failed"
+fi
+
+# 8c. The stranded state needs the install to have happened in an EARLIER,
+# SEPARATE call. Run the whole step 5 fence as one Bash call and the same rm
+# rule denies that call — before the `sudo cp`, which 8a showed means it does
+# not run — so nothing is installed and there is nothing to strand. Classified
+# only, never executed: this fence's own $DROPIN resolves to a real
+# /etc/sudoers.d path, so running it is off the table.
+INSTALL_FENCE="$(awk '
+    /^```bash[[:space:]]*$/ { inf = 1; buf = ""; next }
+    /^```[[:space:]]*$/ {
+        if (inf && buf ~ /sudo cp "\$TMP" "\$DROPIN"/) { printf "%s", buf; exit }
+        inf = 0; buf = ""; next
+    }
+    inf { buf = buf $0 "\n" }
+' "$SUDO_MD")"
+if [[ -n "$INSTALL_FENCE" ]]; then
+    # cwd is the zero-managed-worktree repo on purpose: there the write guard
+    # fails open (section 7c), so the deny that lands is unambiguously the rm
+    # rule rather than write confinement — and the assertion does not change
+    # meaning depending on whether the checkout running it has worktrees.
+    assert_deny_tag "whole step 5 fence as ONE call denies before the cp (rm-scope-unresolved-var)" \
+        "rm-scope-unresolved-var" "$NOWT_REPO" "$INSTALL_FENCE"
+else
+    no "whole step 5 fence as ONE call denies before the cp (rm-scope-unresolved-var)" \
+        "could not extract the install fence (the one containing sudo cp \"\$TMP\" \"\$DROPIN\") from $SUDO_MD"
+fi
+
+# 8d. The prose side of what 8a/8c just established. The note must say the deny
+# blocks the whole call (not merely the rm), must cite the suite that exercises
+# it, and must keep the "earlier, separate call" precondition — otherwise a
+# reader re-derives the old, wrong "the command reports failure and exits
+# non-zero" reading. It must ALSO keep the honesty marker on the half that is
+# still only reasoned: what makes the post-install `visudo -c` fail when the
+# candidate already passed `visudo -cf` has never been observed here, and
+# reproducing it means breaking sudo on a real machine (repo#252's constraint).
+# Losing that marker would upgrade a plausible trigger to a stated fact — the
+# exact reading-vs-exercising slip repo#245 exists to stop.
+assert_contains "note keeps the trigger marked as unreproduced" \
+    "$NOTE" '**That trigger is the unreproduced part**'
+assert_contains "note states the deny blocks the whole Bash call" \
+    "$NOTE" 'the deny blocks the whole Bash call'
+assert_contains "note states the block's own exit 1 does not run either" \
+    "$NOTE" "not the block's own \`exit 1\`"
+assert_contains "note cites the suite that exercises the stranding claim" \
+    "$NOTE" '`commands/repo/tests/test-sudo-rm-guard-contract.sh`'
+assert_contains "note states stranding needs an earlier, separate call" \
+    "$NOTE" 'earlier, separate** call'
 
 # ---------------------------------------------------------------------------
 echo ""

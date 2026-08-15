@@ -55,6 +55,46 @@ report. This surfaces everything before anything is touched.
 Offer to fix gitignore findings here. Leave README, link, and documentation
 fixes for the Docs stage next — don't apply them twice.
 
+**Orphaned files are actioned here too, and nowhere else.** Every other finding
+class has a later home — docs and links to Docs (stage 4), branch and worktree
+hygiene to Reset (stage 7) — but an orphan has none. Tidy (stage 5) is the
+stage it looks like it belongs to and deliberately is not: Tidy inventories
+*filesystem clutter*, and its SAFE tier is safe precisely because those files
+are regenerable or were never committed. A file tracked in git is neither, so
+without an owner here an orphan finding would fall out of the run entirely.
+Split the findings by tracked-ness and handle each half explicitly:
+
+```bash
+git ls-files --error-unmatch -- "$path" >/dev/null 2>&1 && echo tracked || echo untracked
+```
+
+- **Untracked orphans** (build outputs never committed, empty dirs) — leave
+  them for Tidy in stage 5, which already sorts them into its own SAFE/ASK
+  tiers. Acting on them here would put the same file behind two different
+  gates in one run.
+- **Tracked orphans** — offer removal here, **one file at a time, each behind
+  its own explicit yes**, including under the default (non-`--ask`) form. This
+  is never folded into Tidy's auto-applied SAFE tier and must not behave like
+  it: deleting a tracked file is a repo change, recoverable only from history,
+  and "nothing references it" is evidence rather than proof — a deliberately
+  kept standalone script, a fixture opened by path at runtime, and a genuinely
+  dead file all look identical to the orphan check. Show the finding's own
+  evidence with the offer (what was grepped for, how many references were
+  found) so the yes is an informed one, and remove with `git rm` so the removal
+  is staged as the repo change it is.
+
+This is the same kind of exception the gitignore offer above already is, and it
+does not loosen [[audit]]'s read-only posture: [[audit]] still changes nothing
+on its own — as [[orphans]] likewise reports and waits — and what acts here is
+`/repo:all`'s stage, only after the user says yes to that specific file.
+
+**Anything not removed is deferred, not dropped.** Carry every tracked orphan
+the user declined — or that was never offered, because the stage was skipped or
+the run is scoped to a subtree — into the final summary as a deferred item, the
+same way stage 3's scrub findings are. A finding that appears only in the audit
+report and nowhere in the summary is exactly what this stage exists to stop
+losing.
+
 ### 2. Sync early, if and only if nothing can be lost (see [[reset]])
 
 [[reset]] is two separable halves, and only one of them is safe to move:
@@ -319,7 +359,7 @@ forgotten:
 ```
 REPO:ALL COMPLETE
 =================
-Audit:        3 findings surfaced (gitignore rule fixed)
+Audit:        3 findings surfaced (gitignore rule fixed, 1 tracked orphan removed), 2 tracked orphans deferred: vite.config.d.ts, vitest.config.d.ts
 Scrub:        1 at HEAD deferred (identity: docs/runbook.md:41); 63 history-only, 18 topology (--deep)
 Docs:         2 fixed (README table, CHANGELOG entry), 1 deferred: docs/analysis/ missing README
 Tidy:         freed 240 MB (build/, .cache/, 3 empty dirs)
@@ -329,8 +369,12 @@ Reset:        on main (up to date), tree clean, 4 branches deleted, 1 stash kept
 Skipped:      remote (never part of /repo:all); deps install/review (confirm-first — run /repo:deps); scrub --deep/--owner/--forks (run /repo:scrub)
 ```
 
-List anything intentionally left behind — deferred findings, kept stashes,
-UNKNOWN branches — so the user knows exactly what state the repo is in.
+List anything intentionally left behind — deferred findings, tracked orphans
+left in place, kept stashes, UNKNOWN branches — so the user knows exactly what
+state the repo is in. Tracked orphans are named individually rather than
+counted: the whole point of deferring one is that the user has to decide about
+that specific file later, and a bare `2 orphans deferred` sends them back to
+re-run the audit to find out which.
 
 When stage 2's early sync-and-switch ran, the `Reset:` line still carries the
 pruning half's outcome — branches, worktrees, and stashes reviewed — and notes

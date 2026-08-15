@@ -3964,7 +3964,76 @@ extract_write_targets() {
     # lands in the main checkout). Fail-closed by construction: this function
     # can only ever REPLACE a token with a value it actually proved, never
     # make one disappear.
-    function resolve_var(tok,   vname, rest, vv) {
+    #
+    # QUOTED WRITE TARGETS (repo#293): qsplit() copies quote characters
+    # VERBATIM, so the overwhelmingly common builder spelling of this exact
+    # pattern -- `WORKTREE_ABS="<wt>"; cp x "$WORKTREE_ABS/rtl/y"` -- arrived
+    # here as `"$WORKTREE_ABS/rtl/y"`, failed the `substr(tok,1,1) != "$"`
+    # test on its opening double quote, and was emitted UNRESOLVED. It then
+    # hit the #4921 unresolved-`$` classifier downstream and hard-denied with
+    # the `worktree-write-confinement-unresolved-var` tag -- even though the
+    # variable held a static, worktree-confined literal assigned in the SAME
+    # command that the resolver was already fully capable of proving (the
+    # unquoted spelling of the identical command has always resolved and
+    # allowed). resolve_var() is now the quote-aware entry point and
+    # resolve_var_core() is the unchanged resolution itself.
+    function resolve_var(tok,   cand, res) {
+        if (substr(tok, 1, 1) == "$") return resolve_var_core(tok)
+        cand = dequote_expandable(tok)
+        if (cand == "" || substr(cand, 1, 1) != "$") return tok
+        res = resolve_var_core(cand)
+        # Nothing proved => return the ORIGINAL, quote-preserved token, i.e.
+        # byte-identical to the pre-repo#293 verdict for every shape this
+        # cannot resolve.
+        if (res == cand) return tok
+        return res
+    }
+    # dequote_expandable() -- conservative ELIGIBILITY TEST, deliberately NOT a
+    # quote parser (repo#293).
+    #
+    # The mark_expandable_dollars() header warns that a second, hand-copied copy
+    # of "what the shell would do to these quotes" is exactly how the two
+    # consumers drift apart, and that a drift in THAT grammar is a guard
+    # bypass. This function does not re-implement that grammar. It answers one
+    # much weaker, decidable question: "is this token so trivially quoted that
+    # deleting every double quote is PROVABLY identical to what bash produces?"
+    #
+    # It refuses (returns "") the moment anything subtle is present:
+    #   - a single quote  -> `$` inside it is literal data, never an expansion
+    #   - a backslash     -> `\$` is a literal `$`, `\"` shifts the quoting
+    #   - a backtick      -> legacy command substitution in a later component
+    #   - unbalanced `"`  -> bash would not even accept the word
+    # With NONE of those present, every `$` in the token is expanded by bash
+    # whether it sits inside or outside the double-quoted spans, and the
+    # quote characters contribute nothing to the resulting word -- so
+    # `"$V/x"`, `"$V"/x` and `$V"/x"` all denote the same path, and deleting
+    # the quotes is exact rather than approximate.
+    #
+    # Returns "" for "not eligible / nothing to strip", which callers must
+    # treat as "keep the verdict this guard already produces". A resolved
+    # value is NEVER trusted on
+    # its own: it is substituted into the token and then judged by the SAME
+    # confinement tests every literal target goes through, so proving a
+    # variable holds `<main-checkout>/evil.sh` still DENIES (with the ordinary
+    # `worktree-write-confinement` tag). This can only ever make an
+    # unresolvable target resolvable -- it never relaxes a containment test.
+    function dequote_expandable(tok,   n, i, c, out, dq) {
+        if (index(tok, SQ) > 0) return ""
+        if (index(tok, "\\") > 0) return ""
+        if (index(tok, BQ) > 0) return ""
+        n = length(tok)
+        dq = 0
+        out = ""
+        for (i = 1; i <= n; i++) {
+            c = substr(tok, i, 1)
+            if (c == DQ) { dq++; continue }
+            out = out c
+        }
+        if (dq == 0) return ""
+        if (dq % 2 != 0) return ""
+        return out
+    }
+    function resolve_var_core(tok,   vname, rest, vv) {
         if (substr(tok, 1, 1) != "$") return tok
         if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
             vname = substr(tok, RSTART + 2, RLENGTH - 3)
@@ -4006,11 +4075,49 @@ extract_write_targets() {
     # SAME value is not a conflict and still resolves normally -- quotes are
     # stripped above, before the comparison, so a bare and a quoted spelling of
     # one value compare equal.
+    #
+    # A NON-STATIC RHS POISONS THE VARIABLE TOO (repo#293 review): resolution is
+    # only ever sound when the recorded value is a STATIC LITERAL — a value the
+    # real shell would hand to the write idiom byte-for-byte, with nothing left
+    # for it to expand. Before this check, "static" was enforced only by
+    # a test inside resolve_var_core() on the FIRST character, which caught
+    # `A=$B/x` and `A=$(pwd)/x` but nothing embedded further in. That left a
+    # live fail-open bypass on this catastrophic-tier guard:
+    #
+    #     V="<worktree>/`echo evil`/x"; cp /tmp/y "$V/pwned.sh"
+    #
+    # was ALLOWED — the backtick command substitution sits mid-value, so the
+    # leading-byte test never saw it, the value was stored as if it were a
+    # proven literal, and the downstream #4921 unresolved-`$` backstop found no
+    # `$` in the resolved token to trip on (a bare backtick pair carries none).
+    # The `$(...)` spelling happened to be caught only incidentally, because its
+    # literal `$` survived substitution into the final token. Relying on that
+    # accident is not a safety property.
+    #
+    # So the eligibility bar is now enforced where the value is CAPTURED, not
+    # where it is consumed, and over the WHOLE string rather than its first
+    # byte: any RHS containing a backtick or a `$` ANYWHERE is poisoned to
+    # AMBIG and never becomes a resolvable literal. This is checked against the
+    # RAW word (before the outer quote pair is stripped), so no spelling of the
+    # quoting can hide an expansion character from it. Deliberately blunt, and
+    # deliberately on the conservative side of the "ambiguity never widens a
+    # deny" contract this file states elsewhere: poisoning only ever routes the
+    # token back to the pre-#4881 literal treatment, which fails CLOSED under
+    # `worktree-write-confinement-unresolved-var`. A value containing a `$` the
+    # shell would NOT expand (single-quoted, backslash-escaped) is refused here
+    # as well — that costs a resolution this guard was never entitled to make,
+    # and re-deriving "which `$` would bash expand" in a third place is exactly
+    # the drift the mark_expandable_dollars() header warns is itself a bypass.
     function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
         eqpos = index(word, "=")
         if (eqpos < 2) return
         vname = substr(word, 1, eqpos - 1)
         vval = substr(word, eqpos + 1)
+        # Non-static RHS -> poison, never store. Checked on the raw value.
+        if (index(vval, BQ) > 0 || index(vval, "$") > 0) {
+            varmap[vname] = AMBIG
+            return
+        }
         vlen = length(vval)
         if (vlen >= 2) {
             c1 = substr(vval, 1, 1)
@@ -4029,6 +4136,10 @@ extract_write_targets() {
         SEP = sprintf("%c", 31)
         DQ = sprintf("%c", 34)
         SQ = sprintf("%c", 39)
+        # Backtick — legacy command substitution. dequote_expandable()
+        # (repo#293) refuses any token containing one rather than proving a
+        # prefix around it.
+        BQ = sprintf("%c", 96)
         # Poison value for a name assigned two different values in one command
         # (see record_assign). The leading "$" is load-bearing: it routes into
         # the existing unresolved-chain refusal inside resolve_var().

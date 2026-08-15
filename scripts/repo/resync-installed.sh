@@ -27,6 +27,7 @@
 #   .claude/skills/repo/SKILL.md                        <- skills/repo/SKILL.md
 #   .claude/skills/repo/hooks/*.sh                      <- hooks/repo/*.sh
 #   .claude/skills/repo/scripts/repo-remote.sh          <- scripts/repo/repo-remote.sh
+#   .claude/skills/repo/scripts/repo-scrub-forks.sh     <- scripts/repo/repo-scrub-forks.sh
 #   .claude/skills/repo/scripts/resync-installed.sh     <- scripts/repo/resync-installed.sh
 #   .claude/commands/repo/<cmd>.md                      <- commands/repo/<cmd>.md
 #   .agents/skills/repo/SKILL.md                        <- skills/repo/SKILL.md (Codex form)
@@ -280,6 +281,7 @@ plan "skills/repo/SKILL.md"                 ".claude/skills/repo/SKILL.md"      
 plan "hooks/repo/guard-destructive.sh"      ".claude/skills/repo/hooks/guard-destructive.sh"  1
 plan "hooks/repo/session-start-handoff.sh"  ".claude/skills/repo/hooks/session-start-handoff.sh" 1
 plan "scripts/repo/repo-remote.sh"          ".claude/skills/repo/scripts/repo-remote.sh"      1
+plan "scripts/repo/repo-scrub-forks.sh"     ".claude/skills/repo/scripts/repo-scrub-forks.sh" 1
 
 # Which commands belong to this install. A `--skills=` install is a deliberate
 # subset, so widening it here would install commands the operator declined; an

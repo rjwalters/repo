@@ -7,7 +7,8 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-_None._
+- **#297**: fix(guard): resolve quoted $VAR write targets to same-command static literals
+- **#288**: feat(install): package skills for Codex CLI at .agents/skills/repo/
 
 ## Urgent
 
@@ -19,13 +20,15 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#293**: worktree-write-confinement-unresolved-var denies writes via a variable holding a statically-resolvable worktree-scoped literal
+- **#285**: Add Codex-side install/uninstall/drift-detection path for Repo Skills
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#305**: Guard dispatcher probe (c) permanently inert (#5916), so the vendored guard still hits the #53 echo/printf false-positive
+- **#304**: Consolidate worktree-creation logic: docs-worktree.sh and pr-worktree.sh silently lack worktree.sh's concurrency lock
 
 ## PRs Awaiting Review
 
@@ -37,15 +40,17 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#297**: fix(guard): resolve quoted $VAR write targets to same-command static literals
+- **#288**: feat(install): package skills for Codex CLI at .agents/skills/repo/
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
+- **#293**: worktree-write-confinement-unresolved-var denies writes via a variable holding a statically-resolvable worktree-scoped literal *(curated)*
+- **#285**: Add Codex-side install/uninstall/drift-detection path for Repo Skills *(curated)*
 - **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
 - **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
-- **#252**: Stranded-drop-in claim in sudo.md's guard note is reasoned, never exercised *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -59,13 +64,13 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 2 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
-| Curated | 3 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 4 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
