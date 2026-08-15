@@ -46,15 +46,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SKILL="$REPO_ROOT/skills/repo/SKILL.md"
 COMMANDS_DIR="$REPO_ROOT/commands/repo"
 
-PASS=0
-FAIL=0
-SKIP=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 if [[ ! -f "$SKILL" ]]; then
     echo "FATAL: SKILL.md not found at $SKILL" >&2
@@ -64,23 +59,6 @@ if [[ ! -d "$COMMANDS_DIR" ]]; then
     echo "FATAL: commands directory not found at $COMMANDS_DIR" >&2
     exit 1
 fi
-
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-skip() {  # <label> <reason>
-    SKIP=$((SKIP + 1))
-    printf "  ${YELLOW}SKIP${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
 
 # Extract the table rows under "## Commands", stopping at the next heading.
 SECTION="$(awk '

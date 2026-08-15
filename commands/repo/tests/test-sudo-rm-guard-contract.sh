@@ -106,18 +106,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SUDO_MD="$REPO_ROOT/commands/repo/sudo.md"
 GUARD="$REPO_ROOT/hooks/repo/guard-destructive.sh"
 
-PASS=0
-FAIL=0
 # Every case here is unconditional — nothing in this suite is environment- or
-# version-gated — so SKIP stays 0. The column is kept because run.sh's delegated
-# -suite plumbing parses the shared `Skipped:` summary line when present.
-SKIP=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# version-gated — so SKIP (defined below via the shared helpers) stays 0. The
+# column is kept because run.sh's delegated-suite plumbing parses the shared
+# `Skipped:` summary line when present.
 
 for f in "$SUDO_MD" "$GUARD"; do
     if [[ ! -f "$f" ]]; then
@@ -157,22 +149,13 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # ---------------------------------------------------------------------------
-# Assertion helpers
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307).
 # ---------------------------------------------------------------------------
 
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3]"; fi
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+
 assert_guard_defines() {  # <label> <ere>  -- grep the guard source file directly
     # Greps the FILE, not a `printf "$GUARD_SRC" | grep -q` pipeline: under
     # `set -o pipefail`, grep -q's early exit on a 5000-line haystack makes
@@ -183,9 +166,6 @@ assert_guard_defines() {  # <label> <ere>  -- grep the guard source file directl
     else
         no "$1" "no match for /$2/ in hooks/repo/guard-destructive.sh"
     fi
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
 }
 
 # flatten <text> -> one line: leading blockquote markers stripped, lines folded,

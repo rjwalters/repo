@@ -26,13 +26,11 @@ HOOK="$REPO_ROOT/hooks/repo/session-start-handoff.sh"
 INSTALL_SH="$REPO_ROOT/install.sh"
 UNINSTALL_SH="$REPO_ROOT/uninstall.sh"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see commands/repo/tests/lib/assert.sh
+# (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/../../../commands/repo/tests/lib/assert.sh"
 
 if [[ ! -f "$HOOK" ]]; then
     echo "FATAL: hook not found at $HOOK" >&2
@@ -51,27 +49,7 @@ SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # ---------------------------------------------------------------------------
-# Assertion helpers
-# ---------------------------------------------------------------------------
 
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3] in output"; fi
-}
-assert_not_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present in output"; fi
-}
 assert_empty() {  # <label> <actual>
     if [[ -z "$2" ]]; then ok "$1"; else no "$1" "expected no output, got [$2]"; fi
 }

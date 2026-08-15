@@ -30,13 +30,11 @@ INSTALL_SH="$REPO_ROOT/install.sh"
 UNINSTALL_SH="$REPO_ROOT/uninstall.sh"
 LIB="$REPO_ROOT/lib/shell-wrapper.sh"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see commands/repo/tests/lib/assert.sh
+# (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/../../../commands/repo/tests/lib/assert.sh"
 
 for f in "$INSTALL_SH" "$UNINSTALL_SH" "$LIB"; do
     if [[ ! -f "$f" ]]; then
@@ -52,29 +50,7 @@ SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # ---------------------------------------------------------------------------
-# Assertion helpers
-# ---------------------------------------------------------------------------
 
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "%s\n" "$2" | sed 's/^/        /'
-    return 0
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3] in:
-$2"; fi
-}
-assert_not_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpectedly present: [$3]"; fi
-}
 assert_file_bytes_eq() {  # <label> <file-a> <file-b>
     if diff -u "$2" "$3" >/dev/null 2>&1; then
         ok "$1"

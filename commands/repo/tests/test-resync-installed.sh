@@ -31,13 +31,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 RESYNC_SRC="$REPO_ROOT/scripts/repo/resync-installed.sh"
 CONTRACT="$REPO_ROOT/INSTALLER-CONTRACT.md"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+# assert_file is specific to this suite (not part of the shared set).
+assert_file() { if [[ -f "$2" ]]; then ok "$1"; else no "$1" "no such file: $2"; fi; }
 
 if [[ ! -f "$RESYNC_SRC" ]]; then
     echo "FATAL: resync-installed.sh not found at $RESYNC_SRC" >&2
@@ -46,21 +45,6 @@ fi
 
 SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
-
-# ---------------------------------------------------------------------------
-# Assertion helpers (same shape as test-repo-remote.sh)
-# ---------------------------------------------------------------------------
-ok() { TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1)); printf "  ${GREEN}PASS${NC}: %s\n" "$1"; }
-no() {
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-assert_eq()           { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi; }
-assert_contains()     { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3] in [$2]"; fi; }
-assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present"; fi; }
-assert_file()         { if [[ -f "$2" ]]; then ok "$1"; else no "$1" "no such file: $2"; fi; }
 
 # ---------------------------------------------------------------------------
 # Fixture builders.

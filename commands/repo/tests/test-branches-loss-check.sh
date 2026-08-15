@@ -45,15 +45,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BRANCHES_MD="$REPO_ROOT/commands/repo/branches.md"
 RESET_MD="$REPO_ROOT/commands/repo/reset.md"
 
-PASS=0
-FAIL=0
-SKIP=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see lib/assert.sh (repo#307). SKIP does
+# NOT feed TOTAL/PASS/FAIL — run.sh folds only the pass/fail counts, and
+# reports the skip count as a breakdown annotation.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 if [[ ! -f "$BRANCHES_MD" ]]; then
     echo "FATAL: branches.md not found at $BRANCHES_MD" >&2
@@ -64,39 +61,6 @@ SCRATCH="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # ---------------------------------------------------------------------------
-# Assertion helpers
-# ---------------------------------------------------------------------------
-
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-# A skipped assertion is neither pass nor fail: the environment cannot exercise
-# it (e.g. this git predates `merge-tree --write-tree`). It is counted separately
-# and surfaced in the summary so a silently-skipped suite is never mistaken for a
-# full pass (repo#46). SKIP does NOT feed TOTAL/PASS/FAIL — run.sh folds only the
-# pass/fail counts, and reports the skip count as a breakdown annotation.
-skip() {  # <label> <reason>
-    SKIP=$((SKIP + 1))
-    printf "  ${YELLOW}SKIP${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "        %s\n" "$2"
-    return 0
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3]"; fi
-}
-assert_not_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present"; fi
-}
 # The only verdict that can destroy work is SAFE. UNSAFE and KEEP are both
 # "do not delete", so most assertions care about that boundary, not which of
 # the two non-deleting verdicts came back.
