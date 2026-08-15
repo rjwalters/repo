@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #331** (closed): worktree-write-confinement guard flags read-only heredoc-fed interpreter payloads as writes
+- **PR #336**: fix(guard): stop misreading structured-interpreter heredoc comparisons as writes
 - **Issue #330** (closed): guard: force-op:protected ask doesn't exempt out-of-tree scratch clones like force-op:detached (#320) does
 - **PR #332**: fix(guard): exempt out-of-tree CWDs from the force-op:protected ask
 - **Issue #326** (closed): Consolidate 5 near-identical toggle-resolution functions in guard-destructive.sh
