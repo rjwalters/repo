@@ -25,13 +25,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#330**: guard: force-op:protected ask doesn't exempt out-of-tree scratch clones like force-op:detached (#320) does
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#332**: fix(guard): exempt out-of-tree CWDs from the force-op:protected ask
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -43,7 +43,6 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#331**: worktree-write-confinement guard flags read-only heredoc-fed interpreter payloads as writes *(curated)*
 - **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
 - **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
 
@@ -62,10 +61,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 3 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

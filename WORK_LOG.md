@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #335** (closed): Remove unused _is_tty() helper in repo-remote.sh
+- **PR #338**: refactor(repo-remote): remove unused _is_tty() helper
 - **Issue #331** (closed): worktree-write-confinement guard flags read-only heredoc-fed interpreter payloads as writes
 - **PR #336**: fix(guard): stop misreading structured-interpreter heredoc comparisons as writes
 - **Issue #330** (closed): guard: force-op:protected ask doesn't exempt out-of-tree scratch clones like force-op:detached (#320) does
