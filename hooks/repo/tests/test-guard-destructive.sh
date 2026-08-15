@@ -3947,6 +3947,169 @@ if [[ -n "$PMWTC_MAIN" && "$PMWTC_MAIN" != "/" && -d "$PMWTC_MAIN" ]]; then
     rm -rf "$PMWTC_MAIN"
 fi
 
+# =========================================================================
+echo -e "${YELLOW}--- worktree-write-confinement: structured-interpreter heredoc bodies (repo#331) ---${NC}"
+# =========================================================================
+# safehouse#112: a python3 heredoc payload that performs ZERO file-write
+# operations (glob() over already-tracked files, `open(f)` in its DEFAULT
+# read mode, print() to stdout) was denied with the `worktree-write-confinement`
+# tag. Root cause traced by Curator (statically) and confirmed live below: the
+# payload's own `while depth > 0 and i < len(src):` line is an ordinary Python
+# comparison, but extract_write_targets() — a SHELL-syntax scanner — is left
+# the heredoc body fully visible per #5351 (interpreter-fed bodies are not
+# masked, so a genuine write inside one still denies) and misread the bare
+# `>` as a shell redirection operator into a file literally named "0".
+#
+# Fix: a heredoc body fed to a STRUCTURED (non-shell) interpreter — python/
+# perl/ruby/node, per interpreter_opener_kind() — is no longer handed
+# unconditionally to the shell-syntax scanner. structured_body_has_write_marker()
+# decides instead: no recognized write/delete/shell-out marker -> masked
+# (nothing to catch, allow); a marker IS found -> the body is normalized to a
+# single deterministic `> .` write idiom the EXISTING scanner already
+# recognizes, so the confinement verdict still fails closed. See
+# mask_heredoc_bodies_selective() in hooks/repo/guard-destructive.sh.
+read -r WTC331_MAIN WTC331_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- False-positive regression: the exact reported repro must now allow ----
+WTC331_REPRO_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+import re, glob
+
+files = []
+for base in ["safehoused", "safehouse-mcp", "spikes"]:
+    files += glob.glob(f"{base}/**/*.rs", recursive=True)
+
+for f in files:
+    if "/target/" in f:
+        continue
+    src = open(f).read()
+    lines = src.split("\n")
+    # find fn definitions and their bodies (simple brace matching)
+    for m in re.finditer(r'fn\s+\w+\s*\([^)]*\)[^{;]*\{', src):
+        start = m.end()
+        depth = 1
+        i = start
+        while depth > 0 and i < len(src):
+            if src[i] == '{':
+                depth += 1
+            elif src[i] == '}':
+                depth -= 1
+            i += 1
+        body = src[start:i-1].strip()
+        stripped_lines = [l.strip() for l in body.split("\n") if l.strip() and not l.strip().startswith("//")]
+        if len(stripped_lines) == 1:
+            line = stripped_lines[0]
+            if re.match(r'^(return\s+)?(false|true|None|Ok\(\(\)\)|0|""|vec!\[\]|Default::default\(\)|Vec::new\(\)|HashMap::new\(\))\s*;?$', line):
+                lineno = src[:m.start()].count("\n") + 1
+                sig = m.group(0).replace("\n"," ")
+                print(f"{f}:{lineno}: {sig[:100]} => {line}")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "#331: safehouse#112 read-only python heredoc (glob + open(f).read(), no write) no longer denies" \
+    "$WTC331_REPRO_CMD" "$WTC331_MAIN"
+
+# A minimal, narrowly-targeted repro of the SAME mechanism -- a bare `>`
+# comparison operator (not a redirection) inside a python heredoc body.
+WTC331_BARE_GT_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+depth = 3
+i = 0
+while depth > 0 and i < 10:
+    depth -= 1
+    i += 1
+print(depth)
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "#331: bare '>' comparison operator inside a python heredoc is not a redirection" \
+    "$WTC331_BARE_GT_CMD" "$WTC331_MAIN"
+
+# ---- Safety floor: a heredoc body that DOES perform a write-mode operation
+# ---- still denies -- one case per write-mode marker category from the issue.
+WTC331_OPEN_W_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+f = open("evil.py", "w")
+f.write("pwned")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "#331 safety floor: python heredoc with explicit write-mode open(f, \"w\") still denies" \
+    "$WTC331_OPEN_W_CMD" "$WTC331_MAIN"
+
+# Regression guard for the marker itself (#331 review): a comma-free, DEFAULT
+# (read) mode `open(...)` whose filename happens to start with a mode letter
+# ("w"/"a"/"x") must NOT be misread as a write-mode marker -- otherwise the
+# marker scan reproduces exactly the false-positive class this issue reports,
+# one level up.
+WTC331_OPEN_READ_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+data = open("write_report.txt").read()
+print(len(data))
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "#331 regression: default-mode open() of a filename starting with a mode letter stays allowed" \
+    "$WTC331_OPEN_READ_CMD" "$WTC331_MAIN"
+
+WTC331_OS_REMOVE_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+import os
+os.remove("evil.py")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "#331 safety floor: python heredoc with os.remove(...) still denies" \
+    "$WTC331_OS_REMOVE_CMD" "$WTC331_MAIN"
+
+WTC331_SHUTIL_RMTREE_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+import shutil
+shutil.rmtree("evil_dir")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "#331 safety floor: python heredoc with shutil.rmtree(...) still denies" \
+    "$WTC331_SHUTIL_RMTREE_CMD" "$WTC331_MAIN"
+
+WTC331_PERL_UNLINK_CMD=$(cat <<'WTC331_OUTER_EOF'
+perl - <<'PYEOF'
+unlink("evil.txt");
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "#331 safety floor: perl heredoc with bare unlink(...) still denies (no dotted stdlib namespace to qualify it)" \
+    "$WTC331_PERL_UNLINK_CMD" "$WTC331_MAIN"
+
+# A genuine shell `>`/`>>` redirection at the outer, heredoc-CONSUMING shell
+# level (bash-fed, not structured) still denies -- pre-existing #5351
+# coverage, unaffected by this change (interpreter_opener_kind() classifies
+# bash/sh/zsh/dash/ksh as "shell", not "structured").
+WTC331_BASH_REDIRECT_CMD=$(cat <<'WTC331_OUTER_EOF'
+bash <<'PYEOF'
+echo pwned > evil.sh
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "#331: genuine bash-fed heredoc redirection into the main checkout still denies" \
+    "$WTC331_BASH_REDIRECT_CMD" "$WTC331_MAIN"
+
+# An inert `cat`-sink heredoc (not interpreter-fed at all) stays allowed --
+# pre-existing #5000 coverage, unaffected.
+WTC331_CAT_SINK_CMD=$(cat <<'WTC331_OUTER_EOF'
+cat > /tmp/notes-331.txt <<'PYEOF'
+some notes, not a write into the main checkout
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "#331: inert cat-sink heredoc stays allowed" \
+    "$WTC331_CAT_SINK_CMD" "$WTC331_MAIN"
+
+git -C "$WTC331_MAIN" worktree remove --force "$WTC331_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC331_MAIN" && "$WTC331_MAIN" != "/" && -d "$WTC331_MAIN" ]]; then
+    rm -rf "$WTC331_MAIN"
+fi
+
 # Clean up this section's temp repos/worktrees.
 git -C "$WTC_MAIN" worktree remove --force "$WTC_WT" >/dev/null 2>&1 || true
 git -C "$WTC_TOGGLE_OFF_MAIN" worktree remove --force "$WTC_TOGGLE_OFF_WT" >/dev/null 2>&1 || true
