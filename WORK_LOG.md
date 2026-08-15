@@ -2,6 +2,31 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-08-15
+
+- **Issue #301** (closed): /repo:all has no stage that acts on Audit-surfaced tracked-file orphans
+- **PR #303**: docs(all): give stage 1 ownership of tracked-file orphans, defer the rest
+- **Issue #300** (closed): scrub.md specifies \b regexes for a tracked-files-at-HEAD scope, but git grep silently ignores \b — a vacuous scan exits 0
+- **PR #302**: docs(scrub): warn that git grep ignores \b, give a \b-safe HEAD scan
+
+### 2026-08-14
+
+- **Issue #298** (closed): SKILL.md says repo-scrub-forks.sh is installed, but install.sh never copies it
+- **PR #299**: fix(install): copy repo-scrub-forks.sh to the installed skill scripts dir
+- **Issue #291** (closed): update-tools: compare installed commit against source HEAD, not only VERSION — version-equality hides unreleased commits
+- **PR #296**: docs(update-tools): report installed-commit drift against source HEAD
+- **Issue #252** (closed): Stranded-drop-in claim in sudo.md's guard note is reasoned, never exercised
+- **PR #294**: test(sudo): exercise the denied-rollback stranding claim end to end
+- **Issue #290** (closed): release Phase 6 --follow-tags strands lightweight tags created by the repo's own version tool
+- **PR #295**: docs(release): verify remote tag after --follow-tags push, retry gh release create
+- **Issue #289** (closed): update-tools step 5 snapshot snippet is denied by Loom's unexpanded-variable write guard
+- **PR #292**: docs: use literal scratch paths in update-tools step 5 snapshot snippet
+
+### 2026-08-13
+
+- **Issue #284** (closed): Document the canonical SKILL.md frontmatter subset shared across Claude and Codex adapters
+- **PR #287**: docs: document the canonical SKILL.md frontmatter/structure contract
+
 ### 2026-08-12
 
 - **Issue #279** (closed): Guide: GUIDE_DOCS_PR_EXCLUDE apparently not applied when PR #278's WORK_LOG entry for self-referential PR #277 was first written
