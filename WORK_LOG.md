@@ -6,7 +6,6 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 - **Issue #341** (closed): /repo:deps: absent security_and_analysis is not proof of missing admin
 - **PR #344**: docs(deps): read security-updates flag from automated-security-fixes, not security_and_analysis presence
-- **PR #343**: docs: Guide document maintenance update
 - **Issue #340** (closed): guard-destructive: tee ... >/dev/null false-denies as worktree-isolation bypass when sibling worktrees exist
 - **PR #342**: fix(guard): exclude trailing >/>> redirect tokens from tee/sed/cp/mv target scan
 - **Issue #335** (closed): Remove unused _is_tty() helper in repo-remote.sh
