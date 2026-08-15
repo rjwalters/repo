@@ -250,8 +250,8 @@ Conformance work is tracked per tool: Loom
 | C2 | `install.sh` — trailing positional, `TARGET="."` default |
 | C3 | `install.sh -y`; `--shell-wrapper` is the separate opt-in for the one write outside the target |
 | C4 | `install.sh --dry-run`, enumerated from the same constants the real run uses |
-| C5 | `.claude/skills/repo/install-metadata.json`, emitted by [`lib/metadata.sh`](lib/metadata.sh) |
-| C6 | `.claude/skills/repo/.install-local.json`, gitignored by `install.sh`, same emitter |
+| C5 | `.claude/skills/repo/install-metadata.json`, emitted by [`lib/metadata.sh`](lib/metadata.sh). The Codex surface added by repo#285 carries a second copy at `.agents/skills/repo/install-metadata.json` from the same emitter, so each install destination is self-describing; both satisfy the "byte-identical on every machine" property, and the resync re-stamps both |
+| C6 | `.claude/skills/repo/.install-local.json`, gitignored by `install.sh`, same emitter. Deliberately **not** duplicated for the Codex surface: the sidecar's only job is to point at the source clone, one pointer per install is enough, and a second gitignored-and-possibly-tracked file would double the repo#96 bookkeeping for no added information |
 | C7 | [`scripts/repo/resync-installed.sh`](scripts/repo/resync-installed.sh) → installed to `.claude/skills/repo/scripts/` |
 | C8 | [`VERSION`](VERSION) |
 

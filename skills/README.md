@@ -2,14 +2,17 @@
 
 This directory holds the **canonical, runtime-neutral source** for every Repo
 Skills workflow. `install.sh` copies each `skills/<domain>/SKILL.md` verbatim
-into a consumer repo's `.claude/skills/<domain>/SKILL.md` — today that is the
-only runtime it packages for. Part of the dual-runtime Claude/Codex packaging
-work tracked in [#282](https://github.com/rjwalters/repo/issues/282) needs a
-Codex-side install path to package the *same* canonical source for a second
-runtime, without forking workflow semantics. This doc is the contract that
-work builds against: which parts of a `SKILL.md` are safe to assume are
-portable to any runtime, and which parts are specific to how Claude Code
-happens to consume this repo today.
+into a consumer repo's `.claude/skills/<domain>/SKILL.md` for Claude Code, and
+installs the *same* source — body unchanged, frontmatter re-rendered — to
+`.agents/skills/<domain>/SKILL.md` for Codex CLI. That second path is the
+dual-runtime packaging work tracked in
+[#282](https://github.com/rjwalters/repo/issues/282), delivered by
+[#285](https://github.com/rjwalters/repo/issues/285). This doc is the contract
+it was built against, and the contract a third runtime's adapter should build
+against: which parts of a `SKILL.md` are safe to assume are portable to any
+runtime, and which parts are specific to how Claude Code happens to consume
+this repo. See "Resolved: what the Codex adapter actually does" below for what
+building the first non-Claude adapter proved and what it amended.
 
 Everything below is verified against `origin/main` @ `d2dd71d`, 2026-08-13. Two
 sanity checks worth re-running before relying on any claim here, since the
@@ -103,14 +106,48 @@ generalizes to a second runtime:
   of procedural content per workflow, however many runtime-registration files
   point at it.
 
+### Resolved: what the Codex adapter actually does ([#285](https://github.com/rjwalters/repo/issues/285))
+
+The adapter this doc was written for now exists — `lib/codex-skill.sh`, wired
+into `install.sh` / `uninstall.sh` / `scripts/repo/resync-installed.sh`. Two
+findings from building it amend the table above rather than contradict it, and
+both are worth knowing before you build a *third* runtime's adapter:
+
+1. **Codex needs no invented format.** Codex CLI discovers skills from a
+   repo-scoped `.agents/skills/<name>/SKILL.md`, in the open
+   [Agent Skills](https://agentskills.io) format — the same `SKILL.md` shape
+   this directory already uses. Verified 2026-08-13 against
+   [Codex's own docs](https://developers.openai.com/codex/skills) ("Where Codex
+   loads local skills") and the
+   [format specification](https://agentskills.io/specification). So the adapter
+   is a second install destination, not a translation layer.
+2. **`name` is runtime-neutral in meaning but *not* in value.** The table above
+   classifies `name` as safe to reuse as-is. That holds for what the field
+   *means*, but the spec constrains its *form*: 1-64 characters, lowercase
+   `a-z0-9` and hyphens only, no leading/trailing/consecutive hyphens, and it
+   **must match the parent directory name**. `skills/repo/SKILL.md`'s literal
+   value, `"Repo Skills"`, satisfies none of that, so the Codex copy is rendered
+   with `name: repo` instead of copied. Any adapter for a runtime that
+   implements the Agent Skills spec will hit the same constraint — treat
+   `name` as "reuse the meaning, re-derive the token".
+
+Nothing else in the table changed in practice: `description` is copied verbatim,
+`domain` is carried forward (under the spec's `metadata` map, which exists for
+exactly this kind of client-specific key, rather than as an unknown top-level
+one), and `type` / `user-invocable` are dropped as the Claude-Code vocabulary
+the table already calls them. Confirming the wider claim this section makes: no
+Claude-specific *syntax* in the `SKILL.md` or `commands/repo/*.md` bodies blocked
+the adapter — the bodies are installed unmodified for both runtimes.
+
 **What a Codex adapter should replicate**: leave `skills/<domain>/SKILL.md`
 and `commands/<domain>/*.md` exactly as they are — neither is Claude-specific
 in *content* (only parts of their frontmatter are, per the table above) — and
 add Codex's own thin registration artifact(s) that point Codex's discovery
 mechanism at this same content, in whatever shape Codex's own contract
-requires (one file per verb, a single manifest, etc. — that shape is
-[#285](https://github.com/rjwalters/repo/issues/285)'s job to determine, not
-this doc's). The shape this doc fixes is: **one canonical procedure body per
+requires (one file per verb, a single manifest, etc.). For Codex that shape
+turned out to be a directory holding the canonical `SKILL.md` plus the per-verb
+procedures under `references/` — see the resolution section above. The shape
+this doc fixes is: **one canonical procedure body per
 workflow, N thin runtime-registration wrappers around it — never N full
 copies of the workflow.**
 

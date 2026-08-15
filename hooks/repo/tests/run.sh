@@ -16,7 +16,7 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
-# test-install-sidecar-untracking.sh,
+# test-install-sidecar-untracking.sh, test-install-codex-skill.sh,
 # test-shell-wrapper.sh, commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
@@ -378,6 +378,41 @@ else
     PASS=$((PASS + SC_PASS))
     FAIL=$((FAIL + SC_FAIL))
     record_suite "test-install-sidecar-untracking.sh" "$SC_PASS" "$SC_FAIL" "sidecar untracking"
+fi
+
+# The Codex-side skill surface `.agents/skills/repo/` (repo#285): format
+# conformance, ownership of a shared namespace, the install/uninstall/resync
+# lifecycle. Same delegation shape as the two suites above — it drives the real
+# install.sh / uninstall.sh / resync-installed.sh against scratch git repos.
+echo
+echo "-- install.sh Codex skill surface (delegated suite) --"
+CX_TEST="$TESTS_DIR/test-install-codex-skill.sh"
+if [[ ! -f "$CX_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-install-codex-skill.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-install-codex-skill.sh" "$CX_TEST"
+else
+    CX_OUT="$(bash "$CX_TEST" 2>&1)"
+    CX_STATUS=$?
+    CX_PASS="$(suite_count Passed "$CX_OUT")"
+    CX_FAIL="$(suite_count Failed "$CX_OUT")"
+    if ! [[ "$CX_PASS" =~ ^[0-9]+$ && "$CX_FAIL" =~ ^[0-9]+$ ]]; then
+        CX_PASS=0
+        CX_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-install-codex-skill.sh" "$CX_STATUS"
+        strip_ansi "$CX_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$CX_STATUS" -ne 0 || "$CX_FAIL" -ne 0 ]]; then
+        [[ "$CX_FAIL" -eq 0 ]] && CX_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-install-codex-skill.sh" "$CX_PASS" "$CX_FAIL" "$CX_STATUS"
+        strip_ansi "$CX_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-install-codex-skill.sh" "$CX_PASS"
+    fi
+    PASS=$((PASS + CX_PASS))
+    FAIL=$((FAIL + CX_FAIL))
+    record_suite "test-install-codex-skill.sh" "$CX_PASS" "$CX_FAIL" "Codex skill surface"
 fi
 
 # install.sh --shell-wrapper / uninstall.sh's shell `claude` wrapper (repo#35).

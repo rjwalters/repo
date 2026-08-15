@@ -31,6 +31,13 @@ source "$SOURCE_ROOT/lib/claude-md-block.sh"
 # shellcheck source=lib/shell-wrapper.sh
 source "$SOURCE_ROOT/lib/shell-wrapper.sh"
 
+# The Codex-side skill surface's paths and ownership marker, shared with
+# install.sh (repo#285). Removal is symmetric with the Claude side, with one
+# extra precaution: `.agents/skills/` is a shared namespace, so a `repo` skill
+# that carries no Repo Skills marker is someone else's and is never deleted here.
+# shellcheck source=lib/codex-skill.sh
+source "$SOURCE_ROOT/lib/codex-skill.sh"
+
 # Candidate shell rc files that might carry our claude wrapper block, checked
 # regardless of the CURRENT $SHELL: the shell active at uninstall time may
 # differ from whichever was active when --shell-wrapper was installed, and
@@ -132,12 +139,28 @@ done
 [[ -n "$TARGET" ]] || TARGET="."
 TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || error "Target directory does not exist"
 
-[[ -d "$TARGET/.claude/skills/repo" || -d "$TARGET/.claude/commands/repo" ]] \
+CODEX_SKILL_DIR="$TARGET/$CODEX_SKILL_REL"
+CODEX_SKILL_MD="$CODEX_SKILL_DIR/SKILL.md"
+
+# Ours to remove only when the marker proves this package wrote it. A `repo`
+# skill someone else hand-authored under the shared .agents/skills/ namespace is
+# reported and left alone rather than deleted on a name collision.
+codex_dir_is_ours() {
+  [[ -d "$CODEX_SKILL_DIR" ]] && codex_skill_is_managed "$CODEX_SKILL_MD"
+}
+
+[[ -d "$TARGET/.claude/skills/repo" || -d "$TARGET/.claude/commands/repo" ]] || codex_dir_is_ours \
   || { info "No Repo Skills install found in $TARGET"; exit 0; }
 
 echo "Will remove from $TARGET:"
 [[ -d "$TARGET/.claude/skills/repo" ]]   && echo "  .claude/skills/repo/ (incl. hooks/guard-destructive.sh, hooks/session-start-handoff.sh, scripts/repo-remote.sh, scripts/resync-installed.sh)"
 [[ -d "$TARGET/.claude/commands/repo" ]] && echo "  .claude/commands/repo/"
+if codex_dir_is_ours; then
+  echo "  $CODEX_SKILL_REL/ (the Codex skill: SKILL.md, install-metadata.json, references/)"
+elif [[ -d "$CODEX_SKILL_DIR" ]]; then
+  echo "Will NOT remove (present but not marked as installed by Repo Skills):"
+  echo "  $CODEX_SKILL_REL/"
+fi
 grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md" 2>/dev/null && echo "  CLAUDE.md REPO-SKILLS block"
 if [[ -f "$TARGET/.claude/settings.json" ]] && \
    jq -e --arg c "$HOOK_CMD" '(.hooks.PreToolUse // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
@@ -164,6 +187,19 @@ fi
 
 rm -rf "$TARGET/.claude/skills/repo" "$TARGET/.claude/commands/repo"
 success "Removed skill and command directories"
+
+# The Codex surface. Only ever this package's own directory — never
+# `.agents/skills/` itself, which other tools' skills share — and only when the
+# marker proves it is ours. The parents are pruned with rmdir, not rm -rf, so a
+# sibling skill keeps its home.
+if codex_dir_is_ours; then
+  rm -rf "$CODEX_SKILL_DIR"
+  success "Removed $CODEX_SKILL_REL/"
+  rmdir "$TARGET/$CODEX_SKILLS_ROOT_REL" "$TARGET/$(dirname "$CODEX_SKILLS_ROOT_REL")" 2>/dev/null || true
+elif [[ -d "$CODEX_SKILL_DIR" ]]; then
+  warning "Left $CODEX_SKILL_REL/ in place: its SKILL.md carries no Repo Skills marker,"
+  warning "so it was authored elsewhere. Remove it by hand if you do want it gone."
+fi
 
 # Remove the settings.json hook entry BEFORE pruning empty .claude dirs, so the
 # rmdir below can clean up an empty .claude if settings.json was the only file.
