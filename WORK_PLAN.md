@@ -43,7 +43,6 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#341**: /repo:deps: absent security_and_analysis is not proof of missing admin *(curated)*
 - **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
 - **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
 
@@ -65,7 +64,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 3 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
