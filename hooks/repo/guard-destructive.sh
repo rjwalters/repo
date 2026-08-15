@@ -931,6 +931,55 @@ resolve_worktree_root() {
 }
 
 # =============================================================================
+# _force_op_cwd_outside_known_roots() — is the given force-op CWD
+# unambiguously OUTSIDE every repo root this guard tracks (the main
+# checkout's REPO_ROOT, its default in-repo worktrees dir, and any
+# configured/overridden worktree root)?
+#
+# Used ONLY to narrow the force-op:detached ask (#320) for the case where a
+# force op's branch identity is ambiguous (detached HEAD / unresolved) — a
+# bare out-of-tree scratch clone (e.g. under /tmp, the standard workaround for
+# a chronically stale local main: clone, point remote at origin, fetch,
+# `reset --hard`, discard) can leave the working copy detached before the
+# reset lands it on a named ref. A hard reset there cannot touch a protected
+# branch of THIS repo regardless of what the scratch clone's HEAD resolves
+# to, so asking buys no safety and stalls headless/autonomous runs with no
+# human to answer.
+#
+# Deliberately conservative: any directory this function cannot cleanly
+# resolve (empty, unreadable, or no known REPO_ROOT to compare against) is
+# NOT "outside" — the caller keeps asking exactly as before. This is a
+# precision fix, not a policy relaxation: a CWD inside the main checkout or a
+# managed worktree, or one this guard cannot classify, must keep asking.
+# =============================================================================
+_force_op_cwd_outside_known_roots() {
+    local dir="$1"
+    [[ -n "$dir" ]] || return 1     # unresolved/empty — ambiguous, not "outside"
+    [[ -d "$dir" ]] || return 1     # can't stat it — ambiguous, not "outside"
+    [[ -n "$REPO_ROOT" ]] || return 1   # no known repo root to compare against
+    local abs
+    abs=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+
+    case "$abs" in
+        "$REPO_ROOT"|"$REPO_ROOT"/*) return 1 ;;
+        # The default in-repo worktrees dir is always in scope, even when an
+        # external worktree.root / LOOM_WORKTREE_ROOT is configured (mirrors
+        # _rm_scope_in_scope()'s equivalent check).
+        "$REPO_ROOT/.loom/worktrees"|"$REPO_ROOT/.loom/worktrees"/*) return 1 ;;
+    esac
+
+    local wt_root
+    wt_root=$(resolve_worktree_root "$REPO_ROOT")
+    if [[ -n "$wt_root" ]]; then
+        case "$abs" in
+            "$wt_root"|"$wt_root"/*) return 1 ;;
+        esac
+    fi
+
+    return 0
+}
+
+# =============================================================================
 # force-op branch-scope toggle — default ALL (preserve current behaviour).
 #
 # The three generic force-op ASK patterns (git push --force / -f /
@@ -5396,8 +5445,18 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                     fi
                     if [[ -z "$_fbranch" ]]; then
                         # Detached HEAD / unresolved identity is ambiguous — ask,
-                        # never silently allow (fail toward asking).
-                        ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
+                        # never silently allow (fail toward asking) — UNLESS the
+                        # force op's CWD is unambiguously outside every repo
+                        # root this guard tracks (main checkout + managed
+                        # worktrees), e.g. a bare /tmp scratch clone (#320). A
+                        # hard reset there cannot touch a protected branch of
+                        # THIS repo, so asking buys no safety and stalls
+                        # headless runs with no human to answer. Any CWD
+                        # inside the repo/a worktree, or one this guard cannot
+                        # classify, still asks exactly as before.
+                        if ! _force_op_cwd_outside_known_roots "$_fcwd"; then
+                            ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
+                        fi
                     fi
                     _ftarget="$_fbranch"
                 fi
