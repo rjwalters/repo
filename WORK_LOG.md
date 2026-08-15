@@ -4,6 +4,14 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #313** (closed): Remove dead is_recoverable_error() from classify-error.sh
+- **PR #314**: refactor: delete dead is_recoverable_error() from classify-error.sh
+- **Issue #285** (closed): Add Codex-side install/uninstall/drift-detection path for Repo Skills
+- **PR #288**: feat(install): package skills for Codex CLI at .agents/skills/repo/
+- **Issue #293** (closed): worktree-write-confinement-unresolved-var denies writes via a variable holding a statically-resolvable worktree-scoped literal
+- **PR #297**: fix(guard): resolve quoted $VAR write targets to same-command static literals
+- **Issue #305** (closed): Guard dispatcher probe (c) permanently inert (#5916), so the vendored guard still hits the #53 echo/printf false-positive
+- **PR #309**: fix(guard): port #53 echo/printf data-sink redaction into the vendored guard
 - **Issue #304** (closed): Consolidate worktree-creation logic: docs-worktree.sh and pr-worktree.sh silently lack worktree.sh's concurrency lock
 - **PR #308**: refactor(worktree): consolidate managed-worktree creation into a shared lib
 - **Issue #301** (closed): /repo:all has no stage that acts on Audit-surfaced tracked-file orphans
