@@ -117,7 +117,7 @@ log_hook_error() {
 # NOT rename fields without considering that dependency), one JSON object per
 # line:
 #   {"ts":"<UTC>","decision":"deny"|"ask","pattern":"<tag>",
-#    "tier":"catastrophic"|"ask","command":"<redacted>"}
+#    "tier":"catastrophic"|"ask","command":"<redacted>","context":"<optional>"}
 #     ts       — UTC timestamp, same format as log_hook_error's date -u call.
 #     decision — "deny" or "ask".
 #     pattern  — a short, stable rule tag (NOT the full free-text reason). For
@@ -126,6 +126,20 @@ log_hook_error() {
 #     tier     — "catastrophic" for deny, "ask" for ask.
 #     command  — the command string, REDACTED via strip_literal_text() so no raw
 #                --body/-m/--title/--notes/--comment secret value is persisted.
+#     context  — OPTIONAL free-form diagnostic string, ADDITIVE to the schema
+#                (issue #312/rjwalters/loom#312): a call site may pass extra
+#                state that a later false-positive review needs but the human-
+#                readable permissionDecisionReason never persists anywhere (it
+#                is only shown once, inline, in the denied session's own
+#                transcript). The `worktree-write-confinement` /
+#                `worktree-write-confinement-unresolved-var` tags use it to
+#                record the resolved `_WT_MAIN_ROOT` / `_WT_MAIN_ROOT_LOGICAL`
+#                roots the containment test actually compared against, so a
+#                future audit of this log can tell "the guard resolved an
+#                unexpectedly broad root" apart from "the target genuinely
+#                sits inside the checkout" WITHOUT reproducing the session.
+#                Omitted (absent key, not merely empty-string) when a call site
+#                passes none, so every existing record/consumer is unaffected.
 #
 # Best-effort like log_hook_error: gated by the lazy decision_log_enabled()
 # toggle, and a log-write failure (permission denied, disk full, missing dir)
@@ -137,10 +151,10 @@ log_hook_error() {
 #   jq -r '.pattern' .claude/skills/repo/logs/guard-decisions.log | sort | uniq -c | sort -rn
 # =============================================================================
 log_guard_decision() {
-    # Args: <decision> <tier> <pattern-tag>. The command is read from the global
-    # $COMMAND and redacted here. Returns 0 unconditionally.
+    # Args: <decision> <tier> <pattern-tag> [<context>]. The command is read
+    # from the global $COMMAND and redacted here. Returns 0 unconditionally.
     decision_log_enabled || return 0
-    local decision="$1" tier="$2" tag="${3:-$1}"
+    local decision="$1" tier="$2" tag="${3:-$1}" context="${4:-}"
     local ts redacted line
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || ts=""
     # Redact quoted --body/-m/--title/--notes/--comment values (same redactor the
@@ -152,14 +166,31 @@ log_guard_decision() {
     [[ -n "$redacted" ]] || redacted="$COMMAND"
     # Build the JSONL record with jq so all escaping is correct. If jq fails,
     # skip the write entirely rather than hand-roll a line that might mis-escape.
-    line=$(jq -cn \
-        --arg ts "$ts" \
-        --arg decision "$decision" \
-        --arg pattern "$tag" \
-        --arg tier "$tier" \
-        --arg command "$redacted" \
-        '{ts:$ts, decision:$decision, pattern:$pattern, tier:$tier, command:$command}' \
-        2>/dev/null) || return 0
+    # `context` is added to the object only when non-empty — the two jq filters
+    # below differ only in whether the `context` key is constructed at all, so
+    # the key stays ABSENT (not merely `""`) for every call site that does not
+    # pass one, keeping the schema byte-identical for the ~99% of tags that
+    # never set it.
+    if [[ -n "$context" ]]; then
+        line=$(jq -cn \
+            --arg ts "$ts" \
+            --arg decision "$decision" \
+            --arg pattern "$tag" \
+            --arg tier "$tier" \
+            --arg command "$redacted" \
+            --arg context "$context" \
+            '{ts:$ts, decision:$decision, pattern:$pattern, tier:$tier, command:$command, context:$context}' \
+            2>/dev/null) || return 0
+    else
+        line=$(jq -cn \
+            --arg ts "$ts" \
+            --arg decision "$decision" \
+            --arg pattern "$tag" \
+            --arg tier "$tier" \
+            --arg command "$redacted" \
+            '{ts:$ts, decision:$decision, pattern:$pattern, tier:$tier, command:$command}' \
+            2>/dev/null) || return 0
+    fi
     [[ -n "$line" ]] || return 0
     mkdir -p "$(dirname "$DECISION_LOG")" 2>/dev/null || true
     # Group the append so a FAILED >> redirection (unwritable/nonexistent dir)
@@ -2098,13 +2129,17 @@ command_has_shell_segment() {
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
 # decision log's `pattern` field; it defaults to "deny" (a function-name-derived
 # fallback) so this stays backward-compatible with call sites that don't pass
-# one. Telemetry is emitted BEFORE the JSON decision so a logging hiccup can
-# never suppress the deny, and the `|| true` guarantees it never trips the ERR
-# trap. Deny is always the "catastrophic" tier.
+# one. Optional third arg is a free-form diagnostic `context` string (issue
+# #312) forwarded verbatim to log_guard_decision()'s optional 4th arg — omitted
+# by every call site that doesn't pass one, so this is additive-only. Telemetry
+# is emitted BEFORE the JSON decision so a logging hiccup can never suppress
+# the deny, and the `|| true` guarantees it never trips the ERR trap. Deny is
+# always the "catastrophic" tier.
 deny() {
     local reason="$1"
     local tag="${2:-deny}"
-    log_guard_decision "deny" "catastrophic" "$tag" || true
+    local context="${3:-}"
+    log_guard_decision "deny" "catastrophic" "$tag" "$context" || true
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -2124,12 +2159,14 @@ deny() {
 # Helper: output an ask decision and exit
 #
 # Same optional rule-tag convention as deny() (issue #3771); defaults to "ask".
+# Same optional third `context` arg as deny() (issue #312), also additive-only.
 # Ask is always the "ask" tier. Telemetry is best-effort and emitted before the
 # JSON decision.
 ask() {
     local reason="$1"
     local tag="${2:-ask}"
-    log_guard_decision "ask" "ask" "$tag" || true
+    local context="${3:-}"
+    log_guard_decision "ask" "ask" "$tag" "$context" || true
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -4798,6 +4835,28 @@ if worktree_isolation_guard_enabled && \
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
     [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
+    # Diagnostic `context` string (issue #312) for every deny in this block:
+    # the resolved main-checkout root, in BOTH spellings this guard's
+    # containment tests actually compare against, plus REPO_ROOT (the
+    # `git rev-parse --show-toplevel` value FROM CWD — the WORKTREE's own
+    # toplevel when CWD is a linked worktree, per the header comment above) so
+    # a future false-positive review can tell "the guard resolved an
+    # unexpectedly broad root" apart from "the target genuinely sits inside
+    # the checkout" without reproducing the session (#312's own report: a
+    # denied write target that looked, on a static read, like it should have
+    # been outside `_WT_MAIN_ROOT` — this makes the actually-resolved root
+    # part of the persisted record instead of only the ephemeral, per-session
+    # permissionDecisionReason text). An optional trailing arg adds the
+    # specific resolved write-target path (`_wabs`/`_wknown`) the containment
+    # test judged, when the call site has one.
+    _wt_confinement_context() {
+        local _target="${1:-}" _target_physical="${2:-}"
+        local _ctx="wtMainRoot=${_WT_MAIN_ROOT} wtMainRootLogical=${_WT_MAIN_ROOT_LOGICAL} repoRoot=${REPO_ROOT} cwd=${CWD}"
+        [[ -n "$_target" ]] && _ctx="${_ctx} target=${_target}"
+        [[ -n "$_target_physical" ]] && _ctx="${_ctx} targetPhysical=${_target_physical}"
+        printf '%s' "$_ctx"
+    }
+
     # "Worktree isolation is actually in play for this repo/session" — a
     # managed worktree exists somewhere under the worktree base derived from
     # the SAME main-checkout root the containment tests use. Resolved lazily
@@ -4990,7 +5049,7 @@ if worktree_isolation_guard_enabled && \
                 # directory — the main checkout's own included).
                 if [[ "$_wmarked" == $'\001'* || "$_wmarked" == /$'\001'* ]]; then
                     if _wt_isolation_in_play; then
-                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
                     fi
                     continue
                 fi
@@ -5021,11 +5080,11 @@ if worktree_isolation_guard_enabled && \
                         # value picks a top-level directory, the main
                         # checkout's own included. Same verdict as (1).
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
                         fi
                     elif _wt_in_protected_area "$_wknown"; then
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wknown")"
                         fi
                     fi
                     continue
@@ -5132,7 +5191,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
         fi
     done <<< "$WRITE_TARGETS"
 fi

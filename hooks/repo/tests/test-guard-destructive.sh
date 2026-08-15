@@ -3362,6 +3362,72 @@ else
 fi
 rm -rf "$(dirname "$WTC_TAG_LOG")"
 
+# ---- The deny decision log's `context` field (issue #312): a false-positive
+# ---- review of guard-decisions.log could not tell "the guard resolved an
+# ---- unexpectedly broad root" apart from "the target genuinely sits inside
+# ---- the checkout" without reproducing the session, because only the
+# ---- ephemeral, per-session permissionDecisionReason text carried the
+# ---- resolved _WT_MAIN_ROOT/_WT_MAIN_ROOT_LOGICAL values — never the
+# ---- persisted JSONL record. The `context` field now carries them, plus the
+# ---- specific write target the containment test judged, for every
+# ---- worktree-write-confinement[-unresolved-var] deny.
+TOTAL=$((TOTAL + 1))
+WTC_CTX_LOG=$(mktemp -d 2>/dev/null)/decisions.log
+make_input "echo x > $WTC_MAIN/evil.sh" "$WTC_WT" | \
+    env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_CTX_LOG" "$GUARD" >/dev/null 2>&1 || true
+WTC_CTX_VAL="$(tail -1 "$WTC_CTX_LOG" 2>/dev/null | jq -r '.context // empty' 2>/dev/null)"
+if [[ -n "$WTC_CTX_VAL" ]] \
+   && [[ "$WTC_CTX_VAL" == *"wtMainRoot=$WTC_MAIN"* ]] \
+   && [[ "$WTC_CTX_VAL" == *"wtMainRootLogical="* ]] \
+   && [[ "$WTC_CTX_VAL" == *"target=$WTC_MAIN/evil.sh"* ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: write-confinement: deny decision log's context field records the resolved wtMainRoot/target"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: write-confinement: deny decision log's context field records the resolved wtMainRoot/target"
+    echo -e "       Got context: ${WTC_CTX_VAL:-<empty>}"
+fi
+rm -rf "$(dirname "$WTC_CTX_LOG")"
+
+# Same context field, for the unresolved-$VAR deny path (a different call
+# site — case (1) of the #4921 block above) — its context is the raw
+# (unresolvable) target token, not an _wabs-resolved path.
+TOTAL=$((TOTAL + 1))
+WTC_CTX_VAR_LOG=$(mktemp -d 2>/dev/null)/decisions.log
+make_input 'echo x > $DEST' "$WTC_WT" | \
+    env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_CTX_VAR_LOG" "$GUARD" >/dev/null 2>&1 || true
+WTC_CTX_VAR_VAL="$(tail -1 "$WTC_CTX_VAR_LOG" 2>/dev/null | jq -r '.context // empty' 2>/dev/null)"
+if [[ -n "$WTC_CTX_VAR_VAL" ]] \
+   && [[ "$WTC_CTX_VAR_VAL" == *"wtMainRoot=$WTC_MAIN"* ]] \
+   && [[ "$WTC_CTX_VAR_VAL" == *'target=$DEST'* ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: write-confinement-unresolved-var: deny decision log's context field records the resolved wtMainRoot/target"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: write-confinement-unresolved-var: deny decision log's context field records the resolved wtMainRoot/target"
+    echo -e "       Got context: ${WTC_CTX_VAR_VAL:-<empty>}"
+fi
+rm -rf "$(dirname "$WTC_CTX_VAR_LOG")"
+
+# A deny tag OUTSIDE the write-confinement category never gains a `context`
+# field — it stays additive-only, per the schema comment in
+# log_guard_decision(). rm -rf / is the same fixture the "(a)" telemetry test
+# above uses.
+TOTAL=$((TOTAL + 1))
+WTC_CTX_ABSENT_LOG=$(mktemp -d 2>/dev/null)/decisions.log
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_CTX_ABSENT_LOG" "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$WTC_CTX_ABSENT_LOG" ]] \
+   && [[ "$(tail -1 "$WTC_CTX_ABSENT_LOG" | jq 'has("context")' 2>/dev/null)" == "false" ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: decision log: a tag with no context arg omits the context key entirely"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: decision log: a tag with no context arg omits the context key entirely"
+    echo -e "       Got: $(tail -1 "$WTC_CTX_ABSENT_LOG" 2>/dev/null)"
+fi
+rm -rf "$(dirname "$WTC_CTX_ABSENT_LOG")"
+
 # ---- Unresolved shell variable as a write target fails CLOSED (#4921). ----
 assert_deny 'write-confinement: unexpanded $VAR write target fails closed' \
     'echo x > $DEST' "$WTC_WT"
