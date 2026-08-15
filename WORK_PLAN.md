@@ -26,7 +26,6 @@ _None._
 Issues currently being built (`loom:building`).
 
 - **#320**: Auditor: guard-decision telemetry — force-op:detached ask fires on scratch /tmp clone reset --hard
-- **#317**: Guard false-positive: catastrophic rm pattern matches quoted example text inside gh pr comment bodies
 
 ## PRs Awaiting Review
 
@@ -62,7 +61,7 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |

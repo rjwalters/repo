@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #317** (closed): Guard false-positive: catastrophic rm pattern matches quoted example text inside gh pr comment bodies
+- **PR #322**: fix(guard): recognize quoted-delimiter heredoc $(cat <<'EOF) bodies as inert text
 - **Issue #307** (closed): Extract shared PASS/FAIL/assert test helpers duplicated across 22 repo test files
 - **PR #319**: test: extract shared PASS/FAIL/SKIP assertion helpers into lib/assert.sh
 - **Issue #286** (closed): Add cross-runtime parity test for the repo-followups workflow (Claude vs Codex)
