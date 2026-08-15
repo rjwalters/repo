@@ -502,13 +502,6 @@ classify_error() {
     _classify_error_generic "$output"
 }
 
-# Convenience predicate matching legacy callers in claude-wrapper.sh.
-is_recoverable_error() {
-    local classification
-    classification=$(classify_error "$1" "$2")
-    [[ "$classification" != "FATAL" && "$classification" != "SUCCESS" ]]
-}
-
 # --- Retry verdict: the single source of truth (issue #4501) --------------
 #
 # classification_is_transient <category> -> exit 0 when a caller's retry loop
