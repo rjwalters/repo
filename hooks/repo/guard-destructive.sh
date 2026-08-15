@@ -993,6 +993,41 @@ resolve_worktree_root() {
 # NOT "outside" — the caller keeps asking exactly as before. This is a
 # precision fix, not a policy relaxation: a CWD inside the main checkout or a
 # managed worktree, or one this guard cannot classify, must keep asking.
+#
+# REPO_ROOT SELF-MATCH — INVESTIGATED, NOT CHANGED (#350): REPO_ROOT (resolved
+# once, near the top of this file) is `git -C "$CWD" rev-parse --show-toplevel`
+# — derived from the SAME $CWD a force op's own cwd can equal directly (no
+# `-C`/`cd` offset — e.g. a separate Bash call issued after an earlier
+# `cd /tmp/scratch`, so this call's own $CWD already IS the scratch clone).
+# When that happens, REPO_ROOT trivially resolves to the scratch clone's OWN
+# root, so the plain `"$abs" in "$REPO_ROOT"|"$REPO_ROOT"/*` test below
+# self-matches and this function returns "not outside" (still asks) rather
+# than exempting — the #320/#330 exemption does not fire for THIS shape of
+# the idiom (only for the #350-fixed `cd DIR && git …` single-command shape,
+# where -C/cd threading gives `_fcwd` a value genuinely different from
+# REPO_ROOT).
+#
+# This is a DELIBERATE gap, not an oversight: with $CWD as the only signal
+# available to a single, stateless hook invocation, "the operator's real main
+# checkout, given directly as cwd" and "an out-of-tree scratch clone, given
+# directly as cwd" are PROVABLY INDISTINGUISHABLE by path comparison against a
+# REPO_ROOT derived from that very same $CWD — both self-match identically,
+# both can carry a `guards.forceScope:"protected"` config (a scratch clone of
+# THIS repo inherits the tracked `.loom/config.json` verbatim), and both can
+# resolve to a real or detached branch. A path-shape heuristic (e.g. "abs sits
+# under /tmp") was prototyped and rejected: this file's own test fixtures
+# (`make_sql_repo`, via `mktemp -d`) — including the #320/#330 controls that
+# assert a self-matching cwd inside the "main checkout" still asks — ALSO live
+# under /tmp, so any such heuristic exempts exactly the case those controls
+# exist to pin. Soundly resolving this would need a $CWD-independent anchor
+# for "the repo this guard installation protects" (e.g. a session-scoped
+# project-root env var), which this file — a generic, portable guard installed
+# across many unrelated repos — deliberately does not depend on; Loom's own
+# dispatcher glue (`.loom/hooks/guard-destructive.sh`) already threads an
+# analogous `LOOM_PROJECT_ROOT` for a DIFFERENT purpose (choosing which guard
+# to exec) and could in principle export it further, but that is Loom-specific
+# scope, not this file's. Fail-closed (keep asking) is preserved rather than
+# guessing.
 # =============================================================================
 _force_op_cwd_outside_known_roots() {
     local dir="$1"
@@ -1716,6 +1751,12 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 #   - only a segment whose command word is `git` is considered.
 #   - `git -C <path> ...` sets <cpath>; other pre-subcommand global options are
 #     skipped (`-c <k=v>` consumes its argument).
+#   - a preceding `cd DIR &&`/`cd DIR;` segment earlier in the SAME compound
+#     command threads DIR through as the effective cwd for later force-op
+#     segments (#350) — see the cd-tracking block below for the full
+#     rationale. An explicit `git -C <path>` on the force-op's OWN segment
+#     still wins over a threaded `cd` (matches git's own -C-over-cwd
+#     precedence).
 #   - push: emitted only when a --force/-f/--force-with-lease flag is present.
 #     ONE line is emitted per positional refspec (pos[2], pos[3], …) after the
 #     remote — a multi-refspec push like `git push --force origin a b` emits a
@@ -1727,12 +1768,19 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 #       * `HEAD`, or no ref => the literal "@HEAD@" (resolve checked-out branch)
 #   - reset --hard: always emitted with <target> = "@HEAD@".
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
+#
+# Second positional arg is the hook's own $CWD, used to seed cd-tracking
+# (`curcwd`, below) so a force-op segment with no preceding `cd` and no `-C`
+# still emits an explicit <cpath> equal to the caller's own cwd — functionally
+# identical to the pre-#350 empty-cpath fallback (`_fcwd="$CWD"` at the call
+# site), just made explicit so a LATER `cd` in the same command can override it.
 parse_force_ops() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
                                  # read does not trim an empty cpath.
         buf = ""
+        curcwd = startcwd
     }
     # Slurp the whole (possibly multi-line) command, then segment ONCE with the
     # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
@@ -1749,6 +1797,29 @@ parse_force_ops() {
             sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
+            # cd-TRACKING (#350): thread a `cd DIR &&`/`cd DIR;` prefix earlier
+            # in the SAME compound command through to later force-op segments —
+            # mirrors extract_write_targets()/resolve_stash_cwd()s identical
+            # cd-tracking blocks byte-for-byte in spirit (their own header
+            # comments cover expand_cd_arg()s #5315 tilde-expansion fix and
+            # strip_cd_quoting()s #5363 quoted-absolute-path classification
+            # fix). Without this, the idiomatic `cd /tmp/scratch && git reset
+            # --hard origin/main` left `cpath` empty, so the caller fell back
+            # to its OWN raw hook $CWD (typically the main checkout) instead of
+            # the scratch directory the reset actually runs in — defeating the
+            # #320/#330 out-of-tree exemption for exactly the idiom it targets.
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    cdarg = expand_cd_arg(toks[2], home)
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) {
+                        curcwd = cdarg
+                    } else if (curcwd != "") {
+                        curcwd = curcwd "/" cdarg
+                    }
+                }
+                continue
+            }
             if (toks[1] != "git") continue
             # Walk global options between `git` and the subcommand.
             cpath = ""
@@ -1761,6 +1832,11 @@ parse_force_ops() {
                 break
             }
             if (k > m) continue
+            # No explicit `-C` on this segment — fall back to the tracked cd
+            # cwd (#350), which defaults to startcwd (the callers own $CWD)
+            # when no `cd` has run yet in this command, preserving the
+            # pre-#350 fallback exactly.
+            if (cpath == "") cpath = curcwd
             subcmd = toks[k]
             if (subcmd == "push") {
                 force = 0
@@ -5727,7 +5803,7 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
    echo "$COMMAND_ASK_SCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
-        _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN")
+        _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN" "$CWD")
         if [[ -n "$_FORCE_OPS" ]]; then
             if [[ "$_FORCE_MODE" == "all" ]]; then
                 # Preserve pre-#3674 behaviour byte-for-byte: any force op asks.

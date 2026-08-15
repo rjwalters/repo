@@ -1258,6 +1258,66 @@ assert_allow "forceScope protected: out-of-tree scratch-clone explicit push --fo
 assert_ask "forceScope protected: reset --hard on protected branch inside the main checkout still asks (#330)" \
     "git reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
 
+# ---- protected mode: force op reached via `cd DIR && …` cwd-threading (#350). ----
+# The SAME #320/#330 out-of-tree scratch-clone workaround, but written the way
+# it is actually idiomatically issued — `cd` into the scratch clone and the
+# force op in ONE compound command — rather than via an explicit `git -C
+# <path>` flag. Before #350, parse_force_ops() had no `cd`-tracking at all, so
+# `cpath` came back empty and the caller fell back to the OUTER hook $CWD (the
+# main checkout here), which IS "inside" REPO_ROOT — so the exemption never
+# applied and this asked unconditionally, defeating #320/#330 for the exact
+# idiom their own header comments describe.
+FORCE_SCRATCH_CD_DETACHED=$(mktemp -d)
+git -C "$FORCE_SCRATCH_CD_DETACHED" init -q
+git -C "$FORCE_SCRATCH_CD_DETACHED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_SCRATCH_CD_DETACHED" checkout -q --detach
+assert_allow "forceScope protected: cd-then-reset into an out-of-tree scratch clone (detached) does not ask (#350)" \
+    "cd $FORCE_SCRATCH_CD_DETACHED && git reset --hard origin/main" "$FORCE_PROT_DEFAULT"
+
+FORCE_SCRATCH_CD_PROTECTED=$(mktemp -d)
+git -C "$FORCE_SCRATCH_CD_PROTECTED" init -q -b main
+git -C "$FORCE_SCRATCH_CD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_SCRATCH_CD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+assert_allow "forceScope protected: cd-then-reset into an out-of-tree scratch clone on branch 'main' does not ask (#350)" \
+    "cd $FORCE_SCRATCH_CD_PROTECTED && git reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+
+# Full issue #350 reproduction shape: a multi-statement `cd DIR && …; …; …`
+# chain (remote set-url, fetch, reset --hard, all reached via ONE compound
+# command after the `cd`) — the exact idiom #320/#330's own header comment
+# names as their motivating case ("clone, point remote at origin, fetch,
+# `reset --hard`, discard"). The target directory must already exist on disk
+# (the guard evaluates the command's TEXT before any of it runs, so the
+# `[[ -d "$dir" ]]` existence probe in _force_op_cwd_outside_known_roots()
+# needs a real directory already present — mirroring how a re-issued/retried
+# compound command finds its own earlier scratch clone already on disk).
+assert_allow "forceScope protected: full cd/remote-set-url/fetch/reset scratch-clone idiom in ONE command does not ask (#350)" \
+    "cd $FORCE_SCRATCH_CD_PROTECTED && git remote add origin https://example.invalid/repo.git 2>/dev/null; git fetch --quiet origin 2>/dev/null; git reset --hard --quiet HEAD 2>/dev/null" \
+    "$FORCE_PROT_DEFAULT"
+
+# An explicit `-C <path>` on the force-op's OWN segment still wins over a
+# threaded `cd` (matches git's own -C-over-cwd precedence) — a `cd` to a
+# scratch clone followed by an explicit `-C <main checkout>` on the reset
+# itself must still ask; #350's cd-tracking must not weaken this.
+assert_ask "forceScope protected: cd to scratch clone then explicit -C <main checkout> on the reset still asks (#350)" \
+    "cd $FORCE_SCRATCH_CD_PROTECTED && git -C $FORCE_PROT_DEFAULT reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+
+# ---- protected mode: KNOWN LIMITATION (#350, investigated, not fixed) — the
+# tool's own cwd ALREADY equals the scratch clone, with no `cd`/`-C` anywhere
+# in THIS command (e.g. a separate Bash call issued after an earlier `cd` in
+# a prior call). REPO_ROOT self-matches the scratch clone's own root here, and
+# this still asks. See _force_op_cwd_outside_known_roots()'s header comment
+# for why this is not safely fixable with the signals available to a single,
+# stateless hook invocation: this shape is PROVABLY INDISTINGUISHABLE from the
+# #320/#330 in-tree controls above (both self-match identically), which
+# deliberately still ask. Locked in as a regression test so this documented
+# gap does not silently change later.
+FORCE_SCRATCH_CWD_PROTECTED=$(mktemp -d)
+git -C "$FORCE_SCRATCH_CWD_PROTECTED" init -q -b main
+git -C "$FORCE_SCRATCH_CWD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_SCRATCH_CWD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+assert_ask_env "forceScope protected: cwd itself already equals scratch clone still asks (#350 known limitation)" \
+    "LOOM_FORCE_SCOPE=protected" "git reset --hard HEAD~1" "$FORCE_SCRATCH_CWD_PROTECTED"
+
 # CWD inside a managed worktree (the default $REPO_ROOT/.loom/worktrees area)
 # with detached/ambiguous identity → still asks. Path-based containment only
 # (no real linked worktree needed): the guard's check is purely whether the
