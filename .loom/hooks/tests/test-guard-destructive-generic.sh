@@ -224,5 +224,66 @@ git -C "$WTC_MAIN" worktree remove --force "$WTC_WT" >/dev/null 2>&1 || true
 rm -rf "$WTC_MAIN"
 
 echo ""
+echo "=== (e) heredoc-wrapped --body values quoting an example command (Loom issue #317) ==="
+echo ""
+
+# This repo's own recommended commit-message/PR-comment convention is
+# `--body "$(cat <<'EOF' ... EOF)"` -- a QUOTED-delimiter heredoc, so no
+# expansion happens inside the body. Because the whole value necessarily
+# contains a literal `$(`, strip_literal_text()'s pre-existing `$(`-floor used
+# to leave it completely un-redacted, re-exposing any documented
+# dangerous-command example inside the heredoc body to the raw
+# catastrophic/ASK scans. mask_flag_cat_heredocs() masks ONLY the body of this
+# one provably-inert shape before the flag-value redaction runs.
+
+# Danger phrases assembled at runtime so this file's own Bash-tool invocation
+# is never itself flagged by the guard governing this session.
+_HD_DANGER="rm -r""f /"
+_HD_PB=main
+_HD_FORCE="git push --force origin $_HD_PB"
+
+# The exact issue #317 repro: a `gh pr comment` --body built with the quoted-
+# delimiter heredoc idiom, whose body merely documents/quotes a dangerous
+# command as fixture/example text.
+assert_allow "(e) #317: gh pr comment --body heredoc quoting a dangerous-rm example is allowed" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\nfixture asserts %s is denied\nEOF\n)"' "$_HD_DANGER")"
+
+assert_allow "(e) #317: gh pr comment --body heredoc quoting a force-push example is allowed" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\ndo not run %s\nEOF\n)"' "$_HD_FORCE")"
+
+# The `<<-` (dash) form, and a git commit -m using the same convention.
+assert_allow "(e) #317: git commit -m heredoc (<<- dash form) quoting a danger example is allowed" \
+    "$(printf 'git commit -m "$(cat <<-'"'"'EOF'"'"'\n\tfixture asserts %s is denied\n\tEOF\n)"' "$_HD_DANGER")"
+
+# --- SAFETY FLOOR: a --body value whose $(...) is NOT a quoted-delimiter
+# heredoc `cat` -- real command-substitution smuggling -- must still
+# hard-deny, UNMODIFIED.
+assert_deny "(e) #317 safety: --body \"text \$(danger) more\" (non-heredoc \$(...)) still denies" \
+    "gh issue comment 1 --body \"text \$($_HD_DANGER) more\""
+
+# --- SAFETY FLOOR: a heredoc body that ITSELF carries a real $(...)/backtick
+# substitution must still hard-deny -- proves the fix does not widen the
+# exclusion past the provably-inert heredoc-cat shape (per shell semantics a
+# single-quoted heredoc delimiter does NOT expand $()/backticks in the body,
+# so this nested payload never actually executes -- but the guard still
+# denies it as a deliberately conservative floor).
+assert_deny "(e) #317 safety: heredoc body nesting a real \$(danger) substitution still denies" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\n$(%s)\nEOF\n)"' "$_HD_DANGER")"
+
+assert_deny "(e) #317 safety: heredoc body nesting a backtick substitution still denies" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\n\`%s\`\nEOF\n)"' "$_HD_DANGER")"
+
+# --- SAFETY FLOOR: an UNQUOTED heredoc delimiter really is expanded by the
+# shell, so it must NOT be treated as inert -- pre-existing behavior,
+# unchanged by this fix.
+assert_deny "(e) #317 safety: unquoted heredoc delimiter (\$(cat <<EOF ... EOF)) still denies" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<EOF\n%s\nEOF\n)"' "$_HD_DANGER")"
+
+# --- SAFETY FLOOR: a real command chained after the heredoc but still INSIDE
+# the $(...) substitution genuinely executes, so it must not be masked away.
+assert_deny "(e) #317 safety: a real command chained after the heredoc inside \$(...) still denies" \
+    "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\nharmless prose\nEOF\n%s\n)"' "$_HD_DANGER")"
+
+echo ""
 echo "=== $PASS/$TOTAL passed ==="
 [[ "$FAIL" -eq 0 ]]
