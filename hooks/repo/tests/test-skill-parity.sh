@@ -86,13 +86,11 @@ CLAUDE_REL=".claude/commands/repo/followups.md"
 CODEX_REL=".agents/skills/repo/references/followups.md"
 CODEX_SKILL_REL=".agents/skills/repo/SKILL.md"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
+# assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
+# shared across the repo test suites — see commands/repo/tests/lib/assert.sh
+# (repo#307).
+source "$(dirname "${BASH_SOURCE[0]}")/../../../commands/repo/tests/lib/assert.sh"
 
 for f in "$INSTALL_SH" "$SRC_FOLLOWUPS" "$SRC_SKILL"; do
     if [[ ! -f "$f" ]]; then
@@ -107,25 +105,9 @@ FAKE_HOME="$SCRATCH/home"
 mkdir -p "$FAKE_HOME"
 
 # ---------------------------------------------------------------------------
-# Assertion helpers
+# File-specific assertion helpers (not in the shared lib)
 # ---------------------------------------------------------------------------
 
-ok() {   # <label>
-    TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
-    printf "  ${GREEN}PASS${NC}: %s\n" "$1"
-}
-no() {   # <label> <detail>
-    TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
-    printf "  ${RED}FAIL${NC}: %s\n" "$1"
-    [[ -n "${2:-}" ]] && printf "%s\n" "$2" | sed 's/^/        /'
-    return 0
-}
-assert_eq() {  # <label> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1" "expected [$2], got [$3]"; fi
-}
-assert_contains() {  # <label> <haystack> <needle>
-    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "missing [$3]"; fi
-}
 assert_file() {  # <label> <path>
     if [[ -f "$2" ]]; then ok "$1"; else no "$1" "no such file: $2"; fi
 }
