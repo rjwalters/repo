@@ -7,8 +7,7 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#297**: fix(guard): resolve quoted $VAR write targets to same-command static literals
-- **#288**: feat(install): package skills for Codex CLI at .agents/skills/repo/
+_None._
 
 ## Urgent
 
@@ -20,35 +19,31 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#293**: worktree-write-confinement-unresolved-var denies writes via a variable holding a statically-resolvable worktree-scoped literal
-- **#285**: Add Codex-side install/uninstall/drift-detection path for Repo Skills
+- **#286**: Add cross-runtime parity test for the repo-followups workflow (Claude vs Codex)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#305**: Guard dispatcher probe (c) permanently inert (#5916), so the vendored guard still hits the #53 echo/printf false-positive
-- **#304**: Consolidate worktree-creation logic: docs-worktree.sh and pr-worktree.sh silently lack worktree.sh's concurrency lock
+- **#312**: Auditor: worktree-write-confinement denied writes that appear outside its protected region
+- **#307**: Extract shared PASS/FAIL/assert test helpers duplicated across 22 repo test files
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#315**: fix(guard): persist resolved worktree roots in write-confinement deny telemetry
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#297**: fix(guard): resolve quoted $VAR write targets to same-command static literals
-- **#288**: feat(install): package skills for Codex CLI at .agents/skills/repo/
+_None._
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#293**: worktree-write-confinement-unresolved-var denies writes via a variable holding a statically-resolvable worktree-scoped literal *(curated)*
-- **#285**: Add Codex-side install/uninstall/drift-detection path for Repo Skills *(curated)*
 - **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
 - **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
 
@@ -64,13 +59,13 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 0 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 2 |
+| Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 0 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
