@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #304** (closed): Consolidate worktree-creation logic: docs-worktree.sh and pr-worktree.sh silently lack worktree.sh's concurrency lock
+- **PR #308**: refactor(worktree): consolidate managed-worktree creation into a shared lib
 - **Issue #301** (closed): /repo:all has no stage that acts on Audit-surfaced tracked-file orphans
 - **PR #303**: docs(all): give stage 1 ownership of tracked-file orphans, defer the rest
 - **Issue #300** (closed): scrub.md specifies \b regexes for a tracked-files-at-HEAD scope, but git grep silently ignores \b — a vacuous scan exits 0
