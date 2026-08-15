@@ -25,6 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
+- **#326**: Consolidate 5 near-identical toggle-resolution functions in guard-destructive.sh
 - **#320**: Auditor: guard-decision telemetry — force-op:detached ask fires on scratch /tmp clone reset --hard
 
 ## PRs Awaiting Review
@@ -37,7 +38,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#323**: fix(guard): skip force-op:detached ask for out-of-tree scratch clones
 
 ## Proposed
 
@@ -61,9 +62,9 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
+| Approved PRs awaiting merge | 1 |
 | Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
