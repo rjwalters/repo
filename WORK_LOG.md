@@ -4,6 +4,13 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #307** (closed): Extract shared PASS/FAIL/assert test helpers duplicated across 22 repo test files
+- **PR #319**: test: extract shared PASS/FAIL/SKIP assertion helpers into lib/assert.sh
+- **Issue #286** (closed): Add cross-runtime parity test for the repo-followups workflow (Claude vs Codex)
+- **PR #318**: test(repo): add cross-runtime parity test for followups invocation
+- **PR #316**: docs: Guide document maintenance update
+- **Issue #312** (closed): Auditor: worktree-write-confinement denied writes that appear outside its protected region
+- **PR #315**: fix(guard): persist resolved worktree roots in write-confinement deny telemetry
 - **Issue #313** (closed): Remove dead is_recoverable_error() from classify-error.sh
 - **PR #314**: refactor: delete dead is_recoverable_error() from classify-error.sh
 - **Issue #285** (closed): Add Codex-side install/uninstall/drift-detection path for Repo Skills
