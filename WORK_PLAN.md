@@ -25,13 +25,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#326**: Consolidate 5 near-identical toggle-resolution functions in guard-destructive.sh
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#328**: refactor(guard): consolidate toggle-resolution into shared helpers
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -61,8 +61,8 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |
 | Architect / Hermit proposals | 0 |
