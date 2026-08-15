@@ -1213,6 +1213,37 @@ git -C "$FORCE_PROT_DETACHED" -c user.email=t@t -c user.name=t commit -q --allow
 git -C "$FORCE_PROT_DETACHED" checkout -q --detach
 assert_ask "forceScope protected: reset --hard on detached HEAD asks (ambiguous)" \
     "git reset --hard HEAD~1" "$FORCE_PROT_DETACHED"
+# CWD IS the main checkout (no -C, hook cwd == REPO_ROOT) → the out-of-tree
+# scratch-clone carve-out below (#320) must NOT apply here; still asks.
+assert_ask "forceScope protected: detached HEAD inside the main checkout still asks (#320)" \
+    "git reset --hard HEAD~1" "$FORCE_PROT_DETACHED"
+
+# ---- protected mode: force-op CWD outside every known repo root (#320). ----
+# The standard workaround for a chronically stale local main: clone to a
+# scratch dir, point its remote at origin, fetch, `git reset --hard
+# origin/main`, then discard. A fresh clone + remote set-url + fetch can
+# leave the working copy detached before the reset lands it on a named ref,
+# but the reset can never touch THIS repo's protected branches since the
+# scratch clone sits entirely outside the main checkout and any managed
+# worktree — so the ask is skipped (fail open) here, and ONLY here.
+FORCE_SCRATCH_DETACHED=$(mktemp -d)
+git -C "$FORCE_SCRATCH_DETACHED" init -q
+git -C "$FORCE_SCRATCH_DETACHED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_SCRATCH_DETACHED" checkout -q --detach
+assert_allow "forceScope protected: out-of-tree scratch-clone detached HEAD does not ask (#320)" \
+    "git -C $FORCE_SCRATCH_DETACHED reset --hard origin/main" "$FORCE_PROT_DEFAULT"
+
+# CWD inside a managed worktree (the default $REPO_ROOT/.loom/worktrees area)
+# with detached/ambiguous identity → still asks. Path-based containment only
+# (no real linked worktree needed): the guard's check is purely whether the
+# resolved CWD sits under $REPO_ROOT/.loom/worktrees.
+FORCE_WT_DETACHED="$FORCE_PROT_DEFAULT/.loom/worktrees/issue-1"
+mkdir -p "$FORCE_WT_DETACHED"
+git -C "$FORCE_WT_DETACHED" init -q
+git -C "$FORCE_WT_DETACHED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_WT_DETACHED" checkout -q --detach
+assert_ask "forceScope protected: detached HEAD inside a managed worktree still asks (#320)" \
+    "git -C $FORCE_WT_DETACHED reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
 
 # ---- protected mode: git -C <other repo> resolves cwd from the -C argument. ----
 # Command runs with the hook cwd = default-branch repo, but -C points at the
