@@ -1004,6 +1004,80 @@ assert_eq "3" "$(echo "$OUT" | jq -r '.matches | length')" "(z3) --json parses a
 assert_eq "801 901 1001" "$(echo "$OUT" | jq -r '[.matches[].number] | join(" ")')" "(z3) --json recovers every match number, none swallowed by a splice"
 assert_eq "issue pr closed_issue" "$(echo "$OUT" | jq -r '[.matches[].type] | join(" ")')" "(z3) --json assigns each match its correct pool type"
 
+echo ""
+echo "Testing check-duplicate.sh title-only similarity signal (issue #354)..."
+
+# check-duplicate.sh failed to catch that #349 duplicated #347 -- both titles
+# shared 56% Jaccard overlap on their own, but #347's real ~300-word body
+# diluted the COMBINED (title+body) score to 4%, well under the default
+# --threshold=18. Each search now ALSO scores title-only overlap against a
+# separate, higher --title-threshold (default 40), and flags a candidate if
+# EITHER score clears its own bar. Fixtures below use small hand-built
+# keyword sets (NATO-alphabet title words, distinct "fillerNN"/"noiseNN"
+# body filler) so every percentage is exact and checkable by hand (see the
+# computation comment above each fixture).
+
+# (ba) Strong title match (100%) + a long, unrelated candidate body dilutes
+# the combined score to 13% (matches=4, union=4+29-4=29, 4*100/29=13) -- below
+# the default --threshold=18, so the OLD algorithm (combined score only)
+# would have missed this candidate entirely, exactly like #347/#349. The new
+# title-only score (100%, identical 4-word title on both sides) clears the
+# default --title-threshold=40, so it must still be flagged.
+reset_state
+FILLER="$(for i in $(seq -w 1 25); do printf 'filler%s ' "$i"; done)"
+cat > "$STUB_DIR/issues-open.json" <<EOF
+[{"number": 900, "title": "Alpha Bravo Charlie Delta", "body": "$FILLER"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(ba) Title-only signal catches a match the diluted combined score would miss"
+assert_contains "$OUT" "#900: Alpha Bravo Charlie Delta (similarity: 100%)" \
+  "(ba) Reported similarity is the title-only score (100%), the higher of the two"
+
+# (ba2) Same fixture, but with --title-threshold set above 100 (unreachable)
+# so the title-only signal can never fire: the combined score alone (13%) is
+# still below the default --threshold=18, so this must revert to exit 0 --
+# confirming (ba)'s match came from the title-only signal, not the combined
+# score independently clearing its own bar.
+run_cds --title-threshold 101 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(ba2) Disabling the title-only signal (--title-threshold 101) -> combined score alone (13%) does not clear --threshold=18"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(ba2) No duplicate reported once the title-only signal is disabled"
+
+# (bb) Weak title overlap (33%: matches=2 {alpha,bravo}, union=4+4-2=6,
+# 2*100/6=33) diluted further by an unrelated body (combined 6%: union=4+29-2=31,
+# 2*100/31=6). Both scores sit below their respective default thresholds
+# (--title-threshold=40, --threshold=18), so this must NOT be flagged -- the
+# title-only signal should not manufacture false positives out of a merely
+# partial title overlap.
+reset_state
+NOISE="$(for i in $(seq -w 1 25); do printf 'noise%s ' "$i"; done)"
+cat > "$STUB_DIR/issues-open.json" <<EOF
+[{"number": 901, "title": "Alpha Bravo Echo Foxtrot", "body": "$NOISE"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(bb) Weak title overlap (33%) below default --title-threshold=40 -> not flagged"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(bb) No false positive from partial title overlap plus body dilution"
+
+# (bb2) Same weak-overlap fixture, but --title-threshold is lowered to 30 --
+# now the 33% title-only score clears it, and the reported similarity is the
+# title-only score (33%), higher than the combined score (6%).
+run_cds --title-threshold 30 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(bb2) Lowering --title-threshold to 30 lets the 33% title-only score clear the bar"
+assert_contains "$OUT" "#901: Alpha Bravo Echo Foxtrot (similarity: 33%)" \
+  "(bb2) Reported similarity is the title-only score (33%), the higher of the two"
+
+# (bc) --json mode reports the same title-only-driven match with the correct
+# type and similarity value.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<EOF
+[{"number": 900, "title": "Alpha Bravo Charlie Delta", "body": "$FILLER"}]
+EOF
+run_cds --title "Alpha Bravo Charlie Delta" --json
+assert_eq "1" "$RC" "(bc) --json: title-only signal -> exit 1"
+assert_eq "true" "$(echo "$OUT" | jq -r '.duplicate_found')" "(bc) --json duplicate_found is true"
+assert_eq "900" "$(echo "$OUT" | jq -r '.matches[0].number')" "(bc) --json carries the title-only-matched issue number"
+assert_eq "100" "$(echo "$OUT" | jq -r '.matches[0].similarity')" "(bc) --json reports the title-only similarity (100), not the diluted combined score (13)"
+assert_eq "issue" "$(echo "$OUT" | jq -r '.matches[0].type')" "(bc) --json assigns the correct pool type"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
