@@ -612,6 +612,132 @@ positional_mask_cmdre() {
 }
 
 # =============================================================================
+# Shared boolean-toggle resolver: config -> legacy env -> repo env -> cache.
+#
+# sql_guard_enabled(), cloud_guard_enabled(), reversible_gh_guard_enabled(), and
+# decision_log_enabled() below each independently reimplemented this identical
+# "resolve a boolean from repo config + env vars, REPO_*-over-legacy-LOOM_*,
+# one-shot cache" shape (issue #326) — this helper implements the shared
+# *mechanics* exactly once. Each toggle's own doc comment (immediately above
+# its thin wrapper) still explains *why* its default polarity and resolution
+# order are what they are; that reasoning is toggle-specific and belongs
+# there, not here.
+#
+# Args:
+#   $1  cache_var_name    — name of the caller's cache variable (e.g.
+#                           _SQL_GUARD_CACHE), read/written by indirect
+#                           expansion.
+#   $2  config_key        — guard_cfg() key (e.g. sqlDdl).
+#   $3  default           — "true" or "false": the resolved value when
+#                           config, legacy env, and repo env are all
+#                           absent/malformed.
+#   $4  legacy_env_name   — name of the legacy LOOM_GUARD_* env var.
+#   $5  repo_env_name     — name of the REPO_GUARD_* env var (wins over the
+#                           legacy name).
+#   $6  disable_pattern   — optional; extended-regex alternation of env
+#                           values that disable (default: "0|false|no").
+#   $7  enable_pattern    — optional; extended-regex alternation of env
+#                           values that enable (default: "1|true|yes").
+#
+# Resolution order matches every caller exactly: guard_cfg() sets the
+# baseline over `default`, then legacy env overrides config, then repo env
+# overrides legacy env. Caches the resolved "true"/"false" string into the
+# named cache variable so a command that matches multiple patterns for the
+# same toggle pays for at most one guard_cfg() (jq) read. The config read
+# stays best-effort: any parse failure falls through to `default` and never
+# trips the ERR trap.
+# =============================================================================
+guard_toggle_enabled() {
+    local cache_var_name="$1" config_key="$2" default="$3"
+    local legacy_env_name="$4" repo_env_name="$5"
+    local disable_pattern="${6:-0|false|no}" enable_pattern="${7:-1|true|yes}"
+    local cache_val="${!cache_var_name}"
+    if [[ -z "$cache_val" ]]; then
+        local enabled="$default"
+        # Only an explicit true/false from config moves the value; a missing
+        # key or malformed config (guard_cfg() returns "unset") leaves it at
+        # `default`.
+        case "$(guard_cfg "$config_key")" in
+            false) enabled=false ;;
+            true)  enabled=true ;;
+        esac
+        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
+        local legacy_val="${!legacy_env_name:-}"
+        if [[ "$legacy_val" =~ ^($disable_pattern)$ ]]; then
+            enabled=false
+        elif [[ "$legacy_val" =~ ^($enable_pattern)$ ]]; then
+            enabled=true
+        fi
+        local repo_val="${!repo_env_name:-}"
+        if [[ "$repo_val" =~ ^($disable_pattern)$ ]]; then
+            enabled=false
+        elif [[ "$repo_val" =~ ^($enable_pattern)$ ]]; then
+            enabled=true
+        fi
+        printf -v "$cache_var_name" '%s' "$enabled"
+        cache_val="$enabled"
+    fi
+    [[ "$cache_val" == "true" ]]
+}
+
+# =============================================================================
+# Shared mode-toggle resolver: config -> legacy env -> repo env -> cache.
+#
+# Mode-aware sibling of guard_toggle_enabled() above, for a toggle whose
+# resolved value is a named mode string (e.g. "repo"/"off") rather than a
+# plain boolean. Used by rm_scope_repo_enabled() below — see its own doc
+# comment for *why* its default and resolution order are what they are; this
+# helper only implements the shared *mechanics*.
+#
+# Args:
+#   $1  cache_var_name     — name of the caller's cache variable.
+#   $2  config_key         — guard_cfg() key.
+#   $3  default_mode       — the "on" mode, resolved when config/env are all
+#                            absent/malformed (e.g. "repo").
+#   $4  off_value          — the "opt-out" mode value (e.g. "off").
+#   $5  config_off_pattern — extended-regex alternation of guard_cfg() values
+#                            that opt out to `off_value` (e.g. "off|permissive").
+#   $6  legacy_env_name    — name of the legacy LOOM_* env var.
+#   $7  repo_env_name      — name of the REPO_* env var (wins over legacy).
+#   $8  env_on_pattern     — extended-regex alternation of env values that
+#                            force `default_mode` (e.g. "repo").
+#   $9  env_off_pattern    — extended-regex alternation of env values that
+#                            force `off_value` (e.g. "off|0|no|permissive").
+#
+# Caches the resolved mode string; the predicate returns 0 exactly when the
+# cached mode equals `default_mode` — matching each caller's own
+# `[[ "$_CACHE" == "<on-mode>" ]]` check.
+# =============================================================================
+guard_toggle_mode() {
+    local cache_var_name="$1" config_key="$2" default_mode="$3" off_value="$4"
+    local config_off_pattern="$5" legacy_env_name="$6" repo_env_name="$7"
+    local env_on_pattern="$8" env_off_pattern="$9"
+    local cache_val="${!cache_var_name}"
+    if [[ -z "$cache_val" ]]; then
+        local mode="$default_mode"
+        if [[ "$(guard_cfg "$config_key")" =~ ^($config_off_pattern)$ ]]; then
+            mode="$off_value"
+        fi
+        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
+        local legacy_val="${!legacy_env_name:-}"
+        if [[ "$legacy_val" =~ ^($env_on_pattern)$ ]]; then
+            mode="$default_mode"
+        elif [[ "$legacy_val" =~ ^($env_off_pattern)$ ]]; then
+            mode="$off_value"
+        fi
+        local repo_val="${!repo_env_name:-}"
+        if [[ "$repo_val" =~ ^($env_on_pattern)$ ]]; then
+            mode="$default_mode"
+        elif [[ "$repo_val" =~ ^($env_off_pattern)$ ]]; then
+            mode="$off_value"
+        fi
+        printf -v "$cache_var_name" '%s' "$mode"
+        cache_val="$mode"
+    fi
+    [[ "$cache_val" == "$default_mode" ]]
+}
+
+# =============================================================================
 # SQL DDL/DML guard toggle — default ON.
 #
 # The SQL DDL/DML blocks (DROP DATABASE/TABLE/SCHEMA, TRUNCATE TABLE, and
@@ -632,30 +758,12 @@ positional_mask_cmdre() {
 # cached so a command matching multiple SQL patterns pays for at most one read.
 #
 # The config read is best-effort: any parse failure falls through to guard-ON
-# and never trips the ERR trap or produces a non-zero exit.
+# and never trips the ERR trap or produces a non-zero exit. Resolution mechanics
+# shared via guard_toggle_enabled() above.
 # =============================================================================
 _SQL_GUARD_CACHE=""
 sql_guard_enabled() {
-    if [[ -z "$_SQL_GUARD_CACHE" ]]; then
-        local enabled=true
-        # Only an explicit `false` disables (a missing guards.sqlDdl key or a
-        # malformed config reads as unset and stays on).
-        case "$(guard_cfg sqlDdl)" in
-            false) enabled=false ;;
-            true)  enabled=true ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_SQL:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        case "${REPO_GUARD_SQL:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        _SQL_GUARD_CACHE="$enabled"
-    fi
-    [[ "$_SQL_GUARD_CACHE" == "true" ]]
+    guard_toggle_enabled _SQL_GUARD_CACHE sqlDdl true LOOM_GUARD_SQL REPO_GUARD_SQL
 }
 
 # =============================================================================
@@ -705,30 +813,12 @@ stash_scope_guard_enabled() {
 # Mirrors sql_guard_enabled() exactly: cached in _CLOUD_GUARD_CACHE, invoked
 # LAZILY only after a cloud pattern has already matched so the jq config read
 # never touches the hot path for non-cloud commands. The config read is
-# best-effort: any parse failure falls through to guard-ON.
+# best-effort: any parse failure falls through to guard-ON. Resolution
+# mechanics shared via guard_toggle_enabled() above.
 # =============================================================================
 _CLOUD_GUARD_CACHE=""
 cloud_guard_enabled() {
-    if [[ -z "$_CLOUD_GUARD_CACHE" ]]; then
-        local enabled=true
-        # Only an explicit `false` disables (a missing key or malformed config
-        # reads as unset and stays on).
-        case "$(guard_cfg cloudCli)" in
-            false) enabled=false ;;
-            true)  enabled=true ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_CLOUD:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        case "${REPO_GUARD_CLOUD:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        _CLOUD_GUARD_CACHE="$enabled"
-    fi
-    [[ "$_CLOUD_GUARD_CACHE" == "true" ]]
+    guard_toggle_enabled _CLOUD_GUARD_CACHE cloudCli true LOOM_GUARD_CLOUD REPO_GUARD_CLOUD
 }
 
 # =============================================================================
@@ -762,30 +852,13 @@ cloud_guard_enabled() {
 # _REVERSIBLE_GH_GUARD_CACHE, invoked LAZILY only after a reversible-gh pattern
 # has already matched so the jq config read never touches the hot path for the
 # common (non-matching) case. The config read is best-effort: any parse failure
-# falls through to guard-OFF (the default), never blocking.
+# falls through to guard-OFF (the default), never blocking. Resolution
+# mechanics shared via guard_toggle_enabled() above.
 # =============================================================================
 _REVERSIBLE_GH_GUARD_CACHE=""
 reversible_gh_guard_enabled() {
-    if [[ -z "$_REVERSIBLE_GH_GUARD_CACHE" ]]; then
-        local enabled=false
-        # Only an explicit `true` enables (a missing guards.reversibleGh key or
-        # a malformed config reads as unset and stays off — inverse polarity).
-        case "$(guard_cfg reversibleGh)" in
-            true)  enabled=true ;;
-            false) enabled=false ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_REVERSIBLE_GH:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        case "${REPO_GUARD_REVERSIBLE_GH:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        _REVERSIBLE_GH_GUARD_CACHE="$enabled"
-    fi
-    [[ "$_REVERSIBLE_GH_GUARD_CACHE" == "true" ]]
+    guard_toggle_enabled _REVERSIBLE_GH_GUARD_CACHE reversibleGh false \
+        LOOM_GUARD_REVERSIBLE_GH REPO_GUARD_REVERSIBLE_GH
 }
 
 # =============================================================================
@@ -815,29 +888,15 @@ reversible_gh_guard_enabled() {
 # of commands that neither deny nor ask, and in particular never runs on the
 # #3687 read-only fast path (which exits before any deny/ask). The config read is
 # best-effort: any parse failure falls through to guard-OFF (the default).
+# Resolution mechanics shared via guard_toggle_enabled() above — this toggle is
+# the only one of the four booleans that also accepts on/off env spellings, so
+# it passes explicit enable/disable patterns rather than the helper's default.
 # =============================================================================
 _DECISION_LOG_CACHE=""
 decision_log_enabled() {
-    if [[ -z "$_DECISION_LOG_CACHE" ]]; then
-        local enabled=false
-        # Only an explicit `true` enables; a missing key or malformed config
-        # reads as unset and stays OFF — inverse of sql_guard_enabled().
-        case "$(guard_cfg decisionLog)" in
-            true)  enabled=true ;;
-            false) enabled=false ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_DECISION_LOG:-}" in
-            0|false|no|off)   enabled=false ;;
-            1|true|yes|on)    enabled=true ;;
-        esac
-        case "${REPO_GUARD_DECISION_LOG:-}" in
-            0|false|no|off)   enabled=false ;;
-            1|true|yes|on)    enabled=true ;;
-        esac
-        _DECISION_LOG_CACHE="$enabled"
-    fi
-    [[ "$_DECISION_LOG_CACHE" == "true" ]]
+    guard_toggle_enabled _DECISION_LOG_CACHE decisionLog false \
+        LOOM_GUARD_DECISION_LOG REPO_GUARD_DECISION_LOG \
+        '0|false|no|off' '1|true|yes|on'
 }
 
 # =============================================================================
@@ -872,31 +931,14 @@ decision_log_enabled() {
 # _RM_SCOPE_CACHE, invoked LAZILY only after a candidate rm target survives the
 # catastrophic check, so the jq config read never touches the hot path for
 # non-rm commands. The config read is best-effort: any parse failure falls
-# through to REPO (the safe default) and never trips the ERR trap.
+# through to REPO (the safe default) and never trips the ERR trap. Resolution
+# mechanics shared via guard_toggle_mode() above (this toggle is 3-valued —
+# "repo"/"off" — rather than a plain boolean).
 # =============================================================================
 _RM_SCOPE_CACHE=""
 rm_scope_repo_enabled() {
-    if [[ -z "$_RM_SCOPE_CACHE" ]]; then
-        local mode=repo
-        # Only an explicit guards.rmScope of "off" or "permissive" opts out to
-        # the legacy permissive behaviour; any other value, a missing key, or a
-        # malformed config (reads as unset) resolves to "repo" (the safe
-        # default).
-        case "$(guard_cfg rmScope)" in
-            off|permissive) mode=off ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_RM_SCOPE:-}" in
-            repo)                  mode=repo ;;
-            off|0|no|permissive)   mode=off ;;
-        esac
-        case "${REPO_RM_SCOPE:-}" in
-            repo)                  mode=repo ;;
-            off|0|no|permissive)   mode=off ;;
-        esac
-        _RM_SCOPE_CACHE="$mode"
-    fi
-    [[ "$_RM_SCOPE_CACHE" == "repo" ]]
+    guard_toggle_mode _RM_SCOPE_CACHE rmScope repo off 'off|permissive' \
+        LOOM_RM_SCOPE REPO_RM_SCOPE repo 'off|0|no|permissive'
 }
 
 # Resolve the Loom worktree base dir for repo-scope checks. Mirrors the
