@@ -4,6 +4,9 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #340** (closed): guard-destructive: tee ... >/dev/null false-denies as worktree-isolation bypass when sibling worktrees exist
+- **PR #342**: fix(guard): exclude trailing >/>> redirect tokens from tee/sed/cp/mv target scan
+- **PR #339**: docs: Guide document maintenance update
 - **Issue #335** (closed): Remove unused _is_tty() helper in repo-remote.sh
 - **PR #338**: refactor(repo-remote): remove unused _is_tty() helper
 - **Issue #331** (closed): worktree-write-confinement guard flags read-only heredoc-fed interpreter payloads as writes
