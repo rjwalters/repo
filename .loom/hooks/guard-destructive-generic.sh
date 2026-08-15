@@ -2257,7 +2257,14 @@ resolve_stash_cwd() {
 #      speculatively" rule for mask_heredoc_bodies);
 #   4. the very next line after the delimiter line is `)` + that same opening
 #      quote — i.e. the substitution ends immediately, with nothing chained
-#      after the heredoc inside it.
+#      after the heredoc inside it;
+#   5. the body ITSELF carries no `$(` or backtick on any line (Loom issue
+#      #317). A single-quoted heredoc delimiter genuinely prevents the outer
+#      shell from expanding a `$(…)`/backtick that appears IN the body — `cat`
+#      only ever sees and echoes it as literal text — so this condition is a
+#      deliberately CONSERVATIVE belt-and-suspenders floor, not a correctness
+#      requirement: it keeps this masking pass narrowly scoped to bodies that
+#      cannot even be misread as carrying a substitution.
 # Condition 4 is what keeps a `--body "$(cat <<QUOTED_DELIM … QUOTED_DELIM`
 # <newline> `rm -rf /` <newline> `)"` command denying: bash ends the heredoc at
 # the delimiter line and then genuinely RUNS the following line inside the
@@ -2268,7 +2275,10 @@ resolve_stash_cwd() {
 # deliberate narrowing versus reusing mask_heredoc_bodies() (#5000) here: that
 # helper masks ANY closed heredoc body regardless of its consumer, a documented
 # and accepted fail-open for the write-target scanner (#5117 Known Limitation 1)
-# that must NOT be inherited by the catastrophic hard-deny floor.
+# that must NOT be inherited by the catastrophic hard-deny floor. Condition 5
+# is what keeps a `--body "$(cat <<QUOTED_DELIM` <newline> `$(rm -rf /)`
+# <newline> `QUOTED_DELIM` <newline> `)"` command denying even though the
+# nested `$(rm -rf /)` never actually executes.
 #
 # KNOWN LIMITATION (recorded, mirroring the #5117 convention): this recognizes
 # only the literal `cat`-consumed shape spelled out above. A semantically
@@ -2285,7 +2295,7 @@ strip_literal_text() {
     # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
     # its byte offsets and line count; the opener line, the delimiter line and
     # everything outside the body are left untouched.
-    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform) {
+    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform, dirty) {
         if (index(s, "<<") == 0) return s
         nl = split(s, lines, "\n")
         for (i = 1; i <= nl; i++) {
@@ -2321,6 +2331,13 @@ strip_literal_text() {
             #     after the heredoc inside `$( … )` is masked away.
             if (closeat == nl) continue
             if (substr(lines[closeat + 1], 1, 2) != ")" oq) continue
+            # (5) the body must carry no `$(`/backtick on ANY line — a
+            #     deliberately conservative floor, see the header comment.
+            dirty = 0
+            for (j = i + 1; j < closeat; j++) {
+                if (index(lines[j], "$(") != 0 || index(lines[j], "`") != 0) { dirty = 1; break }
+            }
+            if (dirty) continue
             for (j = i + 1; j < closeat; j++) {
                 body = lines[j]
                 gsub(/./, "X", body)

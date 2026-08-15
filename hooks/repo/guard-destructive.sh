@@ -1801,8 +1801,137 @@ dequote_inert_spans() {
     }'
 }
 
+# =============================================================================
+# HEREDOC-WRAPPED FLAG VALUES (#317)
+#
+# The `$(`-floor above is exactly right for a general command substitution, but
+# it also declines to redact this repo's own pervasive idiom for a multi-line
+# comment/commit-message body (this repo's own CLAUDE.md, "Committing changes
+# with git" section, prescribes it):
+#
+#     gh pr comment 315 --body "$(cat <<'EOF'
+#     …prose that may QUOTE a dangerous command as an example…
+#     EOF
+#     )"
+#
+# Every value built that way necessarily contains `$(`, so before this pass it
+# was NEVER redacted — and a dangerous-command example merely quoted inside the
+# body (e.g. a Judge documenting a rejected shell-injection payload, or a test
+# fixture describing what an `rm -rf /` denial looks like) hard-denied the
+# whole command on the catastrophic tier. Reproduced live against:
+#   gh pr comment 315 --body "$(cat <<'EOF'
+#   fixture asserts rm -rf / is denied
+#   EOF
+#   )"
+#
+# mask_flag_cat_heredocs() (below) closes the gap by masking ONLY the BODY of a
+# heredoc in this one provably-inert shape, and only when ALL of these hold:
+#   1. the opener is the complete tail of its line, immediately preceded by a
+#      recognized text-carrying flag, its opening quote, and `$(cat`;
+#   2. the heredoc delimiter is QUOTED (single- or double-quoted, `<<-`
+#      allowed) — a quoted delimiter is what guarantees the outer shell
+#      performs NO expansion on the body, so a `$(…)` sitting IN the body is
+#      inert text rather than live code (an UNQUOTED delimiter is rejected
+#      outright, so `--body "$(cat <<EOF ... EOF)"` still hard-denies, exactly
+#      as before);
+#   3. the block is CLOSED in this same buffer (never mask speculatively);
+#   4. the very next line after the delimiter line is `)` + that same opening
+#      quote — i.e. the substitution ends immediately, with nothing chained
+#      after the heredoc inside it;
+#   5. the body ITSELF carries no `$(` or backtick on any line. A single-quoted
+#      heredoc delimiter genuinely prevents the outer shell from expanding a
+#      `$(…)`/backtick that appears IN the body — `cat` only ever sees and
+#      echoes it as literal text — so this condition is a deliberately
+#      CONSERVATIVE belt-and-suspenders floor, not a correctness requirement:
+#      it keeps this masking pass narrowly scoped to bodies that cannot even
+#      be misread as carrying a substitution, rather than trusting every
+#      caller of this function to reason about heredoc-quoting semantics.
+# Condition 4 is what keeps `--body "$(cat <<'EOF' … EOF` <newline> `rm -rf /`
+# <newline> `)"` denying: bash ends the heredoc at the delimiter line and then
+# genuinely RUNS the following line inside the substitution, so nothing is
+# masked there. Condition 1 is what keeps an INTERPRETER-FED heredoc denying —
+# a body consumed by `bash <<DELIM`, `sh -s <<DELIM`, or `cat <<DELIM … | sh`
+# is live code to the inner shell, and none of those match `<flag> <quote>$(cat`.
+# Condition 5 is what keeps `--body "$(cat <<'EOF'` <newline> `$(rm -rf /)`
+# <newline> `EOF` <newline> `)"` denying even though the nested `$(rm -rf /)`
+# never actually executes (regression test in
+# hooks/repo/tests/test-guard-destructive.sh).
+#
+# KNOWN LIMITATION (deliberate): this recognizes only the literal
+# `cat`-consumed shape spelled out above. A semantically equivalent variant —
+# `$(command cat <<DELIM …)`, a heredoc opened on a continuation line, or a
+# body whose delimiter line is followed by `) "` with a space — is simply not
+# recognized and keeps denying exactly as it does today. That is the safe
+# direction (a false positive that already exists, never a new bypass), and
+# the shape above is the one this repo's own role prompts prescribe.
+#
+# This is closely related to `.loom/hooks/guard-destructive-generic.sh`'s own
+# mask_flag_cat_heredocs() (vendored from upstream Repo Skills rjwalters/repo
+# #5216, which independently closed conditions 1-4 of this same gap) — this
+# port additionally carries condition 5 (#317's AC #3 nested-smuggling floor);
+# keep the two files' behavior in sync.
+# =============================================================================
 strip_literal_text() {
     printf '%s' "$1" | awk '
+    # Mask the body of a `<flag> "$(cat <<QUOTED_DELIM … DELIM\n)"` heredoc.
+    # See the header comment above for the four conditions and why each is
+    # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
+    # its byte offsets and line count; the opener line, the delimiter line and
+    # everything outside the body are left untouched.
+    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform, dirty) {
+        if (index(s, "<<") == 0) return s
+        nl = split(s, lines, "\n")
+        for (i = 1; i <= nl; i++) {
+            line = lines[i]
+            # (2) opener must END the line and carry a QUOTED delimiter.
+            if (match(line, /<<-?["'"'"'][A-Za-z0-9_]+["'"'"'][ \t]*$/) == 0) continue
+            dashform = (substr(line, RSTART + 2, 1) == "-")
+            delim = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?/, "", delim)
+            sub(/[ \t]*$/, "", delim)
+            dq = substr(delim, 1, 1)
+            if (substr(delim, length(delim), 1) != dq) continue   # quotes must match
+            delim = substr(delim, 2, length(delim) - 2)
+            if (delim == "") continue
+            # (1) …immediately preceded by <flag> <openquote>$(cat.
+            pre = substr(line, 1, RSTART - 1)
+            if (pre !~ /(^|[ \t])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*["'"'"']\$\([ \t]*cat[ \t]+$/) continue
+            oq = ""
+            for (j = length(pre); j >= 1; j--) {
+                if (substr(pre, j, 2) == "$(") { oq = substr(pre, j - 1, 1); break }
+            }
+            if (oq != DQ && oq != SQ) continue
+            # (3) the block must be CLOSED inside this buffer.
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                if (dashform) sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            # (4) the substitution must close IMMEDIATELY after the delimiter
+            #     line — `)` + the same opening quote — so nothing chained
+            #     after the heredoc inside `$( … )` is masked away.
+            if (closeat == nl) continue
+            if (substr(lines[closeat + 1], 1, 2) != ")" oq) continue
+            # (5) the body must carry no `$(`/backtick on ANY line — a
+            #     deliberately conservative floor, see the header comment.
+            dirty = 0
+            for (j = i + 1; j < closeat; j++) {
+                if (index(lines[j], "$(") != 0 || index(lines[j], "`") != 0) { dirty = 1; break }
+            }
+            if (dirty) continue
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
+                gsub(/./, "X", body)
+                lines[j] = body
+            }
+            i = closeat
+        }
+        s = lines[1]
+        for (i = 2; i <= nl; i++) s = s "\n" lines[i]
+        return s
+    }
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
@@ -1826,7 +1955,16 @@ strip_literal_text() {
     # byte-for-byte identical to the previous behaviour.
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
-        s = buf
+        # PRE-PASS (#317): blank the body of a `<flag> "$(cat <<QDELIMQ … )"`
+        # heredoc before the quoted-span redaction below runs. It has to happen
+        # here rather than inside the loop because `re`'"'"'s quoted-span classes
+        # ([^"]* / [^'"'"']*) stop at the first quote character, and a heredoc
+        # body is free to contain raw quotes (prose routinely does) — so the
+        # span match alone cannot see such a value whole. Masking first also
+        # means the `$(`-floor below needs no exception: by the time the loop
+        # reads this span, the only text left inside it is `$(cat <<QDELIMQ`,
+        # the delimiter, and `)`.
+        s = mask_flag_cat_heredocs(buf)
         out = ""
         while (match(s, re)) {
             pre     = substr(s, 1, RSTART - 1)
