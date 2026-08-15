@@ -1233,6 +1233,31 @@ git -C "$FORCE_SCRATCH_DETACHED" checkout -q --detach
 assert_allow "forceScope protected: out-of-tree scratch-clone detached HEAD does not ask (#320)" \
     "git -C $FORCE_SCRATCH_DETACHED reset --hard origin/main" "$FORCE_PROT_DEFAULT"
 
+# ---- protected mode: force-op CWD outside every known repo root, TARGET is
+# the protected branch itself (#330, the force-op:protected sibling gap).
+# The #320 fix above exempted only the detached/unresolved-branch ask; a
+# scratch clone left on (or resolving to) a branch literally named "main"
+# still tripped force-op:protected unconditionally, regardless of CWD — this
+# is exactly the "clone --no-checkout, fetch, checkout --detach, checkout -b
+# <feature>" scratch-clone workaround failing at the checkout-a-named-branch
+# step, since any intermediate "git reset --hard origin/main" while still on
+# a branch named main would stall a headless run with no human to answer.
+FORCE_SCRATCH_PROTECTED=$(mktemp -d)
+git -C "$FORCE_SCRATCH_PROTECTED" init -q -b main
+git -C "$FORCE_SCRATCH_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_SCRATCH_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+# Bare form (no refspec): target resolves via symbolic-ref to "main" — allow.
+assert_allow "forceScope protected: out-of-tree scratch-clone on branch 'main' does not ask (#330)" \
+    "git -C $FORCE_SCRATCH_PROTECTED reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+# Explicit refspec target "main" from an out-of-tree CWD — allow.
+assert_allow "forceScope protected: out-of-tree scratch-clone explicit push --force to main does not ask (#330)" \
+    "git -C $FORCE_SCRATCH_PROTECTED push --force origin main" "$FORCE_PROT_DEFAULT"
+# CWD IS the main checkout (no -C, hook cwd == REPO_ROOT) → the out-of-tree
+# carve-out must NOT apply here; still asks (must not weaken the general
+# case — mirrors the #320 in-tree control above).
+assert_ask "forceScope protected: reset --hard on protected branch inside the main checkout still asks (#330)" \
+    "git reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+
 # CWD inside a managed worktree (the default $REPO_ROOT/.loom/worktrees area)
 # with detached/ambiguous identity → still asks. Path-based containment only
 # (no real linked worktree needed): the guard's check is purely whether the

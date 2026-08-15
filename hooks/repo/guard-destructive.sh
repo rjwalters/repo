@@ -5505,7 +5505,20 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                 _fdefault=$(resolve_default_branch "$_fcwd")
                 if [[ "$_ftarget" == "main" || "$_ftarget" == "master" ]] || \
                    { [[ -n "$_fdefault" && "$_ftarget" == "$_fdefault" ]]; }; then
-                    ask "Command requires confirmation: $COMMAND (force operation targets protected branch '$_ftarget')" "force-op:protected"
+                    # Protected-branch target — ask, never silently allow
+                    # (fail toward asking) — UNLESS the force op's CWD is
+                    # unambiguously outside every repo root this guard
+                    # tracks (main checkout + managed worktrees), e.g. a
+                    # bare /tmp scratch clone (#330, mirroring #320's
+                    # force-op:detached exemption above). A hard reset
+                    # there cannot touch a protected branch of THIS repo,
+                    # so asking buys no safety and stalls headless runs
+                    # with no human to answer. Any CWD inside the repo/a
+                    # worktree, or one this guard cannot classify, still
+                    # asks exactly as before.
+                    if ! _force_op_cwd_outside_known_roots "$_fcwd"; then
+                        ask "Command requires confirmation: $COMMAND (force operation targets protected branch '$_ftarget')" "force-op:protected"
+                    fi
                 fi
             done <<< "$_FORCE_OPS"
             # No protected/ambiguous target matched — fall through to allow.
