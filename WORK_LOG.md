@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-16
 
+- **Issue #373** (closed): Consolidate stash_scope_guard_enabled and worktree_isolation_guard_enabled into guard_toggle_enabled
+- **PR #377**: refactor(guard): delegate stash-scope and worktree-isolation toggles to guard_toggle_enabled()
 - **Issue #371** (closed): Auditor: #331's structured-interpreter heredoc fix never ported to vendored guard-destructive-generic.sh
 - **PR #374**: fix(guard): port #331 structured-interpreter heredoc fix into vendored guard
 - **Issue #368** (closed): uninstall.sh: consolidate remove_settings_hook and remove_settings_sessionstart_hook
