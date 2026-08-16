@@ -25,13 +25,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#351**: Migrate two test files to the shared assert.sh helper lib
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#353**: refactor(tests): source shared assert.sh in skill-parity and codex-skill suites
 
 ## Approved (Awaiting Merge)
 
@@ -61,8 +61,8 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |
 | Architect / Hermit proposals | 1 |

@@ -4,6 +4,9 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-15
 
+- **Issue #350** (closed): fix(guard): force-op out-of-tree exemption (#320/#330) never fires for the cd-then-reset scratch-clone idiom
+- **PR #352**: fix(guard): thread cd-tracking through parse_force_ops for #320/#330 scratch-clone exemption
+- **PR #348**: docs: update WORK_PLAN
 - **Issue #341** (closed): /repo:deps: absent security_and_analysis is not proof of missing admin
 - **PR #344**: docs(deps): read security-updates flag from automated-security-fixes, not security_and_analysis presence
 - **Issue #340** (closed): guard-destructive: tee ... >/dev/null false-denies as worktree-isolation bypass when sibling worktrees exist
