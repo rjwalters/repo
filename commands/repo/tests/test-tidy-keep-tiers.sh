@@ -479,8 +479,7 @@ echo ""
 echo "-- doc drift: tidy.md still specifies what this suite implements --"
 # ---------------------------------------------------------------------------
 # Phrases are asserted against a whitespace-flattened copy, since the
-# requirement is prose that wraps across lines.
-flatten() { tr '\n' ' ' < "$1" | tr -s ' '; }
+# requirement is prose that wraps across lines. (flatten() is defined in lib/assert.sh)
 TIDY="$(flatten "$TIDY_MD")"
 
 assert_contains "tidy.md names the KEEP (generated) sub-case" \
