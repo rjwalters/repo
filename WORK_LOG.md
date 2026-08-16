@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-16
 
+- **Issue #368** (closed): uninstall.sh: consolidate remove_settings_hook and remove_settings_sessionstart_hook
+- **PR #370**: refactor(uninstall): consolidate settings-hook removal into one function
 - **Issue #366** (closed): Deduplicate json_escape(): identical function copy-pasted in repo-remote.sh and repo-scrub-forks.sh
 - **PR #367**: test: add json_escape() parity guard across the two shipped copies
 - **Issue #363** (closed): Consolidate duplicated flatten() test helper into lib/assert.sh
