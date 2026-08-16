@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#368**: uninstall.sh: consolidate remove_settings_hook and remove_settings_sessionstart_hook
+- **#371**: Auditor: #331's structured-interpreter heredoc fix never ported to vendored guard-destructive-generic.sh
 
 ## PRs Awaiting Review
 
