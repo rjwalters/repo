@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#371**: Auditor: #331's structured-interpreter heredoc fix never ported to vendored guard-destructive-generic.sh
+- **#373**: Consolidate stash_scope_guard_enabled and worktree_isolation_guard_enabled into guard_toggle_enabled
 
 ## PRs Awaiting Review
 
@@ -48,6 +48,7 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
+- **#375**: Consolidate find_repo_root(): worktree-unaware copies break signal.sh across worktrees *(hermit)*
 - **#346**: Remove clean-labels.sh: dead deprecated stub with zero callers *(hermit)*
 
 ## Epics
@@ -65,6 +66,6 @@ _None._
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |
-| Architect / Hermit proposals | 1 |
+| Architect / Hermit proposals | 2 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
