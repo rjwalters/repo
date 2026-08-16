@@ -4,6 +4,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-16
 
+- **PR #359**: docs: Guide document maintenance update
 - **Issue #356** (closed): Orphaned regression-guard lints: check-cas-recheck-consistency.sh, check-label-descriptions.sh, check-phantom-labels.sh are never invoked
 - **PR #357**: test: wire check-label-descriptions.sh into pnpm test
 - **Issue #354** (closed): check-duplicate.sh: false negative on #347/#349 near-duplicate pair (differently-worded titles, same bug)
