@@ -785,28 +785,12 @@ sql_guard_enabled() {
 #   3. Default: true (guard on)
 #
 # Mirrors sql_guard_enabled() exactly: cached in _STASH_SCOPE_CACHE, invoked
-# LAZILY only after the stash pattern has already matched.
+# LAZILY only after the stash pattern has already matched. Resolution
+# mechanics shared via guard_toggle_enabled() above.
 # =============================================================================
 _STASH_SCOPE_CACHE=""
 stash_scope_guard_enabled() {
-    if [[ -z "$_STASH_SCOPE_CACHE" ]]; then
-        local enabled=true
-        case "$(guard_cfg stashScope)" in
-            false) enabled=false ;;
-            true)  enabled=true ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_STASH_SCOPE:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        case "${REPO_GUARD_STASH_SCOPE:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        _STASH_SCOPE_CACHE="$enabled"
-    fi
-    [[ "$_STASH_SCOPE_CACHE" == "true" ]]
+    guard_toggle_enabled _STASH_SCOPE_CACHE stashScope true LOOM_GUARD_STASH_SCOPE REPO_GUARD_STASH_SCOPE
 }
 
 # =============================================================================
@@ -3095,30 +3079,11 @@ _rm_scope_in_scope() {
 # jq config read never touches the hot path for the vast majority of Bash calls
 # that contain none of the recognized write idioms at all. The config read is
 # best-effort: any parse failure falls through to guard-ON and never trips the
-# ERR trap.
+# ERR trap. Resolution mechanics shared via guard_toggle_enabled() above.
 # =============================================================================
 _WORKTREE_ISOLATION_CACHE=""
 worktree_isolation_guard_enabled() {
-    if [[ -z "$_WORKTREE_ISOLATION_CACHE" ]]; then
-        local enabled=true
-        # Only an explicit `false` disables (a missing guards.worktreeIsolation
-        # key or a malformed config reads as unset and stays on).
-        case "$(guard_cfg worktreeIsolation)" in
-            false) enabled=false ;;
-            true)  enabled=true ;;
-        esac
-        # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
-        case "${LOOM_GUARD_WORKTREE_ISOLATION:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        case "${REPO_GUARD_WORKTREE_ISOLATION:-}" in
-            0|false|no)  enabled=false ;;
-            1|true|yes)  enabled=true ;;
-        esac
-        _WORKTREE_ISOLATION_CACHE="$enabled"
-    fi
-    [[ "$_WORKTREE_ISOLATION_CACHE" == "true" ]]
+    guard_toggle_enabled _WORKTREE_ISOLATION_CACHE worktreeIsolation true LOOM_GUARD_WORKTREE_ISOLATION REPO_GUARD_WORKTREE_ISOLATION
 }
 
 # True if $1 (an absolute, lexically-normalized path) sits inside ANY managed
