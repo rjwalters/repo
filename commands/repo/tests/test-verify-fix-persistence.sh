@@ -282,8 +282,7 @@ echo ""
 echo "-- doc drift: the command files still specify what this suite implements --"
 # ---------------------------------------------------------------------------
 # Phrases are asserted against a whitespace-flattened copy of each file, since
-# the requirement is prose that wraps across lines.
-flatten() { tr '\n' ' ' < "$1" | tr -s ' '; }
+# the requirement is prose that wraps across lines. (flatten() is defined in lib/assert.sh)
 
 for c in "${APPLYING_COMMANDS[@]}"; do
     MD="$(flatten "$CMD_DIR/$c.md")"

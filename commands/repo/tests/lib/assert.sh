@@ -70,3 +70,8 @@ assert_not_contains() {  # <label> <haystack> <needle>
 assert_matches() {  # <label> <haystack> <ere>
     if printf '%s\n' "$2" | grep -qE -- "$3"; then ok "$1"; else no "$1" "no match for /$3/"; fi
 }
+# flatten() (repo#363): whitespace-flatten a file for doc-drift assertions
+# against prose that wraps across lines. Was byte-for-byte duplicated in
+# test-tidy-keep-tiers.sh, test-verify-fix-persistence.sh, and
+# test-early-sync-switch.sh.
+flatten() { tr '\n' ' ' < "$1" | tr -s ' '; }
