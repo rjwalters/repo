@@ -32,8 +32,9 @@
 # commands/repo/tests/test-release-version-citation-check.sh,
 # commands/repo/tests/test-changelog-merged-work-check.sh,
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
-# commands/repo/tests/test-followups-scrub-step.sh, and
-# commands/repo/tests/test-all-orphans-stage.sh.
+# commands/repo/tests/test-followups-scrub-step.sh,
+# commands/repo/tests/test-all-orphans-stage.sh, and
+# commands/repo/tests/test-check-label-descriptions.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1192,6 +1193,45 @@ else
     PASS=$((PASS + OS_PASS))
     FAIL=$((FAIL + OS_FAIL))
     record_suite "test-all-orphans-stage.sh" "$OS_PASS" "$OS_FAIL" "/repo:all orphan stage ownership"
+fi
+
+# .loom/scripts/check-label-descriptions.sh — the lint that fails when a label
+# description in .github/labels.yml exceeds GitHub's 100-character limit
+# (repo#356). Unlike its two orphaned siblings (check-cas-recheck-consistency.sh,
+# check-phantom-labels.sh), which structurally no-op in this repo because they
+# guard a defaults/ tree this repo does not have, this checker evaluates real,
+# live content here today — this block is the wiring that closes the gap
+# between the checker existing and it actually gating `pnpm test`. Same
+# delegation shape as every suite above.
+echo
+echo "-- check-label-descriptions.sh label-registry lint (delegated suite) --"
+LD_TEST="$TESTS_DIR/../../../commands/repo/tests/test-check-label-descriptions.sh"
+if [[ ! -f "$LD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-check-label-descriptions.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-check-label-descriptions.sh" "$LD_TEST"
+else
+    LD_OUT="$(bash "$LD_TEST" 2>&1)"
+    LD_STATUS=$?
+    LD_PASS="$(suite_count Passed "$LD_OUT")"
+    LD_FAIL="$(suite_count Failed "$LD_OUT")"
+    if ! [[ "$LD_PASS" =~ ^[0-9]+$ && "$LD_FAIL" =~ ^[0-9]+$ ]]; then
+        LD_PASS=0
+        LD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-check-label-descriptions.sh" "$LD_STATUS"
+        strip_ansi "$LD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$LD_STATUS" -ne 0 || "$LD_FAIL" -ne 0 ]]; then
+        [[ "$LD_FAIL" -eq 0 ]] && LD_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-check-label-descriptions.sh" "$LD_PASS" "$LD_FAIL" "$LD_STATUS"
+        strip_ansi "$LD_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-check-label-descriptions.sh" "$LD_PASS"
+    fi
+    PASS=$((PASS + LD_PASS))
+    FAIL=$((FAIL + LD_FAIL))
+    record_suite "test-check-label-descriptions.sh" "$LD_PASS" "$LD_FAIL" "label-registry description-length lint"
 fi
 
 echo
