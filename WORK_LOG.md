@@ -2,8 +2,17 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-08-16
+
+- **Issue #356** (closed): Orphaned regression-guard lints: check-cas-recheck-consistency.sh, check-label-descriptions.sh, check-phantom-labels.sh are never invoked
+- **PR #357**: test: wire check-label-descriptions.sh into pnpm test
+- **Issue #354** (closed): check-duplicate.sh: false negative on #347/#349 near-duplicate pair (differently-worded titles, same bug)
+- **PR #358**: fix(scripts): add title-only similarity signal to check-duplicate.sh
+
 ### 2026-08-15
 
+- **Issue #351** (closed): Migrate two test files to the shared assert.sh helper lib
+- **PR #353**: refactor(tests): source shared assert.sh in skill-parity and codex-skill suites
 - **Issue #350** (closed): fix(guard): force-op out-of-tree exemption (#320/#330) never fires for the cd-then-reset scratch-clone idiom
 - **PR #352**: fix(guard): thread cd-tracking through parse_force_ops for #320/#330 scratch-clone exemption
 - **PR #348**: docs: update WORK_PLAN
