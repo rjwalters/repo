@@ -1910,7 +1910,7 @@ function _interp_basename(tok,   base, SQ, DQ) {
     sub(/^.*\//, "", base)
     return base
 }
-function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
+function interpreter_opener_kind(line,   n, segs, i, seg, m, toks, j, base) {
     # Split into command segments on ; & | (covers && and || too) so a piped
     # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`
     # and `cat <<EOF | sudo bash`.
@@ -1944,20 +1944,179 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
         }
         if (j > m) continue
         base = _interp_basename(toks[j])
-        if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
-            return 1
+        # SHELL-family interpreters treat a heredoc body as genuine SHELL
+        # syntax -- `>`/`>>`/tee/sed/cp/mv inside it really are the write
+        # idioms extract_write_targets() looks for -- so this kind keeps the
+        # body scanned exactly as before (the original #5351 behavior, no
+        # change here).
+        if (base ~ /^(bash|sh|zsh|dash|ksh|eval|source|\.)$/)
+            return "shell"
+        # STRUCTURED (non-shell) interpreters -- python/perl/ruby/node -- hand
+        # the body to a language with its OWN grammar, in which a bare `>` is
+        # routinely a comparison/generic operator, not a redirection (#331:
+        # `while depth > 0 and i < len(src):` inside a Python heredoc was
+        # misread by the extract_write_targets() shell-syntax `>` scan as a
+        # redirect to a file literally named "0"). mask_heredoc_bodies_selective()
+        # below applies a dedicated write-marker scan for this kind instead of
+        # handing the raw body to the shell-syntax scanner.
+        if (base ~ /^(python[0-9.]*|perl|ruby|node|nodejs)$/)
+            return "structured"
         # (3) Fail CLOSED on a command word that resolves to no name at all --
         # a variable / command substitution, or an empty word. See the
         # FAIL-CLOSED TAIL note above: resolvable-but-unknown command words
-        # (`cat`, `tee`, a repo script) keep masking, per #5181.
+        # (`cat`, `tee`, a repo script) keep masking, per #5181. Treated the
+        # same as "shell" (body stays fully visible, unmasked) since this
+        # guard cannot prove what the resolved interpreter actually is.
         if (base == "" || base ~ /[$`]/)
-            return 1
+            return "unresolvable"
     }
+    return ""
+}
+# Boolean wrapper over interpreter_opener_kind() -- kept so any FUTURE caller
+# that only needs "is this opener interpreter-fed at all" (the pre-#331
+# question) does not have to know about the kind classification. Currently
+# has no runtime caller of its own (mask_heredoc_bodies_selective() below
+# calls interpreter_opener_kind() directly, since it needs the kind, not just
+# the boolean) -- kept as the reference boolean primitive, deliberately
+# defined ON TOP of interpreter_opener_kind() (never a separate hand-copied
+# regex) so the two can never drift apart -- see the #5226 "re-deriving X in a
+# third place is exactly the drift ... is itself a bypass" rationale reused
+# throughout this file.
+function is_interpreter_opener(line) {
+    return interpreter_opener_kind(line) != ""
+}
+# structured_body_has_write_marker() (#331) -- true when a heredoc body fed to
+# a STRUCTURED (non-shell) interpreter -- python/perl/ruby/node, per
+# interpreter_opener_kind() above -- contains a write-mode marker: an
+# explicit write/append/create/exclusive-mode `open(...)`/`File.open(...)`
+# call, a qualified stdlib/runtime call that writes, renames, or deletes a
+# file (`os.remove(`, `shutil.rmtree(`, `Path(...).unlink(`, the Ruby
+# `FileUtils.rm*` family, the Node `fs.writeFile*` family, ...), or a sign the
+# payload spawns a NESTED shell at all (`subprocess.*`, `os.system(`,
+# backticks, the Node `child_process`/`execSync(` family) -- since this guard cannot see into whatever
+# command string reaches that nested shell, "it shells out" is itself treated
+# as unresolvable and therefore a marker (same "unresolvable => fail closed"
+# contract as the rest of this file, e.g. #4921).
+#
+# Deliberately NOT a marker: a bare `>`/`>>` character anywhere in the body.
+# That is precisely the false-positive vector #331 reported -- Python/Perl/
+# Ruby/JS all use `>` as an ordinary comparison/generic operator, and treating
+# its mere presence as "this heredoc writes a file" is the exact bug this
+# function exists to stop reproducing one level up. A REAL redirection reaching
+# an actual shell from inside one of these languages is instead caught via the
+# "spawns a nested shell" markers above.
+#
+# Deliberately broad ACROSS all four structured languages rather than keyed to
+# which one actually opened THIS heredoc (interpreter_opener_kind() already
+# collapsed that distinction to "structured") -- a marker false-HIT only ever
+# costs one extra deny on a payload that turns out to be read-only, never a
+# missed real write, matching the "narrow, never widen a deny into an allow"
+# contract this file states throughout (e.g. the dequote_expandable() header).
+#
+# Deliberately excludes generic, unqualified method names that collide with
+# extremely common non-filesystem operations (`.write(` -- stdout/socket/
+# buffer writes are routine in read-only analysis/reporting scripts, exactly
+# the #331 false-positive class this fix targets; `.replace(`/`rename(` without
+# a qualifying prefix -- string methods, not filesystem calls, and the #331
+# repro script itself calls `.replace(` on a string). The bare `unlink(`/
+# `rename(`/`system(` markers ARE kept (word-boundary guarded below) because
+# Perl has no dotted stdlib namespace -- `unlink $f;` / `system("cmd")` are
+# its ordinary idiom for exactly these operations, and dropping them would
+# silently stop catching real Perl writes/shell-outs.
+function structured_body_has_write_marker(body,   SQ, DQ, BQ, qc, re) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    BQ = sprintf("%c", 96)    # backtick
+
+    if (body == "") return 0
+    qc = "[" SQ DQ "]"
+
+    # Explicit write/append/create/exclusive `open(...)` mode -- Python
+    # `open(f, "w")` / `open(path, mode="wb")`, Ruby `File.open(p, "a")` --
+    # a quote character immediately followed by w/a/x (case-insensitive)
+    # ANYWHERE after a comma inside the SAME `open(...)` call. The comma is
+    # load-bearing: it is what tells the mode argument apart from the first
+    # (filename) argument, whose OWN value may innocently begin with any of
+    # those letters (`open("write_report.txt")` is an ordinary DEFAULT-mode
+    # -- i.e. read-only -- open whose filename happens to start with "w"; a
+    # bare quote-then-letter test with no comma requirement misread that as
+    # a write-mode marker). The default / explicit read mode with no comma at
+    # all (`open(f)`, `open(f, "r")` -- the exact safehouse#112 shape) never
+    # matches.
+    re = "open\\([^)]*,[^)]*" qc "[wWaAxX]"
+    if (match(body, re)) return 1
+
+    # Perl classic two-arg `open(FH, ">file")` / `open FH, ">file"` --
+    # `>`/`>>` as the FIRST character of the mode/target string argument.
+    re = "open[ \t]*\\(?[^" DQ SQ "\n]*,[ \t]*" qc ">"
+    if (match(body, re)) return 1
+
+    # Qualified stdlib/runtime calls that write, rename, or delete a file --
+    # module- or class-qualified, so a plain substring match is not expected
+    # to collide with an unrelated identifier.
+    if (index(body, "os.remove(")     > 0) return 1
+    if (index(body, "os.unlink(")     > 0) return 1
+    if (index(body, "os.rename(")     > 0) return 1
+    if (index(body, "os.replace(")    > 0) return 1
+    if (index(body, "os.write(")      > 0) return 1
+    if (index(body, "shutil.rmtree(") > 0) return 1
+    if (index(body, "shutil.move(")   > 0) return 1
+    if (index(body, "shutil.copy")    > 0) return 1   # copy/copy2/copyfile/copytree
+    if (index(body, ".write_text(")   > 0) return 1
+    if (index(body, ".write_bytes(")  > 0) return 1
+    if (index(body, ".writelines(")   > 0) return 1
+    if (index(body, ".unlink(")       > 0) return 1
+    if (index(body, ".rmdir(")        > 0) return 1
+    if (index(body, "File.write(")    > 0) return 1
+    if (index(body, "File.delete(")   > 0) return 1
+    if (index(body, "FileUtils.rm")   > 0) return 1
+    if (index(body, "FileUtils.mv")   > 0) return 1
+    if (index(body, "FileUtils.cp")   > 0) return 1
+    if (index(body, "IO.write(")      > 0) return 1
+    if (index(body, "fs.writeFile")   > 0) return 1
+    if (index(body, "fs.appendFile")  > 0) return 1
+    if (index(body, "fs.unlink")      > 0) return 1
+    if (index(body, "fs.rmSync")      > 0) return 1
+    if (index(body, "fs.rmdirSync")   > 0) return 1
+    if (index(body, "fs.rename")      > 0) return 1
+
+    # Nested-shell spawn -- the marker list above cannot enumerate every write
+    # a shelled-out command string might perform, so ANY sign the payload
+    # spawns a shell at all is itself a marker (fail closed on the unresolved
+    # command string), including a genuine `>`/`>>` reaching a REAL shell via
+    # `os.system("cmd > file")` / `subprocess.run("cmd > file", shell=True)`.
+    if (index(body, "os.system(")     > 0) return 1
+    if (index(body, "os.popen(")      > 0) return 1
+    if (index(body, "subprocess.")    > 0) return 1
+    if (index(body, "child_process")  > 0) return 1
+    if (index(body, "execSync(")      > 0) return 1
+    if (index(body, BQ)               > 0) return 1
+
+    # Bare, unqualified Perl idiom (no dotted stdlib namespace exists to
+    # qualify these) -- word-boundary guarded so a substring collision inside
+    # an unrelated identifier (`ecosystem(`, `resystem(`) is not mistaken for
+    # the call itself.
+    if (match(body, "(^|[^A-Za-z0-9_])unlink[ \t]*\\(")) return 1
+    if (match(body, "(^|[^A-Za-z0-9_])rename[ \t]*\\(")) return 1
+    if (match(body, "(^|[^A-Za-z0-9_])system[ \t]*\\(")) return 1
+
     return 0
+}
+# Replace lines[from..to) (to EXCLUSIVE, mirrors the closeat/j<closeat callers
+# use throughout this file) with MASKC placeholders, one placeholder byte per
+# original byte -- shared by both the plain (non-interpreter-fed) and the
+# structured-with-no-write-marker branches below so both stay byte-for-byte
+# identical to the masking mask_heredoc_bodies() itself performs.
+function _mask_heredoc_body_lines(lines, from, to, MASKC,   j, body) {
+    for (j = from; j < to; j++) {
+        body = lines[j]
+        gsub(/./, MASKC, body)
+        lines[j] = body
+    }
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
-# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
+# per interpreter_opener_kind() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
 # tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198) and,
 # as of #5351, the extract_write_targets() ask-tier write-confinement scan (the
 # END-block call below) -- so a write into the main checkout inside an
@@ -1965,7 +2124,33 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 # check. Plain mask_heredoc_bodies() above is retained as the reference
 # primitive (identical minus the interpreter carve-out) but now has no
 # runtime caller.
-function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
+#
+# #331 refinement: a "structured" (non-shell) interpreter-fed body -- python/
+# perl/ruby/node, per interpreter_opener_kind() -- is no longer handed
+# UNCONDITIONALLY visible to the extract_write_targets() shell-syntax scanner
+# (bare `>`/`>>`, `tee`/`sed`/`cp`/`mv` command words). That scanner is sound
+# for SHELL-family bodies (a `>` genuinely is a shell redirection there) but
+# unsound for a structured language own grammar, where those same bytes
+# routinely mean something else entirely (Python own `>` comparison operator
+# -- the exact #331 false positive). Instead:
+#   - no write-mode marker found (structured_body_has_write_marker() == 0) --
+#     the body performs no recognized write/delete/shell-out operation, so it
+#     is masked exactly like a plain non-interpreter-fed heredoc (safe: this
+#     guard already proved there is nothing here to catch).
+#   - a write-mode marker IS found -- this guard cannot parse the target path
+#     out of arbitrary Python/Perl/Ruby/JS source, so rather than leave the
+#     raw body to the shell-syntax scanner (unsound and unreliable for this
+#     kind, per the above) the FIRST line of the body is replaced with a
+#     single, unambiguous shell write-idiom (`> .`) that the EXISTING bare
+#     `>`/`>>` scan below already recognizes -- deterministically producing
+#     exactly one write target, resolved against the SAME tracked `cd` cwd
+#     this heredoc line actually sits at (a plain text substitution at the
+#     original line position, so the surrounding cd-tracking loop is
+#     completely unaffected). The remaining body lines are masked so no OTHER
+#     token in the payload can manufacture a second, spurious target. This
+#     mirrors the existing "target unresolvable -> fail closed" contract this
+#     file already applies elsewhere (#4921) rather than inventing a new one.
+function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, bodytext, delim, closeat, p, off, MASKC, kind, hasmarker, first) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
@@ -1986,13 +2171,33 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
                 if (trimmed == delim) { closeat = j; break }
             }
             if (closeat == 0) continue
-            if (!is_interpreter_opener(line)) {
-                for (j = i + 1; j < closeat; j++) {
-                    body = lines[j]
-                    gsub(/./, MASKC, body)
-                    lines[j] = body
+            kind = interpreter_opener_kind(line)
+            if (kind == "") {
+                # Not interpreter-fed at all -- unchanged (mask, inert body).
+                _mask_heredoc_body_lines(lines, i + 1, closeat, MASKC)
+            } else if (kind == "structured") {
+                bodytext = ""
+                for (j = i + 1; j < closeat; j++)
+                    bodytext = (bodytext == "" ? lines[j] : bodytext "\n" lines[j])
+                hasmarker = structured_body_has_write_marker(bodytext)
+                if (hasmarker) {
+                    first = 1
+                    for (j = i + 1; j < closeat; j++) {
+                        if (first) {
+                            lines[j] = "> ."
+                            first = 0
+                        } else {
+                            body = lines[j]
+                            gsub(/./, MASKC, body)
+                            lines[j] = body
+                        }
+                    }
+                } else {
+                    _mask_heredoc_body_lines(lines, i + 1, closeat, MASKC)
                 }
             }
+            # kind == "shell" or "unresolvable" -- leave the body fully
+            # visible, byte-for-byte unchanged (original #5351 behavior).
             i = closeat            # resume scanning after the delimiter line
             break
         }
@@ -4262,11 +4467,24 @@ fi
 # contract. A cheap substring pre-check keeps the segmenter off the hot path
 # for the vast majority of Bash calls that contain none of the recognized
 # write idioms at all.
+#
+# `<<` is ALSO in this pre-check (#331): a structured-interpreter (python/
+# perl/ruby/node) heredoc body containing a write-mode marker but none of the
+# literal shell bytes above -- `open(f, "w")`, `os.remove(...)`,
+# `shutil.rmtree(...)` -- must still reach extract_write_targets() for its
+# structured_body_has_write_marker() carve-out (see mask_heredoc_bodies_selective()
+# above) to have a chance to convert that marker into the synthetic `> .`
+# write idiom it deliberately injects. Without `<<` here, such a command never
+# even reaches the segmenter and the write-mode marker is never seen -- a
+# silent hole in the #331 safety floor ("a write-mode payload must still
+# deny"), not merely a missed optimization. Heredocs are rare enough in
+# practice that this stays a cheap, narrow widening of the pre-check, not a
+# reintroduction of the hot-path cost this comment describes avoiding.
 # =============================================================================
 if worktree_isolation_guard_enabled && \
    { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
      [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
-     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]]; }; then
+     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]] || [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; }; then
     _WT_WRITE_BASE=""
     _WT_WRITE_BASE_DONE=""
 

@@ -285,5 +285,96 @@ assert_deny "(e) #317 safety: a real command chained after the heredoc inside \$
     "$(printf 'gh pr comment 315 --body "$(cat <<'"'"'EOF'"'"'\nharmless prose\nEOF\n%s\n)"' "$_HD_DANGER")"
 
 echo ""
+echo "=== (f) structured-interpreter heredoc bodies (repo#331 -> repo#371 vendored port) ==="
+echo ""
+
+# repo#331's fix (interpreter_opener_kind() / structured_body_has_write_marker())
+# landed only in the canonical hooks/repo/guard-destructive.sh; repo#371 ports
+# it here so this vendored fallback stops misreading a bare Python/Perl/Ruby/
+# JS `>`/`<` comparison inside an interpreter-fed heredoc as a shell redirect.
+# Mirrors the equivalent "worktree-write-confinement: structured-interpreter
+# heredoc bodies (repo#331)" section in
+# hooks/repo/tests/test-guard-destructive.sh (a narrow subset, consistent with
+# this file's own deliberately-narrow scope described in the header above).
+read -r WTC331_MAIN WTC331_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- False-positive regression: the exact reported repro must now allow ----
+WTC331_BARE_GT_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+depth = 3
+i = 0
+while depth > 0 and i < 10:
+    depth -= 1
+    i += 1
+print(depth)
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "(f) #331: bare '>'/'<' comparison operators inside a python heredoc are not a redirection" \
+    "$WTC331_BARE_GT_CMD" "$WTC331_MAIN"
+
+# ---- Safety floor: a heredoc body that DOES perform a write-mode operation
+# ---- still denies.
+WTC331_OPEN_W_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+f = open("evil.py", "w")
+f.write("pwned")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "(f) #331 safety floor: python heredoc with explicit write-mode open(f, \"w\") still denies" \
+    "$WTC331_OPEN_W_CMD" "$WTC331_MAIN"
+
+# Regression guard for the marker itself: a comma-free, DEFAULT (read) mode
+# `open(...)` whose filename happens to start with a mode letter ("w"/"a"/"x")
+# must NOT be misread as a write-mode marker.
+WTC331_OPEN_READ_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+data = open("write_report.txt").read()
+print(len(data))
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_allow "(f) #331 regression: default-mode open() of a filename starting with a mode letter stays allowed" \
+    "$WTC331_OPEN_READ_CMD" "$WTC331_MAIN"
+
+WTC331_OS_REMOVE_CMD=$(cat <<'WTC331_OUTER_EOF'
+python3 - <<'PYEOF'
+import os
+os.remove("evil.py")
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "(f) #331 safety floor: python heredoc with os.remove(...) still denies" \
+    "$WTC331_OS_REMOVE_CMD" "$WTC331_MAIN"
+
+WTC331_PERL_UNLINK_CMD=$(cat <<'WTC331_OUTER_EOF'
+perl - <<'PYEOF'
+unlink("evil.txt");
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "(f) #331 safety floor: perl heredoc with bare unlink(...) still denies (no dotted stdlib namespace to qualify it)" \
+    "$WTC331_PERL_UNLINK_CMD" "$WTC331_MAIN"
+
+# A genuine shell `>`/`>>` redirection at the outer, heredoc-CONSUMING shell
+# level (bash-fed, not structured) still denies -- pre-existing #5351
+# coverage, unaffected by this change (interpreter_opener_kind() classifies
+# bash/sh/zsh/dash/ksh as "shell", not "structured").
+WTC331_BASH_REDIRECT_CMD=$(cat <<'WTC331_OUTER_EOF'
+bash <<'PYEOF'
+echo pwned > evil.sh
+PYEOF
+WTC331_OUTER_EOF
+)
+assert_deny "(f) #331: genuine bash-fed heredoc redirection into the main checkout still denies" \
+    "$WTC331_BASH_REDIRECT_CMD" "$WTC331_MAIN"
+
+git -C "$WTC331_MAIN" worktree remove --force "$WTC331_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC331_MAIN" && "$WTC331_MAIN" != "/" && -d "$WTC331_MAIN" ]]; then
+    rm -rf "$WTC331_MAIN"
+fi
+
+echo ""
 echo "=== $PASS/$TOTAL passed ==="
 [[ "$FAIL" -eq 0 ]]
