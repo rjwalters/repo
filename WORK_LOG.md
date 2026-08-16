@@ -4,7 +4,6 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-16
 
-- **PR #369**: docs: Guide document maintenance update
 - **Issue #368** (closed): uninstall.sh: consolidate remove_settings_hook and remove_settings_sessionstart_hook
 - **PR #370**: refactor(uninstall): consolidate settings-hook removal into one function
 - **Issue #366** (closed): Deduplicate json_escape(): identical function copy-pasted in repo-remote.sh and repo-scrub-forks.sh
