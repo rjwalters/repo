@@ -68,58 +68,32 @@ HOOK_CMD="\${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh"
 # .claude/skills/repo/hooks/ and goes with the skills dir.
 SESSIONSTART_HOOK_CMD="\${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/session-start-handoff.sh"
 
-# Remove only the Repo-Skills-owned PreToolUse/Bash hook entry from
+# Remove only the Repo-Skills-owned hook entry for a given hook key (e.g.
+# PreToolUse's guard command, or SessionStart's handoff command) from
 # .claude/settings.json, leaving any other entries (a hand-authored hook, or
 # Loom's own guard) untouched, and pruning containers that become empty so no
-# `"hooks": {}` litter is left behind.
-remove_settings_hook() {  # <settings-path>
-  local settings="$1" tmp
+# `"hooks": {}` litter is left behind. Called once per hook key at each call
+# site below (PreToolUse guard entry, SessionStart handoff entry), which
+# differ only in hook key, command, and success-message label.
+remove_settings_hook_entry() {  # <settings-path> <hook-key> <command> <label>
+  local settings="$1" key="$2" cmd="$3" label="$4" tmp
   [[ -f "$settings" ]] || return 0
   jq -e . "$settings" >/dev/null 2>&1 || return 0
   # Only act if our command is actually present.
-  jq -e --arg c "$HOOK_CMD" \
-    '(.hooks.PreToolUse // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
+  jq -e --arg key "$key" --arg c "$cmd" \
+    '(.hooks[$key] // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
     "$settings" >/dev/null 2>&1 || return 0
   tmp="$(mktemp)"
-  if jq --arg c "$HOOK_CMD" '
-        if (.hooks.PreToolUse | type) == "array" then
-          .hooks.PreToolUse |= map(.hooks |= ((. // []) | map(select(.command != $c))))
-          | .hooks.PreToolUse |= map(select(((.hooks // []) | length) > 0))
-          | (if (.hooks.PreToolUse | length) == 0 then .hooks |= del(.PreToolUse) else . end)
+  if jq --arg key "$key" --arg c "$cmd" '
+        if (.hooks[$key] | type) == "array" then
+          .hooks[$key] |= map(.hooks |= ((. // []) | map(select(.command != $c))))
+          | .hooks[$key] |= map(select(((.hooks // []) | length) > 0))
+          | (if (.hooks[$key] | length) == 0 then .hooks |= del(.[$key]) else . end)
           | (if (.hooks | length) == 0 then del(.hooks) else . end)
         else . end
       ' "$settings" >"$tmp"; then
     mv "$tmp" "$settings"
-    success "Removed PreToolUse guard entry from .claude/settings.json"
-  else
-    rm -f "$tmp"
-  fi
-}
-
-# Mirror image of the above for the SessionStart handoff hook: remove only
-# entries whose command is exactly ours, across every source matcher, then prune
-# matcher groups and containers that become empty. A hand-authored SessionStart
-# hook — or another tool's — is left untouched, including one sharing the same
-# "startup"/"resume" matcher group.
-remove_settings_sessionstart_hook() {  # <settings-path>
-  local settings="$1" tmp
-  [[ -f "$settings" ]] || return 0
-  jq -e . "$settings" >/dev/null 2>&1 || return 0
-  # Only act if our command is actually present.
-  jq -e --arg c "$SESSIONSTART_HOOK_CMD" \
-    '(.hooks.SessionStart // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
-    "$settings" >/dev/null 2>&1 || return 0
-  tmp="$(mktemp)"
-  if jq --arg c "$SESSIONSTART_HOOK_CMD" '
-        if (.hooks.SessionStart | type) == "array" then
-          .hooks.SessionStart |= map(.hooks |= ((. // []) | map(select(.command != $c))))
-          | .hooks.SessionStart |= map(select(((.hooks // []) | length) > 0))
-          | (if (.hooks.SessionStart | length) == 0 then .hooks |= del(.SessionStart) else . end)
-          | (if (.hooks | length) == 0 then del(.hooks) else . end)
-        else . end
-      ' "$settings" >"$tmp"; then
-    mv "$tmp" "$settings"
-    success "Removed SessionStart handoff entry from .claude/settings.json"
+    success "Removed $label from .claude/settings.json"
   else
     rm -f "$tmp"
   fi
@@ -204,8 +178,8 @@ fi
 # Remove the settings.json hook entry BEFORE pruning empty .claude dirs, so the
 # rmdir below can clean up an empty .claude if settings.json was the only file.
 if command -v jq >/dev/null 2>&1; then
-  remove_settings_hook "$TARGET/.claude/settings.json"
-  remove_settings_sessionstart_hook "$TARGET/.claude/settings.json"
+  remove_settings_hook_entry "$TARGET/.claude/settings.json" "PreToolUse" "$HOOK_CMD" "PreToolUse guard entry"
+  remove_settings_hook_entry "$TARGET/.claude/settings.json" "SessionStart" "$SESSIONSTART_HOOK_CMD" "SessionStart handoff entry"
 fi
 
 rmdir "$TARGET/.claude/skills" "$TARGET/.claude/commands" "$TARGET/.claude" 2>/dev/null || true
