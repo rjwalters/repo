@@ -4,6 +4,13 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-08-16
 
+- **Issue #366** (closed): Deduplicate json_escape(): identical function copy-pasted in repo-remote.sh and repo-scrub-forks.sh
+- **PR #367**: test: add json_escape() parity guard across the two shipped copies
+- **Issue #363** (closed): Consolidate duplicated flatten() test helper into lib/assert.sh
+- **PR #365**: refactor(tests): consolidate duplicated flatten() into lib/assert.sh
+- **PR #364**: docs: Guide document maintenance update
+- **PR #362**: docs: Guide document maintenance update
+- **PR #359**: docs: Guide document maintenance update
 - **Issue #356** (closed): Orphaned regression-guard lints: check-cas-recheck-consistency.sh, check-label-descriptions.sh, check-phantom-labels.sh are never invoked
 - **PR #357**: test: wire check-label-descriptions.sh into pnpm test
 - **Issue #354** (closed): check-duplicate.sh: false negative on #347/#349 near-duplicate pair (differently-worded titles, same bug)

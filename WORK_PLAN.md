@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#363**: Consolidate duplicated flatten() test helper into lib/assert.sh
+- **#368**: uninstall.sh: consolidate remove_settings_hook and remove_settings_sessionstart_hook
 
 ## PRs Awaiting Review
 
