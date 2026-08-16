@@ -33,8 +33,9 @@
 # commands/repo/tests/test-changelog-merged-work-check.sh,
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
 # commands/repo/tests/test-followups-scrub-step.sh,
-# commands/repo/tests/test-all-orphans-stage.sh, and
-# commands/repo/tests/test-check-label-descriptions.sh.
+# commands/repo/tests/test-all-orphans-stage.sh,
+# commands/repo/tests/test-check-label-descriptions.sh, and
+# commands/repo/tests/test-json-escape-parity.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1232,6 +1233,43 @@ else
     PASS=$((PASS + LD_PASS))
     FAIL=$((FAIL + LD_FAIL))
     record_suite "test-check-label-descriptions.sh" "$LD_PASS" "$LD_FAIL" "label-registry description-length lint"
+fi
+
+# json_escape() parity — the drift guard over the two shipped copies of the
+# escaper in scripts/repo/repo-remote.sh and scripts/repo/repo-scrub-forks.sh
+# (repo#366). Those copies cannot be merged into a shared lib/ file because both
+# scripts install into a consumer repo as standalone files with no lib/ beside
+# them, so what gets tested is that they stay identical. Same delegation shape
+# as every suite above.
+echo
+echo "-- json_escape() parity across the two shipped copies (delegated suite) --"
+JE_TEST="$TESTS_DIR/../../../commands/repo/tests/test-json-escape-parity.sh"
+if [[ ! -f "$JE_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-json-escape-parity.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-json-escape-parity.sh" "$JE_TEST"
+else
+    JE_OUT="$(bash "$JE_TEST" 2>&1)"
+    JE_STATUS=$?
+    JE_PASS="$(suite_count Passed "$JE_OUT")"
+    JE_FAIL="$(suite_count Failed "$JE_OUT")"
+    if ! [[ "$JE_PASS" =~ ^[0-9]+$ && "$JE_FAIL" =~ ^[0-9]+$ ]]; then
+        JE_PASS=0
+        JE_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-json-escape-parity.sh" "$JE_STATUS"
+        strip_ansi "$JE_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$JE_STATUS" -ne 0 || "$JE_FAIL" -ne 0 ]]; then
+        [[ "$JE_FAIL" -eq 0 ]] && JE_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-json-escape-parity.sh" "$JE_PASS" "$JE_FAIL" "$JE_STATUS"
+        strip_ansi "$JE_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-json-escape-parity.sh" "$JE_PASS"
+    fi
+    PASS=$((PASS + JE_PASS))
+    FAIL=$((FAIL + JE_FAIL))
+    record_suite "test-json-escape-parity.sh" "$JE_PASS" "$JE_FAIL" "json_escape() copy parity"
 fi
 
 echo
