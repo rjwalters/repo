@@ -7,6 +7,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #356** (closed): Orphaned regression-guard lints: check-cas-recheck-consistency.sh, check-label-descriptions.sh, check-phantom-labels.sh are never invoked
 - **PR #357**: test: wire check-label-descriptions.sh into pnpm test
 - **Issue #354** (closed): check-duplicate.sh: false negative on #347/#349 near-duplicate pair (differently-worded titles, same bug)
+- **Issue #347** (closed): run.sh inline guard smoke cases pollute real guard-decisions.log under ambient LOOM_GUARD_DECISION_LOG
 - **PR #358**: fix(scripts): add title-only similarity signal to check-duplicate.sh
 
 ### 2026-08-15
