@@ -238,6 +238,18 @@ if [[ -f "$SOURCE_ROOT/lib/codex-skill.sh" ]]; then
   CODEX_EMITTER=true
 fi
 
+# The post-refresh gitignore sweep — requirement C9 of INSTALLER-CONTRACT.md,
+# which C7 (this script) SHOULD also run since a consumer editing .gitignore
+# after install can introduce the condition without a fresh install.sh run.
+# Soft-sourced like the Codex emitter above: an older source clone that
+# predates C9 can still resync everything it knows how to.
+GITIGNORE_CHECK_AVAILABLE=false
+if [[ -f "$SOURCE_ROOT/lib/gitignore-check.sh" ]]; then
+  # shellcheck source=../../lib/gitignore-check.sh
+  source "$SOURCE_ROOT/lib/gitignore-check.sh"
+  GITIGNORE_CHECK_AVAILABLE=true
+fi
+
 VERSION="$(cat "$SOURCE_ROOT/VERSION" 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # The install-date token is stamped once, at install time. Re-deriving it as
@@ -464,6 +476,19 @@ if [[ ${#ORPHANS[@]} -gt 0 ]]; then
   say ""
   say "  left alone (no source counterpart — resync never removes files):"
   for o in "${ORPHANS[@]}"; do say "    $o"; done
+fi
+
+# ---------------------------------------------------------------------------
+# C9 sweep: warn (never fail) about any installed file now hidden by the
+# consumer's .gitignore. Runs regardless of --dry-run — the files it checks
+# already exist on disk from a prior install, so this also catches drift (a
+# .gitignore edited after install) that --dry-run's "nothing written" framing
+# would otherwise mask.
+# ---------------------------------------------------------------------------
+if [[ "$GITIGNORE_CHECK_AVAILABLE" == true ]]; then
+  GITIGNORE_SWEEP_DIRS=("$SKILL_ROOT" "$TARGET/.claude/commands/repo")
+  [[ -n "$CODEX_ROOT" ]] && GITIGNORE_SWEEP_DIRS+=("$CODEX_ROOT")
+  warn_gitignored_payload "$TARGET" "${GITIGNORE_SWEEP_DIRS[@]}"
 fi
 
 # ---------------------------------------------------------------------------

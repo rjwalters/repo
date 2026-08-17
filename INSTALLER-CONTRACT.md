@@ -204,6 +204,38 @@ it is stale.
 
 > Spot-check: `test -s <source>/VERSION`
 
+### C9 — Post-install gitignore sweep
+
+After writing its payload, the installer **MUST** check every file it just
+wrote against the consumer repo's `.gitignore` and **warn** — never fail —
+about any that are hidden. The warning **MUST** name each ignored path and the
+`.gitignore` rule that matches it (`git check-ignore -v`), so the operator can
+find and fix the offending rule without guessing. The same sweep **SHOULD**
+run again at the end of a C7 resync, since a consumer editing `.gitignore`
+after install can introduce the condition without a fresh installer run.
+
+This is a **warning**, not a failure: it MUST NOT abort or roll back an
+otherwise-successful install, and it MUST NOT change the installer's exit
+status. A consumer repo's pre-existing `.gitignore` can carry a broad,
+unrelated rule (a heritage `*.css` glob, a catch-all `*.md`) that happens to
+also match paths inside a tool's installed surface. Without this check the
+installer succeeds, the files exist on disk, and they are silently
+untracked — no error, no signal, nothing in `git status` unless the operator
+already knows to look. That already happened in production: six
+Anvil-installed CSS assets sat untracked for months in a consumer repo
+because of one unrelated legacy `*.css` rule (repo#385), and because Anvil
+had neither C4 (`--dry-run`) nor C7 (resync) implemented at the time, nothing
+downstream could have caught it either.
+
+The check MUST NOT warn about files the installer itself deliberately
+gitignores (the C6 sidecar, for instance) — only about **payload** files a
+consumer is expected to be able to track.
+
+> Spot-check: add a `.gitignore` rule in a scratch consumer repo that
+> incidentally matches a file inside the installed surface, run the installer,
+> and confirm it warns, names the exact path, and names the matching rule —
+> while still exiting 0 and leaving every other file installed.
+
 ## Conformance
 
 `repo` is the only column below this repo can verify mechanically, and it does:
@@ -227,6 +259,7 @@ every test run.
 | C6 gitignored sidecar | ✅ | ❌ inline (legacy) | ✅ | ❌ |
 | C7 consumer resync | ✅ | ❌ | ✅ | ❌ |
 | C8 honest `VERSION` | ❌ empty | ❌ scraped from prose | ✅ | ❌ empty |
+| C9 gitignore sweep | ❌ not yet checked (repo#385) | ❌ not yet checked (repo#385) | ✅ | ❌ not yet checked (repo#385) |
 
 Conformance work is tracked per tool: Loom
 [rjwalters/loom#5517](https://github.com/rjwalters/loom/issues/5517), Anvil
@@ -254,6 +287,7 @@ Conformance work is tracked per tool: Loom
 | C6 | `.claude/skills/repo/.install-local.json`, gitignored by `install.sh`, same emitter. Deliberately **not** duplicated for the Codex surface: the sidecar's only job is to point at the source clone, one pointer per install is enough, and a second gitignored-and-possibly-tracked file would double the repo#96 bookkeeping for no added information |
 | C7 | [`scripts/repo/resync-installed.sh`](scripts/repo/resync-installed.sh) → installed to `.claude/skills/repo/scripts/` |
 | C8 | [`VERSION`](VERSION) |
+| C9 | [`lib/gitignore-check.sh`](lib/gitignore-check.sh)'s `warn_gitignored_payload`, called by both `install.sh` (generalizing the older single-path `dest_is_gitignored()` check) and `scripts/repo/resync-installed.sh` |
 
 The C5/C6 split has exactly one emitter (`lib/metadata.sh`) and the rendering
 of copied surfaces exactly one implementation (`lib/render.sh`), shared by the

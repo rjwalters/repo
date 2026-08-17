@@ -138,6 +138,12 @@ source "$SOURCE_ROOT/lib/metadata.sh"
 # shellcheck source=lib/codex-skill.sh
 source "$SOURCE_ROOT/lib/codex-skill.sh"
 
+# The post-install gitignore sweep — requirement C9 of INSTALLER-CONTRACT.md,
+# shared with the resync (C7) for the same one-implementation reason. See
+# lib/gitignore-check.sh.
+# shellcheck source=lib/gitignore-check.sh
+source "$SOURCE_ROOT/lib/gitignore-check.sh"
+
 INSTALL_DATE="$(date -u +%Y-%m-%d)"
 REPO_OWNER="OWNER"
 REPO_NAME="REPO"
@@ -156,6 +162,9 @@ SHELL_WRAPPER=false
 CODEX=true
 # Appended to the closing success line once the Codex surface is actually written.
 CODEX_HINT=""
+# Set true once the Codex surface is actually written this run, so the C9
+# gitignore sweep below knows whether to include it.
+CODEX_INSTALLED=false
 
 usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -632,6 +641,7 @@ else
       "$TARGET/$CODEX_REFERENCES_REL/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md"
   done <<<"$COMMANDS"
   success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') command procedures into $CODEX_REFERENCES_REL/"
+  CODEX_INSTALLED=true
 
   # Same tracked-metadata emitter and same C5 guarantees as the Claude surface,
   # so the Codex surface is self-describing and the resync can tell an install
@@ -767,11 +777,24 @@ CLAUDE_MD="$TARGET/CLAUDE.md"
 dest_is_gitignored() {
   git -C "$TARGET" check-ignore -q .claude/commands/repo/help.md 2>/dev/null
 }
+
+# Requirement C9 of INSTALLER-CONTRACT.md: sweep every file this run wrote
+# through git check-ignore and WARN (never fail) about any that are hidden by
+# the consumer repo's .gitignore — see lib/gitignore-check.sh. Run at every
+# non-dev exit point so the warning fires regardless of which branch below
+# returns first.
+run_gitignore_sweep() {
+  local -a payload_dirs=("$TARGET/.claude/skills/repo" "$TARGET/.claude/commands/repo")
+  [[ "$CODEX_INSTALLED" == true ]] && payload_dirs+=("$CODEX_SKILL_DIR")
+  warn_gitignored_payload "$TARGET" "${payload_dirs[@]}"
+}
+
 if dest_is_gitignored; then
   warning "Install destination (.claude/commands) is gitignored in $TARGET;"
   warning "skipping the CLAUDE.md pointer block (a committed pointer to uncommitted command"
   warning "files is not what you want). The /repo:* commands still work in-session."
   reconcile_orphaned_block
+  run_gitignore_sweep
   echo ""
   success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code.$CODEX_HINT"
   exit 0
@@ -808,6 +831,8 @@ else
   success "Appended REPO-SKILLS block to CLAUDE.md"
 fi
 rm -f "$BLOCK_FILE"
+
+run_gitignore_sweep
 
 echo ""
 success "Repo Skills v$VERSION installed. Try /repo:help in Claude Code.$CODEX_HINT"

@@ -74,7 +74,7 @@ echo "INSTALLER-CONTRACT.md conformance suite"
 echo "======================================="
 
 # Derived results, filled in below and cross-checked against the document last.
-C1=no; C2=no; C3=no; C4=no; C5=no; C6=no; C7=no; C8=no
+C1=no; C2=no; C3=no; C4=no; C5=no; C6=no; C7=no; C8=no; C9=no
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -258,8 +258,80 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- C9: post-install gitignore sweep --"
+C9_OK=true
+
+# A target whose .gitignore incidentally shadows some (not all) installed
+# files — the exact repo#385 failure mode: a broad pre-existing rule reaching
+# into an otherwise-tracked install and hiding a subset of it.
+C9_T="$SCRATCH/c9"; new_target "$C9_T"
+echo '*.md' >"$C9_T/.gitignore"
+C9_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_T" 2>&1 </dev/null )"
+C9_RC=$?
+
+if [[ "$C9_RC" -eq 0 ]]; then
+    ok "install.sh still exits 0 when the sweep finds ignored payload files"
+else
+    no "install.sh still exits 0 when the sweep finds ignored payload files" "exit $C9_RC"
+    C9_OK=false
+fi
+if [[ "$C9_OUT" == *".claude/commands/repo/help.md"* ]]; then
+    ok "the warning names an ignored payload path"
+else
+    no "the warning names an ignored payload path" "$C9_OUT"
+    C9_OK=false
+fi
+if [[ "$C9_OUT" == *".gitignore:1:*.md"* ]]; then
+    ok "the warning names the matching .gitignore rule"
+else
+    no "the warning names the matching .gitignore rule" "$C9_OUT"
+    C9_OK=false
+fi
+# The install itself must have proceeded normally — this is a warning, not an
+# abort or rollback.
+if [[ -f "$C9_T/.claude/skills/repo/install-metadata.json" ]]; then
+    ok "the sweep does not abort or roll back an otherwise-successful install"
+else
+    no "the sweep does not abort or roll back an otherwise-successful install"
+    C9_OK=false
+fi
+# The C6 sidecar is deliberately gitignored by the installer itself — it must
+# never appear as a C9 sweep hit (its own "Wrote .install-local.json" success
+# line is expected and unrelated; only a sweep-warning line for it would be a
+# false positive).
+if [[ "$C9_OUT" != *"install-local.json  <-"* ]]; then
+    ok "the sweep does not false-positive on the installer's own C6 sidecar"
+else
+    no "the sweep does not false-positive on the installer's own C6 sidecar" "$C9_OUT"
+    C9_OK=false
+fi
+
+# A clean target (no shadowing rule) must produce no C9 warning at all.
+C9_CLEAN="$SCRATCH/c9-clean"; new_target "$C9_CLEAN"
+C9_CLEAN_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_CLEAN" 2>&1 </dev/null )"
+if [[ "$C9_CLEAN_OUT" != *"INSTALLER-CONTRACT.md C9"* ]]; then
+    ok "an unshadowed install produces no C9 warning"
+else
+    no "an unshadowed install produces no C9 warning" "$C9_CLEAN_OUT"
+    C9_OK=false
+fi
+
+# resync-installed.sh (C7) re-derives the same sweep after a refresh.
+C9_RESYNC_SH="$C9_T/.claude/skills/repo/scripts/resync-installed.sh"
+C9_RESYNC_OUT="$( cd "$C9_T" && HOME="$FAKE_HOME" bash "$C9_RESYNC_SH" --dry-run 2>&1 )"
+if [[ "$C9_RESYNC_OUT" == *".claude/commands/repo/help.md"* && "$C9_RESYNC_OUT" == *".gitignore:1:*.md"* ]]; then
+    ok "resync-installed.sh (C7) runs the same sweep after a refresh"
+else
+    no "resync-installed.sh (C7) runs the same sweep after a refresh" "$C9_RESYNC_OUT"
+    C9_OK=false
+fi
+
+[[ "$C9_OK" == true ]] && C9=yes
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- the conformance table matches what was just derived --"
-for id in C1 C2 C3 C4 C5 C6 C7 C8; do
+for id in C1 C2 C3 C4 C5 C6 C7 C8 C9; do
     documented="$(documented_repo_cell "$id")"
     derived="$(eval "echo \"\$$id\"")"
     if [[ -z "$documented" ]]; then
@@ -275,7 +347,7 @@ echo "-- the contract is normative and self-describing --"
 CT="$(cat "$CONTRACT")"
 assert_contains "the contract states its normative status" "$CT" "normative"
 assert_contains "the contract cites RFC 2119 key words" "$CT" "RFC 2119"
-for id in C1 C2 C3 C4 C5 C6 C7 C8; do
+for id in C1 C2 C3 C4 C5 C6 C7 C8 C9; do
     assert_contains "the contract has a section for $id" "$CT" "### $id"
 done
 assert_contains "every requirement publishes a spot-check" "$CT" "Spot-check:"
