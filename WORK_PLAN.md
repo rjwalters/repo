@@ -48,6 +48,7 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
+- **#381**: Remove validate-toolchain.sh: dead entry point, zero in-repo callers *(hermit)*
 - **#379**: Fix random-file.sh: broken gitignore/exclusion filtering leaks .git internals and worktree scratch files *(hermit)*
 - **#375**: Consolidate find_repo_root(): worktree-unaware copies break signal.sh across worktrees *(hermit)*
 - **#346**: Remove clean-labels.sh: dead deprecated stub with zero callers *(hermit)*
@@ -67,6 +68,6 @@ _None._
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |
-| Architect / Hermit proposals | 3 |
+| Architect / Hermit proposals | 4 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
