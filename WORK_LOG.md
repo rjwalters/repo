@@ -2,13 +2,8 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
-### 2026-08-17
-
-- **PR #380**: docs: Guide document maintenance update
-
 ### 2026-08-16
 
-- **PR #378**: docs: Guide document maintenance update
 - **Issue #373** (closed): Consolidate stash_scope_guard_enabled and worktree_isolation_guard_enabled into guard_toggle_enabled
 - **PR #377**: refactor(guard): delegate stash-scope and worktree-isolation toggles to guard_toggle_enabled()
 - **Issue #371** (closed): Auditor: #331's structured-interpreter heredoc fix never ported to vendored guard-destructive-generic.sh
