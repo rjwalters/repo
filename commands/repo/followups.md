@@ -82,11 +82,39 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   instead. `-maxdepth 4` reaches every known tool root (`.loom/`, `.anvil/`,
   `.kct/` at depth 2, and the two-levels-deeper `.claude/skills/*/` at depth 4).
 
-  Resolve each tool's `source` clone path with the **sidecar → legacy inline →
-  unknown** order that is normative in the [tool-package installer
-  contract][contract] (requirement **C6**, which also covers the repo#96 signature
-  below). Each step failing is "source unknown", not an error. Do not re-derive
-  the order from what a given tool happens to do — read C6.
+  **Self-target short-circuit: Repo Skills never needs the ladder.** One of the
+  swept roots is `.claude/skills/repo/` — Repo Skills' own tool root (per the
+  tool-root table in the [installer contract][contract]), the tool that *is*
+  `/repo:followups` running right now. Unlike Loom / Anvil / kicad-tools, which
+  are genuinely-external dependencies with no guarantee a local source clone
+  exists anywhere on this machine, Repo Skills already writes its own repo slug
+  into every copy of itself it installs: the installed
+  `.claude/skills/repo/SKILL.md`'s own contract link and the `CLAUDE.md`
+  install block (`install.sh:786`) both carry the literal
+  `https://github.com/rjwalters/repo`. When the swept metadata path is
+  `.claude/skills/repo/install-metadata.json`, resolve its target from that
+  literal directly and skip the sidecar → legacy → unknown ladder below
+  entirely — there is no source clone to look for, and this target is never
+  surfaced to the operator as UNKNOWN:
+
+  ```bash
+  grep -oE 'github\.com/[^)/]+/[^)/]+' .claude/skills/repo/SKILL.md | head -1 \
+    || echo "github.com/rjwalters/repo"   # fallback constant, mirrors install.sh:786
+  ```
+
+  This is intentionally **not fork-aware** — a fork of Repo Skills that renames
+  itself without also editing its own copy of `SKILL.md` still resolves to
+  `rjwalters/repo` — matching the same non-fork-aware literal `install.sh:786`
+  already writes into every consumer's `CLAUDE.md`. That is a pre-existing
+  limitation of how Repo Skills documents itself, not a new gap introduced by
+  this short-circuit.
+
+  Resolve every **other** discovered tool root's `source` clone path with the
+  **sidecar → legacy inline → unknown** order that is normative in the
+  [tool-package installer contract][contract] (requirement **C6**, which also
+  covers the repo#96 signature below). Each step failing is "source unknown",
+  not an error. Do not re-derive the order from what a given tool happens to
+  do — read C6.
 
   [contract]: https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md
 
@@ -110,15 +138,19 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   (`version` vs `loom_version` / `anvil_version` / `kct_version`, etc.) — read
   whichever variant is present, same as `/repo:update-tools`. Neither the
   tracked metadata nor the sidecar stores an `owner/repo` slug directly for
-  Loom / Anvil / Repo Skills — it is always derived from the source clone's
-  `origin` remote; kicad-tools' `source_ref` in `"git"` mode is the one
-  exception, since it already embeds the full GitHub URL to parse directly.
+  Loom / Anvil — it is always derived from the source clone's `origin` remote.
+  kicad-tools' `source_ref` in `"git"` mode and Repo Skills' self-target
+  short-circuit above are the two exceptions, since each already has the full
+  GitHub URL available to parse without a source clone.
 
 - **Unresolvable targets.** If a tool's source clone is unknown (no sidecar, no
   legacy field) there is no local remote to read — mark that follow-up
   **UNKNOWN** and surface it for the user to name a slug, per the safety rules.
   Likewise, if a candidate doesn't clearly belong to any discovered repo,
-  surface it for a target decision rather than dropping it or guessing.
+  surface it for a target decision rather than dropping it or guessing. Repo
+  Skills itself never reaches this branch — the self-target short-circuit above
+  always resolves it before the ladder runs, so it is never surfaced to the
+  operator as UNKNOWN.
 
   **Signature check** (contract **C6**, "the repo#96 signature"): when
   `install-metadata.json` exists but neither a sidecar nor legacy inline fields
