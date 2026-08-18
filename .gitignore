@@ -71,3 +71,6 @@ hooks/logs/
 .loom/logs/
 .loom/.resync-in-progress
 # <<< loom-managed <<<
+
+# Repo Skills dev-mode Codex surface (machine-local, do not commit)
+.agents/skills/repo/
