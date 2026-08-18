@@ -13,6 +13,7 @@
 #   scripts/version.sh                 # print current version
 #   scripts/version.sh check           # verify VERSION and package.json agree (exit 1 if not)
 #   scripts/version.sh bump <level> [--tag]   # level = major|minor|patch
+#   scripts/version.sh set <version>   # set VERSION (and package.json) to an exact value
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,8 +101,27 @@ EOF
     echo "$new"
     ;;
 
+  set)
+    new="${2:-}"
+    tag=false
+    [ "${3:-}" = "--tag" ] && tag=true
+    if ! printf '%s' "$new" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+      echo "usage: version.sh set <major.minor.patch> [--tag]" >&2
+      exit 2
+    fi
+    printf '%s\n' "$new" > "$VERSION_FILE"
+    sync_pkg "$new"
+    git -C "$ROOT" add VERSION package.json
+    [ -f "$ROOT/CHANGELOG.md" ] && git -C "$ROOT" add CHANGELOG.md || true
+    git -C "$ROOT" commit -q -m "chore: set version to $new"
+    if [ "$tag" = true ]; then
+      git -C "$ROOT" tag -a "v$new" -m "v$new"
+    fi
+    echo "$new"
+    ;;
+
   *)
-    echo "usage: version.sh [print|check|bump <level> [--tag]]" >&2
+    echo "usage: version.sh [print|check|bump <level> [--tag]|set <version> [--tag]]" >&2
     exit 2
     ;;
 esac

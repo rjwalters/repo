@@ -1272,6 +1272,76 @@ else
     record_suite "test-json-escape-parity.sh" "$JE_PASS" "$JE_FAIL" "json_escape() copy parity"
 fi
 
+# scripts/version.sh — this repo's single source of truth for VERSION,
+# including the `set` subcommand added for #387. Same delegation shape as
+# every suite above.
+echo
+echo "-- version.sh VERSION source-of-truth (delegated suite) --"
+VS_TEST="$TESTS_DIR/../../../commands/repo/tests/test-version-script.sh"
+if [[ ! -f "$VS_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-version-script.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-version-script.sh" "$VS_TEST"
+else
+    VS_OUT="$(bash "$VS_TEST" 2>&1)"
+    VS_STATUS=$?
+    VS_PASS="$(suite_count Passed "$VS_OUT")"
+    VS_FAIL="$(suite_count Failed "$VS_OUT")"
+    if ! [[ "$VS_PASS" =~ ^[0-9]+$ && "$VS_FAIL" =~ ^[0-9]+$ ]]; then
+        VS_PASS=0
+        VS_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-version-script.sh" "$VS_STATUS"
+        strip_ansi "$VS_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$VS_STATUS" -ne 0 || "$VS_FAIL" -ne 0 ]]; then
+        [[ "$VS_FAIL" -eq 0 ]] && VS_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-version-script.sh" "$VS_PASS" "$VS_FAIL" "$VS_STATUS"
+        strip_ansi "$VS_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-version-script.sh" "$VS_PASS"
+    fi
+    PASS=$((PASS + VS_PASS))
+    FAIL=$((FAIL + VS_FAIL))
+    record_suite "test-version-script.sh" "$VS_PASS" "$VS_FAIL" "VERSION source-of-truth (print/check/bump/set)"
+fi
+
+# scripts/check-installed-surface-version-bump.sh — the CI gate requiring a
+# VERSION bump (or the loom:no-surface-change marker) on any PR that touches
+# this repo's installed surface (commands/, skills/, hooks/, lib/, install.sh,
+# uninstall.sh), mirroring loom's own defaults/ VERSION-bump gate (#387). Same
+# delegation shape as every suite above.
+echo
+echo "-- check-installed-surface-version-bump.sh VERSION-bump gate (delegated suite) --"
+VB_TEST="$TESTS_DIR/../../../commands/repo/tests/test-check-installed-surface-version-bump.sh"
+if [[ ! -f "$VB_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-check-installed-surface-version-bump.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-check-installed-surface-version-bump.sh" "$VB_TEST"
+else
+    VB_OUT="$(bash "$VB_TEST" 2>&1)"
+    VB_STATUS=$?
+    VB_PASS="$(suite_count Passed "$VB_OUT")"
+    VB_FAIL="$(suite_count Failed "$VB_OUT")"
+    if ! [[ "$VB_PASS" =~ ^[0-9]+$ && "$VB_FAIL" =~ ^[0-9]+$ ]]; then
+        VB_PASS=0
+        VB_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-check-installed-surface-version-bump.sh" "$VB_STATUS"
+        strip_ansi "$VB_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$VB_STATUS" -ne 0 || "$VB_FAIL" -ne 0 ]]; then
+        [[ "$VB_FAIL" -eq 0 ]] && VB_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-check-installed-surface-version-bump.sh" "$VB_PASS" "$VB_FAIL" "$VB_STATUS"
+        strip_ansi "$VB_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-check-installed-surface-version-bump.sh" "$VB_PASS"
+    fi
+    PASS=$((PASS + VB_PASS))
+    FAIL=$((FAIL + VB_FAIL))
+    record_suite "test-check-installed-surface-version-bump.sh" "$VB_PASS" "$VB_FAIL" "installed-surface VERSION-bump gate"
+fi
+
 echo
 echo "==============================="
 echo "Per-suite breakdown"

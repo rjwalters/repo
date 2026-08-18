@@ -80,3 +80,38 @@ jobs:
       # red — verified by fault injection, per #48's acceptance criteria).
       - name: Run test suite
         run: pnpm test
+
+  # Adopts loom's "VERSION on main is the release" CI gate (#387, mirroring
+  # loom#5874): any PR that changes this repo's installed surface (commands/,
+  # skills/, hooks/, lib/, install.sh, uninstall.sh — everything install.sh
+  # copies into a consumer repo) must either bump VERSION or carry the
+  # `<!-- loom:no-surface-change -->` marker in the PR body or a commit
+  # message. Without this, every downstream "am I current?" check
+  # (install-metadata.json, /repo:update-tools, 2AMLogic/2am's compute-drift
+  # tool-version axis) silently reports "current" for changes it does not
+  # have.
+  #
+  # Deliberately NOT wired into required-status-check branch protection, for
+  # the same reason documented above the `test` job (issue #73): this is a
+  # solo-operator repo where merge-pr.sh already treats a red check as a stop
+  # signal, so a visible, non-required check is the right level of force here.
+  version-bump-gate:
+    name: consumer-visible changes require a VERSION bump
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so the PR's base and head shas both resolve locally
+          # — check-installed-surface-version-bump.sh diffs base..head
+          # directly and needs both commits present, not just their ancestry.
+          fetch-depth: 0
+
+      - name: Check installed-surface VERSION bump
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          ./scripts/check-installed-surface-version-bump.sh \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
