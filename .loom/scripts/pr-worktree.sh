@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# Loom PR Worktree Helper - Create a dedicated worktree for an external-fork
-# or ad-hoc PR branch.
+# Loom PR Worktree Helper - Create a dedicated review worktree for a PR.
 #
 # Usage:
 #   ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
 #
-# This helper is for PRs whose branch does NOT match `feature/issue-<N>`,
-# typically:
+# Despite the name suggesting "external-fork / ad-hoc only" (the original,
+# narrower use case, #3358), this is ALSO the script Judge/Doctor use for an
+# ordinary Loom-issue PR (branch `feature/issue-<N>`) whenever no builder
+# `issue-<N>` worktree already exists locally at review time — see
+# `defaults/.claude/commands/loom/judge.md`'s "Worktree-Aware Code Access"
+# section (#6264). In that shape the intended/documented case for
+# `feature/issue-<N>` branches is `worktree.sh <ISSUE_NUMBER>` (below); this
+# script's own worktree/branch-name mismatch (a `pr-<N>` directory holding a
+# `feature/issue-<N>` branch) is exactly why a leftover review worktree could
+# be missed by `merge-pr.sh`'s cleanup — fixed there, not here, by #6264.
+#
+# Typical uses:
 #   - External-fork PRs (e.g., jperla/loom:fix/claude-code-2.1-compat)
 #   - Ad-hoc branch names that don't include a Loom issue number
+#   - A Judge/Doctor review of a Loom-issue PR with no local builder worktree
 #
-# For Loom-issue PRs whose branch IS `feature/issue-<N>`, use:
+# For Loom-issue PRs whose branch IS `feature/issue-<N>` AND a builder
+# worktree may already exist, prefer:
 #   ./.loom/scripts/worktree.sh <ISSUE_NUMBER>
 #
 # What it does:
@@ -22,9 +33,21 @@
 #   3. Writes a `.loom-managed` sentinel so merge-pr.sh / loom-clean will
 #      remove the worktree on PR merge
 #
+# Known failure mode (#6264, reproduced): if the PR's branch is ALREADY
+# checked out in another local worktree (most commonly this same PR's
+# `issue-<N>` builder worktree — git refuses the same branch in two
+# worktrees at once), step 2's `gh pr checkout --force` fails loudly
+# (non-zero exit, git's "already used by worktree" error) and this script
+# exits 1 — but the worktree directory it already created is left behind on
+# a detached HEAD (pinned at the base branch, not the PR). Callers MUST
+# check this script's exit code rather than assuming the printed path is
+# ready to evaluate; merge-pr.sh's cleanup no longer depends on the branch
+# actually having switched (#6264 — it checks by path, not by branch state).
+#
 # Exit codes:
-#   0 = success (worktree exists at the expected path)
-#   1 = failure (error printed)
+#   0 = success (worktree exists at the expected path, PR branch checked out)
+#   1 = failure (error printed; the worktree directory may still exist,
+#       possibly on a detached HEAD if the PR-branch checkout itself failed)
 #   2 = invalid arguments
 
 set -e
@@ -90,14 +113,6 @@ WORKTREE_ROOT_DIR="$(loom_worktree_root "$REPO_ROOT")"
 # (which fails on master-default repos). Resolve against the main repo context.
 # shellcheck source=lib/default-branch.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
-
-# Shared "create a managed worktree" primitives (#304): the repo-global
-# concurrency lock around `git worktree add` (previously present ONLY in
-# worktree.sh, see #3380), the .loom-managed sentinel writer, and the
-# .mcp.json symlink + info/exclude bookkeeping.
-# shellcheck source=lib/managed-worktree.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/managed-worktree.sh"
-
 if ! DEFAULT_BRANCH="$(cd "$REPO_ROOT" && loom_default_branch)"; then
     print_error "Could not determine the default branch. Set LOOM_DEFAULT_BRANCH or run: git remote set-head origin -a"
     exit 1
@@ -137,19 +152,6 @@ mkdir -p "$WORKTREE_ROOT_DIR"
 git -C "$REPO_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || \
     print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing)"
 
-# Serialize `git worktree add` against every other Loom worktree creator in
-# this repo (worktree.sh's issue-<N> worktrees, docs-worktree.sh's docs-guide
-# slot) via the shared repo-global lock (lib/managed-worktree.sh, #304/#3380).
-# Without this, a Doctor/Judge PR checkout landing alongside another worktree
-# creation can race on git's repo-global `.git/config.lock` and hang for
-# 10-20 minutes holding an `index.lock` a peer process never releases.
-if ! loom_wt_acquire_lock "pr-$PR_NUMBER" "pr-worktree.sh"; then
-    print_error "Timed out waiting for the worktree-creation lock (holder PID: ${WORKTREE_LOCK_HOLDER_PID:-unknown})"
-    print_info "Lock dir: $(loom_wt_lock_path)"
-    exit 1
-fi
-trap 'loom_wt_release_lock' EXIT INT TERM
-
 # Use --detach so we don't create a stale branch ref. `gh pr checkout` will
 # switch to the PR's branch once we cd into the worktree.
 if ! git -C "$REPO_ROOT" worktree add --detach "$WORKTREE_PATH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
@@ -157,28 +159,50 @@ if ! git -C "$REPO_ROOT" worktree add --detach "$WORKTREE_PATH" "origin/$DEFAULT
     exit 1
 fi
 
-# The lock only needs to be held across `git worktree add` itself — release it
-# now rather than across the (network-bound, potentially slow) `gh pr
-# checkout` below, so a slow PR checkout never blocks a concurrent worktree
-# creation for an unrelated issue/PR.
-loom_wt_release_lock
-trap - EXIT INT TERM
-
 # Write the sentinel BEFORE any PR mutation so merge-pr.sh / loom-clean
 # recognize it as Loom-managed even if `gh pr checkout` fails midway.
-loom_wt_write_sentinel "$WORKTREE_PATH" "pr-worktree.sh" "# PR: $PR_NUMBER"
+# Mirrors the heredoc shape used by worktree.sh:761-768 but records the PR
+# number instead of the issue number.
+cat > "$WORKTREE_PATH/.loom-managed" <<EOF
+# Loom-managed worktree marker
+# Created by .loom/scripts/pr-worktree.sh
+# PR: $PR_NUMBER
+# Removing this file makes Loom treat the worktree as user-owned and refuse
+# to clean it up automatically.
+EOF
 
-# Now check out the PR branch from inside the new worktree.
-if ! (cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --force >/dev/null 2>&1); then
+# Now check out the PR branch from inside the new worktree. Capture output
+# (rather than discarding it) so a failure can be diagnosed instead of just
+# reported as opaque — in particular the #6264 collision case below.
+CHECKOUT_OUTPUT=""
+if ! CHECKOUT_OUTPUT="$(cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --force 2>&1)"; then
     print_error "Failed to run 'gh pr checkout $PR_NUMBER' in $WORKTREE_PATH"
-    print_info "The worktree was created but the PR branch is not checked out."
-    print_info "You can retry: cd '$WORKTREE_PATH' && gh pr checkout $PR_NUMBER"
+    print_warning "$CHECKOUT_OUTPUT"
+    # #6264: the most common cause is the PR's branch already being checked
+    # out in ANOTHER worktree (git structurally refuses the same branch in
+    # two worktrees at once) — most often this same PR's own issue-<N>
+    # builder worktree. When that's the case, name the colliding worktree
+    # explicitly rather than leaving the caller to guess from the raw git
+    # error above; this worktree is left behind on a detached HEAD either
+    # way (git already refused the checkout before touching HEAD here).
+    if echo "$CHECKOUT_OUTPUT" | grep -qi "already used by worktree"; then
+        COLLIDING_WT="$(echo "$CHECKOUT_OUTPUT" | grep -oE "worktree at '[^']*'" | sed -E "s/worktree at '(.*)'/\1/" | head -1)"
+        print_error "The PR's branch is already checked out in another worktree${COLLIDING_WT:+ ($COLLIDING_WT)} — this is the #6264 detached-HEAD collision. $WORKTREE_PATH now sits on a detached HEAD instead of the PR branch; do NOT evaluate code in it as-is."
+        if [[ -n "$COLLIDING_WT" ]]; then
+            print_info "Prefer reusing the colliding worktree directly instead of retrying here: cd '$COLLIDING_WT'"
+        fi
+    else
+        print_info "The worktree was created but the PR branch is not checked out."
+        print_info "You can retry: cd '$WORKTREE_PATH' && gh pr checkout $PR_NUMBER"
+    fi
     exit 1
 fi
 
-# Symlink .mcp.json so MCP servers work in the PR worktree, with the same
-# info/exclude bookkeeping worktree.sh does (so `git add -A` never stages it).
-loom_wt_symlink_mcp_json "$REPO_ROOT" "$WORKTREE_PATH" || true
+# Symlink .mcp.json so MCP servers work in the PR worktree (same pattern
+# as worktree.sh).
+if [[ -f "$REPO_ROOT/.mcp.json" && ! -e "$WORKTREE_PATH/.mcp.json" ]]; then
+    ln -s "$REPO_ROOT/.mcp.json" "$WORKTREE_PATH/.mcp.json" 2>/dev/null || true
+fi
 
 print_success "PR worktree ready at $WORKTREE_PATH"
 echo "$WORKTREE_PATH"

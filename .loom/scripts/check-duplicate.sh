@@ -59,21 +59,6 @@
 # instead of DUPLICATE_FOUND (still exit code 1, so existing
 # `if ! check-duplicate.sh ...` callers still fall back to manual review --
 # they just should NOT treat the (absent) match list as real duplicates).
-#
-# Title-only signal (#354): the combined title+body Jaccard score is diluted
-# whenever one side has a much longer body than the other -- e.g. a caller
-# probing with a short placeholder body (or a Curator/Guide call that hasn't
-# fetched the candidate's full body yet) against a richly-worded existing
-# issue. This is exactly how two same-day, same-root-cause issues (#347/#349)
-# slipped past the default --threshold=18 despite their titles alone sharing
-# 56% Jaccard overlap: the combined score, diluted by #347's ~300-word body,
-# fell to 4%. Each search function now ALSO compares title-only keyword sets
-# (title vs title, ignoring body on both sides) against a separate, higher
-# --title-threshold (default 40 -- titles are short and specific, so a large
-# overlap there is a much stronger signal than the same percentage over a
-# large combined keyword set). A candidate is flagged if EITHER the combined
-# score clears --threshold OR the title-only score clears --title-threshold;
-# the reported "similarity: N%" is whichever of the two is higher.
 
 set -euo pipefail
 
@@ -85,15 +70,6 @@ set -euo pipefail
 # failure mode (dozens of candidates ~all scoring at/above threshold) while
 # not misfiring on small candidate pools.
 readonly MIN_SCANNED_FOR_DEGENERATE=4
-
-# Default --title-threshold (#354): the similarity threshold applied to the
-# title-only comparison (see the header comment above). Deliberately higher
-# than the default --threshold (18) because title-only keyword sets are much
-# smaller and more specific than combined title+body sets, so the same
-# percentage means something different on each scale -- calibrated against
-# the #347/#349 real duplicate pair (56% title-only Jaccard) while staying
-# well clear of unrelated same-repo issue titles observed to score 0-4%.
-readonly DEFAULT_TITLE_THRESHOLD=40
 
 # Forge-agnostic issue/PR operations via the native `loom-daemon forge`
 # subcommand (port of the retired `loom-forge`). On GitHub it is a byte-identical
@@ -166,15 +142,6 @@ OPTIONS:
                              bodies (a second real duplicate pair scored only
                              13%, indistinguishable from unrelated) -- treat
                              a miss as inconclusive, not proof of no overlap.
-    --title-threshold NUM   Title-only similarity threshold percentage,
-                             compared on titles alone -- ignoring both sides'
-                             bodies (default: 40). A candidate is flagged if
-                             EITHER this OR --threshold clears its bar (#354):
-                             the combined title+body score is diluted whenever
-                             one side has a much longer body than the other,
-                             which let two same-day, same-root-cause issues
-                             (#347/#349) slip past the dedup gate despite
-                             their titles alone sharing 56% Jaccard overlap.
     --include-merged-prs    Also check recently merged PRs and closed issues
     --issue N               Also probe for OPEN issues/PRs that cross-reference
                              issue N (GitHub timeline API). Curator use --
@@ -394,7 +361,6 @@ search_similar_issues() {
     local body="${2:-}"
     local threshold="${3:-18}"
     local self_issue="${4:-}"
-    local title_threshold="${5:-$DEFAULT_TITLE_THRESHOLD}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -404,12 +370,6 @@ search_similar_issues() {
         print_warning "No significant keywords extracted from title/body"
         return 0
     fi
-
-    # Title-only keyword set (#354): a separate, higher-bar signal that
-    # ignores both sides' bodies -- see the header comment for why this
-    # exists. Computed once here, outside the candidate loop below.
-    local new_title_keywords
-    new_title_keywords=$(extract_keywords "$title")
 
     # Search open issues. On a GraphQL rate-limit failure, retry via REST
     # (an independent quota, #4526) before giving up.
@@ -468,18 +428,9 @@ search_similar_issues() {
         local similarity
         similarity=$(calculate_similarity "$new_keywords" "$existing_keywords")
 
-        # Title-only similarity (#354): compared independently of the
-        # combined score above so a long body on either side can't dilute a
-        # strong title match into invisibility. See the header comment.
-        local existing_title_keywords title_similarity
-        existing_title_keywords=$(extract_keywords "$title_text")
-        title_similarity=$(calculate_similarity "$new_title_keywords" "$existing_title_keywords")
-
-        if [[ $similarity -ge $threshold || $title_similarity -ge $title_threshold ]]; then
+        if [[ $similarity -ge $threshold ]]; then
             matched=$((matched + 1))
-            local reported_similarity=$similarity
-            [[ $title_similarity -gt $reported_similarity ]] && reported_similarity=$title_similarity
-            duplicates+="#${num}: ${title_text} (similarity: ${reported_similarity}%)"$'\n'
+            duplicates+="#${num}: ${title_text} (similarity: ${similarity}%)"$'\n'
         fi
     done < <(echo "$issues" | jq -c '.[]')
 
@@ -492,7 +443,7 @@ search_similar_issues() {
     # discriminating anything for this query -- warn instead of dumping a
     # wall of "duplicates" that's really just noise.
     if [[ $scanned -ge $MIN_SCANNED_FOR_DEGENERATE ]] && (( matched * 2 > scanned )); then
-        echo "NON_DISCRIMINATIVE (open issues): ${matched} of ${scanned} candidates cleared --threshold=${threshold}% (combined) or --title-threshold=${title_threshold}% (title-only) -- not discriminative, fall back to manual review (e.g. gh issue list --search)."
+        echo "NON_DISCRIMINATIVE (open issues): ${matched} of ${scanned} candidates scored >= ${threshold}% similarity -- not discriminative, fall back to manual review (e.g. gh issue list --search)."
         return 1
     fi
 
@@ -515,7 +466,6 @@ search_merged_prs() {
     local body="${2:-}"
     local threshold="${3:-18}"
     local self_issue="${4:-}"
-    local title_threshold="${5:-$DEFAULT_TITLE_THRESHOLD}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -524,10 +474,6 @@ search_merged_prs() {
     if [[ -z "$new_keywords" ]]; then
         return 0
     fi
-
-    # Title-only keyword set (#354) -- see search_similar_issues() for why.
-    local new_title_keywords
-    new_title_keywords=$(extract_keywords "$title")
 
     # Search recently merged PRs. On a GraphQL rate-limit failure, retry via
     # REST (#4526). REST has no `state=merged` filter, so fetch closed PRs
@@ -581,16 +527,9 @@ search_merged_prs() {
         local similarity
         similarity=$(calculate_similarity "$new_keywords" "$existing_keywords")
 
-        # Title-only similarity (#354) -- see search_similar_issues().
-        local existing_title_keywords title_similarity
-        existing_title_keywords=$(extract_keywords "$title_text")
-        title_similarity=$(calculate_similarity "$new_title_keywords" "$existing_title_keywords")
-
-        if [[ $similarity -ge $threshold || $title_similarity -ge $title_threshold ]]; then
+        if [[ $similarity -ge $threshold ]]; then
             matched=$((matched + 1))
-            local reported_similarity=$similarity
-            [[ $title_similarity -gt $reported_similarity ]] && reported_similarity=$title_similarity
-            duplicates+="PR #${num}: ${title_text} (similarity: ${reported_similarity}%)"$'\n'
+            duplicates+="PR #${num}: ${title_text} (similarity: ${similarity}%)"$'\n'
         fi
     done < <(echo "$prs" | jq -c '.[]')
 
@@ -600,7 +539,7 @@ search_merged_prs() {
 
     # Degenerate-result self-detection (#4409), same as search_similar_issues.
     if [[ $scanned -ge $MIN_SCANNED_FOR_DEGENERATE ]] && (( matched * 2 > scanned )); then
-        echo "NON_DISCRIMINATIVE (merged PRs): ${matched} of ${scanned} candidates cleared --threshold=${threshold}% (combined) or --title-threshold=${title_threshold}% (title-only) -- not discriminative, fall back to manual review."
+        echo "NON_DISCRIMINATIVE (merged PRs): ${matched} of ${scanned} candidates scored >= ${threshold}% similarity -- not discriminative, fall back to manual review."
         return 0
     fi
 
@@ -619,7 +558,6 @@ search_closed_issues() {
     local body="${2:-}"
     local threshold="${3:-18}"
     local self_issue="${4:-}"
-    local title_threshold="${5:-$DEFAULT_TITLE_THRESHOLD}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -628,10 +566,6 @@ search_closed_issues() {
     if [[ -z "$new_keywords" ]]; then
         return 0
     fi
-
-    # Title-only keyword set (#354) -- see search_similar_issues() for why.
-    local new_title_keywords
-    new_title_keywords=$(extract_keywords "$title")
 
     # Search recently closed issues. On a GraphQL rate-limit failure, retry
     # via REST (#4526).
@@ -686,16 +620,9 @@ search_closed_issues() {
         local similarity
         similarity=$(calculate_similarity "$new_keywords" "$existing_keywords")
 
-        # Title-only similarity (#354) -- see search_similar_issues().
-        local existing_title_keywords title_similarity
-        existing_title_keywords=$(extract_keywords "$title_text")
-        title_similarity=$(calculate_similarity "$new_title_keywords" "$existing_title_keywords")
-
-        if [[ $similarity -ge $threshold || $title_similarity -ge $title_threshold ]]; then
+        if [[ $similarity -ge $threshold ]]; then
             matched=$((matched + 1))
-            local reported_similarity=$similarity
-            [[ $title_similarity -gt $reported_similarity ]] && reported_similarity=$title_similarity
-            duplicates+="Closed #${num}: ${title_text} (similarity: ${reported_similarity}%)"$'\n'
+            duplicates+="Closed #${num}: ${title_text} (similarity: ${similarity}%)"$'\n'
         fi
     done < <(echo "$issues" | jq -c '.[]')
 
@@ -705,7 +632,7 @@ search_closed_issues() {
 
     # Degenerate-result self-detection (#4409), same as search_similar_issues.
     if [[ $scanned -ge $MIN_SCANNED_FOR_DEGENERATE ]] && (( matched * 2 > scanned )); then
-        echo "NON_DISCRIMINATIVE (closed issues): ${matched} of ${scanned} candidates cleared --threshold=${threshold}% (combined) or --title-threshold=${title_threshold}% (title-only) -- not discriminative, fall back to manual review."
+        echo "NON_DISCRIMINATIVE (closed issues): ${matched} of ${scanned} candidates scored >= ${threshold}% similarity -- not discriminative, fall back to manual review."
         return 0
     fi
 
@@ -790,7 +717,6 @@ main() {
     local title=""
     local body=""
     local threshold=18
-    local title_threshold="$DEFAULT_TITLE_THRESHOLD"
     local json_output=false
     local include_merged_prs=false
     local issue=""
@@ -825,10 +751,6 @@ main() {
                 --threshold)
                     shift
                     threshold="$1"
-                    ;;
-                --title-threshold)
-                    shift
-                    title_threshold="$1"
                     ;;
                 --include-merged-prs)
                     include_merged_prs=true
@@ -887,12 +809,6 @@ main() {
         exit 2
     fi
 
-    # Validate title-threshold is a number
-    if ! [[ "$title_threshold" =~ ^[0-9]+$ ]]; then
-        print_error "Title-threshold must be a number"
-        exit 2
-    fi
-
     # Validate --issue is a number, when given
     if [[ -n "$issue" ]] && ! [[ "$issue" =~ ^[0-9]+$ ]]; then
         print_error "--issue must be a number"
@@ -937,7 +853,7 @@ main() {
     # Search for similar issues
     local result
     local exit_code=0
-    result=$(search_similar_issues "$title" "$body" "$threshold" "$issue" "$title_threshold") || exit_code=$?
+    result=$(search_similar_issues "$title" "$body" "$threshold" "$issue") || exit_code=$?
     if [[ $exit_code -eq 1 ]]; then
         duplicate_found=true
     elif [[ $exit_code -eq 2 ]]; then
@@ -950,8 +866,8 @@ main() {
     if $include_merged_prs; then
         local merged_exit_code=0
         local closed_exit_code=0
-        merged_result=$(search_merged_prs "$title" "$body" "$threshold" "$issue" "$title_threshold") || merged_exit_code=$?
-        closed_result=$(search_closed_issues "$title" "$body" "$threshold" "$issue" "$title_threshold") || closed_exit_code=$?
+        merged_result=$(search_merged_prs "$title" "$body" "$threshold" "$issue") || merged_exit_code=$?
+        closed_result=$(search_closed_issues "$title" "$body" "$threshold" "$issue") || closed_exit_code=$?
 
         # #4526: a GraphQL rate-limit that ALSO fails via REST means this
         # pool genuinely could not be checked. Record it; the final verdict
