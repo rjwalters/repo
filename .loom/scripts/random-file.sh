@@ -34,20 +34,33 @@ DEBUG="${DEBUG:-false}"
 INCLUDE_PATTERNS=()
 EXCLUDE_PATTERNS=()
 
-# Default exclude patterns (match MCP implementation)
-DEFAULT_EXCLUDES=(
+# Default exclude patterns (match MCP implementation).
+#
+# Split into directory names vs. file name/glob patterns explicitly, rather
+# than inferring the kind from whether the string happens to contain a
+# literal "." (that heuristic misclassified dotted directory names like
+# ".git" and ".loom/worktrees" as file patterns -- see #379). Each list is
+# matched with the anchoring appropriate to its kind in apply_exclusions().
+DEFAULT_EXCLUDE_DIRS=(
     "node_modules"
     ".git"
     "dist"
     "build"
     "target"
     ".loom/worktrees"
+)
+
+DEFAULT_EXCLUDE_FILE_PATTERNS=(
     "*.log"
     "package-lock.json"
     "pnpm-lock.yaml"
     "yarn.lock"
     "Cargo.lock"
 )
+
+# Flat view for tools (like fd's -E flag) that don't need the dir/file
+# distinction -- just a list of patterns to exclude.
+DEFAULT_EXCLUDES=("${DEFAULT_EXCLUDE_DIRS[@]}" "${DEFAULT_EXCLUDE_FILE_PATTERNS[@]}")
 
 # Parse command line arguments
 parse_args() {
@@ -195,8 +208,14 @@ get_files_with_find() {
                 files+="$found"$'\n'
             fi
         done
+    elif git -C "$WORKSPACE_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
+        # Inside a git repo: let git enumerate tracked + untracked-but-not-
+        # ignored files directly. This defers .gitignore semantics entirely
+        # to git (correctly handling nested .gitignore files, negation
+        # patterns, etc.) instead of a hand-rolled glob-to-regex conversion.
+        files=$(git -C "$WORKSPACE_ROOT" ls-files --cached --others --exclude-standard)
     else
-        # Find all files
+        # Not a git repo - find all files
         files=$(find . -type f 2>/dev/null | sed 's|^\./||')
     fi
 
@@ -238,18 +257,22 @@ apply_exclusions() {
     # Build grep exclusion pattern
     local exclude_regex=""
 
-    for pattern in "${DEFAULT_EXCLUDES[@]}"; do
-        # Handle different pattern types
-        if [[ "$pattern" == *.* ]]; then
-            # File extension or specific file
-            local escaped
-            escaped=$(printf '%s' "$pattern" | sed 's/[.[\*^$()+?{|]/\\&/g')
-            escaped="${escaped//\\\*/.*}"  # Convert \* back to .*
-            exclude_regex+="|$escaped$"
-        else
-            # Directory name
-            exclude_regex+="|/$pattern/|^$pattern/"
-        fi
+    for pattern in "${DEFAULT_EXCLUDE_DIRS[@]}"; do
+        # Directory name: exclude anything under it, whether it's the first
+        # path segment (^$pattern/) or nested deeper (/$pattern/). Escape
+        # regex metacharacters (e.g. the literal "." in ".git") so the
+        # pattern only matches itself, not "look-alike" paths.
+        local escaped
+        escaped=$(printf '%s' "$pattern" | sed 's/[.[\*^$()+?{|]/\\&/g')
+        exclude_regex+="|/$escaped/|^$escaped/"
+    done
+
+    for pattern in "${DEFAULT_EXCLUDE_FILE_PATTERNS[@]}"; do
+        # File extension or specific file: match at the end of the path.
+        local escaped
+        escaped=$(printf '%s' "$pattern" | sed 's/[.[\*^$()+?{|]/\\&/g')
+        escaped="${escaped//\\\*/.*}"  # Convert \* back to .*
+        exclude_regex+="|$escaped$"
     done
 
     for pattern in "${EXCLUDE_PATTERNS[@]}"; do
@@ -283,8 +306,48 @@ glob_to_regex() {
     echo "$regex"
 }
 
-# Filter files by .gitignore
+# Filter files by .gitignore.
+#
+# Prefers asking git directly (git ls-files --exclude-standard), which
+# handles gitignore semantics correctly -- including nested .gitignore
+# files, which the hand-rolled regex fallback below does not attempt to
+# support. Falls back to the regex-based filter only when the workspace is
+# not inside a git repository at all (e.g. a plain directory tree).
 filter_by_gitignore() {
+    local input
+    input=$(cat)
+
+    if [[ -z "$input" ]]; then
+        return
+    fi
+
+    if git -C "$WORKSPACE_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
+        filter_by_gitignore_via_git <<< "$input"
+        return
+    fi
+
+    filter_by_gitignore_via_regex <<< "$input"
+}
+
+# Keep only lines from stdin that are members of git's own non-ignored file
+# set (tracked files plus untracked files not covered by any .gitignore).
+filter_by_gitignore_via_git() {
+    local input
+    input=$(cat)
+
+    local -A allowed=()
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && allowed["$f"]=1
+    done < <(git -C "$WORKSPACE_ROOT" ls-files --cached --others --exclude-standard)
+
+    while IFS= read -r f; do
+        [[ -n "$f" && -n "${allowed[$f]:-}" ]] && echo "$f"
+    done <<< "$input"
+}
+
+# Regex-based .gitignore filter, used only outside a git repository.
+filter_by_gitignore_via_regex() {
     local input
     input=$(cat)
 
@@ -342,7 +405,12 @@ gitignore_to_regex() {
         pattern="${pattern%/}"
         local regex
         regex=$(glob_to_regex "$pattern")
-        echo "/$regex(/|$)"
+        # Anchor with (^|/), matching every other branch in this function,
+        # so the directory can match as the FIRST path segment too (e.g.
+        # ".claude/worktrees/foo") and not only when nested deeper. A
+        # hardcoded leading "/" here previously meant a directory-only
+        # .gitignore entry never matched at the start of a relative path.
+        echo "(^|/)$regex(/|$)"
         return
     fi
 
