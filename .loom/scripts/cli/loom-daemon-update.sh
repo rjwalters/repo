@@ -432,6 +432,13 @@ fi
 # "No loom-daemon/Cargo.toml found at $HOME/loom-daemon". `.git` alone is any
 # git checkout; `.loom/` alone is machine state; only the pair is a Loom repo.
 # Mirrors loom-daemon's own `crate::repo_root::find_repo_root`.
+#
+# NOT consolidated onto `lib/script-helper.sh`'s `_lsh_find_repo_root` (#375)
+# — that canonical implementation deliberately accepts a `.loom/`-only match
+# (most other callers, and their test fixtures, never create a `.git` dir),
+# which would reintroduce the #5140 $HOME false-positive here. This is the
+# one genuinely different variant: same worktree `gitdir:` handling, stricter
+# same-level pairing requirement.
 find_repo_root() {
     local dir="${1:-$PWD}"
     dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo ""; return 0; }

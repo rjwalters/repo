@@ -6,29 +6,10 @@
 # surface is `.loom/bin/loom start|status|stop` (tmux pool). This wrapper
 # maps the legacy flags onto those subcommands.
 
-# Find the repository root by looking for the .loom directory (handles
-# worktrees and the symlinked defaults/scripts source layout).
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then
-            echo "$dir"
-            return 0
-        fi
-        if [[ -f "$dir/.git" ]]; then
-            local gitdir
-            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
-            local main_repo
-            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
-            if [[ -d "$main_repo/.loom" ]]; then
-                echo "$main_repo"
-                return 0
-            fi
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo ""
-}
+# Find the repository root: canonical, worktree-aware implementation (#375).
+# shellcheck source=lib/script-helper.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
+find_repo_root() { _lsh_find_repo_root "$@"; }
 
 REPO_ROOT=$(find_repo_root)
 LOOM_BIN="$REPO_ROOT/.loom/bin/loom"
