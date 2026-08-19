@@ -59,11 +59,23 @@ assert_empty() {  # <label> <actual>
 HOOK_OUT=""
 HOOK_EXIT=0
 run_hook_raw() {  # <stdin-payload>
-    HOOK_OUT=$(printf '%s' "$1" | bash "$HOOK" 2>/dev/null)
+    # Explicitly clear LOOM_ROLE so these "ordinary" runs are deterministic
+    # regardless of the calling environment - this test suite may itself be
+    # invoked from inside a Loom role session (LOOM_ROLE set), which would
+    # otherwise silently trip the issue #389 Layer 2 gate under test below.
+    HOOK_OUT=$(printf '%s' "$1" | LOOM_ROLE= bash "$HOOK" 2>/dev/null)
     HOOK_EXIT=$?
 }
 run_hook() {  # <cwd> <source>
     run_hook_raw "$(jq -nc --arg w "$1" --arg s "$2" '{cwd:$w, source:$s}')"
+}
+
+# run_hook_as_role <cwd> <source> <LOOM_ROLE value> -> like run_hook, but with
+# LOOM_ROLE set in the hook's environment (issue #389 audience gating).
+run_hook_as_role() {  # <cwd> <source> <role>
+    HOOK_OUT=$(jq -nc --arg w "$1" --arg s "$2" '{cwd:$w, source:$s}' \
+        | LOOM_ROLE="$3" bash "$HOOK" 2>/dev/null)
+    HOOK_EXIT=$?
 }
 
 # Portable "N units ago" mtime setter (BSD `date -v` vs GNU `date -d`).
@@ -251,6 +263,8 @@ assert_contains  "under cap: wraps body in a begin marker" "$CTX" "BEGIN HANDOFF
 assert_contains  "under cap: wraps body in an end marker"  "$CTX" "END HANDOFF NOTE"
 assert_not_contains "under cap: no oversize warning"      "$CTX" "OVERSIZE"
 assert_contains  "under cap: directive present"           "$CTX" "Read the note in full before doing anything else"
+assert_contains  "under cap: conditions deletion on operator session" "$CTX" "If you are the operator's interactive session"
+assert_contains  "under cap: instructs role agents not to delete" "$CTX" "do NOT act on this"
 
 # Over the cap: headers outline + oversize warning; body omitted, no markers, but
 # the read-in-full / one-shot directive is still present (BOTH branches carry it).
@@ -339,6 +353,54 @@ mkdir -p "$DIRNOTE/.claude/handoff.md"
 run_hook "$DIRNOTE" startup
 assert_eq        "handoff.md is a directory: exit 0"      "0" "$HOOK_EXIT"
 assert_empty     "handoff.md is a directory: no output"   "$HOOK_OUT"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- LOOM_ROLE audience gating (issue #389) --"
+echo "-- role/autonomous sessions never see (or are told to delete) the note --"
+# ---------------------------------------------------------------------------
+# Layer 2: LOOM_ROLE set -> banner is suppressed entirely, for both startup and
+# resume, regardless of a pending note.
+run_hook_as_role "$FRESH" startup "builder"
+assert_eq        "LOOM_ROLE=builder + startup: exit 0"    "0" "$HOOK_EXIT"
+assert_empty     "LOOM_ROLE=builder + startup: no output despite pending note" "$HOOK_OUT"
+
+run_hook_as_role "$FRESH" resume "judge"
+assert_eq        "LOOM_ROLE=judge + resume: exit 0"       "0" "$HOOK_EXIT"
+assert_empty     "LOOM_ROLE=judge + resume: no output despite pending note" "$HOOK_OUT"
+
+run_hook_as_role "$FRESH" startup "sweep-lifecycle"
+assert_empty     "LOOM_ROLE=sweep-lifecycle: no output (daemon's own role)" "$HOOK_OUT"
+
+# Read-only guarantee holds for role sessions too: no note/pointer is touched.
+ROLE_BEFORE_SUM=$(cksum < "$FRESH/.claude/handoff.md")
+run_hook_as_role "$FRESH" startup "doctor"
+ROLE_AFTER_SUM=$(cksum < "$FRESH/.claude/handoff.md")
+assert_eq        "LOOM_ROLE=doctor: note left untouched"  "$ROLE_BEFORE_SUM" "$ROLE_AFTER_SUM"
+if [[ -f "$FRESH/.claude/handoff.md" ]]; then
+    ok "LOOM_ROLE=doctor: note file still exists"
+else
+    no "LOOM_ROLE=doctor: note file still exists" "note was deleted"
+fi
+
+# Empty LOOM_ROLE (unset or "") is indistinguishable from the operator path -
+# the ordinary full banner, including the deletion directive, is unchanged.
+run_hook_as_role "$FRESH" startup ""
+assert_eq        "LOOM_ROLE='' + startup: exit 0"         "0" "$HOOK_EXIT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "LOOM_ROLE='': full banner still emitted" "$CTX" "$FRESH/.claude/handoff.md"
+assert_contains  "LOOM_ROLE='': deletion directive present" "$CTX" "delete both the note and its pointer"
+
+# Operator path (LOOM_ROLE unset entirely): unchanged from pre-#389 behavior -
+# full banner, deletion directive conditioned on the operator's session.
+run_hook "$FRESH" startup
+assert_eq        "no LOOM_ROLE + startup: exit 0"         "0" "$HOOK_EXIT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains  "no LOOM_ROLE: full banner emitted"       "$CTX" "$FRESH/.claude/handoff.md"
+assert_contains  "no LOOM_ROLE: deletion directive present for operator" "$CTX" \
+    "If you are the operator's interactive session"
+assert_contains  "no LOOM_ROLE: role-agent non-deletion instruction present" "$CTX" \
+    "do NOT act on this"
 
 # ---------------------------------------------------------------------------
 echo ""
