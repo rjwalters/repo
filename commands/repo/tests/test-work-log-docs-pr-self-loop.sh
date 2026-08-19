@@ -241,7 +241,53 @@ else
     # actually applies it AND asks gh for headRefName (jq cannot filter on a
     # field gh was not asked to return; .headRefName would be null and the
     # branch arm would silently never match).
-    QUERY_BLOCK="$(awk '/^update_work_log\(\) \{/{f=1} f{print} f && /^\}/{exit}' "$GUIDE_MD")"
+    #
+    # #391: the `gh pr list` call that supplies those candidates is NOT always
+    # inline in update_work_log() anymore — loom 0.18.96's guide.md moved the
+    # fetch into a helper (`fetch_merged_prs_complete()`, which carries its own
+    # "`headRefName` MUST stay in the --json field list" comment) that
+    # update_work_log() calls. Grepping only update_work_log()'s own body
+    # therefore reported a false regression on a guide.md whose behavior was
+    # correct. Follow one level of the call chain instead: append the body of
+    # every column-0 helper function defined in guide.md that update_work_log()
+    # actually calls, and assert the field is requested somewhere in that
+    # combined fetch path. The assertion's intent (the branch-prefix arm of
+    # GUIDE_DOCS_PR_EXCLUDE can actually match) is unchanged; only the window
+    # it searches widened to match where the call really lives.
+    extract_fn_body() { # <function-name>
+        awk -v fn="$1" '$0 ~ "^" fn "\\(\\) \\{" {f=1} f{print} f && /^\}/{exit}' "$GUIDE_MD"
+    }
+
+    QUERY_BLOCK="$(extract_fn_body update_work_log)"
+    if [[ -n "$QUERY_BLOCK" ]]; then
+        while IFS= read -r helper; do
+            [[ -z "$helper" || "$helper" == "update_work_log" ]] && continue
+            grep -qE "(^|[^A-Za-z0-9_])${helper}([^A-Za-z0-9_]|\$)" <<< "$QUERY_BLOCK" || continue
+            QUERY_BLOCK+=$'\n'"$(extract_fn_body "$helper")"
+        done < <(sed -nE 's/^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{$/\1/p' "$GUIDE_MD" | sort -u)
+    fi
+
+    # Widening the search window must not weaken the assertion: it is not
+    # enough for `headRefName` to appear SOMEWHERE in the combined block (a
+    # sibling helper's unrelated query would satisfy that). Every `gh pr list`
+    # in the fetch path must request it. Continuation lines are joined first
+    # so a `--json ...` split across a `\` newline is still one logical query.
+    # Issue queries are deliberately not checked — `gh issue list` has no
+    # headRefName field.
+    PR_QUERY_LINES="$(printf '%s\n' "$QUERY_BLOCK" | awk '
+        { line = $0
+          if (buf != "") { line = buf line }
+          if (line ~ /\\$/) { sub(/\\$/, "", line); buf = line; next }
+          print line; buf = "" }
+        END { if (buf != "") print buf }' | grep -F 'pr list')"
+    MISSING_FIELD_QUERY=""
+    while IFS= read -r pr_query; do
+        [[ "$pr_query" == *"--json"* ]] || continue
+        [[ "$pr_query" == *headRefName* ]] && continue
+        MISSING_FIELD_QUERY="$pr_query"
+        break
+    done <<< "$PR_QUERY_LINES"
+
     if [[ -z "$QUERY_BLOCK" ]]; then
         no "update_work_log() applies GUIDE_DOCS_PR_EXCLUDE to its candidate query" \
             "no update_work_log() body found in $GUIDE_MD"
@@ -250,7 +296,10 @@ else
             "update_work_log() body does not reference GUIDE_DOCS_PR_EXCLUDE at all"
     elif ! grep -q 'headRefName' <<< "$QUERY_BLOCK"; then
         no "update_work_log() applies GUIDE_DOCS_PR_EXCLUDE to its candidate query" \
-            "update_work_log() never requests headRefName from gh, so the branch-prefix arm can never match"
+            "neither update_work_log() nor any helper it calls requests headRefName from gh, so the branch-prefix arm can never match"
+    elif [[ -n "$MISSING_FIELD_QUERY" ]]; then
+        no "update_work_log() applies GUIDE_DOCS_PR_EXCLUDE to its candidate query" \
+            "a gh pr list in the candidate-fetch path omits headRefName from --json, so the branch-prefix arm can never match for it: ${MISSING_FIELD_QUERY}"
     else
         ok "update_work_log() applies GUIDE_DOCS_PR_EXCLUDE and requests headRefName"
     fi
