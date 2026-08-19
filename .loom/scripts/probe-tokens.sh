@@ -32,21 +32,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
 
-# ---------- repo root (mirrors loom-daemon-start.sh's find_repo_root) ----------
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
-        if [[ -f "$dir/.git" ]]; then
-            local gitdir main_repo
-            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
-            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
-            if [[ -d "$main_repo/.loom" ]]; then echo "$main_repo"; return 0; fi
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo "$PWD"
-}
+# ---------- repo root (canonical, worktree-aware implementation, #375) ----------
+# shellcheck source=lib/script-helper.sh
+source "$SCRIPT_DIR/lib/script-helper.sh"
+find_repo_root() { _lsh_find_repo_root "$@" || echo "$PWD"; }
 
 REPO_ROOT="$(find_repo_root)"
 DAEMON_BIN="$(loom_locate_daemon_bin "$REPO_ROOT")"

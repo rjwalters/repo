@@ -29,17 +29,18 @@
 #
 # See docs/adr/0013-loom-tools-python-retirement.md.
 
-# Find the repository root from the script location
+# Find the repository root from the script location.
+#
+# `_find_repo_root` used to carry its own (buggy — #375) copy of this walk.
+# It now delegates to lib/script-helper.sh's `_lsh_find_repo_root`, the
+# canonical, worktree-aware implementation — see that function's header
+# comment for why the check ordering matters. Both libs live in the same
+# `lib/` directory, so this source is always resolvable without needing a
+# repo root first.
+# shellcheck source=./script-helper.sh
+source "$(dirname "${BASH_SOURCE[0]}")/script-helper.sh"
 _find_repo_root() {
-    local dir="${1:-$(pwd)}"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.git" ]] || [[ -d "$dir/.loom" ]]; then
-            echo "$dir"
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    return 1
+    _lsh_find_repo_root "$@"
 }
 
 # Retired dispatcher. Prints a migration message and exits 1 — it never looks

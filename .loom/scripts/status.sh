@@ -27,21 +27,18 @@ NC='\033[0m' # No Color
 # Stale timeout in seconds (5 minutes)
 STALE_TIMEOUT=300
 
-# Find the repository root (works from any subdirectory)
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
-            echo "$dir"
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo "Error: Not in a git repository" >&2
-    return 1
-}
+# Find the repository root (works from any subdirectory, including a
+# worktree — see lib/script-helper.sh's `_lsh_find_repo_root` for why the
+# worktree `gitdir:` resolution has to come before a `.git`-file-only match).
+# shellcheck source=./lib/script-helper.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
+find_repo_root() { _lsh_find_repo_root "$@"; }
 
 REPO_ROOT=$(find_repo_root)
+if [[ -z "$REPO_ROOT" ]]; then
+    echo "Error: Not in a Loom workspace (.loom directory not found)" >&2
+    exit 1
+fi
 STATUS_DIR="$REPO_ROOT/.loom/status"
 
 # Ensure status directory exists
