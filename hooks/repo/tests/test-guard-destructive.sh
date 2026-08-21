@@ -3508,6 +3508,14 @@ make_wt_confinement_repo_spaced() {
 # shellcheck disable=SC2046 # main/wt are mktemp paths, never contain IFS chars
 read -r WTC_MAIN WTC_WT <<< "$(make_wt_confinement_repo)"
 
+# Physical (symlink-resolved) form of WTC_MAIN — on macOS, mktemp -d returns a
+# LOGICAL path under $TMPDIR (typically /var/folders/... via a /var ->
+# /private/var symlink), while the guard's `_WT_MAIN_ROOT` is always resolved
+# with `pwd -P` (rjwalters/repo#400). The `context` field's `wtMainRoot=`
+# value is therefore the physical form, not the raw mktemp string, so
+# assertions against it must compare against this resolved form too.
+WTC_MAIN_PHYS="$(cd "$WTC_MAIN" && pwd -P)"
+
 # ---- Core deny cases: each write idiom, absolute path into the main checkout,
 # ---- issued from the builder's own worktree cwd (the #4178 escape). ----
 assert_deny "write-confinement: '>' redirect into main checkout denies" \
@@ -3559,7 +3567,7 @@ make_input "echo x > $WTC_MAIN/evil.sh" "$WTC_WT" | \
     env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_CTX_LOG" "$GUARD" >/dev/null 2>&1 || true
 WTC_CTX_VAL="$(tail -1 "$WTC_CTX_LOG" 2>/dev/null | jq -r '.context // empty' 2>/dev/null)"
 if [[ -n "$WTC_CTX_VAL" ]] \
-   && [[ "$WTC_CTX_VAL" == *"wtMainRoot=$WTC_MAIN"* ]] \
+   && { [[ "$WTC_CTX_VAL" == *"wtMainRoot=$WTC_MAIN_PHYS"* ]] || [[ "$WTC_CTX_VAL" == *"wtMainRoot=$WTC_MAIN"* ]]; } \
    && [[ "$WTC_CTX_VAL" == *"wtMainRootLogical="* ]] \
    && [[ "$WTC_CTX_VAL" == *"target=$WTC_MAIN/evil.sh"* ]]; then
     PASS=$((PASS + 1))
@@ -3580,7 +3588,7 @@ make_input 'echo x > $DEST' "$WTC_WT" | \
     env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$WTC_CTX_VAR_LOG" "$GUARD" >/dev/null 2>&1 || true
 WTC_CTX_VAR_VAL="$(tail -1 "$WTC_CTX_VAR_LOG" 2>/dev/null | jq -r '.context // empty' 2>/dev/null)"
 if [[ -n "$WTC_CTX_VAR_VAL" ]] \
-   && [[ "$WTC_CTX_VAR_VAL" == *"wtMainRoot=$WTC_MAIN"* ]] \
+   && { [[ "$WTC_CTX_VAR_VAL" == *"wtMainRoot=$WTC_MAIN_PHYS"* ]] || [[ "$WTC_CTX_VAR_VAL" == *"wtMainRoot=$WTC_MAIN"* ]]; } \
    && [[ "$WTC_CTX_VAR_VAL" == *'target=$DEST'* ]]; then
     PASS=$((PASS + 1))
     echo -e "  ${GREEN}PASS${NC}: write-confinement-unresolved-var: deny decision log's context field records the resolved wtMainRoot/target"
