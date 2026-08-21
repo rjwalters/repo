@@ -173,6 +173,19 @@ and:
 - **MUST NOT** uninstall. Removing installed surfaces is the uninstaller's job
   and stays a separate, explicit action. **A refresh that can delete is not a
   refresh.**
+- **SHOULD** restamp the tool's own version token wherever consumer-facing
+  prose states it (a `CLAUDE.md`/`AGENTS.md` pointer block, a README badge
+  written at install time, etc.), even though that file's *installer-managed
+  boilerplate* otherwise belongs to the installer. This is a narrow,
+  targeted field edit — not a license to rewrite the surrounding block — and
+  it exists because C5/C6 already keep `install-metadata.json`'s version
+  field current on every resync; a prose copy of the same number that resync
+  does not also restamp silently drifts from it (repo#407). Both tools that
+  currently implement C7 take this exception: Loom's
+  `.loom/scripts/resync-installed.sh` restamps the `**Loom Version**` header
+  in `.loom/CLAUDE.md` (loom#5559), and Repo Skills' restamps the `v<version>`
+  token in the REPO-SKILLS marker block via `lib/claude-md-block.sh`
+  (repo#407). A tool with no such prose pointer has nothing to restamp here.
 
 Exit status **MUST** be: `0` in sync (or successfully applied), `2` from
 `--dry-run` when drift was found, `1` on error. A driver can then branch on one
@@ -185,8 +198,9 @@ reading at a meaningless offset mid-run.
 
 Reinstalling via `install.sh -y <consumer>` is **not** a substitute. It is a
 full installer invocation driven from outside, it touches surfaces a refresh
-must not (`CLAUDE.md`, `.gitignore`, `settings.json`), and on some tools it
-refuses to run non-interactively over an existing install at all.
+must not (`CLAUDE.md`'s boilerplate prose beyond the version-token exception
+above, `.gitignore`, `settings.json`), and on some tools it refuses to run
+non-interactively over an existing install at all.
 
 > Spot-check: `<tool-root>/scripts/resync-installed.sh --dry-run` exits 0 or 2
 > and leaves the target's fingerprint unchanged.
