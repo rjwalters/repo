@@ -90,6 +90,24 @@ pr_merged_lookup() {  # <branch>
     esac
 }
 
+# Stands in for arm 4b's forge lookup — the single REST call
+# `gh api .../commits/<sha>/pulls` filtered client-side on `.merged_at !=
+# null`, which yields the count AND the number, the head ref the PR was
+# actually opened from, and the merge date. Echoes "<count> <number> <head-ref>
+# <date>". Only reached when pr_merged_lookup (arm 4, branch's own head name)
+# found nothing (repo#411).
+# COMMIT_LOOKUP_MODE: none -> no merged PR contains this commit | merged -> one
+# merged PR contains it, opened from a different head | fail -> non-zero exit
+# (gh missing / unauthenticated / rate-limited / offline).
+COMMIT_LOOKUP_MODE="none"
+commit_pulls_lookup() {  # <sha>
+    case "$COMMIT_LOOKUP_MODE" in
+        merged) echo "1 6214 fix/w-improvement 2026-08-19" ;;
+        fail)   return 7 ;;
+        *)      echo "0   " ;;
+    esac
+}
+
 # classify <branch> -> "<verdict>|<tag>"
 #   SAFE   : work is preserved elsewhere; branch may be deleted under --prune
 #   UNSAFE : branch holds commits whose content exists nowhere else
@@ -97,7 +115,7 @@ pr_merged_lookup() {  # <branch>
 # The tag is the branches.md step-4 report label naming the check that fired.
 classify() {
     local branch="$1" unique mt tree lookup n num date cherry
-    local n_commits
+    local n_commits tip hits hn hnum hhead hdate
 
     # -- 5a: ancestry. ONE --not, both exclusions after it.
     if ! unique=$(git -C "$REPO" log --oneline "$branch" --not "$DEFAULT" --remotes 2>/dev/null); then
@@ -130,7 +148,7 @@ classify() {
         fi
     fi
 
-    # -- 5b arm 4: forge merge state.
+    # -- 5b arm 4: forge merge state (the branch's own head name).
     if lookup=$(pr_merged_lookup "$branch" 2>/dev/null); then
         read -r n num date <<<"$lookup"
         if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )); then
@@ -139,6 +157,24 @@ classify() {
     else
         # 5c: forge lookup unavailable -> KEEP
         echo "KEEP|unverifiable: forge lookup failed"; return
+    fi
+
+    # -- 5b arm 4b: commit containment via forge (repo#411). Only reached when
+    #    arm 4's head-name lookup found nothing — proves containment for a
+    #    review/scratch branch whose tip landed under a DIFFERENT head name
+    #    than the branch's own (e.g. a local `pr-<N>-review` checkout of a PR
+    #    that was itself opened from `fix/...`).
+    if ! tip=$(git -C "$REPO" rev-parse "$branch" 2>/dev/null); then
+        echo "KEEP|unverifiable: cannot resolve $branch tip"; return   # 5c
+    fi
+    if hits=$(commit_pulls_lookup "$tip" 2>/dev/null); then
+        read -r hn hnum hhead hdate <<<"$hits"
+        if [[ "$hn" =~ ^[0-9]+$ ]] && (( hn >= 1 )); then
+            echo "SAFE|landed (squash), merged PR #${hnum} via ${hhead} (${hdate})"; return
+        fi
+    else
+        # 5c: commit-pulls lookup unavailable -> KEEP
+        echo "KEEP|unverifiable: commit-pulls lookup failed"; return
     fi
 
     echo "UNSAFE|unique work: ${n_commits} commits found nowhere else"
@@ -242,19 +278,44 @@ build_fixtures() {
     git -C "$REPO" push -q origin main
     git -C "$REPO" checkout -q main
 
-    # (6) Finally, a commit made to main and NOT pushed — the `abae8dc` analogue
+    # (6) REVIEW/SCRATCH branch (repo#411): a local checkout tracking someone
+    #     else's PR head, the `pr-<N>-review` motivating case. Its content
+    #     lands via a merged PR, but that PR was opened from a DIFFERENT head
+    #     name than this branch's own — arm 4's head-name lookup (keyed on
+    #     `pr-6214-review`) can never find it; only arm 4b's commit-containment
+    #     lookup (keyed on the tip SHA) can. Deliberately multi-commit, same as
+    #     fixture (4), so the squash never patch-id matches and only the forge
+    #     arms can clear it; main is edited afterward so merge-tree/diff also
+    #     cannot. Built (and pushed) BEFORE the MAINONLY fixture below — it must
+    #     not be the fixture whose `git push origin main` accidentally carries
+    #     MAINONLY's unpushed commit along with it.
+    git -C "$REPO" checkout -q -b pr-6214-review main
+    echo w1 > "$REPO/w.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "W1: add w=w1"
+    echo w1b >> "$REPO/w.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "W2: extend w"
+    git -C "$REPO" checkout -q main
+    git -C "$REPO" merge --squash -q pr-6214-review >/dev/null
+    git -C "$REPO" commit -qm "squash: add w (#6214, opened from fix/w-improvement)"
+    echo w2 > "$REPO/w.txt"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "main: w=w2"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q main
+
+    # (7) Finally, a commit made to main and NOT pushed — the `abae8dc` analogue
     #     from repo#39. Local main is now one commit ahead of origin/main, which
     #     is the ordinary state right after any local merge. The malformed idiom
     #     leaks THIS commit into every branch's output; the fixed one does not.
     #     It must stay unpushed: had it been pushed, `--remotes` would mask the
     #     leak and the malformed form would look correct — that accidental
     #     masking is exactly the "right answer for the wrong reason" failure
-    #     mode this suite exists to pin down.
+    #     mode this suite exists to pin down. Nothing after this point may push
+    #     to origin main again, or it would carry this commit along with it.
     echo mainonly > "$REPO/m.txt"
     git -C "$REPO" add -A && git -C "$REPO" commit -qm "MAINONLY: committed only to main"
     MAINONLY_SHA=$(git -C "$REPO" rev-parse --short HEAD)
 
-    # (7) IDENTICAL-TREE branch: same content as main's current tip but a
+    # (8) IDENTICAL-TREE branch: same content as main's current tip but a
     #     distinct SHA (an amended commit, same tree + same parent). Its tree
     #     equals main's, so even the degraded `git diff --quiet` fallback can
     #     prove containment — this is the legitimate "old git still classifies
@@ -466,6 +527,56 @@ PR_LOOKUP_MODE="none"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- fixture 6: review branch, arm 4b commit-containment (repo#411) --"
+# ---------------------------------------------------------------------------
+# pr-6214-review's own head name never had a PR opened from it — arm 4 (keyed
+# on the branch's own name) can never find it, exactly the gap repo#411 was
+# filed for. Content also isn't contained (main edited the file afterward, and
+# the branch is multi-commit so patch-id doesn't match either) — only arm 4b's
+# commit-containment lookup, keyed on the tip SHA rather than the branch name,
+# can prove this landed.
+PR_LOOKUP_MODE="none"
+COMMIT_LOOKUP_MODE="none"
+assert_eq "review branch, no PR found anywhere -> UNSAFE (arm 4b invents nothing)" \
+    "UNSAFE" "$(loss_check pr-6214-review)"
+assert_contains "its tag says unique work, same as any other unrescued branch" \
+    "$(loss_tag pr-6214-review)" "unique work:"
+
+COMMIT_LOOKUP_MODE="merged"
+assert_eq "review branch's tip landed under a different head -> SAFE (arm 4b)" \
+    "SAFE" "$(loss_check pr-6214-review)"
+assert_eq "arm 4b's tag names the PR and the differently-named head it merged from" \
+    "landed (squash), merged PR #6214 via fix/w-improvement (2026-08-19)" \
+    "$(loss_tag pr-6214-review)"
+assert_not_contains "arm 4b's tag is visibly distinct from arm 4's own tag format" \
+    "$(loss_tag pr-6214-review)" "merged PR #6214 (2026-08-19)"
+
+# Arm 4 succeeding must short-circuit before arm 4b ever runs — flip
+# COMMIT_LOOKUP_MODE to a value that would change the verdict if it ran, and
+# confirm arm 4's own tag (no "via <head-ref>") still wins.
+PR_LOOKUP_MODE="merged"
+COMMIT_LOOKUP_MODE="fail"
+assert_eq "arm 4 success short-circuits before arm 4b runs" \
+    "SAFE" "$(loss_check feature/pr-merged)"
+assert_eq "arm 4's own tag fires, not arm 4b's" \
+    "landed (squash), merged PR #150 (2026-06-28)" "$(loss_tag feature/pr-merged)"
+
+# Arm 4b's own failure direction: a non-zero exit is 5c (KEEP), never SAFE —
+# same rule as every other arm, with its own distinct unverifiable reason.
+PR_LOOKUP_MODE="none"
+COMMIT_LOOKUP_MODE="fail"
+assert_eq "commit-pulls lookup failure -> KEEP, never SAFE" \
+    "KEEP" "$(loss_check pr-6214-review)"
+assert_eq "its tag names the commit-pulls failure, distinct from arm 4's" \
+    "unverifiable: commit-pulls lookup failed" "$(loss_tag pr-6214-review)"
+SAFE_SET="$(safe_to_delete_set | tr '\n' ' ')"
+assert_not_contains "commit-pulls failure keeps the review branch out of SAFE" \
+    "$SAFE_SET" "pr-6214-review"
+PR_LOOKUP_MODE="none"
+COMMIT_LOOKUP_MODE="none"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- degraded path: git < 2.38 has no \`merge-tree --write-tree\` (repo#46) --"
 # ---------------------------------------------------------------------------
 # The documented fallback chain (branches.md:161) is `merge-tree` -> `git diff
@@ -536,9 +647,10 @@ echo "-- report tags: every verdict names the check that fired (repo#97) --"
 # distinct from "unique work", and every tag this suite emits must appear in the
 # vocabulary table branches.md publishes (asserted in the doc-drift block below).
 PR_LOOKUP_MODE="merged"
+COMMIT_LOOKUP_MODE="merged"
 UNTAGGED=""
 for b in feature/squashed feature/unpushed feature/pushed feature/pr-merged \
-         feature/cherry-landed feature/identical; do
+         feature/cherry-landed feature/identical pr-6214-review; do
     t="$(loss_tag "$b")"
     [[ -z "$t" ]] && UNTAGGED+="$b "
 done
@@ -547,6 +659,7 @@ if [[ -z "$UNTAGGED" ]]; then
 else
     no "every classified branch carries a report tag" "untagged: $UNTAGGED"
 fi
+COMMIT_LOOKUP_MODE="none"
 
 # A landed branch and a unique-work branch must not read the same.
 LANDED_TAG="$(loss_tag feature/cherry-landed)"
@@ -614,6 +727,23 @@ assert_contains "branches.md restricts -D to branches step 5 tagged landed" \
 assert_contains "branches.md refuses the git branch --merged offline fallback" \
     "$MD" 'Do **not** fall back to'
 
+# repo#411: arm 4b, the commit-containment lookup for a review branch tracking
+# a differently-named PR head. Pinned by the REST call and its distinguishing
+# `.head.ref` field, not just the tag string, so the arm can't silently regress
+# to keying on the branch's own name again (which is exactly arm 4, not 4b).
+assert_contains "branches.md documents arm 4b (commit-containment via forge)" \
+    "$MD" 'gh api "repos/{owner}/{repo}/commits/${tip}/pulls"'
+assert_contains "branches.md's arm 4b reads the PR's actual head ref" \
+    "$MD" '.head.ref'
+assert_contains "branches.md's arm 4b only runs after arm 4 finds nothing" \
+    "$MD" 'Only run when arm 4 finds nothing'
+assert_contains "branches.md's arm 4b names the pr-<N>-review motivating case" \
+    "$MD" 'pr-<N>-review'
+assert_contains "branches.md's arm 4b keeps the same never-SAFE failure direction" \
+    "$MD" 'Same failure direction as every other arm: a non-zero exit, an unresolvable'
+assert_contains "branches.md's arm 4b failure classifies 5c, not SAFE" \
+    "$MD" 'or unparseable output is 5c (`unverifiable: ...`), never SAFE.'
+
 # repo#103: every forge read in this file goes through REST. `gh pr list` and
 # `gh issue view --json` are GraphQL-backed, and a rate-limited lookup here costs
 # a branch its verdict (5c: KEEP) — so a reintroduced GraphQL form is a
@@ -638,6 +768,7 @@ for tag in 'no unique commits' \
            'landed, identical tree' \
            'landed (squash), patch-id equivalent (git cherry)' \
            'landed (squash), merged PR #N (<date>)' \
+           'landed (squash), merged PR #N via <head-ref> (<date>)' \
            'unique work: N commits found nowhere else' \
            'unverifiable: <reason>'; do
     assert_contains "branches.md publishes the tag: $tag" "$MD" "$tag"
