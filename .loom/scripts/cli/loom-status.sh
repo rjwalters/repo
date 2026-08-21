@@ -58,10 +58,28 @@ source "$_LOOM_STATUS_SCRIPT_DIR/../lib/config-resolver.sh"
 # shellcheck source=../lib/locate-daemon-bin.sh
 source "$_LOOM_STATUS_SCRIPT_DIR/../lib/locate-daemon-bin.sh"
 
-# Find repository root: canonical, worktree-aware implementation (#375).
-# shellcheck source=../lib/script-helper.sh
-source "$_LOOM_STATUS_SCRIPT_DIR/../lib/script-helper.sh"
-find_repo_root() { _lsh_find_repo_root "$@"; }
+# Find repository root
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.loom" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        if [[ -f "$dir/.git" ]]; then
+            local gitdir
+            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
+            local main_repo
+            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
+            if [[ -d "$main_repo/.loom" ]]; then
+                echo "$main_repo"
+                return 0
+            fi
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo ""
+}
 
 REPO_ROOT=$(find_repo_root)
 if [[ -z "$REPO_ROOT" ]]; then

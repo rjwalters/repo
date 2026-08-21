@@ -28,57 +28,11 @@
 # provisioning path and exits 1 (there is no Python fallback any more — the
 # Python modules these subcommands replaced were deleted in #4275).
 
-# Find the repository root from a starting directory (default: $PWD).
-#
-# CANONICAL implementation (#375) — this repo used to carry ~8 behaviorally
-# distinct copies of "find_repo_root" spread across ~23 scripts; this is the
-# one, empirically-verified-correct body they now all delegate to (directly
-# via `source`, or via a small dependency-free bootstrap copy in the handful
-# of scripts that genuinely can't source anything yet — see the comment on
-# those copies for why).
-#
-# Walks up from <dir>. At each level:
-#   - If `.git` is a FILE (the `gitdir: <path>` marker `git worktree add`
-#     leaves in every worktree checkout), resolve through that pointer to the
-#     MAIN checkout and stop there (never at the worktree itself) — checked
-#     FIRST, before the plain-directory match below.
-#   - Else if a `.git` OR `.loom` DIRECTORY exists here, this dir is the root.
-#
-# The ordering is load-bearing. `.loom/` is tracked in git in this repo (only
-# `.loom/signals/` and a few other state dirs are gitignored), so every
-# worktree under `.loom/worktrees/<name>` has its OWN real `.loom/` directory
-# on disk. A naive "does `.loom` exist here?" check run BEFORE the `.git`-file
-# check — what most of the retired duplicate copies did — matches at the
-# worktree root itself and never reaches the `gitdir:` branch below it, which
-# is exactly what caused signal.sh's cross-worktree signaling bug (#375): a
-# Builder polling `signal.sh check` from inside its own worktree could never
-# see a stop signal written to the MAIN repo's `.loom/signals/`. Checking
-# `-f "$dir/.git"` first forces a worktree (whose `.git` is a FILE, not a
-# directory) into the `gitdir:` resolution branch instead of the plain match,
-# so it always resolves back to the main checkout.
-#
-# (Deliberately does NOT require `.git` and `.loom` together at the same
-# level — most callers, and the test fixtures that exercise them, only ever
-# create a `.loom/` directory with no real `.git`. `loom-daemon-update.sh` is
-# the one exception that needs the stricter pairing, for its own documented
-# #5140 reason, so it keeps its own local variant instead of delegating here.)
-#
-# Verified empirically from inside a real worktree — see #375's PR
-# description for the transcript (this function, run from
-# `.loom/worktrees/<name>`, prints the MAIN repo root, not the worktree path).
+# Find the repository root from a starting directory.
 _lsh_find_repo_root() {
-    local dir="${1:-$PWD}"
-    dir="$(cd "$dir" 2>/dev/null && pwd)" || return 1
-    while [[ -n "$dir" && "$dir" != "/" ]]; do
-        if [[ -f "$dir/.git" ]]; then
-            local gitdir main_repo
-            gitdir="$(sed 's/^gitdir: //' "$dir/.git")"
-            main_repo="$(dirname "$(dirname "$(dirname "$gitdir")")")"
-            if [[ -d "$main_repo/.loom" ]]; then
-                echo "$main_repo"
-                return 0
-            fi
-        elif [[ -d "$dir/.git" || -d "$dir/.loom" ]]; then
+    local dir="${1:-$(pwd)}"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -d "$dir/.loom" ]]; then
             echo "$dir"
             return 0
         fi

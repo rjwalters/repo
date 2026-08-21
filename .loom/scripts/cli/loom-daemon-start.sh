@@ -175,10 +175,21 @@ show_help() {
     awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
-# ---------- repo root (canonical, worktree-aware implementation, #375) ----------
-# shellcheck source=../lib/script-helper.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/script-helper.sh"
-find_repo_root() { _lsh_find_repo_root "$@"; }
+# ---------- repo root ----------
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
+        if [[ -f "$dir/.git" ]]; then
+            local gitdir main_repo
+            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
+            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
+            if [[ -d "$main_repo/.loom" ]]; then echo "$main_repo"; return 0; fi
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo ""
+}
 
 # ---------- locate the daemon binary ----------
 # Shared with loom-daemon-watchdog.sh / loom-daemon-update.sh / loom-status.sh

@@ -197,7 +197,7 @@ hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inlin
                              plus every delegated suite below. `pnpm test` runs it
 hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLAUDE.md
                              markers, sidecar untracking, Codex skill surface,
-                             claude + codex shell wrappers
+                             claude + codex shell wrappers, Claude/Codex skill parity
 commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
                              provisioning, verify-after-write, early sync-and-switch, tidy
                              KEEP tiers, C7 resync, installer contract, fork-network sweep,
@@ -206,7 +206,10 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              README layout block vs disk, SKILL.md Commands
                              table vs disk, sudo.md guard note vs the guard,
                              WORK_LOG.md docs-PR self-loop contract,
-                             followups pre-filing scrub step
+                             followups pre-filing scrub step, /repo:all orphan-stage
+                             ownership, CHANGELOG merged-work and version-citation
+                             checks, label-description lint, json_escape parity,
+                             version.sh, and the installed-surface VERSION-bump gate
 INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
@@ -217,6 +220,9 @@ lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): pat
                              and the one SKILL.md emitter shared by install/uninstall/resync. Its header
                              records how the target format was confirmed against Codex's own docs
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
+lib/gitignore-check.sh       C9 post-install sweep: warns (never fails) when a written payload file is gitignored in the consumer repo
+scripts/version.sh           Single source of truth for VERSION (`bump patch|minor|major`), used by /repo:release and CI
+scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```
 
 ## Adding a skill

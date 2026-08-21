@@ -204,10 +204,6 @@ new_fixture() {
     # "locate-daemon-bin.sh not found at <fixture>/.loom/scripts/lib" before
     # reaching the behaviour under test.
     cp "$CLI_DIR/../lib/locate-daemon-bin.sh" "$root/.loom/scripts/lib/locate-daemon-bin.sh"
-    # Same for lib/script-helper.sh (#375): the fixture start/stop scripts now
-    # delegate find_repo_root() to `_lsh_find_repo_root`, sourced relative to
-    # their OWN location — must exist alongside them in the throwaway tree too.
-    cp "$CLI_DIR/../lib/script-helper.sh" "$root/.loom/scripts/lib/script-helper.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]

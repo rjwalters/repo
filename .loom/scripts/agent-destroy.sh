@@ -48,14 +48,18 @@ log_success() { echo -e "${GREEN}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ✓${NC} $*"
 log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ⚠${NC} $*" >&2; }
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ✗${NC} $*" >&2; }
 
-# find_repo_root: this control-plane script's `git -C "$repo_root" worktree
-# remove ...` call needs the MAIN checkout, not the worktree it may be
-# operating on — so this delegates to the canonical, worktree-aware walk
-# (#375) rather than keeping its own local (non-worktree-aware) copy.
 # shellcheck disable=SC2120
-# shellcheck source=lib/script-helper.sh
-source "$SCRIPT_DIR/lib/script-helper.sh"
-find_repo_root() { _lsh_find_repo_root "$@"; }
+find_repo_root() {
+    local dir="${1:-$PWD}"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
 
 show_help() {
     cat <<EOF
