@@ -4,7 +4,8 @@
 # declaring an explicit no-surface-change marker (#387).
 #
 # Why this exists: install.sh copies commands/, skills/, hooks/, lib/,
-# install.sh, and uninstall.sh into every consumer repo, and every "am I
+# install.sh, uninstall.sh, and scripts/repo/ (into
+# .claude/skills/repo/scripts/) into every consumer repo, and every "am I
 # current?" check downstream (install-metadata.json, /repo:update-tools,
 # 2AMLogic/2am's compute-drift tool-version axis) compares against VERSION.
 # If a PR changes the installed surface without bumping VERSION, that signal
@@ -54,8 +55,12 @@ MARKER='<!-- loom:no-surface-change -->'
 
 # Consumer-visible surface this repo installs into other repos (see README.md
 # "Write footprint" / INSTALLER-CONTRACT.md). Keep in sync with what
-# install.sh actually copies.
-WATCHED_PATHS=(commands/ skills/ hooks/ lib/ install.sh uninstall.sh)
+# install.sh actually copies. scripts/repo/ is watched (not all of scripts/)
+# because install.sh only copies scripts/repo/*.sh (repo-remote.sh,
+# repo-scrub-forks.sh, resync-installed.sh) into
+# .claude/skills/repo/scripts/ — scripts/version.sh and this script itself
+# are dev-only tooling that never leaves this repo (#416).
+WATCHED_PATHS=(commands/ skills/ hooks/ lib/ install.sh uninstall.sh scripts/repo/)
 
 BASE=""
 HEAD="HEAD"
@@ -132,8 +137,9 @@ echo "check-installed-surface-version-bump: FAIL — installed surface changed w
 echo "" >&2
 echo "$CHANGED_FILES" | sed 's/^/  /' >&2
 echo "" >&2
-echo "commands/, skills/, hooks/, lib/, install.sh, and uninstall.sh are copied" >&2
-echo "into every consumer repo at install time -- NOT refreshed by a git pull." >&2
+echo "commands/, skills/, hooks/, lib/, install.sh, uninstall.sh, and" >&2
+echo "scripts/repo/ are copied into every consumer repo at install time --" >&2
+echo "NOT refreshed by a git pull." >&2
 echo "VERSION is the only mechanical signal consumers have that those copies" >&2
 echo "are stale (install-metadata.json, /repo:update-tools, and downstream" >&2
 echo "compute-drift checks all key off it), so a change to this surface must" >&2

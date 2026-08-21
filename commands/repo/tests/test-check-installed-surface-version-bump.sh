@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Test suite for scripts/check-installed-surface-version-bump.sh — the CI gate
 # that fails a PR touching this repo's installed surface (commands/, skills/,
-# hooks/, lib/, install.sh, uninstall.sh) without either bumping VERSION or
-# declaring the `<!-- loom:no-surface-change -->` marker (#387).
+# hooks/, lib/, install.sh, uninstall.sh, scripts/repo/) without either
+# bumping VERSION or declaring the `<!-- loom:no-surface-change -->` marker
+# (#387, #416).
 #
 # Structured like .loom/scripts/tests/test-check-defaults-version-bump.sh
 # (the vendored upstream sibling this wrapper mirrors the contract of): a
@@ -96,9 +97,9 @@ assert_contains "failure output mentions the no-surface-change marker escape hat
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- case 4: skills/, hooks/, lib/, install.sh, uninstall.sh are all watched --"
+echo "-- case 4: skills/, hooks/, lib/, install.sh, uninstall.sh, scripts/repo/ are all watched --"
 # ---------------------------------------------------------------------------
-for path in "skills/repo/SKILL.md" "hooks/repo/guard.sh" "lib/foo.sh" "install.sh" "uninstall.sh"; do
+for path in "skills/repo/SKILL.md" "hooks/repo/guard.sh" "lib/foo.sh" "install.sh" "uninstall.sh" "scripts/repo/repo-remote.sh"; do
     make_fixture
     mkdir -p "$REPO/$(dirname "$path")"
     echo "changed" >> "$REPO/$path"
@@ -112,7 +113,50 @@ done
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- case 5: watched-surface change + PR_BODY marker passes --"
+echo "-- case 5: scripts/repo/*.sh change without a VERSION bump fails (#416) --"
+# ---------------------------------------------------------------------------
+make_fixture
+mkdir -p "$REPO/scripts/repo"
+echo "changed" >> "$REPO/scripts/repo/resync-installed.sh"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "scripts/repo change, no bump"
+RC=0
+ERR_OUT="$(cd "$REPO" && "$SCRIPT" --base base 2>&1)" || RC=$?
+assert_eq "unbumped scripts/repo/*.sh change exits 1" "1" "$RC"
+assert_contains "failure output lists scripts/repo/resync-installed.sh" "$ERR_OUT" "scripts/repo/resync-installed.sh"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 6: scripts/repo/*.sh change + VERSION bump passes --"
+# ---------------------------------------------------------------------------
+make_fixture
+mkdir -p "$REPO/scripts/repo"
+echo "changed" >> "$REPO/scripts/repo/resync-installed.sh"
+echo "1.0.1" > "$REPO/VERSION"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "scripts/repo change + bump"
+OUT="$(cd "$REPO" && "$SCRIPT" --base base 2>&1)"
+STATUS=$?
+assert_eq "scripts/repo/*.sh change + VERSION bump exits 0" "0" "$STATUS"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 7: scripts/repo/*.sh change + no-surface-change marker passes --"
+# ---------------------------------------------------------------------------
+make_fixture
+mkdir -p "$REPO/scripts/repo"
+echo "changed" >> "$REPO/scripts/repo/resync-installed.sh"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "scripts/repo change
+
+<!-- loom:no-surface-change -->"
+OUT="$(cd "$REPO" && "$SCRIPT" --base base 2>&1)"
+STATUS=$?
+assert_eq "scripts/repo/*.sh change + marker exits 0" "0" "$STATUS"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 8: watched-surface change + PR_BODY marker passes --"
 # ---------------------------------------------------------------------------
 make_fixture
 echo "changed" >> "$REPO/commands/repo/foo.md"
@@ -125,7 +169,7 @@ assert_eq "PR_BODY marker exits 0" "0" "$STATUS"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- case 6: watched-surface change + commit-message marker passes --"
+echo "-- case 9: watched-surface change + commit-message marker passes --"
 # ---------------------------------------------------------------------------
 make_fixture
 echo "changed" >> "$REPO/commands/repo/foo.md"
@@ -138,7 +182,7 @@ assert_eq "commit-message marker exits 0" "0" "$STATUS"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- case 7: a change outside the watched surface never requires a bump --"
+echo "-- case 10: a change under scripts/ but outside scripts/repo/ never requires a bump --"
 # ---------------------------------------------------------------------------
 make_fixture
 mkdir -p "$REPO/scripts"
@@ -147,11 +191,11 @@ git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "unwatched scripts/ change"
 OUT="$(cd "$REPO" && "$SCRIPT" --base base 2>&1)"
 STATUS=$?
-assert_eq "unwatched scripts/ change exits 0" "0" "$STATUS"
+assert_eq "unwatched scripts/ (outside scripts/repo/) change exits 0" "0" "$STATUS"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- case 8: usage / arg-handling --"
+echo "-- case 11: usage / arg-handling --"
 # ---------------------------------------------------------------------------
 make_fixture
 RC=0

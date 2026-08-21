@@ -4,11 +4,12 @@ This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered de
 
 ## Contributing: VERSION is the release on `main`
 
-`install.sh` copies `commands/`, `skills/`, `hooks/`, `lib/`, `install.sh`, and
-`uninstall.sh` into every consumer repo, and every "am I current?" check a
-consumer runs (`install-metadata.json`, `/repo:update-tools`, downstream
-compute-drift tooling) compares against `VERSION`. That signal is only honest
-if `VERSION` moves whenever this surface does.
+`install.sh` copies `commands/`, `skills/`, `hooks/`, `lib/`, `install.sh`,
+`uninstall.sh`, and `scripts/repo/` (into `.claude/skills/repo/scripts/`) into
+every consumer repo, and every "am I current?" check a consumer runs
+(`install-metadata.json`, `/repo:update-tools`, downstream compute-drift
+tooling) compares against `VERSION`. That signal is only honest if `VERSION`
+moves whenever this surface does.
 
 **Before opening a PR, ask: does this change touch the installed surface
 above?**
