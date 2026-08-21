@@ -197,9 +197,40 @@ Never report an uncomputable distance as `0 commits behind`, and never drop the
 caveat silently: a bare `current` that was never actually checked against the
 source HEAD is the exact failure this comparison exists to remove.
 
-If the source clone no longer exists, fall back to GitHub:
-`gh api repos/<owner>/<repo>/tags --jq '.[0].name'` or the latest release.
-If neither works, mark the tool UNKNOWN rather than guessing.
+If the source clone no longer exists, fall back to the GitHub API — **read the
+version file on the default branch first, tags/releases only as a last
+resort.** Tags routinely lag the version file by a wide margin (observed on
+`rjwalters/loom`: latest tag `v0.18.0` against `VERSION` `0.18.121` at
+`origin/HEAD` — 121 patch versions of drift) because installers read
+`VERSION` / `package.json` / `pyproject.toml`, never tags, so a tags-first
+comparison would confidently report a version dozens of releases stale as
+"latest."
+
+1. **Preferred: the version file at `origin/HEAD` via the Contents API** — try
+   the same file list step 2's local-clone path already checks, in order,
+   stopping at the first that resolves:
+
+   ```bash
+   gh api repos/<owner>/<repo>/contents/VERSION --jq .content 2>/dev/null | base64 -d
+   # or, if VERSION doesn't exist in that repo:
+   gh api repos/<owner>/<repo>/contents/package.json --jq .content 2>/dev/null | base64 -d
+   gh api repos/<owner>/<repo>/contents/pyproject.toml --jq .content 2>/dev/null | base64 -d
+   ```
+
+2. **Last resort, only if none of those files exist: tags or the latest
+   release** — `gh api repos/<owner>/<repo>/tags --jq '.[0].name'` or the
+   latest release. Tags are **not authoritative** on this path: if the tag is
+   *older* than the tool's installed version, that means the tag lags, not
+   that the install is ahead. Report that case as `UNKNOWN` — never `STALE` —
+   since a naive string/semver comparison against a lagging tag would falsely
+   flag an up-to-date install as behind.
+3. **If neither works**, mark the tool UNKNOWN rather than guessing.
+
+**Commit drift stays unknown on this path.** There is no local source clone to
+diff against `<installed-commit>`, so this fallback only ever produces the
+version-drift number — never attempt to compute or report a commit-drift
+count here (see the "Commit drift is only computable" rule above, which
+already lists "the source clone is missing" as one of the unknown cases).
 
 ### 3. Report
 
