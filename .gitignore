@@ -3,7 +3,8 @@
 # Dependencies
 node_modules
 
-# Repo Skills dev-mode symlinks (machine-local, do not commit)
+# Loom-installed Claude Code config (settings.json, agents/, commands/loom/) plus
+# Repo Skills dev-mode symlinks — machine-local, refreshed by install; do not commit
 .claude/
 
 # repo:remote per-repo config (may hold overrides; never commit)
