@@ -34,8 +34,9 @@
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
 # commands/repo/tests/test-followups-scrub-step.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
-# commands/repo/tests/test-check-label-descriptions.sh, and
-# commands/repo/tests/test-json-escape-parity.sh.
+# commands/repo/tests/test-check-label-descriptions.sh,
+# commands/repo/tests/test-json-escape-parity.sh, and
+# commands/repo/tests/test-release-notes-extraction.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1086,6 +1087,42 @@ else
     PASS=$((PASS + MW_PASS))
     FAIL=$((FAIL + MW_FAIL))
     record_suite "test-changelog-merged-work-check.sh" "$MW_PASS" "$MW_FAIL" "release.md Phase 5 merged-work coverage check"
+fi
+
+# release.md Phase 6's GitHub Release notes extraction (repo#399): the portable
+# awk-based CHANGELOG range extraction (replacing a GNU-only sed '\?' idiom
+# that silently produced an empty release body on BSD/macOS sed) plus the
+# empty-output guard before `gh release create`. Same delegation shape as
+# every suite above.
+echo
+echo "-- release.md notes-extraction check (delegated suite) --"
+RN_TEST="$TESTS_DIR/../../../commands/repo/tests/test-release-notes-extraction.sh"
+if [[ ! -f "$RN_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-release-notes-extraction.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-release-notes-extraction.sh" "$RN_TEST"
+else
+    RN_OUT="$(bash "$RN_TEST" 2>&1)"
+    RN_STATUS=$?
+    RN_PASS="$(suite_count Passed "$RN_OUT")"
+    RN_FAIL="$(suite_count Failed "$RN_OUT")"
+    if ! [[ "$RN_PASS" =~ ^[0-9]+$ && "$RN_FAIL" =~ ^[0-9]+$ ]]; then
+        RN_PASS=0
+        RN_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-release-notes-extraction.sh" "$RN_STATUS"
+        strip_ansi "$RN_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RN_STATUS" -ne 0 || "$RN_FAIL" -ne 0 ]]; then
+        [[ "$RN_FAIL" -eq 0 ]] && RN_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-release-notes-extraction.sh" "$RN_PASS" "$RN_FAIL" "$RN_STATUS"
+        strip_ansi "$RN_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-release-notes-extraction.sh" "$RN_PASS"
+    fi
+    PASS=$((PASS + RN_PASS))
+    FAIL=$((FAIL + RN_FAIL))
+    record_suite "test-release-notes-extraction.sh" "$RN_PASS" "$RN_FAIL" "release.md Phase 6 notes-extraction check"
 fi
 
 # WORK_LOG.md's docs-PR self-loop contract (repo#151, repo#263): the Guide's
