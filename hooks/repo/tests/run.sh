@@ -35,8 +35,9 @@
 # commands/repo/tests/test-followups-scrub-step.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
-# commands/repo/tests/test-json-escape-parity.sh, and
-# commands/repo/tests/test-release-notes-extraction.sh.
+# commands/repo/tests/test-json-escape-parity.sh,
+# commands/repo/tests/test-release-notes-extraction.sh, and
+# commands/repo/tests/test-tidy-mcp-dist-demotion.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -693,6 +694,45 @@ else
     PASS=$((PASS + TK_PASS))
     FAIL=$((FAIL + TK_FAIL))
     record_suite "test-tidy-keep-tiers.sh" "$TK_PASS" "$TK_FAIL" "$TK_NOTE"
+fi
+
+# /repo:tidy's CACHE -> ASK demotion when a registered MCP server config
+# (.mcp.json, ~/.claude.json mcpServers, top-level or project-scoped) loads
+# from a CACHE-tier directory's path — "regenerable" is not "harmless to
+# delete right now" when a live process is configured to load from it
+# (repo#410). Same delegation shape as the suites above.
+echo
+echo "-- tidy CACHE MCP-reference demotion (delegated suite) --"
+MD_TEST="$TESTS_DIR/../../../commands/repo/tests/test-tidy-mcp-dist-demotion.sh"
+if [[ ! -f "$MD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-tidy-mcp-dist-demotion.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-tidy-mcp-dist-demotion.sh" "$MD_TEST"
+else
+    MD_OUT="$(bash "$MD_TEST" 2>&1)"
+    MD_STATUS=$?
+    MD_PASS="$(suite_count Passed "$MD_OUT")"
+    MD_FAIL="$(suite_count Failed "$MD_OUT")"
+    MD_SKIP="$(suite_count Skipped "$MD_OUT")"
+    MD_NOTE="tidy CACHE MCP-reference demotion"
+    [[ "$MD_SKIP" =~ ^[0-9]+$ && "$MD_SKIP" -gt 0 ]] && MD_NOTE+=" — $MD_SKIP skipped"
+    if ! [[ "$MD_PASS" =~ ^[0-9]+$ && "$MD_FAIL" =~ ^[0-9]+$ ]]; then
+        MD_PASS=0
+        MD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-tidy-mcp-dist-demotion.sh" "$MD_STATUS"
+        strip_ansi "$MD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$MD_STATUS" -ne 0 || "$MD_FAIL" -ne 0 ]]; then
+        [[ "$MD_FAIL" -eq 0 ]] && MD_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-tidy-mcp-dist-demotion.sh" "$MD_PASS" "$MD_FAIL" "$MD_STATUS"
+        strip_ansi "$MD_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-tidy-mcp-dist-demotion.sh" "$MD_PASS"
+    fi
+    PASS=$((PASS + MD_PASS))
+    FAIL=$((FAIL + MD_FAIL))
+    record_suite "test-tidy-mcp-dist-demotion.sh" "$MD_PASS" "$MD_FAIL" "$MD_NOTE"
 fi
 
 # scripts/repo/resync-installed.sh — the consumer-side resync required by
