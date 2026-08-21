@@ -92,6 +92,13 @@ the tracked file.
   "source unknown" above and skip straight to the GitHub check in step 2. Never
   report it as a missing/broken source repo.
 
+**Loom's sidecar is named differently, but still conforms to C6's ladder.**
+Where C6 step 1 names the sidecar `<tool-root>/.install-local.json`, Loom's
+actual sidecar is the plain-text `.loom/loom-source-path` (a single path, not
+JSON) — check that file, not `.install-local.json`, when resolving Loom's
+source in step 2, and treat its presence as a resolved sidecar for step 3's
+`sidecar missing` status below.
+
 Known family members: Loom (`.loom/`), Anvil (`.anvil/`), Repo Skills
 (`.claude/skills/repo/`), kicad-tools, and anything else that follows the same
 metadata pattern. Report any metadata file found even if the tool is
@@ -240,7 +247,10 @@ The last two rows are **different** failure modes, so report them distinctly:
 `source repo missing` means the recorded source clone path no longer exists on
 disk, while `sidecar missing` is the signature check above (installed here once,
 but the machine-local pointer is gone — typically deleted by pulling an
-untracking commit, repo#96).
+untracking commit, repo#96). For Loom, that pointer is `.loom/loom-source-path`
+(step 1's C6 exception), not `.install-local.json` — report `sidecar missing`
+for Loom only when `.loom/loom-source-path` is also absent, never on the
+absence of `.install-local.json` alone (Loom never writes that file).
 
 **A dev-mode tool (step 1) always gets its own `dev (symlinked to <source>)`
 status row — never `current`, never `STALE`, and never the commit-drift status
