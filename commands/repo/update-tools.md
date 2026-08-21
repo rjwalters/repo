@@ -392,6 +392,41 @@ they will silently resync whichever repo cwd happens to be.
   (the C5/C6 split), and resolves its source clone with the same sidecar → legacy
   inline order documented in step 1.
 
+#### A `layout_version` bump needs the installer re-run, not resync
+
+**Resync only refreshes file contents at their existing destinations — it
+cannot move a file to a new destination or rewire a new hook.** C5's tracked
+metadata carries `layout_version` alongside `version`/`commit` for exactly
+this reason: content and placement/wiring drift independently, and only the
+former is resync's job. `resync-installed.sh` says so itself when it hits
+this case: "only refreshes file contents. Re-run install.sh to pick up moved
+destinations or changed wiring." So before trusting a `0`/`2` resync exit
+code as sufficient, compare the installed `layout_version` against the
+source's: if the source has bumped it, resync alone is not enough — the
+installer has to run so it can move files, add new surfaces, and rewire
+hooks. This is a separate trigger from "resync cannot resolve the drift"
+below; check `layout_version` first.
+
+**That installer re-run is not automatically the destructive path — its
+safety differs per tool, and "fallback" should not be read as "destructive"
+across the board:**
+
+- **Repo Skills**: safe/idempotent. Verified going 0.10.0 → 0.11.2 across a
+  `layout_version` bump (1 → 2) — the re-run added the new
+  `.agents/skills/repo/` surface and respected existing hook wiring, with no
+  uninstall step and no confirmation flag needed.
+- **Anvil** and **kicad-tools**: already verified safe/idempotent (issue
+  #135, below), independent of `layout_version` — a second installer run
+  succeeds cleanly with no duplication.
+- **Loom**: the one tool here where the installer re-run is *not* the plain
+  path — its installer refuses a non-interactive reinstall over an existing
+  `.loom/` and exits with an error instead, so a Loom `layout_version` bump
+  falls back to resync (which will warn it cannot fully resolve the drift)
+  rather than to a bare installer re-run. `--confirm-reinstall` (below) is
+  Loom's genuinely destructive path — it is a different action from "the
+  installer re-run" that Repo Skills, Anvil, and kicad-tools all perform
+  safely, and the two must not be conflated under one "fallback" label.
+
 #### Between the dry-run and the apply: flag repo-local modifications
 
 **A `would update` path that upstream never touched is a repo-local
@@ -504,8 +539,10 @@ than re-patched from the old commit.
   content, save it before applying — the diff check above says nothing about
   it.
 
-Reinstall is the **destructive fallback**, used only when resync cannot resolve
-the drift:
+For **Loom specifically**, `--confirm-reinstall` is the **destructive
+fallback**, used only when resync cannot resolve the drift (including a
+`layout_version` bump — see above, since Loom's plain installer re-run is not
+available as a middle option the way it is for the other three tools):
 
 ```bash
 # Destructive — uninstalls the existing Loom payload before writing the new version.
@@ -514,7 +551,12 @@ the drift:
 ```
 
 Confirm that separately with the user; do not escalate to it just because a
-resync pass exited non-zero — see the re-run caveat first.
+resync pass exited non-zero — see the re-run caveat first. This flag, and the
+uninstall-then-reinstall it performs, is what "destructive" refers to
+throughout this doc — it is **not** a description of the plain installer
+re-run that Repo Skills, Anvil, and kicad-tools perform for a `layout_version`
+bump (above), which is a normal, non-destructive, idempotent update for those
+three.
 
 **Anvil and kicad-tools rows verified correct as written (issue #135) — do not
 re-investigate.** Unlike Loom, neither installer refuses a non-interactive
@@ -584,6 +626,12 @@ Land each tool's bump as its own commit:
    (`git -C <this-repo> add -- $(cat /tmp/update-tools-changed.txt)`), never
    `git add -A`. If `/tmp/update-tools-changed.txt` is empty the installer was
    a no-op — report "already current" and skip the commit for that tool.
+
+   **This recipe is unchanged whether step 4 ran a resync or a full installer
+   re-run for a `layout_version` bump** — `post − pre` captures whatever the
+   installer actually touched either way, moved/new/rewired files included; a
+   real Repo Skills `layout_version` re-run staged 39 files this way with no
+   change to the recipe itself.
 
 2. **Cross-check the flagged set before committing.** Staging is the last point
    at which a dropped repo-local patch is still cheap to recover, so show the
@@ -656,10 +704,13 @@ Land each tool's bump as its own commit:
 2. **Always use the tool's own installer or update mechanism** — where a tool
    ships a dedicated non-destructive updater (e.g. Loom's
    `.loom/scripts/resync-installed.sh`), prefer it over re-running the
-   installer; installer reinstall is the destructive fallback, not the default
-   update path. Either way, never hand-copy files — the installer/updater owns
-   the write footprint and marker blocks, and hand-copying breaks reinstall
-   idempotency
+   installer for ordinary content drift. A `layout_version` bump needs the
+   installer re-run regardless (step 4) — that re-run is a safe, idempotent
+   update for Repo Skills, Anvil, and kicad-tools; only Loom's
+   `--confirm-reinstall` flag is the genuinely destructive fallback, so
+   "installer re-run" and "destructive" are not synonyms across tools. Either
+   way, never hand-copy files — the installer/updater owns the write
+   footprint and marker blocks, and hand-copying breaks reinstall idempotency
 3. **Never resolve source-repo git problems silently** (diverged clone, dirty
    tree) — report and skip
 4. **Land the update, don't just stage it** — by default commit the installer's
