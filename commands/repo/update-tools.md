@@ -392,6 +392,118 @@ they will silently resync whichever repo cwd happens to be.
   (the C5/C6 split), and resolves its source clone with the same sidecar → legacy
   inline order documented in step 1.
 
+#### Between the dry-run and the apply: flag repo-local modifications
+
+**A `would update` path that upstream never touched is a repo-local
+modification about to be destroyed — diff the dry-run against upstream before
+applying.** A resync rewrites managed files wholesale, so any repo-local patch
+to one of them is silently reverted. That has already eaten the same
+`.loom/roles/guide.md` patch three times in this repo, and the third time the
+only thing that caught it was a session memory note — nothing in this flow
+(repo#405). The signal was in the dry-run output every time, and reading it
+costs one `git diff --name-only` per candidate file:
+
+1. **Capture the dry-run's `would update` set.** Exit `2` means drift was
+   found; the preview lines have the shape `  would update <rel>` (alongside
+   `would create` and `would remove`). Only `would update` can destroy local
+   content — a `would create` has nothing to overwrite yet.
+
+   ```bash
+   <this-repo>/.loom/scripts/resync-installed.sh --dry-run \
+     | sed -n 's/^[[:space:]]*would update[[:space:]]*//p' \
+     > /tmp/update-tools-would-update.txt
+   ```
+
+   Redirecting to a file already disables the script's ANSI colors, so the
+   captured lines are plain paths; strip escapes yourself if you teed the run
+   through a TTY.
+
+2. **Map each `<rel>` back to a path in the source clone.** The two trees
+   mirror each other, but the prefix is per tool and is documented in that
+   tool's own resync script header — do not guess it:
+   - **Loom** — `<rel>` is relative to `defaults/`: installed `roles/guide.md`
+     <- `defaults/roles/guide.md`, installed `scripts/x.sh` <-
+     `defaults/scripts/x.sh`.
+   - **Repo Skills** — the header comment table in
+     `scripts/repo/resync-installed.sh` gives the mapping, e.g. installed
+     `.claude/commands/repo/<cmd>.md` <- `commands/repo/<cmd>.md`.
+
+3. **Ask whether upstream actually changed that file** across the
+   installed→HEAD range. `<installed-commit>` is the metadata `commit` field
+   from step 1 (`loom_commit` for Loom's legacy inline shape), and the source
+   clone was already brought to `origin/HEAD` by the `git -C <source> pull
+   --ff-only` at the top of this step:
+
+   ```bash
+   git -C <source> diff --name-only <installed-commit>..origin/HEAD -- <source-path>
+   ```
+
+4. **Empty output means LOCAL MODIFICATION.** Upstream has not touched that
+   file since the installed commit, yet the resync still wants to rewrite it —
+   the only way both can be true is that the *installed* copy diverged
+   locally. **Non-empty output is an ordinary upstream update**: leave it in
+   the normal `would update` list and do not flag it. This is the distinction
+   the whole check turns on; a genuine upstream change must never be reported
+   as a local modification, or the flag becomes noise the operator learns to
+   click through.
+
+Report the flagged set as its own block **before** the confirmation prompt,
+naming what would be lost:
+
+```
+LOCAL MODIFICATIONS — will be overwritten by resync
+===================================================
+  roles/guide.md   (upstream unchanged since <installed-commit>)
+```
+
+```bash
+# Per flagged file, show exactly what the resync would destroy — the source
+# copy that would be written vs the installed copy that would go away. The
+# installed path is the resync's own destination for that <rel> (for Loom,
+# <this-repo>/.loom/<rel>; for Repo Skills, the header table's destination):
+git diff --no-index -- <source>/<source-path> <this-repo>/<installed-path>
+```
+
+**The confirmation prompt must list these files by name and offer three
+choices for the affected tool**, not a bare yes/no:
+
+- **apply and re-patch** — run the resync, then re-apply the local
+  modification immediately (recipe below) and confirm in step 5 that it
+  survived;
+- **skip this tool** — leave it stale for this run and keep the local patch;
+- **abort** — stop the whole update run.
+
+Never fold a flagged tool into a blanket "update all?" confirmation: the
+operator cannot consent to losing a patch they were never shown.
+
+**Known recurring case in this repo — `.loom/roles/guide.md`.** It carries a
+repo-local `preflight_refresh_docs_pr_exclude()` block (repo#280, restored by
+repo#391) that upstream Loom's `defaults/roles/guide.md` does not have
+(loom#6627), and `commands/repo/tests/test-work-log-docs-pr-self-loop.sh` goes
+red the moment a resync drops it. When the operator picks *apply and re-patch*,
+re-apply it from the last commit that restored it:
+
+```bash
+git log --oneline -- .loom/roles/guide.md          # find <last-restoring-commit>
+git show <last-restoring-commit> -- .loom/roles/guide.md | git apply
+bash commands/repo/tests/test-work-log-docs-pr-self-loop.sh   # must pass again
+```
+
+Once loom#6627 lands upstream, this file stops being repo-local and the flagged
+set is expected to be **empty** — a flagged `roles/guide.md` after that point
+means a *new* local divergence, not this one, and should be investigated rather
+than re-patched from the old commit.
+
+**Two blind spots, so an empty flagged set is not proof nothing will be lost:**
+
+- A file that upstream changed **and** carries a repo-local patch has a
+  non-empty diff, so it is reported as an ordinary update. Step 5's
+  net-negative-lines cross-check is the backstop for that case.
+- `would remove` lines (a payload file retired upstream) delete the installed
+  copy outright rather than rewriting it. If such a file holds repo-local
+  content, save it before applying — the diff check above says nothing about
+  it.
+
 Reinstall is the **destructive fallback**, used only when resync cannot resolve
 the drift:
 
@@ -473,7 +585,35 @@ Land each tool's bump as its own commit:
    `git add -A`. If `/tmp/update-tools-changed.txt` is empty the installer was
    a no-op — report "already current" and skip the commit for that tool.
 
-2. **Commit + land on the default branch, without committing straight to it:**
+2. **Cross-check the flagged set before committing.** Staging is the last point
+   at which a dropped repo-local patch is still cheap to recover, so show the
+   per-file diffstat and the net line delta of everything the installer
+   touched:
+
+   ```bash
+   git -C <this-repo> diff --stat --cached -- $(cat /tmp/update-tools-changed.txt)
+   # Net line delta per changed file (added - removed), most-negative first —
+   # a resync that dropped a local patch shows up as a large negative number:
+   git -C <this-repo> diff --numstat --cached -- $(cat /tmp/update-tools-changed.txt) \
+     | awk '{printf "%+d\t%s\n", $1 - $2, $3}' | sort -n
+   ```
+
+   **Any file from step 4's `LOCAL MODIFICATIONS` set whose net delta is
+   negative must be called out by name in the landing summary** — e.g.
+   `roles/guide.md: -81 lines — flagged local modification was overwritten;
+   re-apply before committing`. Never let it land silently. If the operator
+   chose *apply and re-patch*, re-apply the patch **now**, before the commit,
+   and re-run the two commands above until that file is no longer
+   net-negative; if the patch will not re-apply cleanly, stop and report
+   rather than committing the loss.
+
+   A net-negative file that was **not** in the flagged set is normally a
+   genuine upstream trim — mention it in the summary, but it needs no action.
+   If step 4 flagged nothing, say so explicitly ("no repo-local modifications
+   flagged") so the absence is a reported result rather than an unasked
+   question.
+
+3. **Commit + land on the default branch, without committing straight to it:**
 
    ```bash
    DEFAULT=$(git -C <this-repo> symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^origin/##')
@@ -501,15 +641,18 @@ Land each tool's bump as its own commit:
    fi
    ```
 
-3. **Report** the resulting commit (`git -C <this-repo> log --oneline -1`) and
-   remind the user it has **not** been pushed (run `git push` explicitly to
-   share it).
+4. **Report** the resulting commit (`git -C <this-repo> log --oneline -1`), the
+   flagged-set outcome from item 2, and a reminder that it has **not** been
+   pushed (run `git push` explicitly to share it).
 
 ## Safety Rules
 
 1. **Never update without confirmation** — show installed → latest per tool
    first, including commit-drift tools, whose prompt shows installed commit →
-   source `origin/HEAD` rather than a version bump
+   source `origin/HEAD` rather than a version bump. The same prompt must name
+   every repo-local modification the resync would overwrite (step 4's
+   `LOCAL MODIFICATIONS` block) — an operator cannot consent to losing a patch
+   they were never shown
 2. **Always use the tool's own installer or update mechanism** — where a tool
    ships a dedicated non-destructive updater (e.g. Loom's
    `.loom/scripts/resync-installed.sh`), prefer it over re-running the
