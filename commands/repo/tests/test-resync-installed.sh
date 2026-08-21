@@ -222,8 +222,13 @@ assert_not_contains "config.json is not reported as an orphan" "$RS_OUT" "config
 
 # The strongest form of the guarantee: the script contains no removal of any
 # path in the target. Every `rm` in it must be a temp file it created itself.
+# $block_file/$scratch/$CLAUDE_MD_BLOCK_BACKUP (repo#407) are sync_claude_md_block()'s
+# own mktemp-created staging files for the CLAUDE.md version-token restamp —
+# same category as $tmp/$SCRATCH, just named differently since that function
+# juggles more than one temp file at once.
 RESYNC_BODY="$(grep -nE '(^|[^[:alnum:]_])(rm|unlink)[[:space:]]' "$RESYNC_SRC" \
-    | grep -v '^[0-9]*:#' | grep -v 'rm -f "\$tmp"' | grep -v 'rm -rf "\$SCRATCH"')"
+    | grep -v '^[0-9]*:#' | grep -v 'rm -f "\$tmp"' | grep -v 'rm -rf "\$SCRATCH"' \
+    | grep -v 'rm -f "\$block_file"' | grep -v 'rm -f "\$CLAUDE_MD_BLOCK_BACKUP"')"
 assert_eq "no rm/unlink targets anything but this script's own temp files" "" "$RESYNC_BODY"
 
 # ---------------------------------------------------------------------------
@@ -405,6 +410,90 @@ INSTALLED_OUT="$( cd "$TGT" && HOME="$FAKE_HOME" \
 INSTALLED_RC=$?
 assert_eq "the INSTALLED copy runs and reports in-sync" "0" "$INSTALLED_RC"
 assert_contains "the installed copy prints a summary" "$INSTALLED_OUT" "in sync"
+
+# ---------------------------------------------------------------------------
+# repo#407: the REPO-SKILLS block's "v<version>" token in CLAUDE.md must track
+# the resynced version — a resync used to leave install-metadata.json current
+# while this line kept reading whatever version was installed originally.
+echo ""
+echo "-- CLAUDE.md's REPO-SKILLS block: version-token restamp (repo#407) --"
+CSRC="$SCRATCH/claude-md-src"; CTGT="$SCRATCH/claude-md-tgt"
+new_source "$CSRC"
+new_target "$CTGT"
+echo "1.0.0" >"$CSRC/VERSION"
+do_install "$CSRC" "$CTGT"
+
+assert_contains "a fresh install's CLAUDE.md block reports the install version" \
+    "$(cat "$CTGT/CLAUDE.md")" "Repo Skills](https://github.com/rjwalters/repo) v1.0.0 installed"
+
+run_resync "$CTGT" --dry-run
+assert_eq "dry-run on a freshly-installed CLAUDE.md block is in sync" "0" "$RS_RC"
+assert_contains "dry-run reports CLAUDE.md as unchanged, not silently omitted (out of scope no longer means invisible)" \
+    "$RS_OUT" "unchanged CLAUDE.md"
+
+echo "2.0.0" >"$CSRC/VERSION"
+CLAUDE_MD_BEFORE="$(cat "$CTGT/CLAUDE.md")"
+run_resync "$CTGT" --dry-run
+assert_eq "dry-run detects the stale CLAUDE.md version token as drift" "2" "$RS_RC"
+assert_contains "dry-run names CLAUDE.md as would-sync" "$RS_OUT" "would sync CLAUDE.md"
+assert_eq "dry-run leaves CLAUDE.md byte-identical" "$CLAUDE_MD_BEFORE" "$(cat "$CTGT/CLAUDE.md")"
+
+run_resync "$CTGT"
+assert_eq "apply after a version bump exits 0" "0" "$RS_RC"
+assert_contains "apply reports CLAUDE.md as synced" "$RS_OUT" "synced    CLAUDE.md"
+assert_contains "CLAUDE.md's block now reads the new version" \
+    "$(cat "$CTGT/CLAUDE.md")" "Repo Skills](https://github.com/rjwalters/repo) v2.0.0 installed"
+assert_not_contains "a resync from N to M leaves no vN text in CLAUDE.md" \
+    "$(cat "$CTGT/CLAUDE.md")" "v1.0.0"
+
+run_resync "$CTGT"
+assert_eq "the second apply is idempotent" "0" "$RS_RC"
+assert_contains "the second apply reports CLAUDE.md unchanged" "$RS_OUT" "unchanged CLAUDE.md"
+
+# Edge case (a): CLAUDE.md has no REPO-SKILLS block at all (never installed, or
+# removed by the consumer) — resync must not add one.
+NOBLOCK_TGT="$SCRATCH/claude-md-noblock"
+new_target "$NOBLOCK_TGT"
+do_install "$CSRC" "$NOBLOCK_TGT"
+awk '/<!-- BEGIN REPO-SKILLS -->/{skip=1} /<!-- END REPO-SKILLS -->/{skip=0; next} !skip' \
+    "$NOBLOCK_TGT/CLAUDE.md" >"$NOBLOCK_TGT/CLAUDE.md.stripped"
+mv "$NOBLOCK_TGT/CLAUDE.md.stripped" "$NOBLOCK_TGT/CLAUDE.md"
+echo "3.0.0" >"$CSRC/VERSION"
+run_resync "$NOBLOCK_TGT"
+assert_eq "apply with no REPO-SKILLS block exits 0" "0" "$RS_RC"
+assert_not_contains "resync does not add a REPO-SKILLS block that was never there" \
+    "$RS_OUT" "CLAUDE.md"
+assert_not_contains "CLAUDE.md itself stays blockless" \
+    "$(cat "$NOBLOCK_TGT/CLAUDE.md")" "BEGIN REPO-SKILLS"
+
+# Edge case (b): the marker layout cannot be resolved unambiguously (repo#38's
+# failure mode) — refuse safely and report a FAILURE, exactly like install.sh's
+# own refusal, rather than guessing.
+BADMARKER_TGT="$SCRATCH/claude-md-badmarker"
+new_target "$BADMARKER_TGT"
+do_install "$CSRC" "$BADMARKER_TGT"
+printf '\n<!-- BEGIN REPO-SKILLS -->\nduplicate\n<!-- END REPO-SKILLS -->\n' >>"$BADMARKER_TGT/CLAUDE.md"
+BADMARKER_BEFORE="$(cat "$BADMARKER_TGT/CLAUDE.md")"
+echo "4.0.0" >"$CSRC/VERSION"
+run_resync "$BADMARKER_TGT" --dry-run
+assert_eq "an unresolvable marker layout fails the whole run (loud, not partial)" "1" "$RS_RC"
+assert_contains "the failure names CLAUDE.md" "$RS_OUT" "CLAUDE.md"
+assert_contains "the failure explains the ambiguity rather than guessing" "$RS_OUT" "expected exactly 1"
+assert_eq "CLAUDE.md is left byte-identical on refusal" "$BADMARKER_BEFORE" "$(cat "$BADMARKER_TGT/CLAUDE.md")"
+
+# Edge case (c): the commands destination is gitignored — mirrors install.sh's
+# own skip (a committed pointer to uncommitted command files is not wanted),
+# even when the block predates the .gitignore rule that now hides it.
+GITIGNORED_TGT="$SCRATCH/claude-md-gitignored"
+new_target "$GITIGNORED_TGT"
+do_install "$CSRC" "$GITIGNORED_TGT"
+echo ".claude/commands/" >"$GITIGNORED_TGT/.gitignore"
+GITIGNORED_BEFORE="$(cat "$GITIGNORED_TGT/CLAUDE.md")"
+echo "5.0.0" >"$CSRC/VERSION"
+run_resync "$GITIGNORED_TGT"
+assert_eq "apply with a gitignored commands destination still exits 0" "0" "$RS_RC"
+assert_contains "CLAUDE.md's restamp is skipped, not silently dropped" "$RS_OUT" "skipped   CLAUDE.md"
+assert_eq "CLAUDE.md is untouched when its dest is gitignored" "$GITIGNORED_BEFORE" "$(cat "$GITIGNORED_TGT/CLAUDE.md")"
 
 # ---------------------------------------------------------------------------
 echo ""
