@@ -313,5 +313,5 @@ Behavioral coverage lives in
 [`commands/repo/tests/test-resync-installed.sh`](commands/repo/tests/test-resync-installed.sh)
 (C7's properties) and
 [`commands/repo/tests/test-installer-contract.sh`](commands/repo/tests/test-installer-contract.sh)
-(the C1–C8 spot-checks and the conformance-table cross-check). Both run under
+(the C1–C9 spot-checks and the conformance-table cross-check). Both run under
 `pnpm test`.

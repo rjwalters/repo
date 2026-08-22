@@ -168,6 +168,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/repo-scrub-forks.sh` — the `/repo:scrub --forks` fork-network sweep. Same colocation, removed with the skill dir on uninstall
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
@@ -210,7 +211,7 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              ownership, CHANGELOG merged-work and version-citation
                              checks, label-description lint, json_escape parity,
                              version.sh, and the installed-surface VERSION-bump gate
-INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C8), owned by this repo
+INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C9), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
@@ -221,7 +222,7 @@ lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): pat
                              records how the target format was confirmed against Codex's own docs
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 lib/gitignore-check.sh       C9 post-install sweep: warns (never fails) when a written payload file is gitignored in the consumer repo
-scripts/version.sh           Single source of truth for VERSION (`bump patch|minor|major`), used by /repo:release and CI
+scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`), used by /repo:release and CI
 scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```
 

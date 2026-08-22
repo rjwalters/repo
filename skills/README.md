@@ -38,7 +38,7 @@ user-invocable: false
 ```
 
 Every file under `commands/repo/*.md` carries the same four keys with
-`type: command` and `user-invocable: true` instead (verified: all 19 command
+`type: command` and `user-invocable: true` instead (verified: all 20 command
 files use exactly this five-key shape — `name`, `description`, `domain`,
 `type`, `user-invocable` — no file in this repo adds or omits a key).
 
