@@ -708,7 +708,7 @@ echo "-- fleet-marker guard on AWS reuse discovery (repo#164) --"
 # Reuse discovery (a pinned REPO_REMOTE_INSTANCE_ID, or the repo-remote=<name>
 # tag) resolves a handle that can outlive the host's role as an ephemeral dev
 # box. Starting/re-aliasing a host that has since become a fleet worker is the
-# second finding of 2AMLogic/2am#52, so a fleet marker on the resolved instance
+# second finding of an operator incident (private tracker), so a fleet marker on the resolved instance
 # must block the run unless --force is passed.
 
 # (a) Marker ABSENT -> behavior is exactly as before (reuse proceeds).
@@ -910,7 +910,7 @@ echo "-- fleet-marker guard on AWS down (repo#170) --"
 # `down` resolves instances from the SAME never-expiring handles `up` does (a
 # pinned REPO_REMOTE_INSTANCE_ID, or the repo-remote=<name> tag), and is
 # strictly worse when it hits a repurposed fleet host: it STOPS it, or with
-# --delete TERMINATES it (disk gone, unrecoverable) — the 2AMLogic/2am#52
+# --delete TERMINATES it (disk gone, unrecoverable) — the operator incident (private tracker)
 # failure mode. Mirrors the up-side block above.
 
 # (a) Marker ABSENT -> unchanged behavior (stops as before).
