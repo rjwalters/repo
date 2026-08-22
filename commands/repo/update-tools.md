@@ -511,23 +511,25 @@ choices for the affected tool**, not a bare yes/no:
 Never fold a flagged tool into a blanket "update all?" confirmation: the
 operator cannot consent to losing a patch they were never shown.
 
-**Known recurring case in this repo — `.loom/roles/guide.md`.** It carries a
-repo-local `preflight_refresh_docs_pr_exclude()` block (repo#280, restored by
-repo#391) that upstream Loom's `defaults/roles/guide.md` does not have
-(loom#6627), and `commands/repo/tests/test-work-log-docs-pr-self-loop.sh` goes
-red the moment a resync drops it. When the operator picks *apply and re-patch*,
-re-apply it from the last commit that restored it:
+**Former recurring case in this repo — `.loom/roles/guide.md` (resolved).**
+Through Loom 0.18.121 this file carried a repo-local
+`preflight_refresh_docs_pr_exclude()` block (repo#280, restored by repo#391 and
+again at the 0.18.121 resync) that upstream's `defaults/roles/guide.md` lacked,
+and every resync stripped it. loom#6627 landed in Loom 0.18.130: upstream now
+ships the equivalent `refresh_docs_pr_exclude_from_origin()` (same behavior,
+different contract — it reads and rewrites `GUIDE_DOCS_PR_EXCLUDE` in place
+instead of taking a positional argument), and
+`commands/repo/tests/test-work-log-docs-pr-self-loop.sh` targets that name.
+**Do not re-apply the old patch from history** — it would duplicate upstream's
+logic. A flagged `roles/guide.md` from this point on means a *new* local
+divergence and should be investigated, not re-patched. The recipe it replaces
+is kept here only as the shape to use for any future genuine local patch:
 
 ```bash
 git log --oneline -- .loom/roles/guide.md          # find <last-restoring-commit>
 git show <last-restoring-commit> -- .loom/roles/guide.md | git apply
 bash commands/repo/tests/test-work-log-docs-pr-self-loop.sh   # must pass again
 ```
-
-Once loom#6627 lands upstream, this file stops being repo-local and the flagged
-set is expected to be **empty** — a flagged `roles/guide.md` after that point
-means a *new* local divergence, not this one, and should be investigated rather
-than re-patched from the old commit.
 
 **Two blind spots, so an empty flagged set is not proof nothing will be lost:**
 
