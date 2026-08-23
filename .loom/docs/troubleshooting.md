@@ -69,6 +69,47 @@ behavior — a forge outage never blocks worktree creation. The #4823 in-flight
 case (remote branch exists, not yet merged, possibly diverged from base) is
 unaffected and still reused exactly as before.
 
+### `git push --force-with-lease` prints a rejection for a ref update that landed (#6695)
+
+On a repository using Git LFS, `git push --force-with-lease=<branch>:<old-sha>
+origin <branch>` can print a rejection —
+
+```
+! [rejected]        <branch> -> <branch> (stale info)
+error: failed to push some refs to '...'
+remote rejected ... is at <new-sha> but expected <old-sha>
+```
+
+— even though the ref update actually **landed** (confirmed by `git
+ls-remote` and the `origin/<branch>` reflog showing an `update by push`
+entry). Suspected cause: the **LFS pre-push hook** races the lease
+re-check — the hook uploads LFS objects and the ref update proceeds on the
+remote, while the printed rejection reflects a lease comparison read at a
+different (already-stale) moment. Both known occurrences were on branches
+with pending LFS objects to upload; a same-session push with nothing to
+upload did not exhibit it.
+
+**Do not treat this message as an automatic retry/re-rebase signal.** An
+agent that trusts the printed rejection alone may retry the push, re-rebase,
+or report failure against a ref that already moved — all of which turn a
+clean state into a confusing one. Before reacting to a `force-with-lease`
+rejection, check the *live* remote ref yourself:
+
+```bash
+git ls-remote origin "refs/heads/<branch>"   # compare against your local tip
+```
+
+If they already match, the push landed — do nothing further. Loom's own
+stacked-PR automation (`reconcile-stack.sh`, `rebase-stacked-children.sh`)
+performs exactly this check via the shared
+`defaults/scripts/lib/push-lease-verify.sh` helper
+(`push_landed_despite_rejection`) whenever a `--force-with-lease` push
+reports failure, and logs the condition with a greppable
+`PUSH-LEASE-RACE-DETECTED` marker so it is never silently folded into an
+ordinary failure. A genuine rejection (the ref really did not move) is still
+reported and handled as a failure — the check only reclassifies a reported
+rejection whose ref update is confirmed to have landed.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
@@ -169,6 +210,59 @@ stands:
 So: build wherever you like, but **install** what you run — copy the binary to
 `~/.local/bin` (or a package path) and point the unit at that. `loom-daemon`
 itself was only ever immune to this by that accident of install location.
+
+### `.loom/logs/` retention (#6655)
+
+`.loom/logs/` has no bound of its own — every sweep writes its own per-issue
+log (`sweep-issue-<N>.log` from `claude-wrapper.sh`,
+`loom-daemon-sweep-issue-<N>-<ts>.log` from `loom-daemon`) directly into that
+directory, and nothing removed them before this. On a saturated fleet host
+this grows unbounded (one incident: 310 MB across 4,114 `.log` files, the
+oldest six months stale). `archive-logs.sh`'s own `--retention-days` (default
+7, invoked via `loom-daemon cleanup logs`) does **not** cover this — it only
+prunes its own dated `.loom/logs/YYYY-MM-DD/` archive subdirectories (task
+output archives + daemon-state snapshots), a different mechanism entirely.
+
+**`loom-clean` (and the scheduled `com.rjwalters.loom-fleet-clean` launchd
+job, which already runs it) now also prunes stale per-issue logs** as part of
+its normal "Cleaning Stale Logs" phase — no separate flag needed, and
+`--dry-run` lists what it would remove without deleting anything:
+
+```bash
+loom-clean --dry-run   # lists stale logs it would remove, alongside worktrees/branches
+loom-clean --force     # actually removes them
+```
+
+Only files directly under `.loom/logs/` whose name embeds an issue number
+(the `sweep-issue-<N>.log` / `loom-daemon-sweep-issue-<N>-<ts>.log` /
+`issue-<N>-<role>.log` conventions) are ever candidates — singleton
+accumulator logs with no issue number (`role-<name>.log`,
+`guard-decisions.log`, `hook-errors.log`, `daemon-start.log`,
+`main-quarantine.log`, `worktree-removals.log`, …) and anything under a
+subdirectory (`archive-logs.sh`'s own dated archives, `skill-router-seen/`,
+…) are never touched by this pass. A candidate log is removed only once ALL
+of:
+
+1. Its mtime is older than the retention window (below).
+2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
+   lock, no `.loom/spawn-loop-state.json` entry).
+3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
+   sweep (even one not currently running) keeps its log regardless of age.
+
+**Retention window** — precedence **env > config > default (30 days)**:
+
+```jsonc
+// .loom/config.json
+{ "logs": { "retentionDays": 14 } }
+```
+
+```bash
+LOOM_LOGS_RETENTION_DAYS=14 loom-clean --dry-run
+```
+
+A non-positive or unparseable value at either tier is treated as absent (falls
+through to the next tier), never as "disable retention" — a config typo can
+never silently turn this pass into a no-op.
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
@@ -1570,6 +1664,78 @@ disabled — this knob can never block or fail a sweep.
   it never claims the host IS protected (macOS user-idle sleep assertions are
   not reliable, per the incident above), it only stops re-printing an
   already-evaluated warning on every run.
+
+### The base-branch trap: a session-start git snapshot is not evidence about the present (#6718)
+
+**Every agent session's context includes a git status block captured once, at
+session start, and explicitly labelled as a point-in-time snapshot — it does
+not update as the session runs.** This is the harness's own environment
+context, not something any Loom role prompt injects or can suppress. Over a
+long sweep — which by construction runs for hours and merges many PRs — that
+block drifts arbitrarily far from reality: every merge the sweep performs
+moves the default branch out from under it. An agent primed by role guidance
+to watch for **the base-branch trap** (local default branch diverged from
+`origin`, starving new worktrees of recently-merged work — see "Main Branch
+Freshness (#3770)" in `sweep.md`) but holding only that stale snapshot has no
+reason to distrust it: it reports a confident, plausible, and **wrong**
+divergence. This happened twice independently in one session (#6718) — both
+reports cited the exact commit SHA present at the parent session's start,
+hours after several merges had already moved `origin`'s default branch past
+it, with local, remote-tracking, and the forge's own view all agreeing on the
+newer SHA once actually checked.
+
+The false positive is more expensive than a missed one: an agent that believes
+the base branch is starved reasonably refuses to dispatch, escalates to the
+operator, or attempts a corrective push — all three are wrong against a branch
+that is already current, and each has to be disproved by hand before the sweep
+can continue.
+
+**Any role guidance that mentions the base-branch trap (or any other
+long-running check of "is my repository fact still current") must say two
+things, not one:**
+
+1. **Branch state must be read with a live command at the moment of the
+   check** — never inferred from a `git status`/`git log` block already
+   sitting in context, however recent it looks. A block captured at session
+   start is a snapshot of that moment, not a fact about now, and nothing
+   refreshes it for the rest of the session.
+2. **The check must compare three refs, not one, and all three must agree**
+   before concluding the branch is current:
+   - the **local branch** (`git rev-parse <branch>` / `git log -1 <branch>`,
+     run now, not recalled),
+   - the **remote-tracking ref, after an explicit `git fetch`** (a
+     remote-tracking ref you didn't just fetch is a second stale snapshot,
+     not a live fact), and
+   - **the forge's own view** — `gh api repos/<owner>/<repo>/branches/<branch>`
+     or `gh repo view --json defaultBranchRef` for default-branch freshness,
+     `gh pr view`/`gh pr list` for a PR branch — the one source not subject to
+     local clock or fetch skew.
+
+   `./.loom/scripts/check-main-freshness.sh` already performs exactly this
+   bounded fetch-and-compare for the sweep-preflight instance of this check
+   (see "Main Branch Freshness (#3770)" in `sweep.md`) — reach for it, or its
+   pattern, rather than hand-rolling a weaker one-ref comparison. It is
+   **pre-wave-only**: it runs once before the first wave/dispatch and does not
+   re-fire for a Builder/Judge/Doctor subagent spawned mid-sweep, potentially
+   hours and many merges later — that subagent must run its own live check
+   before treating anything about branch freshness as established, not trust
+   the pre-wave result or its own session-start context.
+3. **A reported divergence must carry the live command output that
+   established it** — paste the actual `git fetch` + ref comparison (or
+   `check-main-freshness.sh`'s own output) into the report, not just the
+   conclusion. This lets a downstream orchestrator or human tell a
+   freshly-derived finding apart from one recalled from stale context, without
+   re-deriving it themselves.
+
+This generalizes beyond branch state: any long-running role that reasons about
+a repository fact captured once at session start (a worktree's HEAD, a PR's
+mergeability, a label set) is exposed to the identical failure — branch
+divergence is simply where Loom's own guidance happens to prime agents to look
+hardest. Because the stale snapshot is harness-injected context rather than
+something a role `.md` file adds, no role brief can opt out of *receiving* it;
+the only lever available at the role-prompt layer is strengthening the
+guidance above so agents distrust it by default, which is why it is written
+here once and pointed to, rather than restated per role.
 
 ### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777/#4239 resync)
 
