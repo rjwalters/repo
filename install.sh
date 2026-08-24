@@ -778,11 +778,17 @@ dest_is_gitignored() {
   git -C "$TARGET" check-ignore -q .claude/commands/repo/help.md 2>/dev/null
 }
 
-# Requirement C9 of INSTALLER-CONTRACT.md: sweep every file this run wrote
-# through git check-ignore and WARN (never fail) about any that are hidden by
-# the consumer repo's .gitignore — see lib/gitignore-check.sh. Run at every
+# Requirement C9 of INSTALLER-CONTRACT.md: sweep the installed payload roots
+# through git check-ignore and WARN (never fail) about any file hidden by the
+# consumer repo's .gitignore — see lib/gitignore-check.sh. Run at every
 # non-dev exit point so the warning fires regardless of which branch below
 # returns first.
+#
+# Payload roots, not "every file this run wrote": a root can pre-date this run
+# (e.g. an existing .claude/skills/repo/) and can hold runtime output the
+# installer never writes (guard-hook logs under logs/) — lib/gitignore-check.sh
+# excludes that runtime output by construction so the sweep only ever flags
+# installed content (repo#425).
 run_gitignore_sweep() {
   local -a payload_dirs=("$TARGET/.claude/skills/repo" "$TARGET/.claude/commands/repo")
   [[ "$CODEX_INSTALLED" == true ]] && payload_dirs+=("$CODEX_SKILL_DIR")

@@ -245,10 +245,29 @@ The check MUST NOT warn about files the installer itself deliberately
 gitignores (the C6 sidecar, for instance) — only about **payload** files a
 consumer is expected to be able to track.
 
+**Installed content vs. runtime output beneath the same root.** The sweep
+walks payload *roots* (e.g. `.claude/skills/repo/`), not a literal list of
+files this run wrote — a root can pre-date the run, and a root can also hold
+files the installer never writes at all: output the *installed tooling itself*
+produces later, at runtime (log files, caches, state a hook accumulates across
+sessions). That output is not payload, even though it lives beneath a payload
+root, and a consumer gitignoring it is correct, not a defect — runtime output
+routinely carries machine-local detail (absolute filesystem paths, the
+operator's account name) that must never be pushed to a shared remote. The
+installer MUST distinguish the two by construction (a well-known subpath such
+as a `logs/` directory, or an explicit runtime-path declaration) and exclude
+runtime output from the sweep entirely, rather than warn and then rely on the
+remedy text to hedge — a warning that fires on a deliberately-ignored runtime
+path and tells the operator to "make it tracked" is actively harmful advice,
+since following it commits exactly the machine-local detail the ignore rule
+existed to keep out (repo#425).
+
 > Spot-check: add a `.gitignore` rule in a scratch consumer repo that
 > incidentally matches a file inside the installed surface, run the installer,
 > and confirm it warns, names the exact path, and names the matching rule —
-> while still exiting 0 and leaving every other file installed.
+> while still exiting 0 and leaving every other file installed. Separately,
+> place a file under the installed surface's runtime `logs/` directory,
+> gitignore it, and confirm the sweep stays silent about it.
 
 ## Conformance
 
