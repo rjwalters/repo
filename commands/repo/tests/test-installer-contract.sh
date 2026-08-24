@@ -326,6 +326,37 @@ else
     C9_OK=false
 fi
 
+# repo#425 — a gitignored *runtime* file under the tool root (guard-hook logs,
+# not installer payload) must never trigger the C9 warning. Unlike the C6
+# sidecar case above, this file is not written by the installer at all: it is
+# left behind by the installed guard hooks running between installs, and a
+# consumer deliberately ignoring it (it carries absolute filesystem paths) is
+# the CORRECT state, not a defect the warning should flag.
+C9_RUNTIME="$SCRATCH/c9-runtime"; new_target "$C9_RUNTIME"
+cat >"$C9_RUNTIME/.gitignore" <<'EOF'
+# guard-hook decision logs (machine-local)
+.claude/skills/repo/logs/
+EOF
+HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_RUNTIME" >/dev/null 2>&1 </dev/null
+# Simulate a guard hook having run since install and left runtime output behind
+# — this directory is never part of the installer's own payload.
+mkdir -p "$C9_RUNTIME/.claude/skills/repo/logs"
+echo '{"decision":"allow","cmd":"/Users/some-operator/project/run.sh"}' \
+    >"$C9_RUNTIME/.claude/skills/repo/logs/guard-decisions.log"
+C9_RUNTIME_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_RUNTIME" 2>&1 </dev/null )"
+if [[ "$C9_RUNTIME_OUT" != *"INSTALLER-CONTRACT.md C9"* ]]; then
+    ok "a gitignored runtime log under the tool root does not trigger the C9 warning"
+else
+    no "a gitignored runtime log under the tool root does not trigger the C9 warning" "$C9_RUNTIME_OUT"
+    C9_OK=false
+fi
+if [[ "$C9_RUNTIME_OUT" != *"guard-decisions.log"* ]]; then
+    ok "the runtime log path is not named anywhere in C9 output"
+else
+    no "the runtime log path is not named anywhere in C9 output" "$C9_RUNTIME_OUT"
+    C9_OK=false
+fi
+
 [[ "$C9_OK" == true ]] && C9=yes
 
 # ---------------------------------------------------------------------------

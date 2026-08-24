@@ -28,6 +28,16 @@
 # Files the installer itself deliberately gitignores (the C6 machine-local
 # sidecar, `.install-local.json`) are excluded from the sweep: warning about a
 # file we intentionally hid is noise, not a bug report.
+#
+# Runtime output written by the *installed hooks themselves* after install —
+# any file under a top-level `logs/` directory beneath one of the swept
+# roots (e.g. `.claude/skills/repo/logs/guard-decisions.log`,
+# `.claude/skills/repo/logs/hook-errors.log`) — is excluded the same way.
+# These paths did not exist when the installer ran; they are hook execution
+# artifacts that routinely carry the operator's absolute filesystem paths, so
+# "ignored" is the correct, intended state for them, not a defect to repair
+# (repo#425). `logs/` is never a source path this installer ships from, so the
+# exclusion cannot shadow real payload.
 warn_gitignored_payload() {
   local target="$1"
   shift
@@ -54,6 +64,7 @@ warn_gitignored_payload() {
       rel="${f#"$target"/}"
       case "$rel" in
         */.install-local.json | .install-local.json) continue ;;
+        */logs/* | logs/*) continue ;;
       esac
       files+=("$rel")
     done < <(find "$d" -type f 2>/dev/null)
@@ -76,6 +87,10 @@ warn_gitignored_payload() {
     path="${line#*$'\t'}"
     "$emit" "  $path  <- $rule"
   done <<<"$hits"
-  "$emit" "Fix the matching .gitignore rule above (or relocate the file) so these get tracked."
+  "$emit" "If the path(s) above are meant to be tracked, fix the matching .gitignore rule"
+  "$emit" "(or relocate the file) so they get tracked. Everything under this sweep is"
+  "$emit" "installed payload, not runtime output — but double-check before un-ignoring:"
+  "$emit" "un-ignoring a path that legitimately belongs machine-local (e.g. one carrying"
+  "$emit" "absolute filesystem paths) would commit it instead of fixing anything."
   return 0
 }
