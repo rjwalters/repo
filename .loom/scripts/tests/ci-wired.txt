@@ -38,6 +38,7 @@ test-cargo-test-daemon-guard.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
 test-champion-held-pr-health-pass.sh
+test-champion-standing-authorization.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-duplicate.sh
@@ -54,6 +55,7 @@ test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
 test-check-shell-syntax.sh
 test-check-verified-corrections-preserved.sh
+test-classify-ac-verification.sh
 test-classify-capacity-defer.sh
 test-classify-dependency-block.sh
 test-classify-error.sh
@@ -75,6 +77,7 @@ test-docs-guide-lock.sh
 test-docs-only-fast-path.sh
 test-docs-worktree.sh
 test-epic-label-preserved-on-escalation.sh
+test-extract-capability-markers.sh
 test-filing-lock.sh
 test-fleet-check.sh
 test-fleet-send.sh
@@ -157,6 +160,7 @@ test-resolve-tier-model.sh
 test-resync-installed.sh
 test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh
+test-run-ci-suites-serial-lane.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-spawn-generic.sh
