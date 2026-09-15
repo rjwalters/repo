@@ -148,3 +148,38 @@ echo 'rm -rf /' | parallel sh -c '{}'
 # ── ordinary xargs pipelines with no dangerous text must stay allowed ─────
 echo hello | xargs -I{} echo {}
 find . -name '*.tmp' | xargs rm
+
+# ── query commands: the PATTERN is data, not a command (repo#311) ─────────
+# jq/grep/egrep/fgrep/rg/inert-sed/awk MATCH AGAINST their pattern argument;
+# they never execute it. These shapes — auditing this repo's own guard-decision
+# log for the text of a catastrophic pattern — were denied purely because the
+# pattern text appeared in the command string. They are the same false-positive
+# class as the echo/printf rows above, and the vendored copy still denies them,
+# so each has a DECLARED_WEAKER entry in test-guard-equivalence.sh.
+#
+# The shapes below deliberately carry a pipe or a non-fastpath command word:
+# `grep`/`rg`/`jq` with no shell metacharacter at all are already admitted by
+# the read-only fast path (see the section above), so a corpus case without one
+# would prove nothing about the redaction under test.
+jq -r 'select(.pattern == "catastrophic:git push --force origin main") | .ts' log.jsonl
+jq -r 'select(.command | test("rm -rf /"))' log.jsonl
+egrep 'rm -rf /' log.jsonl
+fgrep 'git push --force origin main' log.jsonl
+grep -c 'rm -rf /' log.jsonl | wc -l
+rg 'git push --force origin main' . | head -3
+sed -n 's|rm -rf /|X|p' log.jsonl
+awk '$0 ~ "git push --force origin main" {print}' log.jsonl
+
+# ── query-sink EXCLUSIONS and safety floor (repo#311) ─────────────────────
+# Sub-forms that ACT rather than query are vetoed out of sink treatment, and
+# the shared safety floor (command substitution, pipe-to-shell) is unchanged.
+# Every row here must still DENY in BOTH guards — a weaker verdict on any of
+# them is a real regression, not a declarable divergence.
+sed -i 's|x|rm -rf /|' f.txt
+sed -n 's|x|y|w rm -rf /' f.txt
+sed -n 'e rm -rf /' f.txt
+awk '{system("rm -rf /")}' f.txt
+awk '{print | "rm -rf /"}' f.txt
+rg --pre 'rm -rf /' . | head -3
+jq "$(printf 'rm -rf /')" f.json
+grep 'rm -rf /' f.txt | sh
