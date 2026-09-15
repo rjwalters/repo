@@ -2376,15 +2376,29 @@ mask_ask_positional_args() {
 }
 
 # Return 0 (success) if ANY quote-aware segment's command word is a shell binary
-# (sh/bash/dash/zsh/ksh/csh/tcsh/fish/pwsh, with or without a leading path).
-# GATES strip_datasink_literals(): when a shell could consume the command's data
-# (e.g. `echo '<payload>' | sh`), the data-sink redaction is skipped so the raw
-# catastrophic scan still sees — and blocks — the payload. Conservative by
-# construction: a shell ANYWHERE in the command disables the (narrowing)
-# redaction, so the worst case is a preserved false BLOCK, never a skipped one.
-# `guard-destructive.sh` (basename is not a bare shell word) is deliberately NOT
-# matched, so the guard's own `echo '<json>' | guard-destructive.sh` self-test
-# still redacts and no longer false-blocks (#53). Emits "yes"/"no".
+# (sh/bash/dash/zsh/ksh/csh/tcsh/fish/pwsh, with or without a leading path) OR a
+# pipeline consumer that can itself spawn a shell over its input (`xargs`,
+# `parallel`). GATES strip_datasink_literals(): when a shell could consume the
+# command's data (e.g. `echo '<payload>' | sh`, or the same payload reached
+# through `echo '<payload>' | xargs -I{} sh -c '{}'`), the data-sink redaction
+# is skipped so the raw catastrophic scan still sees — and blocks — the
+# payload. Conservative by construction: a shell-or-shell-spawner ANYWHERE in
+# the command disables the (narrowing) redaction, so the worst case is a
+# preserved false BLOCK, never a skipped one.
+#
+# `xargs`/`parallel` are matched UNCONDITIONALLY — regardless of what command
+# they themselves invoke — because `xargs <anything>` handed attacker-shaped
+# input on the pipe is the hazard, not just the `sh -c`/`bash -c` sub-form of
+# it (repo#429). The precision cost is measured and accepted: an ordinary,
+# non-shell `xargs`/`parallel` pipeline that carries no dangerous text (e.g.
+# `grep '<text>' f | xargs -I{} echo {}`) goes back to being redaction-blind,
+# i.e. it now depends on the raw scan not matching `<text>` rather than on the
+# redaction — a false DENY only if `<text>` itself matches ALWAYS_BLOCK, never
+# a missed catastrophic block.
+#
+# `guard-destructive.sh` (basename is not a bare shell/xargs/parallel word) is
+# deliberately NOT matched, so the guard's own `echo '<json>' | guard-destructive.sh`
+# self-test still redacts and no longer false-blocks (#53). Emits "yes"/"no".
 command_has_shell_segment() {
     printf '%s' "$1" | awk "$_ESCAPE_AWK$_QSPLIT_AWK"'
     { buf = buf (NR > 1 ? "\n" : "") $0 }
@@ -2397,7 +2411,9 @@ command_has_shell_segment() {
             sub(/^[ \t]+/, "", seg)
             # Strip any run of leading VAR=val assignments, then a sudo/env wrapper,
             # so the REAL command word is classified. The required trailing [ \t]+
-            # in the assignment pattern guarantees the loop makes progress.
+            # in the assignment pattern guarantees the loop makes progress. This
+            # also composes with xargs/parallel below: `sudo xargs …` / `env
+            # parallel …` are stripped down to the same bare command word.
             while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/)) { seg = substr(seg, RLENGTH + 1) }
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^env[ \t]+/, "", seg)
@@ -2407,7 +2423,8 @@ command_has_shell_segment() {
             w = toks[1]
             sub(/.*\//, "", w)   # basename only
             if (w == "sh" || w == "bash" || w == "dash" || w == "zsh" || \
-                w == "ksh" || w == "csh" || w == "tcsh" || w == "fish" || w == "pwsh") { found = 1 }
+                w == "ksh" || w == "csh" || w == "tcsh" || w == "fish" || w == "pwsh" || \
+                w == "xargs" || w == "parallel") { found = 1 }
         }
         print (found ? "yes" : "no")
     }'
