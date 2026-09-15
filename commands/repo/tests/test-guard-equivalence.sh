@@ -85,6 +85,8 @@ declare -a DECLARED_DIVERGENCES=(
     "rm -rf '/'|repo#197: single-quoted form of the row above; same fix, same rationale."
     "git push --force origin \"main\"|repo#197: quoting the branch name downgraded a hard deny to a mere ask in both guards. Canonical now denies; the vendored copy still asks."
     "git push -f origin 'main'|repo#197: -f short-flag, single-quoted branch. Same fix and rationale as the --force row above."
+    "rg --pre 'rm -rf /' . | head -3|repo#311: ripgrep's --pre names an external preprocessor program that rg EXECUTES, so an rg carrying it is vetoed out of query-sink treatment and its pattern stays visible to the catastrophic scan. The vendored copy has no query sinks at all and allows this shape outright."
+    "grep 'rm -rf /' f.txt | sh|repo#311: the pattern is piped into a shell that WOULD execute it, so command_has_shell_segment() skips the redaction entirely and canonical denies. The vendored copy allows it; this is the safety floor that makes the query sinks safe, and it is measurably stricter here."
 )
 
 # ---------------------------------------------------------------------------
@@ -106,17 +108,34 @@ declare -a DECLARED_DIVERGENCES=(
 # correct. An undeclared weaker verdict is still a hard failure; adding a row
 # here to silence one is the wrong move unless the vendored guard is genuinely
 # wrong about it.
+#
+# Rows are MEASURED, never speculative (same discipline as DECLARED_DIVERGENCES
+# above). repo#311 added query sinks for jq/grep/egrep/fgrep/rg/inert-sed/awk
+# and corpus cases for all of them, but only the two rows below actually came
+# back weaker than the vendored copy — the vendored guard already allows the
+# jq/grep/egrep/fgrep/rg shapes, so declaring those too would be dead weight.
 # ---------------------------------------------------------------------------
 declare -a DECLARED_WEAKER=(
     "printf '%s\\n' \"rm -rf /\"|repo#53: printf prints its argument, it does not execute it. The vendored guard denies this, which blocks documenting a destructive command. Redaction is skipped when a shell segment is present, so a piped-to-shell payload still denies."
     "echo 'git push --force origin main'|repo#53: same as the printf row — echo of a string is not execution of it."
+    "sed -n 's|rm -rf /|X|p' log.jsonl|repo#311: an inert sed (no -i, no w/W write command, no e execute command) only PRINTS what it matches — the pattern is data, not a command. The vendored guard denies it, which blocks auditing a log for the literal text of a catastrophic pattern. The acting sub-forms (sed -i, s///w, e) are vetoed out of sink treatment and still deny in both guards (see the corpus rows below this one)."
+    "awk '\$0 ~ \"git push --force origin main\" {print}' log.jsonl|repo#311: same as the sed row — awk program text is matched and printed, never executed. system(…) and pipe-to-command (print | \"cmd\") are vetoed out of sink treatment and still deny in both guards."
 )
 
+# Both lookups match on the "<command>|" PREFIX rather than on `${entry%%|*}`
+# (repo#311). `%%|*` truncates at the FIRST pipe, so any corpus case that
+# contains a `|` — `grep '<pattern>' f | sh`, a jq filter, an awk pipe-to-
+# command — could never be declared at all: its key silently became the text
+# before its first pipe, the declaration never matched, and a hard FAIL was
+# reported with the row sitting right there in the array. The prefix test is
+# exact for the `<command>|<reason>` row format and behaves identically for
+# every pipe-free row. Only the trailing `*` is a glob: the "$cmd|" half is
+# quoted, so a command containing `*`/`?`/`[` is compared literally.
 declared_reason() {  # <command> -> reason, or empty
     local cmd="$1" entry
     for entry in "${DECLARED_DIVERGENCES[@]}"; do
-        if [[ "${entry%%|*}" == "$cmd" ]]; then
-            printf '%s' "${entry#*|}"
+        if [[ "$entry" == "$cmd|"* ]]; then
+            printf '%s' "${entry#"$cmd|"}"
             return 0
         fi
     done
@@ -126,8 +145,8 @@ declared_reason() {  # <command> -> reason, or empty
 declared_weaker_reason() {  # <command> -> reason, or empty
     local cmd="$1" entry
     for entry in "${DECLARED_WEAKER[@]}"; do
-        if [[ "${entry%%|*}" == "$cmd" ]]; then
-            printf '%s' "${entry#*|}"
+        if [[ "$entry" == "$cmd|"* ]]; then
+            printf '%s' "${entry#"$cmd|"}"
             return 0
         fi
     done

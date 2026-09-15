@@ -2177,8 +2177,113 @@ strip_literal_text() {
 # an unterminated quote copies the remainder verbatim (never redacts), and the
 # result feeds only the NARROWING scans, so the worst case is a raw substring
 # surviving (a false block) — never a catastrophic block being skipped.
+#
+# ---------------------------------------------------------------------------
+# OPT-IN QUERY SINKS (repo#311) — $2 non-empty enables them
+# ---------------------------------------------------------------------------
+# `jq`, `grep`/`egrep`/`fgrep`/`rg`, `sed` and `awk` are data sinks in exactly
+# the same sense echo/printf are: their pattern/program argument is text they
+# MATCH AGAINST or PRINT, never text they execute. A `jq` query over this very
+# repo's guard-decision log, or a `grep` for the literal text of a catastrophic
+# pattern, was denied purely because the pattern text appeared as the query
+# (repo#311). They are behind an opt-in second argument rather than always-on
+# because COMMAND_ASK_SCAN feeds two DENY-tier consumers whose SUBJECT is a
+# grep/sed command word (the SQL DDL scan and extract_write_targets()'s write
+# confinement — see the consumer audit table at _POSITIONAL_MASK_NEVER); only
+# the catastrophic working copy, whose sole consumer is the
+# ALWAYS_BLOCK_PATTERNS loop, opts in.
+#
+# Unlike echo/printf — where every argument is data by definition — these
+# commands have flags and sub-forms that DO act. A command word is admitted as
+# a query sink only after its whole simple command (raw, pre-redaction, read
+# with qseg() below) survives a per-command veto:
+#
+#   sed   — vetoed by `-i`/`--in-place` (edits the file), by a `w`/`W` write
+#           command or s///w flag, and by an `e` execute command or s///e flag.
+#           What remains is a query-only `sed -n '…p'` / `sed 's/…/…/'`.
+#   awk   — vetoed by `system(…)`, by a pipe-to-command (`print | "cmd"`,
+#           `|&` coprocess), and by the one-way `"cmd" | getline` exec form.
+#           What remains is pure pattern/print program text.
+#   rg    — vetoed by `--pre`/`--pre-glob`/`--hostname-bin`, which name an
+#           external program ripgrep executes.
+#   jq /
+#   grep  — no execution surface at all (jq has no shell-out filter; grep has
+#           no exec flag), so nothing to veto.
+#
+# The veto is whole-command, not per-argument: one `system(` anywhere in the
+# simple command disqualifies the entire command from sink treatment, so there
+# is no argument-position arithmetic to get wrong (a `sed -i` flag or an
+# `awk -F ':'` separator can never be mistaken for program text, because a
+# vetoed command is not a sink at all and a non-vetoed one has no argument that
+# executes). The vetoes are deliberately over-broad — they may decline a
+# genuinely inert command — because declining is the SAFE direction: it keeps
+# today's behaviour (a false block), never widens a deny into an allow.
+#
+# The rest of the safety floor is shared verbatim with echo/printf above: spans
+# carrying `$(`/backtick are never redacted, redirection targets are never
+# redacted, the command_has_shell_segment() gate at the call site skips this
+# whole function whenever any segment could feed a shell, and `bash -c`/`sh -c`/
+# `eval`/`xargs` are not sinks and never will be.
+#
+# $1 = command string. $2 = non-empty to enable the query sinks (absent/empty
+# keeps the historical echo/printf-only behaviour).
 strip_datasink_literals() {
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | awk -v qsinks="${2:-}" '
+    # Raw text of the simple command starting at `start`, up to the first
+    # UNQUOTED shell separator (or end of buffer). Quote-aware so an `awk`
+    # program that contains `|` or `;` inside its quoted program text is read
+    # as one unit — which is exactly what the vetoes below must see.
+    function qseg(s, start, n,    i, c, q, out) {
+        out = ""; q = ""
+        for (i = start; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (q != "") { out = out c; if (c == q) q = ""; continue }
+            if (c == SQ || c == DQ) { q = c; out = out c; continue }
+            if (c == ";" || c == "&" || c == "|" || c == "\n") break
+            out = out c
+        }
+        return out
+    }
+    # Is `tok` a query-sink command word at all? (The veto is separate.)
+    function is_query_sink(tok) {
+        return (tok == "jq" || tok == "grep" || tok == "egrep" || \
+                tok == "fgrep" || tok == "rg" || tok == "sed" || \
+                tok == "awk" || tok == "gawk" || tok == "mawk")
+    }
+    # Per-command veto over the RAW simple command. Returns 1 to admit.
+    function query_sink_ok(tok, seg) {
+        if (tok == "sed") {
+            # In-place edit: --in-place, or any short-flag cluster carrying i
+            # (-i, -ni, -i.bak). A leading `--` can never start such a cluster.
+            if (seg ~ /(^|[ \t])--in-place/) return 0
+            if (seg ~ /(^|[ \t])-[A-Za-z]*i/) return 0
+            # `w file` / `W file` / s///w flag — writes a file. `e cmd` /
+            # s///e flag — EXECUTES the pattern space. The character BEFORE the
+            # command letter is whatever delimiter the author chose (`s|a|b|w`
+            # is as valid as `s/a/b/w`), so the guard is "not part of a word"
+            # rather than a fixed delimiter set — deliberately over-broad, since
+            # declining to treat a sed as a sink only preserves the verdict the
+            # guard already produces.
+            if (seg ~ /(^|[^A-Za-z0-9_])[wW][ \t]/) return 0
+            if (seg ~ /(^|[^A-Za-z0-9_])e([ \t;}'"'"'"]|$)/) return 0
+            return 1
+        }
+        if (tok == "awk" || tok == "gawk" || tok == "mawk") {
+            if (seg ~ /system[ \t]*\(/) return 0      # system("cmd")
+            if (seg ~ /\|[ \t]*"/) return 0           # print | "cmd"
+            if (seg ~ /\|[ \t]*&/) return 0           # |& coprocess
+            if (seg ~ /\|[ \t]*getline/) return 0     # "cmd" | getline (one-way exec)
+            return 1
+        }
+        if (tok == "rg") {
+            # ripgrep flags that name an external program it then executes.
+            if (seg ~ /(^|[ \t])--pre([ \t=]|$)/) return 0
+            if (seg ~ /(^|[ \t])--pre-glob([ \t=]|$)/) return 0
+            if (seg ~ /(^|[ \t])--hostname-bin([ \t=]|$)/) return 0
+            return 1
+        }
+        return 1   # jq / grep / egrep / fgrep: no execution surface
+    }
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
@@ -2229,6 +2334,15 @@ strip_datasink_literals() {
                     out = out tok; i = j; atcmd = 1; continue
                 }
                 if (tok == "echo" || tok == "printf") { sink = 1 }
+                # repo#311 query sinks (opt-in): admitted only when the RAW
+                # remainder of this simple command carries no acting sub-form.
+                # A path-qualified spelling (/usr/bin/jq, ./rg) is classified on
+                # its basename, exactly like command_has_shell_segment() does.
+                else if (qsinks != "") {
+                    base = tok
+                    sub(/.*\//, "", base)
+                    if (is_query_sink(base) && query_sink_ok(base, qseg(s, j, n))) { sink = 1 }
+                }
                 out = out tok; i = j; continue
             }
             # Mid-command: a quoted span is redacted only inside a data sink.
@@ -2607,9 +2721,24 @@ fi
 # so the raw scan still blocks the payload. `-c` wrappers (bash -c/sh -c) are
 # never data sinks, and `$(`/backtick spans are never redacted, so smuggling
 # still hard-denies.
-if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]] && \
+#
+# repo#311: the QUERY sinks (jq/grep/egrep/fgrep/rg/inert sed/awk) are enabled
+# here — and ONLY here. Their pattern/program argument is text they match
+# against or print, never text they execute, so a `jq` query over this repo's
+# own guard-decision log, or a `grep` for the literal text of a catastrophic
+# pattern, is inert data in exactly the sense an echo argument is. This copy's
+# only consumer is the ALWAYS_BLOCK_PATTERNS loop below, which is why the
+# opt-in is safe to make here: the ASK-tier copy deliberately does NOT enable
+# them, because it also feeds two DENY-tier consumers whose subject IS a
+# grep/sed command word (the SQL DDL scan and extract_write_targets()'s write
+# confinement — see the consumer audit table at _POSITIONAL_MASK_NEVER above).
+# Same gate, same floor: a shell segment anywhere, or `$(`/backtick inside the
+# span, and nothing is redacted.
+if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* || \
+      "$COMMAND" == *"jq"* || "$COMMAND" == *"grep"* || "$COMMAND" == *"rg"* || \
+      "$COMMAND" == *"sed"* || "$COMMAND" == *"awk"* ]] && \
    [[ "$(command_has_shell_segment "$COMMAND")" == "no" ]]; then
-    COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT")
+    COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT" query)
 fi
 
 # =============================================================================
