@@ -272,8 +272,18 @@ Behavioral contract:
 - **Skips `/clear`.** `clear` is not a process relaunch, so re-emitting the
   banner there would be noise.
 
-There are no configuration toggles — the hook's behavior is fixed. To disable
-it, remove its `SessionStart` entries from `.claude/settings.json` (or run
+**Sibling visibility (opt-in, off by default).** A note is repo-scoped, so "no
+note in this repo" and "no note anywhere" are indistinguishable at session
+start. Export `REPO_HANDOFF_SIBLING_ROOT=<dir of checkouts>` and — *only* when
+the current repo has no note of its own — the hook also lists which repos
+directly under that root do have one, **path and age only, never the body**.
+The scan is single-level (`"$ROOT"/*/.claude/handoff.md`), capped at
+`MAX_SIBLING_DIRS` (64) directories examined, never `cd`s into a sibling or
+writes anything, and fails open to silence on a missing or unreadable root.
+Unset, the hook behaves exactly as it did before the variable existed.
+
+That variable is the hook's only configuration toggle. To disable the hook
+entirely, remove its `SessionStart` entries from `.claude/settings.json` (or run
 `uninstall.sh`, which removes only the entries it owns).
 
 ## Refreshing this install (`resync-installed.sh`)

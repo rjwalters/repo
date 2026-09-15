@@ -49,6 +49,8 @@ Installing Repo Skills also wires a **SessionStart hook** (`session-start-handof
 
 It is strictly read-only: it never writes or deletes the note (absorbing it and removing it is `/repo:handoff`'s own one-shot contract), it stays silent when no note exists, and it fails open, so a hook error can never block session start. It deliberately does not fire on `/clear`, which is not a process relaunch.
 
+A note is repo-scoped, which makes "no note in this repo" and "no note anywhere" look identical at session start — and a real handoff has been lost that way, sitting unread in a sibling checkout. Setting `REPO_HANDOFF_SIBLING_ROOT` to the directory your checkouts live in opts into closing that gap: when the current repo has no note, the hook also reports which repos directly under that root do have one — **path and age only, never the body**, since a note is one-shot for the repo it belongs to. The scan is single-level, capped at 64 directories, writes nothing, and fails open to silence. Leave the variable unset and behavior is exactly as above.
+
 ### Optional: surface the note to the human too (`--shell-wrapper`)
 
 The `SessionStart` hook above gets the note into **Claude's** context. It shows the **human** nothing before the session starts — you quit, relaunch, and there's no visible signal that the previous session left instructions. Pass `--shell-wrapper` to `install.sh` to also opt into a shell `claude` wrapper that prints a compact banner (note path, age, a `##`-header outline, and a STALE warning past seven days) *before* Claude starts.
