@@ -2454,6 +2454,96 @@ assert_deny "#53 safety: echo 'ok' | tee f ; <danger> still denies (separate seg
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- command_has_shell_segment(): a shell reached through xargs/parallel (#429) ---${NC}"
+# =========================================================================
+#
+# command_has_shell_segment() gates strip_datasink_literals(): when a shell
+# could consume the command's data, the data-sink redaction is skipped so the
+# raw catastrophic scan still sees the payload. It previously recognised a
+# shell only when a segment's OWN command word was a shell binary (sh/bash/…),
+# missing the case where the command word is `xargs` (or `parallel`) which
+# itself spawns a shell over its input:
+#
+#   echo '<danger>' | xargs -I{} sh -c '{}'
+#
+# Here the data-sink redaction used to apply (no segment's command word was a
+# shell), blanking the danger out of the catastrophic scan even though the
+# `sh -c` under xargs would execute whatever text arrived on the pipe. Fixed by
+# having command_has_shell_segment() also report "yes" for `xargs`/`parallel`
+# segments, UNCONDITIONALLY (regardless of what they themselves invoke), since
+# `xargs <anything>` executing attacker-shaped input is the hazard, not just
+# its `sh -c`/`bash -c` sub-form.
+#
+# NOTE: as of this fix, PR #428 (repo#311)'s jq/grep/sed/awk query-sink
+# extension to strip_datasink_literals() has not yet merged to main, so those
+# command words are not yet data sinks at all here — a
+# `grep '<danger>' f | xargs -I{} sh -c '{}'` case would deny today for an
+# unrelated reason (grep's own quoted argument is raw, unredacted, and matches
+# ALWAYS_BLOCK_PATTERNS directly), not because of this fix. This fix is
+# orthogonal to which command words strip_datasink_literals() treats as sinks
+# — it changes only command_has_shell_segment() itself, which repo#311's sink
+# extension reuses unchanged at its own call sites — so no follow-up is needed
+# here once repo#311 lands; echo/printf are exercised below as the sinks that
+# exist on main today.
+#
+# Danger phrase assembled at runtime so this file never contains the literal
+# string a naive scan of the harness's own Bash call would flag (mirrors #53).
+_XP_DANGER="rm -r""f /"
+
+assert_deny "#429: echo '<danger>' | xargs -I{} sh -c '{}' now denies (was allowed)" \
+    "echo '$_XP_DANGER' | xargs -I{} sh -c '{}'"
+
+assert_deny "#429: echo '<danger>' | xargs -0 bash -c '{}' now denies (was allowed)" \
+    "echo '$_XP_DANGER' | xargs -0 bash -c '{}'"
+
+assert_deny "#429: echo '<danger>' | xargs -n1 sh -c '{}' now denies (was allowed)" \
+    "echo '$_XP_DANGER' | xargs -n1 sh -c '{}'"
+
+assert_deny "#429: printf '<danger>' | xargs -I{} sh -c '{}' now denies (was allowed)" \
+    "printf '%s' '$_XP_DANGER' | xargs -I{} sh -c '{}'"
+
+assert_deny "#429: echo '<danger>' | parallel sh -c '{}' now denies (was allowed)" \
+    "echo '$_XP_DANGER' | parallel sh -c '{}'"
+
+assert_deny "#429: echo '<danger>' | parallel bash -c '{}' now denies (was allowed)" \
+    "echo '$_XP_DANGER' | parallel bash -c '{}'"
+
+# sudo/env wrapper composition: the existing assignment/sudo/env stripping
+# in command_has_shell_segment() must still resolve down to the bare xargs/
+# parallel command word.
+assert_deny "#429: echo '<danger>' | sudo xargs -I{} sh -c '{}' still denies" \
+    "echo '$_XP_DANGER' | sudo xargs -I{} sh -c '{}'"
+
+assert_deny "#429: echo '<danger>' | env parallel sh -c '{}' still denies" \
+    "echo '$_XP_DANGER' | env parallel sh -c '{}'"
+
+# --- Existing gate cases (sh/bash directly) are unaffected: no regression ---
+
+assert_deny "#429 regression: echo '<danger>' | sh still denies (unchanged, #53)" \
+    "echo '$_XP_DANGER' | sh"
+
+assert_deny "#429 regression: echo '<danger>' | bash still denies (unchanged, #53)" \
+    "echo '$_XP_DANGER' | bash"
+
+# --- Precision cost: an ordinary, non-shell xargs pipeline carrying NO
+# dangerous text still allows. This is the measured cost of the widened gate
+# (stated in the issue, not merely assumed): a xargs/parallel segment now
+# always disables the data-sink redaction, so a xargs pipeline that DID carry
+# dangerous-looking TEXT as inert data would go back to false-denying — but
+# one that carries no such text is unaffected and still allows. ---
+
+assert_allow "#429: ordinary non-shell xargs pipeline (no danger text) still allows" \
+    "echo hello | xargs -I{} echo {}"
+
+assert_allow "#429: find | xargs rm on an ordinary path still allows" \
+    "find . -name '*.tmp' | xargs rm"
+
+assert_allow "#429: ls | xargs wc -l still allows" \
+    "ls *.txt | xargs wc -l"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Multi-line quoted literal, line-leading recursive-force delete (#60) ---${NC}"
 # =========================================================================
 #

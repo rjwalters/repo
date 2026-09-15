@@ -133,3 +133,18 @@ rg --fixed-strings "DROP TABLE users" .
 awk '/rm -rf \//' file.txt
 printf '%s\n' "rm -rf /"
 echo 'git push --force origin main'
+
+# ── a shell reached through xargs/parallel (repo#429) ─────────────────────
+# echo/printf piped into xargs/parallel, which then spawns a shell over the
+# piped data. Both guards deny these: the vendored copy has no data-sink
+# redaction at all (it denies any echo/printf of dangerous-looking text
+# outright, see the DECLARED_WEAKER rows above), and canonical now recognises
+# xargs/parallel as a shell-spawning segment so its own data-sink redaction is
+# skipped and the raw scan still sees the payload.
+echo 'rm -rf /' | xargs -I{} sh -c '{}'
+echo 'rm -rf /' | xargs -0 bash -c '{}'
+echo 'rm -rf /' | parallel sh -c '{}'
+
+# ── ordinary xargs pipelines with no dangerous text must stay allowed ─────
+echo hello | xargs -I{} echo {}
+find . -name '*.tmp' | xargs rm
