@@ -63,7 +63,10 @@ run_hook_raw() {  # <stdin-payload>
     # regardless of the calling environment - this test suite may itself be
     # invoked from inside a Loom role session (LOOM_ROLE set), which would
     # otherwise silently trip the issue #389 Layer 2 gate under test below.
-    HOOK_OUT=$(printf '%s' "$1" | LOOM_ROLE= bash "$HOOK" 2>/dev/null)
+    # REPO_HANDOFF_SIBLING_ROOT is cleared for the same reason: an operator who
+    # has opted into the issue #257 sibling scan in their own shell must not
+    # change what these baseline cases observe.
+    HOOK_OUT=$(printf '%s' "$1" | LOOM_ROLE= REPO_HANDOFF_SIBLING_ROOT= bash "$HOOK" 2>/dev/null)
     HOOK_EXIT=$?
 }
 run_hook() {  # <cwd> <source>
@@ -74,7 +77,22 @@ run_hook() {  # <cwd> <source>
 # LOOM_ROLE set in the hook's environment (issue #389 audience gating).
 run_hook_as_role() {  # <cwd> <source> <role>
     HOOK_OUT=$(jq -nc --arg w "$1" --arg s "$2" '{cwd:$w, source:$s}' \
-        | LOOM_ROLE="$3" bash "$HOOK" 2>/dev/null)
+        | LOOM_ROLE="$3" REPO_HANDOFF_SIBLING_ROOT= bash "$HOOK" 2>/dev/null)
+    HOOK_EXIT=$?
+}
+
+# run_hook_sibling <cwd> <source> <REPO_HANDOFF_SIBLING_ROOT> -> like run_hook,
+# but with the issue #257 sibling-scan opt-in set in the hook's environment.
+run_hook_sibling() {  # <cwd> <source> <sibling-root>
+    HOOK_OUT=$(jq -nc --arg w "$1" --arg s "$2" '{cwd:$w, source:$s}' \
+        | LOOM_ROLE= REPO_HANDOFF_SIBLING_ROOT="$3" bash "$HOOK" 2>/dev/null)
+    HOOK_EXIT=$?
+}
+
+# run_hook_sibling_as_role <cwd> <source> <sibling-root> <role>
+run_hook_sibling_as_role() {  # <cwd> <source> <sibling-root> <role>
+    HOOK_OUT=$(jq -nc --arg w "$1" --arg s "$2" '{cwd:$w, source:$s}' \
+        | LOOM_ROLE="$4" REPO_HANDOFF_SIBLING_ROOT="$3" bash "$HOOK" 2>/dev/null)
     HOOK_EXIT=$?
 }
 
@@ -401,6 +419,173 @@ assert_contains  "no LOOM_ROLE: deletion directive present for operator" "$CTX" 
     "If you are the operator's interactive session"
 assert_contains  "no LOOM_ROLE: role-agent non-deletion instruction present" "$CTX" \
     "do NOT act on this"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- sibling-repo visibility, opt-in via REPO_HANDOFF_SIBLING_ROOT (#257) --"
+# ---------------------------------------------------------------------------
+# A root of checkouts: alpha has a fresh note, beta a stale one, gamma none.
+# A loose FILE at the root level proves the single-level glob ignores non-dirs.
+SIBROOT="$SCRATCH/siblings"
+mkdir -p "$SIBROOT/alpha/.claude" "$SIBROOT/beta/.claude" "$SIBROOT/gamma"
+git -C "$SIBROOT/alpha" init -q 2>/dev/null || git init -q "$SIBROOT/alpha"
+printf '%s' "$NOTE_BODY"                   > "$SIBROOT/alpha/.claude/handoff.md"
+printf 'sibling-beta-body-sentinel\n'      > "$SIBROOT/beta/.claude/handoff.md"
+set_mtime_ago "$SIBROOT/beta/.claude/handoff.md" -9d "9 days ago"
+printf 'not a directory\n'                 > "$SIBROOT/loose-file.txt"
+
+# The session's own repo: a real repo with NO note of its own.
+BARE="$(make_repo sibling_local)"
+
+# (a) Opt-in unset: byte-identical to today — the sibling notes are invisible.
+run_hook "$BARE" startup
+assert_eq    "sibling opt-in unset: exit 0"               "0" "$HOOK_EXIT"
+assert_empty "sibling opt-in unset: silent despite sibling notes" "$HOOK_OUT"
+
+# (b) Opt-in set: path + age for each sibling note, and nothing else.
+run_hook_sibling "$BARE" startup "$SIBROOT"
+assert_eq    "sibling scan: exit 0"                       "0" "$HOOK_EXIT"
+if printf '%s' "$HOOK_OUT" | jq -e . >/dev/null 2>&1; then
+    ok "sibling scan: stdout is well-formed JSON"
+else
+    no "sibling scan: stdout is well-formed JSON" "got [$HOOK_OUT]"
+fi
+EVENT=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.hookEventName // ""' 2>/dev/null)
+assert_eq    "sibling scan: hookEventName is SessionStart" "SessionStart" "$EVENT"
+LINES=$(printf '%s' "$HOOK_OUT" | grep -c . || true)
+assert_eq    "sibling scan: exactly one output line"      "1" "$LINES"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains "sibling scan: says no note is pending here" "$CTX" \
+    "No /repo:handoff note is pending in THIS repository"
+assert_contains "sibling scan: names the opt-in variable"  "$CTX" "REPO_HANDOFF_SIBLING_ROOT ($SIBROOT)"
+assert_contains "sibling scan: reports the alpha note path" "$CTX" "$SIBROOT/alpha/.claude/handoff.md"
+assert_contains "sibling scan: reports the beta note path"  "$CTX" "$SIBROOT/beta/.claude/handoff.md"
+assert_contains "sibling scan: counts both notes"          "$CTX" "found 2 pending handoff notes"
+assert_contains "sibling scan: fresh sibling age label"    "$CTX" "just now"
+assert_contains "sibling scan: stale sibling age label"    "$CTX" "9d old"
+assert_contains "sibling scan: stale sibling flagged"      "$CTX" "STALE"
+# Path and age ONLY: neither sibling body may appear, in any form.
+assert_not_contains "sibling scan: alpha body never inlined"  "$CTX" "PR #41 awaits review"
+assert_not_contains "sibling scan: alpha headers never shown" "$CTX" "In-flight — resolve before anything else"
+assert_not_contains "sibling scan: beta body never inlined"   "$CTX" "sibling-beta-body-sentinel"
+assert_not_contains "sibling scan: no inline body markers"    "$CTX" "BEGIN HANDOFF NOTE"
+# ...and no one-shot deletion directive for a note that belongs to another repo.
+assert_not_contains "sibling scan: no deletion directive"     "$CTX" "delete both the note and its pointer"
+assert_contains "sibling scan: warns against acting from here" "$CTX" \
+    "Do NOT open, act on, or delete another repository's note"
+assert_not_contains "sibling scan: non-repo dir not reported"  "$CTX" "gamma"
+assert_not_contains "sibling scan: loose file not reported"    "$CTX" "loose-file.txt"
+
+run_hook_sibling "$BARE" resume "$SIBROOT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains "sibling scan: fires on resume too"       "$CTX" "$SIBROOT/alpha/.claude/handoff.md"
+
+for src in clear compact fork; do
+    run_hook_sibling "$BARE" "$src" "$SIBROOT"
+    assert_empty "sibling scan: source=$src stays silent" "$HOOK_OUT"
+done
+
+# A trailing slash on the configured root must not double up in reported paths.
+run_hook_sibling "$BARE" startup "$SIBROOT/"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains     "trailing slash: path reported cleanly" "$CTX" "$SIBROOT/alpha/.claude/handoff.md"
+assert_not_contains "trailing slash: no doubled separator"  "$CTX" "$SIBROOT//"
+
+# (c) Configured root that does not exist: fails open to silence.
+run_hook_sibling "$BARE" startup "$SCRATCH/no-such-root"
+assert_eq    "sibling root missing: exit 0"               "0" "$HOOK_EXIT"
+assert_empty "sibling root missing: no output"            "$HOOK_OUT"
+
+# A root that is a file rather than a directory is equally inert.
+run_hook_sibling "$BARE" startup "$SIBROOT/loose-file.txt"
+assert_empty "sibling root is a file: no output"          "$HOOK_OUT"
+
+# An unreadable root fails open too (skipped as root, where mode bits don't bite).
+if [[ "$(id -u)" != "0" ]]; then
+    NOREAD="$SCRATCH/sibroot-unreadable"
+    mkdir -p "$NOREAD/one/.claude"
+    printf 'x\n' > "$NOREAD/one/.claude/handoff.md"
+    chmod 000 "$NOREAD"
+    run_hook_sibling "$BARE" startup "$NOREAD"
+    assert_eq    "sibling root unreadable: exit 0"        "0" "$HOOK_EXIT"
+    assert_empty "sibling root unreadable: no output"     "$HOOK_OUT"
+    chmod 755 "$NOREAD"
+fi
+
+# (d) "No note anywhere" is still silence — the point is only to distinguish it
+#     from "no note here", never to announce an empty scan.
+EMPTYROOT="$SCRATCH/sibroot-empty"
+mkdir -p "$EMPTYROOT/one" "$EMPTYROOT/two/.claude"
+run_hook_sibling "$BARE" startup "$EMPTYROOT"
+assert_eq    "sibling root has no notes: exit 0"          "0" "$HOOK_EXIT"
+assert_empty "sibling root has no notes: no output"       "$HOOK_OUT"
+
+# (e) A local note always wins: the scan never runs, so the ordinary banner is
+#     unchanged even with the opt-in set.
+LOCALWINS="$SIBROOT/localwins"
+mkdir -p "$LOCALWINS/.claude"
+git -C "$LOCALWINS" init -q 2>/dev/null || git init -q "$LOCALWINS"
+printf '%s' "$NOTE_BODY" > "$LOCALWINS/.claude/handoff.md"
+run_hook_sibling "$LOCALWINS" startup "$SIBROOT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains "local note wins: ordinary banner emitted" "$CTX" "$LOCALWINS/.claude/handoff.md"
+assert_contains "local note wins: body still inlined"      "$CTX" "PR #41 awaits review"
+assert_not_contains "local note wins: no sibling section"  "$CTX" "A sibling scan"
+assert_not_contains "local note wins: sibling not listed"  "$CTX" "$SIBROOT/alpha/.claude/handoff.md"
+rm -rf "$LOCALWINS"
+
+# The current repo is never reported to itself: an unreadable local note under
+# the configured root is skipped by the scan, while siblings still surface.
+if [[ "$(id -u)" != "0" ]]; then
+    SELFREPO="$SIBROOT/selfrepo"
+    mkdir -p "$SELFREPO/.claude"
+    git -C "$SELFREPO" init -q 2>/dev/null || git init -q "$SELFREPO"
+    printf 'self-note-sentinel\n' > "$SELFREPO/.claude/handoff.md"
+    chmod 000 "$SELFREPO/.claude/handoff.md"
+    run_hook_sibling "$SELFREPO" startup "$SIBROOT"
+    CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+    assert_contains "self-exclusion: siblings still reported" "$CTX" "$SIBROOT/alpha/.claude/handoff.md"
+    assert_not_contains "self-exclusion: own repo not listed" "$CTX" "$SELFREPO/.claude/handoff.md"
+    chmod 644 "$SELFREPO/.claude/handoff.md"
+    rm -rf "$SELFREPO"
+fi
+
+# (f) Bounded scan: at most MAX_SIBLING_DIRS (64) directories are examined, in
+#     glob order, and the truncation is disclosed rather than hidden.
+CAPROOT="$SCRATCH/sibroot-cap"
+for i in $(seq -w 1 70); do mkdir -p "$CAPROOT/d$i"; done
+mkdir -p "$CAPROOT/d01/.claude" "$CAPROOT/d70/.claude"
+printf 'early\n' > "$CAPROOT/d01/.claude/handoff.md"
+printf 'late\n'  > "$CAPROOT/d70/.claude/handoff.md"
+run_hook_sibling "$BARE" startup "$CAPROOT"
+assert_eq    "cap: exit 0"                                "0" "$HOOK_EXIT"
+CTX=$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+assert_contains "cap: note within the first 64 dirs is reported" "$CTX" "$CAPROOT/d01/.claude/handoff.md"
+assert_not_contains "cap: note past the 64-dir cap is not reached" "$CTX" "$CAPROOT/d70/.claude/handoff.md"
+assert_contains "cap: truncation is disclosed"            "$CTX" "scan stopped after 64 directories"
+
+# (g) Read-only: the scan never touches a sibling note (content, mtime, or
+#     existence) — a note is one-shot for the repo it belongs to.
+SIB_A_SUM_BEFORE=$(cksum < "$SIBROOT/alpha/.claude/handoff.md")
+SIB_A_MTIME_BEFORE=$(mtime_of "$SIBROOT/alpha/.claude/handoff.md")
+SIB_B_MTIME_BEFORE=$(mtime_of "$SIBROOT/beta/.claude/handoff.md")
+run_hook_sibling "$BARE" startup "$SIBROOT"
+assert_eq "read-only: sibling note content unchanged"     "$SIB_A_SUM_BEFORE" \
+    "$(cksum < "$SIBROOT/alpha/.claude/handoff.md")"
+assert_eq "read-only: sibling note mtime unchanged"       "$SIB_A_MTIME_BEFORE" \
+    "$(mtime_of "$SIBROOT/alpha/.claude/handoff.md")"
+assert_eq "read-only: stale sibling mtime unchanged"      "$SIB_B_MTIME_BEFORE" \
+    "$(mtime_of "$SIBROOT/beta/.claude/handoff.md")"
+if [[ -f "$SIBROOT/beta/.claude/handoff.md" ]]; then
+    ok "read-only: sibling note still exists"
+else
+    no "read-only: sibling note still exists" "sibling note was deleted"
+fi
+
+# (h) Audience gating still wins: a role session sees nothing, opt-in or not.
+run_hook_sibling_as_role "$BARE" startup "$SIBROOT" "builder"
+assert_eq    "LOOM_ROLE + sibling scan: exit 0"           "0" "$HOOK_EXIT"
+assert_empty "LOOM_ROLE + sibling scan: no output"        "$HOOK_OUT"
 
 # ---------------------------------------------------------------------------
 echo ""
