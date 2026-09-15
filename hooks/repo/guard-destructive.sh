@@ -2201,8 +2201,9 @@ strip_literal_text() {
 #   sed   — vetoed by `-i`/`--in-place` (edits the file), by a `w`/`W` write
 #           command or s///w flag, and by an `e` execute command or s///e flag.
 #           What remains is a query-only `sed -n '…p'` / `sed 's/…/…/'`.
-#   awk   — vetoed by `system(…)` and by a pipe-to-command (`print | "cmd"`,
-#           `|&` coprocess). What remains is pure pattern/print program text.
+#   awk   — vetoed by `system(…)`, by a pipe-to-command (`print | "cmd"`,
+#           `|&` coprocess), and by the one-way `"cmd" | getline` exec form.
+#           What remains is pure pattern/print program text.
 #   rg    — vetoed by `--pre`/`--pre-glob`/`--hostname-bin`, which name an
 #           external program ripgrep executes.
 #   jq /
@@ -2271,6 +2272,7 @@ strip_datasink_literals() {
             if (seg ~ /system[ \t]*\(/) return 0      # system("cmd")
             if (seg ~ /\|[ \t]*"/) return 0           # print | "cmd"
             if (seg ~ /\|[ \t]*&/) return 0           # |& coprocess
+            if (seg ~ /\|[ \t]*getline/) return 0     # "cmd" | getline (one-way exec)
             return 1
         }
         if (tok == "rg") {

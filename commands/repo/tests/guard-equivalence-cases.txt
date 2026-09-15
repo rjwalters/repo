@@ -180,6 +180,7 @@ sed -n 's|x|y|w rm -rf /' f.txt
 sed -n 'e rm -rf /' f.txt
 awk '{system("rm -rf /")}' f.txt
 awk '{print | "rm -rf /"}' f.txt
+awk 'BEGIN{"rm -rf /" | getline x; print x}'
 rg --pre 'rm -rf /' . | head -3
 jq "$(printf 'rm -rf /')" f.json
 grep 'rm -rf /' f.txt | sh

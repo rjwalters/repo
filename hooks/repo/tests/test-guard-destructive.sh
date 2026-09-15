@@ -4619,9 +4619,9 @@ echo -e "${YELLOW}--- Query-command data sinks: jq/grep/sed/awk (repo#311) ---${
 #
 # A command word is admitted as a sink only if the RAW remainder of its simple
 # command survives a per-command veto: `sed -i`/`--in-place`, a sed `w`/`W`
-# write or `e` execute command, `awk` `system(…)` / `print | "cmd"`, and
-# ripgrep's `--pre`/`--hostname-bin` preprocessor flags all disqualify the
-# whole command, so those shapes still deny exactly as before.
+# write or `e` execute command, `awk` `system(…)` / `print | "cmd"` /
+# `"cmd" | getline`, and ripgrep's `--pre`/`--hostname-bin` preprocessor flags
+# all disqualify the whole command, so those shapes still deny exactly as before.
 #
 # NOTE ON THE FAST PATH: `grep`, `rg` and `jq` with no shell metacharacter are
 # already admitted by fastpath_builtin_admits() before any scan runs, so a
@@ -4710,6 +4710,12 @@ assert_deny "#311 exclusion: awk system(...) still denies" \
 
 assert_deny "#311 exclusion: awk print | \"cmd\" still denies" \
     "awk '{print | \"$_QS_DANGER\"}' f.txt"
+
+assert_deny "#428 exclusion: awk \"cmd\" | getline (one-way exec) still denies" \
+    "awk 'BEGIN{\"$_QS_DANGER\" | getline x; print x}'"
+
+assert_deny "#428 exclusion: awk \"cmd\" | getline var still denies" \
+    "awk 'BEGIN{\"$_QS_DANGER\" | getline line}'"
 
 assert_deny "#311 exclusion: rg --pre (runs a preprocessor program) still denies" \
     "rg --pre '$_QS_DANGER' . | head -3"
