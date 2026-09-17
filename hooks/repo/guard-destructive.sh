@@ -1197,6 +1197,65 @@ function trusted_close(s, n, ci, qc,   j) {
 '
 
 # =============================================================================
+# LIVE-vs-ESCAPED COMMAND SUBSTITUTION (escaped-backtick false positive)
+#
+# Several passes in this file ask "does this quoted span carry a command
+# substitution?" before treating the span as inert (redacting its bytes, or
+# keeping its separators literal). The historical test was a byte-presence
+# check:
+#
+#     index(inner, "$(") == 0 && index(inner, "`") == 0
+#
+# which cannot tell a backslash-ESCAPED backtick or `\$(` from a live one. An
+# escaped backtick inside a double-quoted string is LITERAL TEXT — it is the
+# standard way to spell a markdown code span in a shell string — so it carries
+# zero execution risk, yet it vetoed the inert treatment and produced a false
+# DENY on ordinary text (e.g. `gh pr comment -b "see \`--force\` below"`).
+#
+# has_live_subst(str) returns 1 only when a backtick, or a `$` immediately
+# followed by `(`, is preceded by an EVEN number of backslashes (0, 2, …) —
+# i.e. is live at the shell's first parse — and 0 when every occurrence is
+# escaped. Parity, not presence: `\`` is escaped, `\\\`` is a literal backslash
+# followed by a LIVE backtick.
+#
+# SAFETY DIRECTION. This only ever NARROWS a false positive; it never widens a
+# deny into an allow on live substitution:
+#   - a span with any live `$(` or backtick is classified exactly as before;
+#   - an escaped-only span expands to a plain string that merely CONTAINS those
+#     characters — the same risk class as any other plain literal these passes
+#     already redact. It can only execute if something RE-PARSES it, and every
+#     pass gates re-parsing separately and independently of this scan (the
+#     data-sink command-word anchoring, command_has_shell_segment()'s
+#     pipe-to-interpreter check, and the positional-mask allowlist).
+#
+# Lives in its own awk source string, prepended to each consuming program, so
+# the copies cannot drift — the same mechanism as _ESCAPE_AWK above. awk has no
+# way to share a function across separately-invoked programs, so the string is
+# concatenated at each call site rather than duplicated in source.
+#
+# NOT applied to dequote_inert_spans() — see the note at its own `index()` test
+# for why that one is a deliberately conservative check, not this defect.
+# =============================================================================
+_HASLIVESUBST_AWK='
+function has_live_subst(str,    i, c, bs) {
+    bs = 0
+    for (i = 1; i <= length(str); i++) {
+        c = substr(str, i, 1)
+        if (c == "\\") {
+            bs++
+            continue
+        }
+        if (bs % 2 == 0) {
+            if (c == "`") return 1
+            if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+        }
+        bs = 0
+    }
+    return 0
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE COMMAND SEGMENTATION (#3755)
 #
 # The three segment parsers below (parse_force_ops, lifecycle_or_cloud_reason,
@@ -1431,7 +1490,10 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            # LIVE substitution only: a backslash-ESCAPED backtick / `\$(` is
+            # literal text, so the span really is inert and its separators
+            # really are literal (has_live_subst(), parity not presence).
+            if (!has_live_subst(inner)) {
                 # Inert quoted span: copy verbatim, separators inside are literal.
                 # KNOWN LIMIT (#130): this is the one branch that can LOSE segment
                 # boundaries, because it consumes whatever the forward scan paired
@@ -1792,7 +1854,11 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
             # when the text it pairs with carries a substitution. Every member of
             # that family needs an ODD quote count, so the shell rejects the
             # command outright and nothing executes.
-            if (qc == SQ || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
+            #
+            # For a DOUBLE-quoted/unquoted span, LIVE substitution only
+            # (has_live_subst()): an escaped `\`code\`` inside the span is
+            # literal text and keeps it inert.
+            if (qc == SQ || !has_live_subst(inner)) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
                 # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
                 # it consumes whatever the forward scan paired with, which for a
@@ -1963,7 +2029,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 # identical to the pre-#350 empty-cpath fallback (`_fcwd="$CWD"` at the call
 # site), just made explicit so a LATER `cd` in the same command can override it.
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
                                  # read does not trim an empty cpath.
@@ -2141,6 +2207,16 @@ dequote_inert_spans() {
                     continue
                 }
                 inner = substr(s, i + 1, endpos - i - 1)
+                # DELIBERATELY the byte-presence test, NOT has_live_subst().
+                # Every other span gate in this file decides whether to REDACT
+                # (fewer denies); this one decides whether to DEQUOTE, and a
+                # dequoted span is scanned IN ADDITION to the raw copy, so
+                # dequoting more can only ADD denies. Accepting escaped-only
+                # spans here would therefore widen the catastrophic tier, which
+                # is a separate change with its own risk, not part of the
+                # escaped-backtick false-positive fix. Leaving a span quoted is
+                # the conservative direction and costs nothing: the raw copy
+                # still sees it.
                 if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
                     out = out inner
                 } else {
@@ -2227,7 +2303,7 @@ dequote_inert_spans() {
 # keep the two files' behavior in sync.
 # =============================================================================
 strip_literal_text() {
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | awk "$_HASLIVESUBST_AWK"'
     # Mask the body of a `<flag> "$(cat <<QUOTED_DELIM … DELIM\n)"` heredoc.
     # See the header comment above for the four conditions and why each is
     # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
@@ -2338,7 +2414,9 @@ strip_literal_text() {
             # gsub(/./) leaves embedded newlines untouched (awk `.` never matches a
             # newline), so a multi-line span stays SAME-LENGTH and byte offsets of
             # the surrounding command are preserved.
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            # LIVE substitution only (has_live_subst()): an escaped backtick
+            # or `\$(` is literal text, so the value is still provably inert.
+            if (!has_live_subst(inner)) {
                 gsub(/./, "X", inner)
             }
             out = out pre head inner qchar
@@ -2445,7 +2523,7 @@ strip_literal_text() {
 # directions because neither pass can create text the other keys on (see the
 # PASS 2 comment at the call site for the full argument).
 strip_datasink_literals() {
-    printf '%s' "$1" | awk -v qsinks="${2:-}" '
+    printf '%s' "$1" | awk -v qsinks="${2:-}" "$_HASLIVESUBST_AWK"'
     # Raw text of the simple command starting at `start`, up to the first
     # UNQUOTED shell separator (or end of buffer). Quote-aware so an `awk`
     # program that contains `|` or `;` inside its quoted program text is read
@@ -2578,7 +2656,9 @@ strip_datasink_literals() {
                     out = out substr(s, i); i = n + 1; continue
                 }
                 inner = substr(s, i + 1, ci - i - 1)
-                if (sink && !redir && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                # LIVE substitution only (has_live_subst()): an escaped
+                # backtick in echo/printf data is literal text, not a command.
+                if (sink && !redir && !has_live_subst(inner)) {
                     gsub(/./, "X", inner)   # . never matches \n: multi-line stays same-length
                 }
                 out = out qc inner qc; i = ci + 1; redir = 0; continue
@@ -2659,7 +2739,7 @@ mask_ask_positional_args() {
     # would be silently decoded back to a bare "." before the regex engine
     # ever sees it, defeating the escaping and emitting a spurious "unknown
     # escape sequence" warning). ENVIRON values are passed through verbatim.
-    printf '%s' "$1" | CMDRE_FOR_AWK="$2" awk '
+    printf '%s' "$1" | CMDRE_FOR_AWK="$2" awk "$_HASLIVESUBST_AWK"'
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -2693,7 +2773,9 @@ mask_ask_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                # LIVE substitution only (has_live_subst()): an escaped
+                # backtick in a positional argument is literal text.
+                if (!has_live_subst(inner)) {
                     gsub(/./, "X", inner)
                 }
                 out = out qc inner qc
@@ -2735,7 +2817,7 @@ mask_ask_positional_args() {
 # deliberately NOT matched, so the guard's own `echo '<json>' | guard-destructive.sh`
 # self-test still redacts and no longer false-blocks (#53). Emits "yes"/"no".
 command_has_shell_segment() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         found = 0
@@ -3125,7 +3207,7 @@ fi
 lifecycle_or_cloud_reason() {
     # Emit a deny reason (one per line) for every segment whose command word is a
     # system-lifecycle command or an az/gcloud delete. Portable awk only.
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK"'
     BEGIN { buf = "" }
     # Slurp the whole (possibly multi-line) command, then segment ONCE with the
     # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
@@ -3273,7 +3355,7 @@ extract_rm_targets() {
     # so parse_force_ops()/lifecycle_or_cloud_reason() reuse the SAME algorithm
     # instead of duplicating it (see the _ML_QSPLIT_AWK header for the full
     # segmentation contract).
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_ML_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK"'
     BEGIN { buf = "" }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
@@ -3629,7 +3711,7 @@ mark_expandable_dollars() {
 # with no -C at all -- is fixed in the pre-check block below.)
 # =============================================================================
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation
@@ -4859,7 +4941,7 @@ extract_write_targets() {
     # guard's separate, older qsplit() copy — the two must not both define a
     # `qsplit()` under the same awk source variable, and this file's version
     # is the more advanced of the two (rjwalters/repo#188).
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     # Unresolvable cases all return tok UNCHANGED, which is exactly the
     # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
     # lands in the main checkout). Fail-closed by construction: this function
