@@ -2583,11 +2583,27 @@ assert_deny "#60 safety: genuine multi-line command with rm -rf / on a later lin
 
 # Command substitution smuggled inside the SAME multi-line quoted literal keeps
 # its separators active (the span is not inert), so the payload still denies.
+#
+# NOTE ON THE FORMAT STRING: the `$(` / backtick below must be UNESCAPED. These
+# two cases previously read `\$(` / `` \` `` — and because the printf FORMAT
+# string is SINGLE-quoted, those backslashes survived into the command, so what
+# was under test was an ESCAPED (literal, non-substituting) span rather than the
+# live one the description names. The guard could not tell the two apart before
+# has_live_subst() (see the block near the end of this file), so these cases
+# passed for the wrong reason. Both spellings are now pinned explicitly.
 assert_deny "#60 safety: command-substitution inside a multi-line quoted literal still denies" \
-    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML_DANGER")"
+    "$(printf 'echo "line one\n$(%s)\nline three"' "$_ML_DANGER")"
 
 # Backtick substitution inside the same shape likewise still denies.
 assert_deny "#60 safety: backtick substitution inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n`%s`\nline three"' "$_ML_DANGER")"
+
+# ...and the BACKSLASH-ESCAPED spellings of the same two shapes are literal text
+# the shell never substitutes, so they are (correctly) allowed.
+assert_allow "#60: an ESCAPED \$( ) inside the same multi-line quoted literal is literal text and is allowed" \
+    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML_DANGER")"
+
+assert_allow "#60: an ESCAPED backtick span inside the same multi-line quoted literal is allowed" \
     "$(printf 'echo "line one\n\`%s\`\nline three"' "$_ML_DANGER")"
 
 # bash -c / sh -c with a multi-line payload whose interior line leads with the
@@ -2680,10 +2696,18 @@ assert_deny "#71 safety: genuine multi-line command with az ... delete on a late
 
 # Command substitution / backtick smuggled inside the SAME multi-line quoted
 # literal keeps its separators active (the span is not inert), so it still denies.
+# The `$(` / backtick must be UNESCAPED here — see the NOTE ON THE FORMAT STRING
+# at the #60 pair above for why, and for the escaped counterparts.
 assert_deny "#71 safety: command-substitution force-push inside a multi-line quoted literal still denies" \
-    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML71_FORCE")"
+    "$(printf 'echo "line one\n$(%s)\nline three"' "$_ML71_FORCE")"
 
 assert_deny "#71 safety: backtick force-push inside a multi-line quoted literal still denies" \
+    "$(printf 'echo "line one\n`%s`\nline three"' "$_ML71_FORCE")"
+
+assert_allow "#71: an ESCAPED \$( ) force-push inside the same multi-line quoted literal is allowed" \
+    "$(printf 'echo "line one\n\$(%s)\nline three"' "$_ML71_FORCE")"
+
+assert_allow "#71: an ESCAPED backtick force-push inside the same multi-line quoted literal is allowed" \
     "$(printf 'echo "line one\n\`%s\`\nline three"' "$_ML71_FORCE")"
 
 # bash -c / sh -c with a multi-line payload whose interior line leads with the
@@ -4598,6 +4622,154 @@ assert_allow "stash (#204): '-C' + '--git-dir=' at a worktree from a spaced main
     "git -C \"$STASHWS_WT\" --git-dir=\"$STASHWS_WT/.git\" stash pop" "$STASHWS_MAIN"
 
 echo ""
+
+
+# =========================================================================
+# ESCAPED vs LIVE COMMAND SUBSTITUTION IN A QUOTED SPAN (has_live_subst())
+# =========================================================================
+#
+# Every span gate that decides "is this quoted span inert?" used a plain
+# byte-presence test — index(inner, "$(") / index(inner, "`") — which cannot
+# tell a backslash-ESCAPED backtick from a live one. Inside a double-quoted
+# shell string `\`` is LITERAL TEXT (the standard way to spell a markdown code
+# span), so it carries zero execution risk, yet a single one anywhere in the
+# value vetoed the inert treatment of the WHOLE span and produced a false DENY
+# on ordinary prose. has_live_subst() replaces the presence test with a
+# backslash-PARITY scan: an occurrence counts as live only when preceded by an
+# EVEN number of backslashes.
+#
+# Each block below is a matched pair, so the parity rule is pinned in both
+# directions:
+#   - the ESCAPED case is the false positive this fix removes (it DENIES/ASKS
+#     on the pre-fix guard);
+#   - the LIVE case immediately under it is a no-regression pin (it denies on
+#     both, and must keep denying).
+# The escaped code span is placed ELSEWHERE in the value, not wrapped around
+# the dangerous phrase, so the phrase keeps its own leading word boundary and
+# the span gate is the only thing deciding the verdict.
+
+echo ""
+echo -e "${YELLOW}--- strip_literal_text(): escaped code span in a flag value ---${NC}"
+
+assert_allow "has_live_subst: escaped code span in a --body value no longer blocks the prose around it" \
+    'gh pr comment 1 --body "see \`README\` ; never run rm -rf / here"'
+assert_deny "has_live_subst floor: a LIVE backtick span in the same --body value still denies" \
+    'gh pr comment 1 --body "see `README` ; never run rm -rf / here"'
+assert_allow "has_live_subst: escaped \$( in a -m value no longer blocks the prose around it" \
+    'gh pr comment 1 -m "spell it \$(cmd) ; never run git push --force origin main here"'
+assert_deny "has_live_subst floor: a LIVE \$( span in the same -m value still denies" \
+    'gh pr comment 1 -m "spell it $(cmd) ; never run git push --force origin main here"'
+# PARITY, not presence: two backslashes are a literal backslash followed by a
+# LIVE backtick, so the span is still active and the deny must stand.
+assert_deny "has_live_subst parity: a DOUBLE backslash before a backtick leaves it LIVE and still denies" \
+    'gh pr comment 1 --body "see \\`README` ; never run rm -rf / here"'
+# The motivating real-world shape: an automated review comment that is nothing
+# but markdown code spans. Allowed before and after — pinned so a future
+# tightening of the parity scan cannot regress it.
+assert_allow "has_live_subst: a review comment made only of escaped markdown code spans is allowed" \
+    'gh pr comment 42 --body "Use \`--force-with-lease\` rather than \`--force\` when rebasing."'
+
+echo ""
+echo -e "${YELLOW}--- strip_datasink_literals(): escaped code span in echo/printf data ---${NC}"
+
+assert_allow "has_live_subst: escaped code span in echo data no longer blocks the prose around it" \
+    'echo "see \`README\` ; never run rm -rf / here"'
+assert_allow "has_live_subst: same for printf data" \
+    'printf "see \`README\` ; never run rm -rf / here"'
+assert_deny "has_live_subst floor: a LIVE backtick span in the same echo data still denies" \
+    'echo "see `README` ; never run rm -rf / here"'
+# SAFETY FLOOR: the data-sink redaction is disabled outright when a shell (or a
+# shell-spawner) can consume the data, so widening WHICH spans are redactable
+# cannot open a pipe-to-interpreter hole. One case per consumer shape.
+assert_deny "has_live_subst floor: escaped-span echo data piped to sh still denies" \
+    'echo "see \`README\` ; never run rm -rf / here" | sh'
+assert_deny "has_live_subst floor: escaped-span echo data piped to bash still denies" \
+    'echo "see \`README\` ; never run rm -rf / here" | bash'
+assert_deny "has_live_subst floor: escaped-span echo data piped to xargs sh -c still denies" \
+    'echo "see \`README\` ; never run rm -rf / here" | xargs -I{} sh -c "{}"'
+# A REAL command chained after an escaped-span quoted argument is still seen:
+# masking blanks the span, it never swallows what follows it.
+assert_deny "has_live_subst floor: a real destructive command chained after an escaped-span echo still denies" \
+    'echo "see \`README\`" ; rm -rf /'
+assert_deny "has_live_subst floor: bash -c carrying an escaped-span payload still denies" \
+    'bash -c "see \`README\` ; rm -rf /"'
+assert_deny "has_live_subst floor: eval carrying an escaped-span payload still denies" \
+    'eval "see \`README\` ; rm -rf /"'
+
+echo ""
+echo -e "${YELLOW}--- qsplit()/ml_segment(): escaped code span in a quoted alternation ---${NC}"
+
+# The lexers keep a quoted span's separators literal only while the span is
+# inert. An escaped backtick used to force the span ACTIVE, so the `|`
+# alternation inside a read-only grep pattern was split into phantom segments
+# and the bare lifecycle word became a command word — a hard deny on a
+# read-only command. The fast path is pinned OFF so these exercise the lexers
+# rather than the read-only admission that would short-circuit them.
+assert_allow_env "has_live_subst: escaped code span in a grep alternation no longer manufactures a lifecycle segment" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep -E "\`foo\`|lifecycle|halt|poweroff" f.txt'
+assert_deny_env "has_live_subst floor: a LIVE backtick span in the same alternation keeps separators ACTIVE and denies" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep -E "`foo`|lifecycle|halt|poweroff" f.txt'
+assert_deny_env "has_live_subst floor: a smuggled LIVE \$( ) inside the span still denies" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep -E "x|$(a|halt )" f.txt'
+# ml_segment() is the multi-line lexer; the same span carried across a newline
+# must reach the same verdicts (the two lexers share the defect and the fix).
+assert_allow_env "has_live_subst (ml_segment): escaped code span in a MULTI-LINE alternation is allowed" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep -E "\`foo\`|lifecycle|
+halt|poweroff" f.txt'
+assert_deny_env "has_live_subst floor (ml_segment): a LIVE backtick span in the MULTI-LINE alternation still denies" \
+    "REPO_GUARD_READONLY_FASTPATH=0" 'grep -E "`foo`|lifecycle|
+halt|poweroff" f.txt'
+
+echo ""
+echo -e "${YELLOW}--- mask_ask_positional_args(): escaped code span in a positional argument ---${NC}"
+
+HLS_PMASK_REPO=$(make_sql_repo '{"guards":{"positionalMaskAllowlist":["mytool.sh"]}}')
+
+assert_allow "has_live_subst: escaped code span in an allowlisted command's positional arg no longer asks" \
+    'mytool.sh "see \`README\` then please run: gh release delete v1"' "$HLS_PMASK_REPO"
+assert_ask "has_live_subst floor: a LIVE backtick span in the same positional arg still asks" \
+    'mytool.sh "see `README` then please run: gh release delete v1"' "$HLS_PMASK_REPO"
+assert_ask "has_live_subst floor: a real invocation chained after an escaped-span positional arg still asks" \
+    'mytool.sh "see \`README\`" && gh release delete v1' "$HLS_PMASK_REPO"
+assert_ask "has_live_subst: an UNCONFIGURED command's escaped-span positional arg is unaffected (still asks)" \
+    'othertool.sh "see \`README\` then please run: gh release delete v1"' "$HLS_PMASK_REPO"
+
+echo ""
+echo -e "${YELLOW}--- dequote_inert_spans(): deliberately NOT converted ---${NC}"
+
+# dequote_inert_spans() keeps the byte-presence test on purpose: it decides
+# whether to DEQUOTE (a copy scanned IN ADDITION to the raw one), so accepting
+# escaped-only spans there would ADD denies rather than remove a false one.
+# Its behaviour is unchanged by this fix — pinned here so a later "finish the
+# job" edit has to argue with a test rather than with a comment.
+assert_deny "dequote_inert_spans unchanged: quoting a catastrophic argument still denies" \
+    'rm -rf "/"'
+assert_deny "dequote_inert_spans unchanged: quoted force-push refspec still denies" \
+    'git push --force origin "main"'
+
+echo ""
+echo -e "${YELLOW}--- KNOWN LIMIT: an sh -c/eval payload is ONE outer word ---${NC}"
+
+# The segment lexers work at the OUTER shell level. A payload written as
+# `sh -c "<program>"` is a single word there, so a `;` inside it is literal and
+# the rm-scope / force-op parsers (which segment, then classify a command word)
+# never see the inner commands. THAT GAP IS PRE-EXISTING AND UNCHANGED BY THIS
+# FIX — the identical payload with no code span in it is allowed by the pre-fix
+# guard too, and so is its single-quoted spelling. What changed is only that the
+# ESCAPED-code-span spelling used to DENY, not by design but because the escaped
+# backtick forced the span ACTIVE and re-split it; the three spellings now agree.
+#
+# The raw catastrophic floor is independent of segmentation and is unaffected:
+# a root-level recursive delete in the same payload still denies in every
+# spelling. These four cases pin exactly that boundary.
+assert_allow "KNOWN LIMIT: sh -c with a quoted payload is one outer word, so an inner rm target is not segmented" \
+    'sh -c "note README ; rm -rf /etc"'
+assert_allow "KNOWN LIMIT: the escaped-code-span spelling of that payload now agrees with the plain one" \
+    'sh -c "note \`README\` ; rm -rf /etc"'
+assert_deny "KNOWN LIMIT floor: the raw catastrophic pattern still denies inside the same sh -c payload" \
+    'sh -c "note README ; rm -rf /"'
+assert_deny "KNOWN LIMIT floor: ...and in its escaped-code-span spelling too" \
+    'sh -c "note \`README\` ; rm -rf /"'
 
 # =========================================================================
 echo -e "${YELLOW}--- Query-command data sinks: jq/grep/sed/awk (repo#311) ---${NC}"
