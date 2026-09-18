@@ -98,10 +98,7 @@ for the work it is coordinating. Three properties decide it:
 - **Proven in this repo.** The same marker-comment idiom already carries lease
   records (`<!-- loom:lease host=… sweep=… -->`), peer-claim standdowns
   (`<!-- loom:standdown claim=… -->`), and Champion's merge-risk hold digest
-  (an issue body overwritten in place behind a
-  `<!-- champion:merge-risk-hold-digest -->` marker, #6877 — the digest is also
-  pinned, but the pin is a discoverability affordance, not part of this
-  idiom). Phase 2 of Epic #6165 made a
+  (a pinned issue overwritten in place, #6877). Phase 2 of Epic #6165 made a
   forge comment's `updated_at` a **load-bearing** liveness signal for claim
   reclamation; this reuses the mechanism that is already trusted with that
   decision.
