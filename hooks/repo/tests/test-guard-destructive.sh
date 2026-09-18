@@ -4724,6 +4724,49 @@ assert_deny_env "#311 exclusion: rg --pre still denies with the fast path OFF" \
     "REPO_GUARD_READONLY_FASTPATH=0" \
     "rg --pre '$_QS_DANGER' ."
 
+# --- repo#434: an EARLIER masking pass must not be able to hide a veto token ---
+#
+# The vetoes above are text checks: they can only refuse what they can still
+# SEE. The catastrophic working copy is built by two redaction passes, and
+# strip_literal_text() — which blanks the quoted value of --message/--body/
+# --notes/--title/--comment/-m to same-length `X` runs — is a GLOBAL textual
+# regex with no notion of which simple command a flag belongs to. So a veto
+# token parked inside such a quoted span, in the SAME simple command as the
+# sink word, used to be masked away before query_sink_ok() ever looked: the
+# veto never fired, the command was admitted as an inert query sink, and its
+# real program text (the payload) was redacted out of the catastrophic scan.
+# Every row below ALLOWED before repo#434 reordered the two passes so the
+# data-sink pass reads the RAW command.
+#
+# The pairing is what makes each row adversarial rather than arbitrary: the
+# masked span carries the veto token, and the SECOND quoted span carries the
+# danger phrase that only stays visible if the veto fires.
+
+assert_deny "#434: sed -i hidden inside a --title value still vetoes the sink" \
+    "sed -n --title \"pass -i to edit in place\" 's|$_QS_DANGER|X|p' f.txt"
+
+assert_deny "#434: sed -i hidden inside a -m value still vetoes the sink" \
+    "sed -n -m \"note: -i edits the file in place\" 's|$_QS_DANGER|X|p' f.txt"
+
+assert_deny "#434: awk system( hidden inside a --body value still vetoes the sink" \
+    "awk --body 'use system( ) to shell out here' '\$0 ~ \"$_QS_DANGER\" {print}' f.txt"
+
+assert_deny "#434: rg --pre hidden inside a -m value still vetoes the sink" \
+    "rg -m \"use --pre for preprocessing\" '$_QS_DANGER' . | head -3"
+
+# …and the fix must NARROW, not blanket-deny: the same shape with no veto token
+# in the masked span is a genuinely inert query and is still allowed.
+assert_allow "#434: an inert sed whose --title value hides no veto token still allows" \
+    "sed -n --title \"harmless note here ok\" 's|$_QS_DANGER|X|p' f.txt"
+
+# Both passes still compose the other way round, too: the flag-value redaction
+# (#3679) and the sink redaction (repo#311) each still apply after the reorder.
+assert_allow "#434: a --body value quoting the danger is still redacted (#3679 intact)" \
+    "gh issue comment 1 --body \"never run $_QS_DANGER by hand\""
+
+assert_allow "#434: a non-vetoed sink still redacts a masked flag value's span" \
+    "grep -n --title \"mentions $_QS_DANGER inline\" 'pattern' f.txt | wc -l"
+
 # --- SAFETY FLOOR: the query sinks must never widen a deny into an allow ---
 
 assert_deny "#311 safety: a bare catastrophic delete still denies" \

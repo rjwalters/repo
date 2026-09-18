@@ -184,3 +184,15 @@ awk 'BEGIN{"rm -rf /" | getline x; print x}'
 rg --pre 'rm -rf /' . | head -3
 jq "$(printf 'rm -rf /')" f.json
 grep 'rm -rf /' f.txt | sh
+
+# ── a masked flag value must not hide a veto token (repo#434) ─────────────
+# strip_literal_text() blanks the quoted value of --title/--body/-m anywhere in
+# the command string, with no notion of which simple command the flag belongs
+# to. Parking a veto token inside such a span used to hide it from the
+# query-sink veto, admitting the command as a sink and redacting its real
+# payload out of the catastrophic scan. The data-sink pass now reads the RAW
+# command, so the veto fires and the payload stays visible. Measured: the first
+# two match the vendored copy exactly; the rg row is stricter and declared.
+sed -n --title "pass -i to edit in place" 's|rm -rf /|X|p' f.txt
+awk --body 'use system( ) to shell out here' '$0 ~ "rm -rf /" {print}' f.txt
+rg -m "use --pre for preprocessing" 'rm -rf /' . | head -3
