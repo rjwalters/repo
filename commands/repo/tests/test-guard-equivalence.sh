@@ -87,6 +87,7 @@ declare -a DECLARED_DIVERGENCES=(
     "git push -f origin 'main'|repo#197: -f short-flag, single-quoted branch. Same fix and rationale as the --force row above."
     "rg --pre 'rm -rf /' . | head -3|repo#311: ripgrep's --pre names an external preprocessor program that rg EXECUTES, so an rg carrying it is vetoed out of query-sink treatment and its pattern stays visible to the catastrophic scan. The vendored copy has no query sinks at all and allows this shape outright."
     "grep 'rm -rf /' f.txt | sh|repo#311: the pattern is piped into a shell that WOULD execute it, so command_has_shell_segment() skips the redaction entirely and canonical denies. The vendored copy allows it; this is the safety floor that makes the query sinks safe, and it is measurably stricter here."
+    "rg -m \"use --pre for preprocessing\" 'rm -rf /' . | head -3|repo#434: the --pre veto token sits inside a -m value that strip_literal_text() blanks, so the veto only fires because the data-sink pass now reads the RAW command. Canonical denies; the vendored copy has no query sinks at all and allows every rg shape outright (same posture as the plain rg --pre row above). The sed and awk rows of this trio match the vendored copy exactly and need no entry."
 )
 
 # ---------------------------------------------------------------------------

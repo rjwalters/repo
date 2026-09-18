@@ -2227,6 +2227,19 @@ strip_literal_text() {
 #
 # $1 = command string. $2 = non-empty to enable the query sinks (absent/empty
 # keeps the historical echo/printf-only behaviour).
+#
+# CONTRACT (repo#434): when $2 enables the query sinks, $1 MUST be the RAW
+# command, not a copy another masking pass has already redacted. The vetoes
+# below are text checks — they can only refuse what they can still SEE — so a
+# copy in which strip_literal_text() has already blanked a `--title "… -i …"`
+# value hides the very `-i` the sed veto exists to catch, and admits as an inert
+# query sink a command the veto was meant to refuse. strip_literal_text()'s
+# quoted-value redaction is a global textual regex with no notion of which
+# simple command a flag belongs to, so the hidden token need only share a simple
+# command with the sink word. The call site therefore runs THIS function first
+# and strip_literal_text() second; ordering them that way is safe in both
+# directions because neither pass can create text the other keys on (see the
+# PASS 2 comment at the call site for the full argument).
 strip_datasink_literals() {
     printf '%s' "$1" | awk -v qsinks="${2:-}" '
     # Raw text of the simple command starting at `start`, up to the first
@@ -2251,6 +2264,10 @@ strip_datasink_literals() {
                 tok == "awk" || tok == "gawk" || tok == "mawk")
     }
     # Per-command veto over the RAW simple command. Returns 1 to admit.
+    #
+    # "RAW" is a contract on the CALLER (repo#434): `seg` comes from qseg() over
+    # $1, so these checks are only as honest as $1 is unredacted. See the
+    # CONTRACT paragraph in the shell header comment above this function.
     function query_sink_ok(tok, seg) {
         if (tok == "sed") {
             # In-place edit: --in-place, or any short-flag cluster carrying i
@@ -2698,22 +2715,12 @@ ALWAYS_BLOCK_PATTERNS=(
     # (#3584).
 )
 
-# Build a literal-text-redacted working copy ONLY for the catastrophic scan
-# below, so a force-push-to-main phrase quoted inside a
-# --body/-m/--title/--notes/--comment value no longer false-positives (#3679,
-# --comment added #3756). The awk only runs when one of those flags is actually
-# present, keeping it off the hot path (mirrors the COMMAND_NO_COMMENT
-# `#`-present guard). `-c` is intentionally excluded so `bash -c '<payload>'`
-# payloads still reach the raw scan; spans carrying `$(` / backtick are left
-# intact so command-substitution smuggling still hard-denies.
+# Build a redacted working copy ONLY for the catastrophic scan below. TWO
+# passes feed it, and their ORDER is load-bearing (repo#434) — see the block
+# comment on the second one for why the data-sink pass must run FIRST.
 COMMAND_NO_LITERAL_TEXT="$COMMAND"
-if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
-      "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
-      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
-    COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
-fi
-# ALSO redact the quoted args of a data-sink command word (echo/printf), so a
-# dangerous string handed to echo/printf as inert DATA no longer trips the raw
+# PASS 1 — redact the quoted args of a data-sink command word (echo/printf), so
+# a dangerous string handed to echo/printf as inert DATA no longer trips the raw
 # scan (#53) — the meta false-positive that blocked guard self-tests and filing
 # this issue's heredoc body. Gated on echo/printf being present (off the hot
 # path otherwise) AND on NO shell segment existing: when data is piped into a
@@ -2734,11 +2741,43 @@ fi
 # confinement — see the consumer audit table at _POSITIONAL_MASK_NEVER above).
 # Same gate, same floor: a shell segment anywhere, or `$(`/backtick inside the
 # span, and nothing is redacted.
+#
+# ORDER (repo#434): this pass reads $COMMAND — the RAW command — and must keep
+# doing so. Its query-sink vetoes (`sed -i`, `awk system(…)`, `rg --pre`, …) are
+# text checks over the simple command they are classifying, so running
+# strip_literal_text() first handed them a copy in which the veto token itself
+# could already have been blanked: `sed -n --title "pass -i to edit" 's|<danger>|X|p'`
+# had its `-i` masked to `X`s by the --title redaction, the `-i` veto therefore
+# never fired, the sed was admitted as a query sink, and its program text — the
+# real payload — was redacted out of the catastrophic scan. See
+# strip_datasink_literals()'s "$1 MUST be the raw command" contract.
 if [[ "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* || \
       "$COMMAND" == *"jq"* || "$COMMAND" == *"grep"* || "$COMMAND" == *"rg"* || \
       "$COMMAND" == *"sed"* || "$COMMAND" == *"awk"* ]] && \
    [[ "$(command_has_shell_segment "$COMMAND")" == "no" ]]; then
-    COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND_NO_LITERAL_TEXT" query)
+    COMMAND_NO_LITERAL_TEXT=$(strip_datasink_literals "$COMMAND" query)
+fi
+# PASS 2 — redact literal text, so a force-push-to-main phrase quoted inside a
+# --body/-m/--title/--notes/--comment value no longer false-positives (#3679,
+# --comment added #3756). The awk only runs when one of those flags is actually
+# present, keeping it off the hot path (mirrors the COMMAND_NO_COMMENT
+# `#`-present guard). `-c` is intentionally excluded so `bash -c '<payload>'`
+# payloads still reach the raw scan; spans carrying `$(` / backtick are left
+# intact so command-substitution smuggling still hard-denies.
+#
+# Running SECOND costs this pass nothing, because neither pass can hide input
+# the other needs: both only ever rewrite the interior of a quoted span, both
+# refuse any span carrying `$(`/backtick, and both replace a character with `X`
+# — which can never synthesize a `-`, a quote, a `(` or a flag name. So pass 1
+# can only ever shrink the set of spans pass 2 masks (never grow it), and the
+# composed output is identical to the old order on every command where pass 1's
+# vetoes were not being fooled. The gate still tests $COMMAND, so a flag name
+# that pass 1 masked away (inside an echo argument) cannot skip this pass
+# either — it just finds nothing left to redact there.
+if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
+      "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
+      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
 fi
 
 # =============================================================================
