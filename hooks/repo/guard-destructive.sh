@@ -1236,16 +1236,167 @@ function trusted_close(s, n, ci, qc,   j) {
 # that did. For input with an UNBALANCED quote count the guarantee is weaker —
 # see the KNOWN LIMIT note on the inert-span branch (#130).
 #
+# SEPARATORS INSIDE A COMMAND SUBSTITUTION (#436)
+# -----------------------------------------------
+# "Keep separators ACTIVE inside a substitution-bearing span" used to mean
+# "split the OUTER stream at every `;`/`&`/`|` byte in the span", including one
+# that sits INSIDE the substitution's own `$( … )`/backtick boundaries. Such a
+# byte is inert to the OUTER shell — it is a pipeline separator of the SUBSHELL,
+# never a top-level one — so splitting there tore the enclosing token in half.
+# The reported harm: a quoted redirect target
+# `> "/tmp/out-$(echo $F|tr -d x).json"` reached extract_write_targets() as the
+# fragment `"/tmp/out-$(echo $F`, which no longer looks absolute, so the main
+# checkout was prepended and an ordinary /tmp scratch write hard-denied with the
+# `worktree-write-confinement` (worktree-isolation-bypass) tag.
+#
+# qsplit() now models both facts at once instead of trading one for the other:
+#   1. subst_depth() precomputes, for every byte, how many `$( … )`/backtick
+#      substitutions enclose it (plain `( … )` nests only INSIDE one, so a
+#      genuine top-level subshell keeps its separators live). A separator only
+#      splits the outer stream when that depth is 0, so the enclosing token —
+#      a redirect target, an rm target, a `cd` argument — stays intact.
+#   2. subst_inner() re-emits the commands those inner separators really do
+#      start as their OWN segments, appended after the outer stream. That is
+#      exactly the set of post-separator segments the legacy inline split
+#      produced (minus the text that trailed the substitution's close, which
+#      belongs to the outer segment), so a smuggled `"$(cat f|sh -c …)"` still
+#      exposes `sh` to command_has_shell_segment() and a `"$(x|tee <in-repo>)"`
+#      still exposes the write target — the #3679/#3755 safety floor is kept,
+#      not relaxed. Text BEFORE a substitution's first inner separator is not
+#      re-emitted, matching the legacy behaviour exactly (it stayed part of the
+#      enclosing segment there too), so this adds no segment the old lexer did
+#      not already produce.
+# Unbalanced input stays fail-closed by the same mechanism: an UNCLOSED `$(`
+# leaves every later byte at depth > 0, but each separator after it still starts
+# an inner segment, so a trailing `; <destructive command>` is still segmented
+# and still denied.
+# This is deliberately scoped to qsplit() (command_has_shell_segment(),
+# resolve_stash_cwd(), extract_write_targets()) — ml_segment() below keeps the
+# legacy inline split; its consumers are the three command-word parsers, where
+# the split costs no token integrity this change needs to restore.
+#
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK='
-function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
+# subst_depth(s, d) — fill d[i] with the number of `$( … )`/backtick command
+# substitutions enclosing byte i of s (#436).
+#
+# The opening `$(` / opening backtick bytes carry the INNER depth and the
+# closing `)` / closing backtick byte carries the OUTER depth, so a byte is
+# "inside a substitution" exactly when d[i] > 0 — boundary bytes included on the
+# side they belong to, which is what makes the inner-segment capture in
+# subst_inner() terminate on the close.
+#
+# A plain `(` only nests when a substitution is already open: a genuine TOP-LEVEL
+# subshell `( a ; b )` runs its own commands in the calling shell-s pipeline, so
+# its separators must stay live. `$((` arithmetic therefore reads as `$(` plus a
+# plain `(`, which nests and unnests symmetrically. A `)` never closes a backtick
+# span. Escaped openers/closers (`\$(`, `` \` ``) are literal text, matching the
+# escape convention the rest of this lexer uses (#113).
+#
+# Deliberately quote-BLIND, exactly like the `index(inner, "$(")` probe the
+# active-span branch already uses: a `$( … )` inside single quotes is not
+# expanded by the real shell, but both are treated as a substitution here so the
+# conservative direction (separators inside stay capturable as inner segments) is
+# the one taken.
+function subst_depth(s, d,   n, i, c, dep, kind, BQ) {
+    BQ = sprintf("%c", 96)   # backtick
+    n = length(s)
+    split("", d)
+    split("", kind)
+    dep = 0
+    i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (!bs_escaped(s, i)) {
+            if (c == "$" && i < n && substr(s, i + 1, 1) == "(") {
+                dep++
+                kind[dep] = "P"
+                d[i] = dep
+                d[i + 1] = dep
+                i += 2
+                continue
+            }
+            if (c == BQ) {
+                if (dep > 0 && kind[dep] == "B") { dep--; d[i] = dep }
+                else { dep++; kind[dep] = "B"; d[i] = dep }
+                i++
+                continue
+            }
+            if (c == "(" && dep > 0) {
+                dep++
+                kind[dep] = "p"
+                d[i] = dep
+                i++
+                continue
+            }
+            if (c == ")" && dep > 0 && kind[dep] != "B") {
+                dep--
+                d[i] = dep
+                i++
+                continue
+            }
+        }
+        d[i] = dep
+        i++
+    }
+}
+# subst_inner(s, d) — the inner commands that separators INSIDE a substitution
+# really do start, as "\n"-prefixed segments to append after the outer stream
+# (#436). d[] comes from subst_depth().
+#
+# One segment per separator at depth > 0, running from just after that separator
+# to whichever comes first: the next separator at or below its depth, or the
+# close of the substitution that contains it. Text before a substitution-s FIRST
+# inner separator is NOT emitted — it stayed part of the enclosing segment under
+# the legacy inline split too, so this function only ever reproduces boundaries
+# the old lexer already produced.
+function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
+    n = length(s)
+    res = ""
+    seg = ""
+    cap = 0
+    capd = 0
+    split("", act)           # act[k] — a capture is open at depth k
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        # Leaving the depth the current capture belongs to ENDS it. Unwind to the
+        # nearest still-open enclosing capture, if any, so an inner substitution
+        # with its own separators does not silently swallow the rest of the outer
+        # one.
+        if (cap && d[i] < capd) {
+            res = res "\n" seg
+            seg = ""
+            while (capd > d[i]) { act[capd] = 0; capd-- }
+            cap = (capd > 0 && act[capd]) ? 1 : 0
+            # This byte is the substitution-s own closing `)`/backtick — a
+            # boundary, never the first byte of the enclosing capture resumed
+            # above.
+            continue
+        }
+        if (d[i] > 0 && (c == ";" || c == "&" || c == "|") && !bs_escaped(s, i)) {
+            if (cap) { res = res "\n" seg }
+            seg = ""
+            cap = 1
+            capd = d[i]
+            act[capd] = 1
+            # `&&` / `||` are one separator, not two.
+            if ((c == "&" || c == "|") && i < n && substr(s, i + 1, 1) == c) i++
+            continue
+        }
+        if (cap) seg = seg c
+    }
+    if (cap) res = res "\n" seg
+    return res
+}
+function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
     n = length(s)
     split("", acs)           # stack of pending active-span CLOSING quote indexes
     acn = 0
+    subst_depth(s, sdep)     # byte -> enclosing `$( … )`/backtick depth (#436)
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
@@ -1296,7 +1447,10 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
                 continue
             }
             # Span carries command substitution: keep separators ACTIVE (copy the
-            # opening quote and keep walking char-by-char so a `|` inside splits).
+            # opening quote and keep walking char-by-char so a `|` at the span-s
+            # OWN level still splits; one nested inside the substitution-s
+            # parens/backticks does not — see the #436 note in this block-s
+            # header, and subst_inner() for where those inner commands resurface).
             # REMEMBER where the span really ENDS (#113) so the char-walk does not
             # re-read that quote as a NEW opener — which used to swallow
             # everything after the span. `trusted_close()` resolves the real close
@@ -1307,6 +1461,16 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
             out = out c
             tc = trusted_close(s, n, ci, qc)
             if (tc > 0) acs[++acn] = tc
+            i++
+            continue
+        }
+        # A separator INSIDE a `$( … )`/backtick substitution is inert to the
+        # OUTER shell (#436): copy it literally so the enclosing token — e.g. a
+        # quoted redirect target `"/tmp/out-$(echo $F|tr -d x).json"` — is not
+        # torn in half. The command it really does start is re-emitted as its own
+        # segment by subst_inner() below, so nothing stops being segmented.
+        if ((c == ";" || c == "&" || c == "|") && sdep[i] > 0) {
+            out = out c
             i++
             continue
         }
@@ -1322,7 +1486,7 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn) {
         out = out c
         i++
     }
-    return out
+    return out subst_inner(s, sdep)
 }
 '
 

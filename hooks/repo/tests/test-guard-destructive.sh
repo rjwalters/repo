@@ -4316,6 +4316,105 @@ done
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #436: a separator INSIDE \$( ) is not a top-level split ---${NC}"
+# =========================================================================
+#
+# qsplit() treats a quoted span that carries a command substitution as
+# separator-ACTIVE (the #3679/#3755 safety floor). It used to apply that rule to
+# EVERY `;`/`&`/`|` byte in the span, including one sitting inside the
+# substitution's own `$( … )`/backtick boundaries — a byte that is a pipeline
+# separator of the SUBSHELL and is inert to the outer shell. Splitting there tore
+# the enclosing token in half, so the ordinary idiom
+#   echo hi > "/tmp/out-$(echo $F|tr -d x).json"
+# reached extract_write_targets() as the fragment `"/tmp/out-$(echo $F`, which no
+# longer looks absolute; the main checkout was prepended and a /tmp scratch write
+# hard-denied as a worktree-isolation bypass.
+#
+# The fix splits the outer stream only at substitution DEPTH 0 and re-emits the
+# commands the inner separators really do start as their own segments
+# (subst_inner()), so the safety floor is kept rather than traded away. Both
+# halves are pinned below: the allows are the reported false positive, and the
+# denies are the smuggling shapes that must survive the change — several of which
+# the old truncating split silently ALLOWED (a write into the main checkout whose
+# target token was truncated stopped looking absolute and was re-rooted at the
+# acting worktree, i.e. the very bypass this block exists to catch).
+read -r WTC436_MAIN WTC436_WT <<< "$(make_wt_confinement_repo)"
+
+# Danger phrase assembled at runtime so this file never contains the literal
+# string a naive scan of the harness's own Bash call would flag (mirrors #113).
+_Q436_DANGER="rm -r""f /"
+
+# ---- (a) The reported false positive: the write lands in /tmp, never the repo.
+assert_allow "#436: quoted /tmp redirect target whose \$( ) body pipes is allowed" \
+    'F=x; echo hi > "/tmp/out-$(echo $F|tr -d x).json"' "$WTC436_MAIN"
+assert_allow "#436: same target with a ; inside the substitution is allowed" \
+    'echo hi > "/tmp/out-$(cd /tmp; echo z).json"' "$WTC436_MAIN"
+assert_allow "#436: same target with an && inside the substitution is allowed" \
+    'echo hi > "/tmp/out-$(echo a && echo b).json"' "$WTC436_MAIN"
+assert_allow "#436: backtick substitution body that pipes is allowed" \
+    'echo hi > "/tmp/out-`echo x|tr -d x`.json"' "$WTC436_MAIN"
+assert_allow "#436: tee target whose \$( ) body pipes is allowed" \
+    'echo hi | tee "/tmp/out-$(echo x|tr -d x).json"' "$WTC436_MAIN"
+assert_allow "#436: the same write issued from the worktree cwd is allowed" \
+    'echo hi > "/tmp/out-$(echo x|tr -d x).json"' "$WTC436_WT"
+assert_allow "#436: a benign \$( ) pipeline with no write idiom at all is allowed" \
+    'echo "$(git log --oneline|head -5)"' "$WTC436_MAIN"
+
+# ---- (b) Keeping the token intact must not free a write INTO the main checkout.
+assert_deny_tag "#436: quoted main-checkout target whose \$( ) body pipes still denies" \
+    "echo hi > \"$WTC436_MAIN/out-\$(echo x|tr -d x).json\"" "$WTC436_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#436: tee into the main checkout with a piping \$( ) still denies" \
+    "echo hi | tee \"$WTC436_MAIN/out-\$(echo x|tr -d x).json\"" "$WTC436_WT" \
+    "worktree-write-confinement"
+
+# ---- (c) A write idiom smuggled AFTER a separator INSIDE the substitution really
+# ---- runs in the subshell, so subst_inner() must still expose it as a segment.
+assert_deny_tag "#436: tee into main after a | INSIDE the substitution still denies" \
+    "echo \"\$(id|tee $WTC436_MAIN/evil.sh)\"" "$WTC436_WT" "worktree-write-confinement"
+assert_deny_tag "#436: redirect into main after a ; INSIDE the substitution still denies" \
+    "echo \"\$(id; echo x > $WTC436_MAIN/evil.sh)\"" "$WTC436_WT" "worktree-write-confinement"
+assert_deny_tag "#436: cp into main after an && INSIDE the substitution still denies" \
+    "echo \"\$(id && cp /tmp/s.txt $WTC436_MAIN/evil.sh)\"" "$WTC436_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#436: tee into main after a | inside a BACKTICK span still denies" \
+    "echo \"\`id|tee $WTC436_MAIN/evil.sh\`\"" "$WTC436_WT" "worktree-write-confinement"
+assert_deny_tag "#436: nested \$( ) spans do not hide a tee into main" \
+    "echo \"\$(a \$(b|c)|tee $WTC436_MAIN/evil.sh)\"" "$WTC436_WT" \
+    "worktree-write-confinement"
+
+# ---- (d) Separators that are genuinely top-level still split, exactly as before:
+# ---- outside the quotes entirely, and smuggled at the quoted span's OWN level
+# ---- (outside any `$( )`/backtick nesting) — the #3679/#3755/#113 floor.
+assert_deny_tag "#436: a real ; AFTER the span still splits (write into main denies)" \
+    "echo \"\$(id)\" ; echo x > $WTC436_MAIN/evil.sh" "$WTC436_WT" \
+    "worktree-write-confinement"
+assert_deny "#436: a | at the quoted span's own level still exposes a shell sink" \
+    "echo '$_Q436_DANGER' \"\$(id)|sh -c x\""
+assert_deny "#436: a ; at the quoted span's own level still exposes a shell sink" \
+    "echo '$_Q436_DANGER' \"\$(id);sh -c x\""
+# …and a shell sink INSIDE the substitution is exposed by subst_inner() instead,
+# so command_has_shell_segment() still gates the data-sink redaction either way.
+assert_deny "#436: a shell sink after a | INSIDE the substitution still gates redaction" \
+    "echo '$_Q436_DANGER' \"\$(id|sh -c x)\""
+
+# ---- (e) Unbalanced input stays fail-closed: an UNCLOSED `$(` leaves every later
+# ---- byte at depth > 0, but each separator after it still starts an inner
+# ---- segment, so the trailing command is still segmented and still denied.
+assert_deny_tag "#436: unterminated \$( then a ;-separated write into main denies" \
+    "echo \"\$(a\" ; echo x > $WTC436_MAIN/evil.sh" "$WTC436_WT" \
+    "worktree-write-confinement"
+assert_deny "#436: unterminated \$( then a ;-separated catastrophic delete denies" \
+    "echo \"\$(a\" ; $_Q436_DANGER"
+
+git -C "$WTC436_MAIN" worktree remove --force "$WTC436_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC436_MAIN" && "$WTC436_MAIN" != "/" && -d "$WTC436_MAIN" ]]; then
+    rm -rf "$WTC436_MAIN"
+fi
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
