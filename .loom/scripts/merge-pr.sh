@@ -22,14 +22,7 @@
 #                          repo with GitHub auto-merge disabled
 #                          (allow_auto_merge:false) this degrades gracefully to
 #                          wait-for-checks-then-merge (immediate if CLEAN)
-#                          instead of failing (#3820). It degrades the same way
-#                          when the parent branch still has open stacked child
-#                          PRs (#8048): the server-side queue would return here
-#                          before the merge lands, and the post-merge
-#                          _auto_reconcile_stacked_children pass would never run
-#                          for those children. Both degradations are bounded by
-#                          LOOM_AUTO_MERGE_TIMEOUT and exit non-zero on timeout
-#                          or a failed required check.
+#                          instead of failing (#3820).
 #   --allow-stacked-children
 #                          Bypass the pre-merge merge-ordering guard's hard-block
 #                          path. That guard's DEFAULT behavior, when the parent
@@ -183,11 +176,11 @@ Options:
                          the matching local branch via 'git branch -d'
                          (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
-  --auto                 Enable auto-merge instead of immediate merge. Degrades
-                         to a bounded wait-for-checks-then-merge (immediate if
-                         already CLEAN) when the repo has auto-merge disabled
-                         (#3820), or when this branch has open stacked child
-                         PRs to reconcile once the parent lands (#8048).
+  --auto                 Enable auto-merge instead of immediate merge. When the
+                         repository has GitHub auto-merge disabled
+                         (allow_auto_merge:false), this is detected up front and
+                         degrades gracefully to wait-for-checks-then-merge
+                         (immediate if already CLEAN) rather than failing (#3820).
   --allow-stacked-children
                          Bypass the pre-merge merge-ordering guard's remaining
                          hard-block path. By default (#7982) the guard pins
@@ -583,17 +576,6 @@ _check_no_open_stacked_children() {
   count="$(echo "$children_json" | jq 'length' 2>/dev/null || echo 0)"
   [[ "$count" -gt 0 ]] || return 0
 
-  # Captured for the POST-merge reconcile pass (#8010 item 2) —
-  # _auto_reconcile_stacked_children below prefers this pre-merge snapshot
-  # over a fresh post-merge query: GitHub retargets an open child PR the
-  # instant delete_branch_on_merge removes this parent branch, so a query run
-  # AFTER the merge can return zero rows even though children existed seconds
-  # earlier. A plain (non-local) assignment so it survives this function
-  # returning — read via `${STACKED_CHILDREN_JSON:-}` everywhere else so a
-  # standalone invocation of either function (e.g. from a test) without this
-  # guard having run first still behaves exactly as before.
-  STACKED_CHILDREN_JSON="$children_json"
-
   # Comma-separated "#N" list for the operator-facing message.
   child_list="$(echo "$children_json" \
     | jq -r '[.[].number | "#" + tostring] | join(", ")' 2>/dev/null || echo '')"
@@ -624,13 +606,7 @@ _check_no_open_stacked_children() {
   # verify the object locally, fetch the branch once if it is absent, and
   # re-verify. All three failing means a detached/unreadable parent.
   if { git -C "$REPO_ROOT" cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null || git -C "$REPO_ROOT" fetch --quiet origin "$PR_BRANCH" 2>/dev/null; } && git -C "$REPO_ROOT" cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null && git -C "$REPO_ROOT" update-ref "$pin" "$PR_HEAD_SHA" 2>/dev/null; then
-    # Non-local global, mirroring STACKED_CHILDREN_JSON above: unlike that
-    # var (set as soon as an open child is FOUND), this one is set only once
-    # a pin is actually WRITTEN — the item-3 re-pin below must gate on this,
-    # not on STACKED_CHILDREN_JSON, or the --allow-stacked-children bypass
-    # path (which returns above without ever reaching this line) would still
-    # trip the re-pin and write a ref the guard itself chose not to create.
-    STACKED_CHILDREN_PIN_WRITTEN=true; warning "Merge-ordering guard: PR #$PR_NUMBER's branch '$PR_BRANCH' still has $count open stacked child PR(s) ($child_list) targeting it. Pinned the parent tip to $pin ($PR_HEAD_SHA) so reconcile-stack.sh can still resolve '$PR_BRANCH' after the merge deletes it (#3747 item 2, #7982). Proceeding with the merge — reconcile each child once this has landed:"$'\n'"$cmds"
+    warning "Merge-ordering guard: PR #$PR_NUMBER's branch '$PR_BRANCH' still has $count open stacked child PR(s) ($child_list) targeting it. Pinned the parent tip to $pin ($PR_HEAD_SHA) so reconcile-stack.sh can still resolve '$PR_BRANCH' after the merge deletes it (#3747 item 2, #7982). Proceeding with the merge — reconcile each child once this has landed:"$'\n'"$cmds"
     return 0
   fi
 
@@ -1479,16 +1455,10 @@ _auto_reconcile_stacked_children() {
   # Only a parent PR on a feature/issue-<N> branch can have stacked children.
   [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
 
-  # Prefer the pre-merge snapshot the guard above already captured (#8010
-  # item 2) over a fresh post-merge query: GitHub retargets an open child PR
-  # the instant delete_branch_on_merge removes this parent branch, so a query
-  # run AFTER the merge can return zero rows even though children existed
-  # seconds earlier — the guard's own pre-merge query already paid for this
-  # exact answer. Live forge discovery (uncached `gh`, NEVER the daemon
-  # registry) is only a fallback for when the guard never ran (e.g. this
-  # function invoked standalone, as the unit tests do).
-  local children_json="${STACKED_CHILDREN_JSON:-}"
-  [[ -n "$children_json" ]] || children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
+  # Live forge discovery — NEVER the daemon registry. Plain `gh` (uncached) so we
+  # see child PRs as of the merge, not a cached list snapshot.
+  local children_json
+  children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
     --json number,headRefName 2>/dev/null || echo '[]')"
   [[ -n "$children_json" ]] || return 0
 
@@ -1795,28 +1765,6 @@ _MPS_FRESH_SHA="$(echo "$_MPS_JSON" | jq -r '.head.sha // empty' 2>/dev/null || 
 [[ -n "$_MPS_FRESH_SHA" ]] && MERGE_PRECONDITION_SHA="$_MPS_FRESH_SHA"
 unset _MPS_JSON _MPS_FRESH_SHA
 
-# Re-pin refs/loom/parent/<branch> to the SHA actually being merged (#8010
-# item 3), when the merge-ordering guard above pinned one. That guard pinned
-# $PR_HEAD_SHA — read once, at the top of the script, from the initial
-# (possibly gh-cached) $PR_JSON — but the merge itself uses the
-# $MERGE_PRECONDITION_SHA just refreshed above, live, ~1100 lines and one
-# CI-wait later. If the parent branch was pushed in between, the two SHAs
-# differ and the pin would otherwise still point at a tip that is NOT what
-# gets merged. Re-pointing it here keeps reconcile-stack.sh's fallback
-# rebasing from the tip that was ACTUALLY merged. Best-effort and silent: a
-# failure here leaves the existing (already-correct-when-written) pin in
-# place, and reconcile-stack.sh's #8010-item-4 ancestry check refuses any pin
-# that is not an ancestor of the child rather than silently replaying the
-# wrong commit range. Gated on `$DRY_RUN != true` — this runs unconditionally
-# ahead of both merge paths' own dry-run checks below, and the guard's pin
-# path honors the "dry-run never mutates local refs" contract, so this must
-# too. Gated on STACKED_CHILDREN_PIN_WRITTEN, NOT STACKED_CHILDREN_JSON: the
-# latter is set as soon as the guard FINDS an open child, even on the
-# --allow-stacked-children bypass path that returns without ever writing a
-# pin — gating on it would silently create a pin the guard itself declined
-# to create.
-[[ "$DRY_RUN" != "true" && "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" && "$MERGE_PRECONDITION_SHA" != "$PR_HEAD_SHA" ]] && { git -C "$REPO_ROOT" update-ref "refs/loom/parent/$PR_BRANCH" "$MERGE_PRECONDITION_SHA" 2>/dev/null || true; }
-
 if [[ "$AUTO_MERGE" == "true" ]]; then
   # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
   # (#3664). Reuses the same env-var names/semantics as the shell Gitea
@@ -1856,36 +1804,8 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
   # wait function either returns 0 (proceed) or error()s out terminally. Setting
   # AUTO_MERGE_OK=true lets the post-loop "after N attempts" guard pass; the loop
   # itself is short-circuited by the AUTO_MERGE guard on its first iteration.
-  #
-  # #8048 adds the SECOND trigger for that same degradation: the merge-ordering
-  # guard above found open stacked child PRs and pinned this parent's tip
-  # (STACKED_CHILDREN_PIN_WRITTEN). Server-side auto-merge only ever QUEUES the
-  # merge here, so the script used to exit 0 at the "Auto-merge queued" branch
-  # below — and _auto_reconcile_stacked_children lives AFTER that exit, so it
-  # never ran for this invocation. GitHub completed the merge minutes later,
-  # delete_branch_on_merge dropped the parent branch, and nothing ever
-  # reconciled the children; the refs/loom/parent/<branch> pin (#7982/#7998)
-  # just sat there unread until an operator ran reconcile-stack.sh by hand.
-  # Reusing this already-bounded wait-then-merge path fixes that at the root
-  # rather than bolting a second poll loop onto the queued path: the merge
-  # becomes synchronous in THIS process, so the shared post-merge cleanup block
-  # — and with it the reconcile pass — is actually reached, while the parent
-  # branch still exists (so reconcile-stack.sh resolves it directly, not only
-  # via the pin fallback). A failing required check or the
-  # LOOM_AUTO_MERGE_TIMEOUT ceiling makes _wait_for_checks_then_sync_merge
-  # error() out non-zero, which is #8048's "loud, non-zero-exit signal that the
-  # children were NOT reconciled" alternative — and it fires BEFORE the merge,
-  # so the queued-then-cancelled case (checks fail after queueing) can no
-  # longer strand children behind an already-merged parent.
-  # The cost is confined to stacked parents: with no open children the guard
-  # never writes a pin, this stays unset, and --auto keeps its zero-added-
-  # polling fast path byte-for-byte. The --allow-stacked-children bypass also
-  # leaves it unset (the guard returns before pinning), so an operator who has
-  # already reconciled by hand keeps the fast queued path too. Written as two
-  # separate [[ ]] tests rather than one `||`-joined condition so the #3820
-  # clause survives verbatim as its own testable predicate.
-  if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]] || [[ "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" ]]; then
-    info "PR #$PR_NUMBER: --auto degraded to wait-for-checks-then-merge (immediate if already CLEAN) — repo 'Allow auto-merge' allowed=$REPO_AUTO_MERGE_ALLOWED, open stacked children pinned=${STACKED_CHILDREN_PIN_WRITTEN:-false}"
+  if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]]; then
+    info "PR #$PR_NUMBER: repository 'Allow auto-merge' is disabled; --auto will wait for checks then merge synchronously (immediate if already CLEAN)"
     _wait_for_checks_then_sync_merge
     AUTO_MERGE=false
     AUTO_MERGE_OK=true
@@ -2359,17 +2279,9 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # handle the stale worktree later.
     POST_AUTO_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
     POST_AUTO_MERGED=$(echo "$POST_AUTO_JSON" | jq -r '.merged // false')
-    # #8048 backstop. This branch is now UNREACHABLE for a parent with open
-    # stacked children — the degrade above converts --auto to a synchronous
-    # merge before the enable mutation is even attempted — but the gap it
-    # closes was invisible precisely because this path exits 0 silently. So
-    # assert the invariant here too: if a future refactor ever routes a pinned
-    # stacked parent back through the queued exit, it fails loudly and
-    # non-zero instead of silently orphaning the children (the two-line info
-    # below is merged into one to keep this file at its size-ratchet ceiling).
     if [[ "$POST_AUTO_MERGED" != "true" ]]; then
-      [[ "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" ]] && error "Auto-merge for PR #$PR_NUMBER is queued but NOT merged, and its branch '$PR_BRANCH' still has open stacked child PR(s). The post-merge reconcile pass cannot run from this path, so those children were NOT reconciled by this invocation — once GitHub completes the merge, run ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH for each of them (#8048)."
-      info "Auto-merge queued (server-side merge pending checks); skipping local cleanup — run loom-clean later to remove the worktree once GitHub completes the merge"
+      info "Auto-merge queued (server-side merge pending checks); skipping local cleanup"
+      info "Run loom-clean later to remove the worktree once GitHub completes the merge"
       exit 0
     fi
     info "PR #$PR_NUMBER already merged server-side; running cleanup"
