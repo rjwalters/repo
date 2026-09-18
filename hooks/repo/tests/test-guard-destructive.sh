@@ -4600,6 +4600,187 @@ assert_allow "stash (#204): '-C' + '--git-dir=' at a worktree from a spaced main
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Query-command data sinks: jq/grep/sed/awk (repo#311) ---${NC}"
+# =========================================================================
+#
+# repo#311 extends strip_datasink_literals()'s sink allowlist from echo/printf
+# to the non-executing QUERY commands: jq, grep/egrep/fgrep/rg, an inert sed,
+# and awk program text. These commands MATCH AGAINST or PRINT their pattern
+# argument; they never execute it, so a `jq` query over this repo's own
+# guard-decision log — or a `grep` for the literal text of a catastrophic
+# pattern — was denied purely for quoting the text it was searching for.
+#
+# The redaction is enabled ONLY for the catastrophic working copy
+# (COMMAND_NO_LITERAL_TEXT). The ASK-tier copy deliberately keeps the
+# echo/printf-only behaviour, because it also feeds two DENY-tier consumers
+# whose subject IS a grep/sed command word (the SQL DDL scan and
+# extract_write_targets()'s write confinement) — pinned at the end of this
+# section.
+#
+# A command word is admitted as a sink only if the RAW remainder of its simple
+# command survives a per-command veto: `sed -i`/`--in-place`, a sed `w`/`W`
+# write or `e` execute command, `awk` `system(…)` / `print | "cmd"` /
+# `"cmd" | getline`, and ripgrep's `--pre`/`--hostname-bin` preprocessor flags
+# all disqualify the whole command, so those shapes still deny exactly as before.
+#
+# NOTE ON THE FAST PATH: `grep`, `rg` and `jq` with no shell metacharacter are
+# already admitted by fastpath_builtin_admits() before any scan runs, so a
+# metacharacter-free grep case would pass even with this fix reverted. Every
+# allow case below therefore either carries a pipe (which declines the fast
+# path) or uses a command word the fast path does not list (egrep/fgrep/sed/
+# awk), and two cases pin the behaviour with the fast path explicitly disabled.
+#
+# Danger phrases assembled at runtime so this file never contains the literal
+# string a naive scan of the harness's own Bash call would flag (mirrors #53).
+_QS_DANGER="rm -r""f /"
+_QS_FORCE="git push --force origin main"
+
+# --- The issue's own repro: a jq query over the guard-decision log ---
+# The jq filter's `|` is inside the quoted program, so qsplit()/
+# command_has_shell_segment() correctly see ONE segment whose command word is
+# jq. (The `|` also makes the fast path decline, so this is the redaction.)
+assert_allow "#311: jq query selecting on a catastrophic pattern tag is allowed" \
+    "jq -r 'select(.pattern == \"catastrophic:$_QS_FORCE\") | .ts' .loom/logs/guard-decisions.log"
+
+assert_allow "#311: jq test() over a command field mentioning the danger is allowed" \
+    "jq -r 'select(.command | test(\"$_QS_DANGER\"))' .loom/logs/guard-decisions.log"
+
+# --- grep family ---
+assert_allow "#311: egrep for the danger as a pattern is allowed" \
+    "egrep '$_QS_DANGER' guard-decisions.log"
+
+assert_allow "#311: fgrep for the force-push phrase is allowed" \
+    "fgrep '$_QS_FORCE' guard-decisions.log"
+
+assert_allow "#311: grep piped into wc (fast path declines) is allowed" \
+    "grep -c '$_QS_DANGER' guard-decisions.log | wc -l"
+
+assert_allow "#311: rg piped into head (fast path declines) is allowed" \
+    "rg '$_QS_FORCE' . | head -3"
+
+# The fast path is not what makes the grep case pass: with it explicitly off,
+# the redaction alone must still allow.
+assert_allow_env "#311: grep for the danger is allowed with the fast path OFF" \
+    "REPO_GUARD_READONLY_FASTPATH=0" \
+    "grep -n '$_QS_DANGER' guard-decisions.log"
+
+# --- inert sed (no -i, no w/W, no e) ---
+assert_allow "#311: sed -n s///p over the danger text is allowed" \
+    "sed -n 's|$_QS_DANGER|X|p' guard-decisions.log"
+
+assert_allow "#311: sed substitution (no -n) over the force-push phrase is allowed" \
+    "sed 's/$_QS_FORCE/X/' guard-decisions.log"
+
+# --- awk program text ---
+assert_allow "#311: awk program matching the force-push phrase is allowed" \
+    "awk '\$0 ~ \"$_QS_FORCE\" {print}' guard-decisions.log"
+
+# A -F field separator is a FLAG, not program text. The veto is whole-command,
+# so there is no argument-position arithmetic that could mistake one for the
+# other — both stay inert and the command is still allowed.
+assert_allow "#311: awk -F separator plus a dangerous-looking program is allowed" \
+    "awk -F ':' '\$0 ~ \"$_QS_DANGER\" {print}' guard-decisions.log"
+
+# --- wrapper forms that are still the same sink ---
+assert_allow "#311: a path-qualified jq is classified on its basename" \
+    "/usr/bin/jq -r 'select(.c | test(\"$_QS_DANGER\"))' log.jsonl"
+
+assert_allow "#311: sudo grep is still the same data sink" \
+    "sudo grep -n '$_QS_DANGER' guard-decisions.log | wc -l"
+
+# --- EXCLUSIONS: sub-forms that ACT are vetoed out of sink treatment ---
+
+assert_deny "#311 exclusion: sed -i (in-place edit) still denies" \
+    "sed -i 's|x|$_QS_DANGER|' f.txt"
+
+assert_deny "#311 exclusion: sed --in-place still denies" \
+    "sed --in-place 's|x|$_QS_DANGER|' f.txt"
+
+assert_deny "#311 exclusion: sed s///w <file> (writes a file) still denies" \
+    "sed -n 's|x|y|w $_QS_DANGER' f.txt"
+
+assert_deny "#311 exclusion: sed 'e <cmd>' (executes) still denies" \
+    "sed -n 'e $_QS_DANGER' f.txt"
+
+assert_deny "#311 exclusion: sed s///e (executes the pattern space) still denies" \
+    "sed -n 's|$_QS_DANGER|y|e' f.txt"
+
+assert_deny "#311 exclusion: awk system(...) still denies" \
+    "awk '{system(\"$_QS_DANGER\")}' f.txt"
+
+assert_deny "#311 exclusion: awk print | \"cmd\" still denies" \
+    "awk '{print | \"$_QS_DANGER\"}' f.txt"
+
+assert_deny "#428 exclusion: awk \"cmd\" | getline (one-way exec) still denies" \
+    "awk 'BEGIN{\"$_QS_DANGER\" | getline x; print x}'"
+
+assert_deny "#428 exclusion: awk \"cmd\" | getline var still denies" \
+    "awk 'BEGIN{\"$_QS_DANGER\" | getline line}'"
+
+assert_deny "#311 exclusion: rg --pre (runs a preprocessor program) still denies" \
+    "rg --pre '$_QS_DANGER' . | head -3"
+
+assert_deny_env "#311 exclusion: rg --pre still denies with the fast path OFF" \
+    "REPO_GUARD_READONLY_FASTPATH=0" \
+    "rg --pre '$_QS_DANGER' ."
+
+# --- SAFETY FLOOR: the query sinks must never widen a deny into an allow ---
+
+assert_deny "#311 safety: a bare catastrophic delete still denies" \
+    "$_QS_DANGER"
+
+assert_deny "#311 safety: a real force-push to main still denies" \
+    "$_QS_FORCE"
+
+assert_deny "#311 safety: a real -f force-push to main still denies" \
+    "git push -f origin main"
+
+# Command substitution inside a sink argument keeps the span RAW (the payload
+# really runs), exactly as for echo/printf.
+assert_deny "#311 safety: jq \"\$(<danger>)\" command substitution still denies" \
+    "jq \"\$($_QS_DANGER)\" f.json"
+
+assert_deny "#311 safety: grep with a backtick-substituted pattern still denies" \
+    "grep \"\`$_QS_DANGER\`\" f.txt"
+
+# Pipe-to-shell: command_has_shell_segment() skips the whole redaction, so the
+# raw scan still sees the payload.
+assert_deny "#311 safety: grep '<danger>' | sh still denies (piped to shell)" \
+    "grep '$_QS_DANGER' f.txt | sh"
+
+assert_deny "#311 safety: sed -n '<danger>' | bash still denies (piped to shell)" \
+    "sed -n 's|$_QS_DANGER|x|p' f.txt | bash"
+
+assert_deny "#311 safety: awk '<danger>' | sh still denies (piped to shell)" \
+    "awk '\$0 ~ \"$_QS_DANGER\" {print}' f.txt | sh"
+
+# A sink command word that is not in COMMAND position is not a sink.
+assert_deny "#311 safety: bash -c \"grep '<danger>' f\" still denies (payload executes)" \
+    "bash -c \"grep '$_QS_DANGER' f\""
+
+assert_deny "#311 safety: eval grep '<danger>' f still denies (eval is the command word)" \
+    "eval grep '$_QS_DANGER' f"
+
+# The redaction is segment-scoped: a real dangerous command chained after an
+# inert query still denies.
+assert_deny "#311 safety: jq '.x' f ; <danger> still denies (separate segment)" \
+    "jq '.x' f ; $_QS_DANGER"
+
+# --- The ASK-tier copy is deliberately NOT given the query sinks ---
+# COMMAND_ASK_SCAN feeds the SQL DDL deny and extract_write_targets()'s write
+# confinement, whose SUBJECT is a grep/sed command word. Enabling query sinks
+# there would blind both. With the fast path off (so the full scan runs), a
+# grep/sed carrying a DDL phrase must still deny exactly as it did before.
+assert_deny_env "#311: grep's own quoted DDL pattern still denies (ask copy untouched)" \
+    "REPO_GUARD_READONLY_FASTPATH=0" \
+    "grep -n 'DROP TABLE users' schema.sql"
+
+assert_deny "#311: sed's own quoted DDL pattern still denies (ask copy untouched)" \
+    "sed -n 's|DROP TABLE users|x|p' schema.sql"
+
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
