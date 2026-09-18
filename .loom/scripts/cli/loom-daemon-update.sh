@@ -504,49 +504,13 @@ fi
 locate_daemon_bin() { loom_locate_daemon_bin "$1"; }
 
 # resolve_self_daemon_bin -- the loom-daemon that IMPLEMENTS this script's
-# ported logic, which is NOT the same binary as locate_daemon_bin's.
-#
-# The distinction is the whole point and it is easy to get wrong (#7977 caught
-# it in the test fixture): `locate_daemon_bin` / $LOOM_DAEMON_BIN name the
-# INSTALLED daemon this script MANAGES -- the one whose version is compared,
-# which may be an old release that has no `release-resolve` subcommand at all,
-# and which during a test is a deliberately fake binary. Exec'ing a subcommand
-# on that is a category error.
-#
-# Resolution order, most explicit first:
-#   1. $LOOM_DAEMON_SELF_BIN -- must be executable. The seam a test or an
-#      operator uses to name the implementation directly.
-#   2. A build in this checkout ($CARGO_TARGET_DIR honored, release then debug).
-#   3. `loom-daemon` on PATH.
-# Echoes "" when none resolves; the caller then answers in the mode's own
-# contract rather than failing silently.
-resolve_self_daemon_bin() {
-    if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" && -x "${LOOM_DAEMON_SELF_BIN}" ]]; then
-        printf '%s\n' "$LOOM_DAEMON_SELF_BIN"
-        return 0
-    fi
-    # Script-relative FIRST among the build candidates: this file lives at
-    # <checkout>/defaults/scripts/cli/ (or <consumer>/.loom/scripts/cli/), so
-    # the build that implements the logic THIS COPY delegates to is the one in
-    # the checkout this copy came from — not whatever $REPO_ROOT happens to be
-    # (in a test fixture, $REPO_ROOT is the fixture, which has no build at all).
-    local self_root
-    self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || self_root=""
-    local base candidate
-    for base in "${CARGO_TARGET_DIR:-}" "${self_root:+$self_root/target}" \
-                "$REPO_ROOT/target" "$REPO_ROOT/loom-daemon/target"; do
-        [[ -n "$base" ]] || continue
-        for candidate in "$base/release/loom-daemon" "$base/debug/loom-daemon"; do
-            if [[ -x "$candidate" ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-        done
-    done
-    candidate="$(command -v loom-daemon 2>/dev/null || true)"
-    [[ -n "$candidate" && -x "$candidate" ]] && printf '%s\n' "$candidate"
-    return 0
-}
+# ported logic, which is NOT the same binary as locate_daemon_bin's. The
+# definition moved into lib/locate-daemon-bin.sh with #8037, when
+# claude-wrapper.sh became the second caller needing that distinction; see
+# `loom_resolve_self_daemon_bin` there for the resolution order and the #7977
+# category error it exists to prevent. Wrapped under the local name this
+# script's call sites already use, the same way locate_daemon_bin is.
+resolve_self_daemon_bin() { loom_resolve_self_daemon_bin; }
 
 # Extract the short commit from `loom-daemon --version` output, e.g.
 # "loom-daemon 0.15.0 (commit ab12cd3, built 2026-07-26T12:00:00Z)" -> ab12cd3
@@ -888,21 +852,20 @@ verify_artifact_signature() {
             fi
             local desc
             desc="$(codesign -dv "$bin_path" 2>&1 || true)"
+            # Recorded regardless of outcome below (used by
+            # verify_destination_artifact() after provisioning, #8008): whether
+            # the VERIFIED download carried a certificate-anchored (Developer
+            # ID) signature, so a post-provision downgrade to an ad-hoc/no
+            # signature can be caught instead of going unnoticed (the #7932
+            # incident this follows up on).
+            if grep -q '^Authority=' <<<"$desc"; then
+                ARTIFACT_SIGNATURE_HAD_AUTHORITY=true
+            else
+                ARTIFACT_SIGNATURE_HAD_AUTHORITY=false
+            fi
             if grep -q 'code object is not signed at all' <<<"$desc"; then
                 warn "Downloaded artifact is unsigned (no Developer ID secrets were configured for this release) -- proceeding without signature verification, per design (checksum is unconditional; signature is optional)."
                 return 0
-            fi
-            # #8008: record whether this VERIFIED download carries a
-            # certificate-backed (Developer ID) signature -- verify_destination_artifact()
-            # asserts against this AFTER provisioning, closing the hole that let
-            # sign_daemon_binary() (scripts/install/provision-daemon.sh) silently
-            # downgrade a Developer ID signature to ad-hoc on every provision
-            # (#6662, #7932) go unnoticed. READ then match -- never
-            # `codesign … | grep -q` (same SIGPIPE/pipefail defect as #6662/#7932).
-            local dvvv_desc
-            dvvv_desc="$(codesign -dvvv "$bin_path" 2>&1 || true)"
-            if grep -q '^Authority=' <<<"$dvvv_desc"; then
-                ARTIFACT_HAD_AUTHORITY=true
             fi
             if codesign --verify --strict "$bin_path" 2>/dev/null; then
                 ok "macOS codesign verification passed for $(basename "$bin_path")."
@@ -1448,35 +1411,36 @@ verify_destination_artifact() {
     fi
     ok "Post-provision verification: destination binary at $dest is the fetched release artifact ($dest_version)."
 
-    # #8008: signature-preservation assertion (Darwin only, best-effort). A
-    # version match alone does NOT prove the destination's SIGNATURE survived
-    # provisioning intact -- sign_daemon_binary() (scripts/install/provision-daemon.sh)
-    # runs on the destination as part of provision_machine_daemon() and, before
-    # #7932, silently downgraded a Developer ID-signed download's
-    # certificate-anchored signature to an ad-hoc one on EVERY provision: the
-    # guard meant to prevent that reported "not signed" for every
-    # Developer-ID-signed release artifact because of a `codesign -dvvv | grep
-    # -q` SIGPIPE/pipefail defect (measured 20/20 on a real host). If the
-    # verified download carried an Authority= line (ARTIFACT_HAD_AUTHORITY,
-    # captured pre-provision by verify_artifact_signature) and the destination
-    # no longer does, that regression class has recurred — fail loudly rather
-    # than silently shipping a downgraded signature and orphaning TCC grants
-    # (this is the SECOND occurrence of this exact bug shape in
-    # sign_daemon_binary; see #6662, #7932).
-    if [[ "$ARTIFACT_HAD_AUTHORITY" == "true" ]]; then
+    # ---- signature-preservation assertion (Darwin only, #8008) ----
+    # The version-string compare above proves the destination IS the fetched
+    # binary; it says nothing about whether provisioning left its SIGNATURE
+    # intact. #7932 fixed a guard in sign_daemon_binary() that had been
+    # silently ad-hoc-resigning every Developer ID-signed release artifact on
+    # provision since #5020 (a `codesign ... | grep -q` pipe form that always
+    # reported 141 under `set -o pipefail`) -- replacing the
+    # certificate-anchored designated requirement with a per-build cdhash and
+    # orphaning TCC grants on every roll. Nothing caught that regression
+    # because nothing compared the destination's signature against the
+    # verified download's. This closes that gap: only runs when the
+    # pre-provision download demonstrably carried an Authority (set by
+    # verify_artifact_signature() before provisioning); skips silently when
+    # that is unknown (Linux target, or codesign unavailable at download time).
+    if [[ "$ARTIFACT_SIGNATURE_HAD_AUTHORITY" == "true" ]]; then
         if ! command -v codesign >/dev/null 2>&1; then
-            warn "'codesign' not available -- skipping post-provision signature-preservation check (the fetched artifact's Authority= signature was verified pre-provision but cannot be re-checked here)."
+            warn "'codesign' not available -- cannot verify the destination binary's signature survived provisioning (the verified download carried a Developer ID Authority signature)."
         else
-            # READ the listing, THEN match it — never `codesign … | grep -q`
-            # (same SIGPIPE/pipefail defect as #6662/#7932).
-            local dest_sig
-            dest_sig="$(codesign -dvvv "$dest" 2>&1 || true)"
-            if ! grep -q '^Authority=' <<<"$dest_sig"; then
-                err "Post-provision verification FAILED: the fetched artifact at $dest carried a Developer ID (Authority=) signature before provisioning, but the destination no longer does."
-                err "This is a signature DOWNGRADE (certificate-anchored -> ad-hoc/unsigned), not a version mismatch — provisioning replaced the artifact's trusted signature, orphaning any TCC grants anchored to it. Refusing to report success (see #6662, #7932, #8008)."
+            local dest_sig_desc
+            # Read-then-match (#6662/#7932): NEVER `codesign ... | grep -q`,
+            # which is exactly the pipefail bug this whole check exists to
+            # guard against (grep -q closes the pipe before codesign finishes
+            # writing, reporting 141 under `set -o pipefail`).
+            dest_sig_desc="$(codesign -dvvv "$dest" 2>&1 || true)"
+            if ! grep -q '^Authority=' <<<"$dest_sig_desc"; then
+                err "Post-provision verification FAILED: the fetched release artifact carried a Developer ID (Authority=) signature, but the provisioned destination at $dest does not."
+                err "Provisioning has DOWNGRADED the signature -- this replaces the certificate-anchored designated requirement with a per-build ad-hoc identity and orphans every TCC grant on this host (the #7932 regression class). Refusing to report success."
                 exit 5
             fi
-            ok "Post-provision verification: destination binary at $dest retains its Developer ID (Authority=) signature."
+            ok "Post-provision verification: destination binary at $dest retains its Developer ID Authority signature."
         fi
     fi
 }
@@ -2276,11 +2240,17 @@ ARTIFACT_TARGET=""
 ARTIFACT_BIN=""
 ARTIFACT_COMMIT=""
 ARTIFACT_VERSION_OUTPUT=""
+# Darwin-only (#8008): whether the VERIFIED download's `codesign -dv` output
+# carried an `Authority=` line, i.e. a certificate-anchored (Developer ID)
+# signature rather than an ad-hoc/unsigned one. Set by verify_artifact_signature()
+# before provisioning; verify_destination_artifact() asserts against it after,
+# so a post-provision downgrade (the #7932 incident: ad-hoc re-signing a
+# Developer ID-signed release artifact) is caught instead of going unnoticed.
+# Left "" (neither true nor false) on Linux targets and when codesign is
+# unavailable -- both cases where the pre-provision state is unknown, so the
+# post-provision check has nothing to assert against and skips.
+ARTIFACT_SIGNATURE_HAD_AUTHORITY=""
 ARTIFACT_FALLBACK_REASON=""
-# #8008: set true by verify_artifact_signature() (Darwin only) when the
-# VERIFIED download carries a certificate-backed (Authority=) signature.
-# verify_destination_artifact() asserts this survives provisioning.
-ARTIFACT_HAD_AUTHORITY=false
 # Gap-visibility (#6010): true when the newest resolved release is behind the
 # CURRENT source tree's VERSION file — independent of ARTIFACT_MODE, which
 # only compares against the (possibly much older) INSTALLED_VERSION. This is
