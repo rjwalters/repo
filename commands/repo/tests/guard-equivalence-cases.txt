@@ -13,6 +13,21 @@
 # Lines are commands only — no cwd. The harness runs every case from a scratch
 # git repo it builds itself, so results do not depend on the developer's
 # working directory or on any ambient worktree.
+#
+# ONE EXCEPTION (repo#438): a line prefixed `wt:` runs from the harness's
+# SECOND fixture instead — a Loom-managed worktree (`.loom/worktrees/issue-1`
+# carrying `.loom-managed`) whose main checkout is a real git repo. That is the
+# only cwd shape in which `worktree-write-confinement` can engage at all, and
+# it is the single capability marker Loom's dispatcher keys on when it swaps
+# the canonical guard in for its own. Inside a `wt:` line:
+#
+#   {{MAIN}}  -> the main checkout's absolute path
+#   {{WT}}    -> the acting worktree's absolute path (the case's cwd)
+#
+# Both are mktemp paths, so they cannot be written literally here. The `wt:`
+# prefix and the unexpanded placeholders are what DECLARED_DIVERGENCES /
+# DECLARED_WEAKER key on in test-guard-equivalence.sh — declare the LINE as
+# written below, not the expanded command.
 
 # ── catastrophic tier ─────────────────────────────────────────────────────
 rm -rf /
@@ -196,3 +211,44 @@ grep 'rm -rf /' f.txt | sh
 sed -n --title "pass -i to edit in place" 's|rm -rf /|X|p' f.txt
 awk --body 'use system( ) to shell out here' '$0 ~ "rm -rf /" {print}' f.txt
 rg -m "use --pre for preprocessing" 'rm -rf /' . | head -3
+
+# ── worktree write confinement, from a worktree cwd (repo#438) ────────────
+# Every row below is a `wt:` row: it runs from a Loom-managed worktree whose
+# main checkout is a real git repo (see the `wt:` note in this file's header).
+# Nothing above this section can exercise worktree-write-confinement at all —
+# the flat scratch cwd has no alternate worktree, so the check never engages
+# and every verdict collapses to `allow` in both guards.
+#
+# Controls first: writes that must stay ALLOWED, so a future change that
+# widens the deny is caught here rather than by a builder losing a scratch
+# file. The substitution in the target is the point — these prove the guards
+# do not deny a write merely because its path carries a `$( … | … )`.
+wt:echo hi > /tmp/out.json
+wt:echo hi > "/tmp/out-$(echo x|tr -d x).json"
+wt:echo hi > "{{WT}}/out-$(echo x|tr -d x).json"
+
+# The plain shapes: a literal write into the main checkout from the worktree
+# cwd. Both guards deny these — this is the #4178 escape both already close,
+# and the floor the rows after it are measured against.
+wt:echo x > {{MAIN}}/evil.sh
+wt:cp /tmp/src.txt {{MAIN}}/evil.sh
+wt:sed -i s/a/b/ {{MAIN}}/evil.sh
+wt:echo x > $DIR/f.txt
+
+# The divergences. Each is a real worktree-isolation bypass the vendored copy
+# still allows and canonical denies, so each carries a DECLARED_DIVERGENCES
+# entry with its measured rationale. Two of the three only deny at all because
+# repo#437 stopped qsplit() splitting the outer stream at a separator inside
+# $( ) — the write idiom sits AFTER a separator, inside a substitution the
+# shell executes.
+wt:echo hi > "{{MAIN}}/o-$(echo x|tr -d x).json"
+wt:echo "$(id|tee {{MAIN}}/evil.sh)"
+wt:echo "$(id && cp /tmp/s {{MAIN}}/e.sh)"
+
+# Measured equal at `allow` in BOTH guards, and that is a real gap in both,
+# not a false positive being correctly allowed: a SINGLE simple command with
+# no separator, inside a quoted substitution, still writes into the main
+# checkout when the shell runs it. Tracked separately in repo#439 — kept here
+# because the harness's job is relative strictness, and this row now fails
+# loudly the moment the vendored copy fixes it first.
+wt:echo "$(id > {{MAIN}}/e.sh)"

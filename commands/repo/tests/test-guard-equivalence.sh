@@ -45,6 +45,33 @@
 # tests). Being correct there means being more permissive there. Both lists are
 # short, every row states its reasoning, and an UNDECLARED divergence in either
 # direction is surfaced — stricter as a warning, weaker as a hard failure.
+#
+# TWO FIXTURE CWDs (repo#438)
+#
+# Until repo#438 every case ran from ONE cwd: a flat scratch git repo with no
+# sibling worktree. `worktree-write-confinement` only engages when an ALTERNATE
+# Loom-managed worktree exists alongside the acting checkout, so that
+# precondition was never met — every write-confinement verdict collapsed to
+# `allow` in both guards, and divergences in the one capability the dispatcher
+# swap is keyed on were invisible BY CONSTRUCTION rather than merely absent.
+#
+# So there are now two fixtures, and a corpus row opts into the second with a
+# `wt:` line prefix (see guard-equivalence-cases.txt):
+#
+#   default   -> $WORK,   a flat scratch repo (unchanged, still the default)
+#   `wt:` row -> $WTC_WT, a Loom-managed worktree whose main checkout is a real
+#                git repo with a .loom/worktrees/issue-1 sibling carrying
+#                `.loom-managed` (the make_wt_confinement_repo() shape from
+#                hooks/repo/tests/test-guard-destructive.sh)
+#
+# `{{MAIN}}` and `{{WT}}` in a `wt:` row expand to those two absolute paths,
+# since both are mktemp paths not knowable when the corpus is written.
+#
+# A BROKEN fixture would re-create exactly the blindness this fixes — every
+# `wt:` row would quietly read `allow == allow` and pass. So the fixture is
+# canaried (see WTC_CANARY below): if a plain redirect into the main checkout
+# from the worktree cwd does not deny in BOTH guards, the suite FAILS instead
+# of reporting a green run over a dead fixture.
 
 set -uo pipefail
 
@@ -70,9 +97,12 @@ NC='\033[0m'
 
 # ---------------------------------------------------------------------------
 # Known deliberate divergences — canonical is intentionally stricter here.
-# Keyed by exact command string. Anything NOT listed that comes back stricter
-# is still a pass, but is reported as an undeclared divergence so it gets
-# either fixed or declared.
+# Keyed by the exact corpus LINE, verbatim: for a `wt:` row that means the
+# `wt:` prefix and the unexpanded `{{MAIN}}`/`{{WT}}` placeholders are part of
+# the key (the expanded paths are mktemp temporaries, different every run, so
+# they could never be a stable key). Anything NOT listed that comes back
+# stricter is still a pass, but is reported as an undeclared divergence so it
+# gets either fixed or declared.
 # ---------------------------------------------------------------------------
 # Each entry was MEASURED, not assumed — an entry here that no longer diverges
 # is dead weight, and one that diverges without an entry is reported as
@@ -88,6 +118,9 @@ declare -a DECLARED_DIVERGENCES=(
     "rg --pre 'rm -rf /' . | head -3|repo#311: ripgrep's --pre names an external preprocessor program that rg EXECUTES, so an rg carrying it is vetoed out of query-sink treatment and its pattern stays visible to the catastrophic scan. The vendored copy has no query sinks at all and allows this shape outright."
     "grep 'rm -rf /' f.txt | sh|repo#311: the pattern is piped into a shell that WOULD execute it, so command_has_shell_segment() skips the redaction entirely and canonical denies. The vendored copy allows it; this is the safety floor that makes the query sinks safe, and it is measurably stricter here."
     "rg -m \"use --pre for preprocessing\" 'rm -rf /' . | head -3|repo#434: the --pre veto token sits inside a -m value that strip_literal_text() blanks, so the veto only fires because the data-sink pass now reads the RAW command. Canonical denies; the vendored copy has no query sinks at all and allows every rg shape outright (same posture as the plain rg --pre row above). The sed and awk rows of this trio match the vendored copy exactly and need no entry."
+    "wt:echo hi > \"{{MAIN}}/o-\$(echo x|tr -d x).json\"|repo#438: a write target carrying a command substitution, issued from a Loom-managed worktree into its own main checkout. Canonical resolves the target past the substitution and denies under worktree-write-confinement; the vendored copy still allows it — a live worktree-isolation bypass, and the first divergence in this capability the harness has ever been able to see (measured deny vs allow, 2026-09-19)."
+    "wt:echo \"\$(id|tee {{MAIN}}/evil.sh)\"|repo#438: a tee into the main checkout smuggled inside a command substitution, which the shell EXECUTES. repo#437 stopped qsplit() splitting the outer stream at a separator inside \$( ), so canonical now sees the inner segment and denies; the vendored copy still allows it. Measured deny vs allow, 2026-09-19."
+    "wt:echo \"\$(id && cp /tmp/s {{MAIN}}/e.sh)\"|repo#438: same shape as the tee row, with the write idiom after a && separator rather than a pipe, confirming the fix is separator-general and not pipe-specific. Canonical denies, vendored allows. Measured 2026-09-19."
 )
 
 # ---------------------------------------------------------------------------
@@ -188,8 +221,9 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Scratch repo — every case runs from here, so verdicts never depend on the
-# developer's cwd or on an ambient worktree.
+# Scratch repo — the DEFAULT cwd for every case, so verdicts never depend on
+# the developer's cwd or on an ambient worktree. A `wt:` row opts into the
+# worktree fixture built immediately below instead (repo#438).
 #
 # NOTE: both guards must be invoked at their real in-tree paths. A guard copied
 # to /tmp and run from there fails open and reports `allow` for everything,
@@ -197,14 +231,48 @@ fi
 # review). Never "helpfully" copy the guards somewhere neutral.
 # ---------------------------------------------------------------------------
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+WTC_MAIN=""
+# shellcheck disable=SC2317 # invoked indirectly, by the EXIT trap below
+cleanup() {
+    [[ -n "$WTC_MAIN" && -d "$WTC_MAIN" ]] && rm -rf "$WTC_MAIN"
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 git -C "$WORK" init -q 2>/dev/null
 git -C "$WORK" -c user.email=t@example.com -c user.name=t \
     commit -q --allow-empty -m init 2>/dev/null
 
-decide() {  # <guard> <command> -> deny|ask|allow
-    local guard="$1" cmd="$2" input out dec
-    input=$(jq -n --arg c "$cmd" --arg w "$WORK" '{tool_input:{command:$c}, cwd:$w}')
+# ---------------------------------------------------------------------------
+# Second fixture (repo#438): a main checkout with a Loom-managed worktree
+# sibling, so `worktree-write-confinement` can actually engage.
+#
+# Mirrors make_wt_confinement_repo() in hooks/repo/tests/test-guard-destructive.sh:
+# a real git repo, plus `.loom/worktrees/issue-1` added with `git worktree add`
+# and carrying the `.loom-managed` sentinel worktree.sh writes. Both halves
+# matter — the sentinel alone is not enough, the alternate worktree must be
+# registered with git for the guard to see a main root to confine writes to.
+#
+# WTC_READY gates the `wt:` corpus rows. If the fixture cannot be built (no
+# `git worktree` support, a read-only TMPDIR), those rows are SKIPPED and
+# counted, never silently run against a cwd that makes them all pass.
+# ---------------------------------------------------------------------------
+WTC_READY=0
+WTC_WT=""
+WTC_MAIN="$(mktemp -d)"
+if git -C "$WTC_MAIN" init -q 2>/dev/null &&
+    git -C "$WTC_MAIN" -c user.email=t@example.com -c user.name=t \
+        commit -q --allow-empty -m init 2>/dev/null &&
+    mkdir -p "$WTC_MAIN/.loom/worktrees" 2>/dev/null; then
+    WTC_WT="$WTC_MAIN/.loom/worktrees/issue-1"
+    if git -C "$WTC_MAIN" worktree add -q -b "eqv-$(basename "$WTC_MAIN")" \
+        "$WTC_WT" >/dev/null 2>&1 && touch "$WTC_WT/.loom-managed" 2>/dev/null; then
+        WTC_READY=1
+    fi
+fi
+
+decide() {  # <guard> <command> [cwd] -> deny|ask|allow
+    local guard="$1" cmd="$2" cwd="${3:-$WORK}" input out dec
+    input=$(jq -n --arg c "$cmd" --arg w "$cwd" '{tool_input:{command:$c}, cwd:$w}')
     out=$(printf '%s' "$input" | bash "$guard" 2>/dev/null)
     if [[ -z "$out" ]]; then
         printf 'allow'
@@ -223,11 +291,48 @@ rank() {  # <verdict> -> integer, higher = stricter
     esac
 }
 
+expand_wt() {  # <corpus line, minus the wt: prefix> -> command with paths filled in
+    local cmd="$1"
+    cmd="${cmd//\{\{MAIN\}\}/$WTC_MAIN}"
+    cmd="${cmd//\{\{WT\}\}/$WTC_WT}"
+    printf '%s' "$cmd"
+}
+
 echo "guard-equivalence harness"
 echo "========================="
 echo "canonical: $CANONICAL"
 echo "vendored:  $VENDORED"
+if [[ "$WTC_READY" -eq 1 ]]; then
+    echo "wt cwd:    $WTC_WT (main checkout: $WTC_MAIN)"
+else
+    printf "wt cwd:    ${YELLOW}unavailable${NC} — 'wt:' cases will be skipped\n"
+fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# Fixture canary (repo#438). A fixture that LOOKS built but does not actually
+# engage worktree-write-confinement would make every `wt:` row read
+# `allow == allow` and pass — the exact silent blindness repo#438 exists to
+# remove. So assert the precondition directly, against both guards, on the
+# most basic confinement shape there is. This is a property of the FIXTURE,
+# not a corpus case: it must deny in both, and a weaker verdict from either is
+# a broken harness rather than a declarable divergence.
+# ---------------------------------------------------------------------------
+if [[ "$WTC_READY" -eq 1 ]]; then
+    TOTAL=$((TOTAL + 1))
+    canary_cmd="echo x > $WTC_MAIN/canary.sh"
+    canary_c=$(decide "$CANONICAL" "$canary_cmd" "$WTC_WT")
+    canary_v=$(decide "$VENDORED" "$canary_cmd" "$WTC_WT")
+    if [[ "$canary_c" == "deny" && "$canary_v" == "deny" ]]; then
+        PASS=$((PASS + 1))
+        printf "  ${GREEN}ok${NC}    %-7s [fixture canary] plain redirect into main checkout denies in both\n" "deny"
+    else
+        FAIL=$((FAIL + 1))
+        printf "  ${RED}FAIL${NC}  [fixture canary] worktree-write-confinement is NOT engaging: canonical=%s vendored=%s\n" \
+            "$canary_c" "$canary_v"
+        printf "        Every 'wt:' case below is therefore meaningless — fix the fixture, do not declare the rows.\n"
+    fi
+fi
 
 declare -a UNDECLARED=()
 
@@ -235,11 +340,26 @@ while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     TOTAL=$((TOTAL + 1))
 
-    dec_c=$(decide "$CANONICAL" "$line")
-    dec_v=$(decide "$VENDORED" "$line")
+    cwd="$WORK"
+    cmd="$line"
+    if [[ "$line" == wt:* ]]; then
+        if [[ "$WTC_READY" -ne 1 ]]; then
+            SKIP=$((SKIP + 1))
+            printf "  ${YELLOW}SKIP${NC}  %-7s %s\n" "no-wt-fixture" "${line:0:64}"
+            continue
+        fi
+        cmd="$(expand_wt "${line#wt:}")"
+        cwd="$WTC_WT"
+    fi
+
+    dec_c=$(decide "$CANONICAL" "$cmd" "$cwd")
+    dec_v=$(decide "$VENDORED" "$cmd" "$cwd")
     r_c=$(rank "$dec_c")
     r_v=$(rank "$dec_v")
 
+    # Declarations and the printed label both key on the RAW corpus line, so
+    # they stay stable across runs even though $WTC_MAIN is a fresh mktemp
+    # path every time.
     short="${line:0:64}"
 
     if [[ "$dec_c" == "$dec_v" ]]; then
@@ -292,9 +412,12 @@ if [[ ${#UNDECLARED[@]} -gt 0 ]]; then
 fi
 
 if [[ $FAIL -gt 0 ]]; then
-    printf "\n${RED}TESTS FAILED${NC} — the canonical guard is more permissive than the vendored copy.\n"
-    printf "This is the direction that downgrades protection fleet-wide once Loom's\n"
-    printf "capability probe swaps this guard in. Fix before merging.\n"
+    printf "\n${RED}TESTS FAILED${NC} — either the canonical guard is more permissive than the\n"
+    printf "vendored copy on a case above, or the fixture canary did not engage (repo#438).\n"
+    printf "The first is the direction that downgrades protection fleet-wide once Loom's\n"
+    printf "capability probe swaps this guard in. The second means the 'wt:' cases measured\n"
+    printf "nothing at all, which is how this blind spot went unnoticed in the first place.\n"
+    printf "Fix before merging.\n"
     exit 1
 fi
 printf "\n${GREEN}ALL TESTS PASSED${NC}\n"
