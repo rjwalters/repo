@@ -245,10 +245,21 @@ wt:echo hi > "{{MAIN}}/o-$(echo x|tr -d x).json"
 wt:echo "$(id|tee {{MAIN}}/evil.sh)"
 wt:echo "$(id && cp /tmp/s {{MAIN}}/e.sh)"
 
-# Measured equal at `allow` in BOTH guards, and that is a real gap in both,
-# not a false positive being correctly allowed: a SINGLE simple command with
-# no separator, inside a quoted substitution, still writes into the main
-# checkout when the shell runs it. Tracked separately in repo#439 — kept here
-# because the harness's job is relative strictness, and this row now fails
-# loudly the moment the vendored copy fixes it first.
+# A SINGLE simple command with no separator, inside a quoted substitution.
+# These measured `allow == allow` until repo#439: subst_inner() emits nothing
+# when there is no separator to emit for, so the whole span stayed one quoted
+# token and the `>` / the spaces in it were masked as inert data — while the
+# shell, which executes a substitution whatever quoting wraps it, really did
+# write into the main checkout. Canonical now re-emits the substitution's HEAD
+# as its own segment (subst_heads()) and denies; the vendored copy still
+# allows, so each row is a declared divergence like the three above.
 wt:echo "$(id > {{MAIN}}/e.sh)"
+wt:echo "$(cp /tmp/s {{MAIN}}/e.sh)"
+wt:echo "`id > {{MAIN}}/e.sh`"
+
+# The controls for that fix, in the same shapes: a write the head scan now
+# SEES but that lands inside the acting worktree or in /tmp must still be
+# allowed by both guards. A regression here is a widened deny, which is what
+# would actually break a builder.
+wt:echo "$(id > {{WT}}/ok.sh)"
+wt:echo "$(id > /tmp/loom-439-scratch.txt)"
