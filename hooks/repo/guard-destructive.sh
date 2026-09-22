@@ -6494,42 +6494,67 @@ if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" ==
     if [[ -r "$_TMPFS_MOUNTS" ]] && tmpfs_scratch_guard_enabled; then
         _TMPFS_ASSIGNMENTS="$(tmpfs_scratch_assignments "$COMMAND_ASK_SCAN")" || _TMPFS_ASSIGNMENTS=""
 
-        # Shape 4: a `target-dir = <path>` line being written INTO a cargo
-        # config file. Deliberately narrow — the command must name a cargo
-        # config file AND carry a write idiom — because the bare TOML text on
-        # its own is just as likely to be documentation, and denying someone
-        # writing an issue about this hazard would be the exact "deny that
-        # prevents nothing and blocks ordinary work" mistake the guard
-        # equivalence harness calls out by name.
-        #
-        # This shape reads COMMAND_NO_COMMENT, NOT COMMAND_ASK_SCAN, on
-        # purpose: the canonical spelling of this write is
-        # `echo 'target-dir = "…"' >> .cargo/config.toml`, and
-        # strip_datasink_literals() redacts exactly that quoted argument (it
-        # treats `echo`'s operand as inert text, which it is NOT when the
-        # output is redirected into a config file). The three-way narrowing
-        # above — TOML key, cargo config filename, write idiom, all present —
-        # is what keeps the false-positive rate down here instead.
-        if [[ "$COMMAND_NO_COMMENT" == *"target-dir"* ]] && \
-           printf '%s' "$COMMAND_NO_COMMENT" | grep -qE '(\.cargo/config(\.toml)?|config\.toml)' && \
-           printf '%s' "$COMMAND_NO_COMMENT" | grep -qE '(>>?|[|][[:space:]]*tee[[:space:]]|sed[[:space:]]+-i)'; then
-            # The quote class is a RUN (`*`, and it includes a literal
-            # backslash) rather than a single optional quote, because the
-            # `echo "target-dir = \"…\"" >> …` spelling reaches this scan with
-            # its inner quotes still backslash-escaped — matching only one
-            # unescaped quote character would capture the backslash as the
-            # whole path and silently classify nothing.
-            _TMPFS_TOML_VALUES="$(printf '%s' "$COMMAND_NO_COMMENT" \
-                | grep -oE '(^|[^-[:alnum:]])target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*[^\"'"'"'[:space:],]+' \
-                | sed -E 's/.*target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*//')" || _TMPFS_TOML_VALUES=""
-            while IFS= read -r _tmpfs_tv; do
-                [[ -n "$_tmpfs_tv" ]] || continue
-                _TMPFS_ASSIGNMENTS+=$'\n'"build.target-dir"$'\t'"$_tmpfs_tv"
-            done <<< "$_TMPFS_TOML_VALUES"
-        fi
-
         _TMPFS_BASE="${CWD:-$REPO_ROOT}"
         [[ -n "$_TMPFS_BASE" ]] || _TMPFS_BASE="$PWD"
+
+        # Shape 4: a `target-dir = <path>` line being written INTO a cargo
+        # config file. The three substrings this used to gate on (TOML key,
+        # cargo config filename, write idiom — each checked independently
+        # ANYWHERE in the command) are uncorrelated and false-deny on ordinary
+        # prose ABOUT this hazard, because nothing ties the write idiom to the
+        # config file or either to the TOML key (#461 review):
+        #   gh pr comment 461 --body "target-dir = /dev/shm/x lands in
+        #     .cargo/config.toml; use > /dev/null to hide"
+        #   echo "in .cargo/config.toml, target-dir = /dev/shm/x is a hazard" > notes.md
+        # Neither writes into a cargo config — the first writes nothing at all
+        # (its only `>` is inside the quoted --body value), the second writes
+        # notes.md — yet both satisfied all three substrings.
+        #
+        # So gate on extract_write_targets()'s RESOLVED destination instead of
+        # hoping the substrings imply each other: it already tokenizes every
+        # `>`/`>>`/tee/sed -i/cp/mv target in the command, and its `>` scan is
+        # independently quote-aware (mask_gt(), #4245) — a `>` inside a quoted
+        # argument is never treated as a redirection operator, which is why
+        # the --body example above naturally yields no write target at all.
+        # This reads COMMAND_NO_COMMENT, NOT COMMAND_ASK_SCAN, on purpose: the
+        # canonical spelling of this write is `echo 'target-dir = "…"' >>
+        # .cargo/config.toml`, and strip_datasink_literals() redacts exactly
+        # that quoted echo argument, which would hide the TOML value extracted
+        # below (COMMAND_ASK_SCAN's own literal-text redaction plays no part
+        # in extract_write_targets()'s quote-awareness, which is independent
+        # of it).
+        if [[ "$COMMAND_NO_COMMENT" == *"target-dir"* ]] && \
+           printf '%s' "$COMMAND_NO_COMMENT" | grep -qE '(\.cargo/config(\.toml)?|config\.toml)'; then
+            _TMPFS_CARGO_CONFIG_WRITE=""
+            _TMPFS_WRITE_TARGETS="$(extract_write_targets "$COMMAND_NO_COMMENT" "$_TMPFS_BASE" | head -20)" || _TMPFS_WRITE_TARGETS=""
+            while IFS=$'\037' read -r _wcwd _wtarget; do
+                [[ -n "$_wtarget" ]] || continue
+                _wabs="$_wtarget"
+                [[ "$_wabs" != /* ]] && _wabs="${_wcwd:-$_TMPFS_BASE}/$_wabs"
+                [[ "$_wabs" == /* ]] || continue
+                _wabs="$(normalize_abs_path "$_wabs")"
+                case "$_wabs" in
+                    */.cargo/config.toml|*/.cargo/config) _TMPFS_CARGO_CONFIG_WRITE=1; break ;;
+                esac
+            done <<< "$_TMPFS_WRITE_TARGETS"
+
+            if [[ -n "$_TMPFS_CARGO_CONFIG_WRITE" ]]; then
+                # The quote class is a RUN (`*`, and it includes a literal
+                # backslash) rather than a single optional quote, because the
+                # `echo "target-dir = \"…\"" >> …` spelling reaches this scan with
+                # its inner quotes still backslash-escaped — matching only one
+                # unescaped quote character would capture the backslash as the
+                # whole path and silently classify nothing.
+                _TMPFS_TOML_VALUES="$(printf '%s' "$COMMAND_NO_COMMENT" \
+                    | grep -oE '(^|[^-[:alnum:]])target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*[^\"'"'"'[:space:],]+' \
+                    | sed -E 's/.*target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*//')" || _TMPFS_TOML_VALUES=""
+                while IFS= read -r _tmpfs_tv; do
+                    [[ -n "$_tmpfs_tv" ]] || continue
+                    _TMPFS_ASSIGNMENTS+=$'\n'"build.target-dir"$'\t'"$_tmpfs_tv"
+                done <<< "$_TMPFS_TOML_VALUES"
+            fi
+        fi
+
         # The acting cwd's own mount, for the "already in RAM" exemption above.
         _TMPFS_CWD_MP=""
         if [[ "$_TMPFS_BASE" == /* ]]; then

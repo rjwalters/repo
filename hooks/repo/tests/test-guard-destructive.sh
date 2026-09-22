@@ -5418,6 +5418,16 @@ assert_tmpfs_allow "#454: an on-disk build.target-dir config write is silent" \
 assert_tmpfs_allow "#454: prose merely mentioning a tmpfs target-dir is not a config write" \
     'echo "never set target-dir = /dev/shm/t, it pins RAM"'
 
+# #461 review — shape 4's three substrings (TOML key, cargo config filename,
+# write idiom) used to be checked independently ANYWHERE in the command, so
+# a command that merely mentions all three without ever writing into a cargo
+# config false-denied. Both reproductions from the review:
+assert_tmpfs_allow "#461: a PR comment describing the hazard is not itself a config write" \
+    'gh pr comment 461 --body "the deny fires when target-dir = /dev/shm/t lands in .cargo/config.toml; use > /dev/null to hide"'
+
+assert_tmpfs_allow "#461: writing prose to an unrelated file that merely mentions both substrings is silent" \
+    'echo "in .cargo/config.toml, target-dir = /dev/shm/t is a hazard" > notes.md'
+
 assert_tmpfs_allow "#454: an unexpanded shell variable is unknowable, so no opinion" \
     'CARGO_TARGET_DIR=$SCRATCH/x cargo build'
 
