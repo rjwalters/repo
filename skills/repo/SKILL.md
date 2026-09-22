@@ -94,8 +94,11 @@ guard** (rjwalters/repo#30). It runs before every agent `Bash` command and:
   (`aws iam delete`, `aws s3 rb`, `aws cloudformation delete-stack`,
   `az … delete`, `gcloud … delete`), system-lifecycle commands
   (`halt`/`reboot`/`poweroff`/`shutdown`/`init 0|6`, command-word matched so
-  prose never trips), and SQL DDL/DML (`DROP TABLE`, `TRUNCATE TABLE`,
-  `DELETE FROM …` without a `WHERE`).
+  prose never trips), SQL DDL/DML (`DROP TABLE`, `TRUNCATE TABLE`,
+  `DELETE FROM …` without a `WHERE`), and a build/scratch dir pointed at a
+  RAM-backed filesystem (`CARGO_TARGET_DIR=`/`TMPDIR=`/`--target-dir`/a
+  `build.target-dir` config write that resolves onto a `tmpfs`/`ramfs` mount —
+  see `tmpfsScratch` below).
 - **Asks** for confirmation on risky-but-legitimate ones: force ops
   (`git push --force` / `git reset --hard`, branch-aware via `forceScope`),
   `git clean -fd`, un-isolated `git read-tree`, mutating cloud verbs
@@ -186,6 +189,7 @@ All toggles resolve: `REPO_*` env var (wins) → legacy `LOOM_*` env var →
 | Reversible-GitHub asks (`gh pr/issue close`, `gh label delete`) | `REPO_GUARD_REVERSIBLE_GH` | `LOOM_GUARD_REVERSIBLE_GH` | `guards.reversibleGh` | **off** (opt-in) |
 | rm scope (`repo` denies outside-repo/temp targets; `off`/`permissive` restores legacy) | `REPO_RM_SCOPE` | `LOOM_RM_SCOPE` | `guards.rmScope` | `repo` |
 | Force-op branch scope (`all` / `protected` / `off`) | `REPO_FORCE_SCOPE` | `LOOM_FORCE_SCOPE` | `guards.forceScope` | `all` |
+| tmpfs build/scratch dir (deny a build dir that resolves onto a RAM-backed mount) | `REPO_GUARD_TMPFS_SCRATCH` | `LOOM_GUARD_TMPFS_SCRATCH` | `guards.tmpfsScratch` | on |
 | Decision telemetry log | `REPO_GUARD_DECISION_LOG` (path: `REPO_GUARD_DECISION_LOG_FILE`) | `LOOM_GUARD_DECISION_LOG` (`…_FILE`) | `guards.decisionLog` | **off** (opt-in) |
 
 For the on-by-default guards only an explicit `false` disables — a missing key
@@ -195,6 +199,27 @@ or malformed config keeps the guard on; the opt-in toggles are the inverse.
 // .claude/skills/repo/config.json
 { "guards": { "sqlDdl": false, "cloudCli": true, "forceScope": "protected" } }
 ```
+
+**`tmpfsScratch` classifies by mount TYPE, and says nothing when it cannot
+measure (#454).** A build/scratch dir parked on a `tmpfs` is build output
+written into RAM: it consumes the host's memory for as long as it exists, and
+nothing deletes it when the build ends (rjwalters/loom#8512 — a 6.2 GB Cargo
+target dir left in `/dev/shm` pinned RAM for 2.5 days and drove a worker into
+an OOM-kill storm). The guard resolves the assigned path, matches it against
+the **longest-prefix** entry of `/proc/mounts`, and denies when that mount's
+fs type is `tmpfs` or `ramfs` — never by a hardcoded `/dev/shm` prefix, since
+a systemd host very commonly mounts `/tmp` as tmpfs and a disk-backed bind
+mount under `/dev/shm` is not a hazard at all. The deny message always names
+an on-disk alternative, so refusing costs no work.
+
+Two deliberate silences: there is no `/proc/mounts` on macOS, and
+**unmeasurable must not deny** — an absent or unreadable mount table means no
+opinion, so this guard is a complete no-op on a Mac. And when the acting cwd
+is *itself* on the same RAM mount, nothing is being redirected into RAM that
+wasn't already there and the on-disk alternative the message would name does
+not exist, so that case is exempt too. (This is why `/repo:host-optimize`'s
+confirm-first `build.target-dir` redirect is unaffected: it writes an on-disk
+path.)
 
 **`rmScope`'s unresolved-shell-variable policy (#239).** `extract_rm_targets()`
 is a tokenizer, not a shell evaluator: an `rm` target of `"$p"` reaches the
