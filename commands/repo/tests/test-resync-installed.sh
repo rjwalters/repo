@@ -64,8 +64,8 @@ new_source() {  # <dir> — build a Repo Skills source clone at <dir>
     cp "$REPO_ROOT/skills/repo/SKILL.md" "$dir/skills/repo/"
     cp "$REPO_ROOT"/commands/repo/*.md "$dir/commands/repo/"
     cp "$REPO_ROOT"/hooks/repo/*.sh "$dir/hooks/repo/"
-    cp "$REPO_ROOT"/scripts/repo/*.sh "$dir/scripts/repo/"
-    chmod +x "$dir/install.sh" "$dir/uninstall.sh" "$dir"/scripts/repo/*.sh
+    cp "$REPO_ROOT"/scripts/repo/*.sh "$REPO_ROOT"/scripts/repo/*.py "$dir/scripts/repo/"
+    chmod +x "$dir/install.sh" "$dir/uninstall.sh" "$dir"/scripts/repo/*.sh "$dir"/scripts/repo/*.py
     git -C "$dir" init -q
     git -C "$dir" add -A >/dev/null 2>&1
     git -C "$dir" -c user.email=t@example.com -c user.name=Test \
