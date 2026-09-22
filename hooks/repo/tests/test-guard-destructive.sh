@@ -5431,6 +5431,29 @@ assert_tmpfs_allow "#461: writing prose to an unrelated file that merely mention
 assert_tmpfs_allow "#454: an unexpanded shell variable is unknowable, so no opinion" \
     'CARGO_TARGET_DIR=$SCRATCH/x cargo build'
 
+# #461 second review — shape 3's --target-dir scan was not anchored to the
+# segment's command word, so any command whose TEXT happened to contain
+# "--target-dir <tmpfs-path>" was denied, even when nothing was actually
+# invoking cargo. Four reproductions from the review, all silent once the
+# scan is anchored on toks[j] being cargo/cross:
+assert_tmpfs_allow "#461: prose about --target-dir via a non-cargo command word is not a cargo invocation" \
+    "echo cargo build --target-dir /dev/shm/x"
+
+assert_tmpfs_allow "#461: a commit message mentioning --target-dir is not a cargo invocation" \
+    'git commit -am "note: cargo build --target-dir /dev/shm/x is denied"'
+
+assert_tmpfs_allow "#461: a sed -i doc edit mentioning --target-dir is not a cargo invocation" \
+    'sed -i "s|old|cargo build --target-dir /dev/shm/x|" README.md'
+
+assert_tmpfs_allow "#461: a heredoc body mentioning --target-dir is not a cargo invocation" \
+    "$(printf 'cat > /tmp/notes.md <<EOF\nUse cargo build --target-dir /dev/shm/x\nEOF')"
+
+# The anchor must not weaken the genuine positives: a real cargo/cross
+# invocation still denies, including when it is not the first command in
+# the shell segment.
+assert_tmpfs_deny "#461: a real cargo invocation after an unrelated command still denies" \
+    'python3 -c "print(1)" && cargo build --target-dir /dev/shm/x'
+
 # The "already in RAM" exemption: when the acting cwd is itself on the same
 # RAM mount, the assignment redirects nothing into RAM that wasn't already
 # there, and the on-disk alternative the message would name does not exist.

@@ -555,6 +555,15 @@ guard_cfg_array() {
 #   worktree-write-confinement)                 target PATH from this scan;
 #                                               masking that argument blinds the
 #                                               confinement deny. => cp|mv|tee|sed
+#   tmpfs_scratch_assignments            DENY   yes — no exclusion needed. It
+#   (tmpfs-scratch-dir, shapes 1-3,             reads a leading `VAR=` run and a
+#   #454/#461)                                  `--target-dir` flag value, neither
+#                                               of which mask_ask_positional_args()
+#                                               can reach: that function only masks
+#                                               a QUOTED argument immediately after
+#                                               an allowlisted command word (plus
+#                                               its flags), never a `VAR=value`
+#                                               token or a flag's own value.
 #
 # The deny-tier rows are why this set is hardcoded rather than advisory: with
 # `positionalMaskAllowlist: ["cp"]` configured and no exclusion,
@@ -6466,6 +6475,11 @@ tmpfs_scratch_assignments() {
                 while (j <= m && toks[j] ~ /^-/) j++
                 while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { emitassign(toks[j]); j++ }
             }
+            # `--target-dir` is a cargo flag and is meaningless outside a
+            # cargo invocation; anchor on the command word so this scan does
+            # not fire on prose or write targets that merely mention the flag
+            # text (git commit -am, sed -i, heredoc bodies, #461 review).
+            if (!(toks[j] == "cargo" || toks[j] == "cross")) continue
             for (k = j; k <= m; k++) {
                 if (toks[k] ~ /^--target-dir=/) {
                     v = unq(substr(toks[k], index(toks[k], "=") + 1))
@@ -6584,8 +6598,17 @@ if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" ==
             # Already-in-RAM exemption: nothing is being redirected into RAM,
             # and there would be no on-disk alternative to recommend.
             [[ -n "$_TMPFS_CWD_MP" && "$_TMPFS_CWD_MP" == "$_tmpfs_mp" ]] && continue
-            _tmpfs_suggest="${REPO_ROOT:-$_TMPFS_BASE}/target"
-            deny "BLOCKED: $_tmpfs_name=$_tmpfs_value resolves to $_tmpfs_abs, which is on a RAM-backed $_tmpfs_fs mount ($_tmpfs_mp). Build/scratch output written there consumes the host's memory for as long as it exists, and nothing deletes it when the build ends (rjwalters/loom#8512: a 6.2 GB target dir left in /dev/shm pinned RAM for 2.5 days and drove a worker into an OOM-kill storm). Use an on-disk location instead: drop the assignment to build into the default $_tmpfs_suggest, or point it at another disk-backed path (e.g. an on-disk [build] target-dir in .cargo/config.toml). Set guards.tmpfsScratch:false in .claude/skills/repo/config.json if this host deliberately builds in RAM." "tmpfs-scratch-dir:$_tmpfs_name"
+            # The suggested fix differs by assignment: CARGO_TARGET_DIR / --target-dir
+            # are cargo-specific, so the repo's on-disk `target/` is the natural
+            # default; TMPDIR is a generic scratch root with no such default, so
+            # naming `<repo>/target` there would be inapplicable advice (#461 review).
+            if [[ "$_tmpfs_name" == "TMPDIR" ]]; then
+                _tmpfs_advice="point it at a disk-backed scratch path instead (e.g. ${REPO_ROOT:-$_TMPFS_BASE}/.tmp)"
+            else
+                _tmpfs_suggest="${REPO_ROOT:-$_TMPFS_BASE}/target"
+                _tmpfs_advice="drop the assignment to build into the default $_tmpfs_suggest, or point it at another disk-backed path (e.g. an on-disk [build] target-dir in .cargo/config.toml)"
+            fi
+            deny "BLOCKED: $_tmpfs_name=$_tmpfs_value resolves to $_tmpfs_abs, which is on a RAM-backed $_tmpfs_fs mount ($_tmpfs_mp). Build/scratch output written there consumes the host's memory for as long as it exists, and nothing deletes it when the build ends (rjwalters/loom#8512: a 6.2 GB target dir left in /dev/shm pinned RAM for 2.5 days and drove a worker into an OOM-kill storm). Use an on-disk location instead: $_tmpfs_advice. Set guards.tmpfsScratch:false in .claude/skills/repo/config.json if this host deliberately builds in RAM." "tmpfs-scratch-dir:$_tmpfs_name"
         done <<< "$_TMPFS_ASSIGNMENTS"
     fi
 fi
