@@ -75,6 +75,10 @@ ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_FIXTURE" -q
 
 # run_rr <extra-env...> -- <args...>  -> runs the script in the fixture repo with
 # XDG_CONFIG_HOME set, SSH config redirected to scratch, and the mock aws on PATH.
+# The public-IP poll (repo#451) is pinned SHORT and sleep-free by default
+# (2 attempts, 0s apart) so the many scenarios below that resolve no IP don't
+# each pay the real 6 x 2s budget; `env` applies assignments left-to-right, so a
+# test passing its own REPO_REMOTE_IP_POLL_* value still wins.
 MOCK_BIN="$SCRATCH/bin"
 MOCK_LOG="$SCRATCH/aws.log"
 mkdir -p "$MOCK_BIN"
@@ -85,6 +89,9 @@ run_rr() {
     shift
     : >"$MOCK_LOG"
     : >"$MOCK_LOG.sshprobes"          # per-run ssh probe counter (repo#449)
+    # The mock's Nth-poll public-IP counter (MOCK_AWS_PUBLIC_IP_AFTER) is a
+    # sidecar of the log, so it must be reset per run alongside it (repo#451).
+    rm -f "$MOCK_LOG.ipcount"
     local errf; errf="$(mktemp)"
     # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
     # real 120s readiness window (repo#449); the assignments below come BEFORE
@@ -98,6 +105,8 @@ run_rr() {
         REPO_REMOTE_SSH_READY_TIMEOUT=0 \
         REPO_REMOTE_SSH_READY_POLL_INTERVAL=0 \
         MOCK_AWS_LOG="$MOCK_LOG" \
+        REPO_REMOTE_IP_POLL_ATTEMPTS=2 \
+        REPO_REMOTE_IP_POLL_INTERVAL=0 \
         "${envs[@]}" \
         bash "$RR" "$@" 2>"$errf")"
     RR_RC=$?
@@ -197,6 +206,23 @@ case "$1 $2" in
       if [[ "${MOCK_AWS_PUBLIC_IP_FAIL:-0}" == 1 ]]; then
         echo "An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation: The instance ID '${MOCK_AWS_NEW_ID:-i-0newinstance}' does not exist" >&2
         exit 254
+      fi
+      # repo#451: MOCK_AWS_PUBLIC_IP_AFTER=<n> makes the IP appear only from
+      # the Nth poll onward (earlier polls answer the literal "None"), which is
+      # how the bounded retry in aws_wait_public_ip() is exercised: AWS has not
+      # always propagated a restarted instance's NEW public IP by the time
+      # `wait instance-running` returns. The call counter is a sidecar of the
+      # log file so run_rr can reset it per run.
+      if [[ -n "${MOCK_AWS_PUBLIC_IP_AFTER:-}" ]]; then
+        ipcount_file="${MOCK_AWS_LOG}.ipcount"
+        ipcount=$(( $(cat "$ipcount_file" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$ipcount" >"$ipcount_file"
+        if (( ipcount >= MOCK_AWS_PUBLIC_IP_AFTER )); then
+          printf '%s\n' "${MOCK_AWS_PUBLIC_IP:-203.0.113.42}"
+        else
+          printf 'None\n'
+        fi
+        exit 0
       fi
       if [[ -n "${MOCK_AWS_PUBLIC_IP:-}" ]]; then
         printf '%s\n' "$MOCK_AWS_PUBLIC_IP"
@@ -795,17 +821,157 @@ run_rr MOCK_AWS_STATE=running -- up --yes --json
 assert_contains "reused the pinned running instance" "$RR_OUT" '"instance_id":"i-0pinned"'
 assert_contains "reported reused=true" "$RR_OUT" '"reused":true'
 assert_eq "no new instance launched on reuse" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
-# repo#176 edge case: reusing an instance must NOT re-run security-group
-# creation/ingress-authorization on every `up` — that logic belongs solely to
-# aws_create(), which the reuse path never calls.
+# repo#176: reusing an instance must never create a security group per `up` —
+# no SG may accumulate per invocation. repo#451 keeps that property: the reuse
+# path re-authorizes ingress on a group it can RESOLVE (see the dedicated
+# section below), and when there is none to resolve — as here, where the mock
+# reports no tagged group — it logs a notice rather than conjuring one that
+# could not be attached to an already-running instance anyway.
 assert_eq "reuse: no SG creation on every up"  "0" "$(grep -c 'create-security-group' "$MOCK_LOG" 2>/dev/null)"
-assert_eq "reuse: no ingress re-authorized on every up" "0" "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_eq "reuse with no resolvable SG: no ingress call either" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "reuse with no resolvable SG: says so explicitly (repo#451)" \
+  "$RR_ERR" "SSH ingress was NOT refreshed for this reused instance"
 # A stopped pinned instance is started, still reused.
-run_rr MOCK_AWS_STATE=stopped -- up --yes --json
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_SG_FIND=sg-0existing -- up --yes --json
 assert_contains "stopped pinned instance is started" "$(cat "$MOCK_LOG")" "start-instances"
 assert_contains "still reported reused" "$RR_OUT" '"reused":true'
 assert_eq "reuse (start-from-stopped): no SG creation either" \
   "0" "$(grep -c 'create-security-group' "$MOCK_LOG" 2>/dev/null)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- reuse re-authorizes SSH ingress for the CURRENT CIDR (repo#451) --"
+# ---------------------------------------------------------------------------
+# The reported incident: the idle guard stopped the box; the next `up` restarted
+# it, but the security group's tcp/22 rule was still pinned to the laptop IP
+# from the ORIGINAL create (52.119.115.124), while the laptop had since moved to
+# 104.7.12.215 — so SSH timed out until the /32 was revoked and re-authorized by
+# hand. Every reuse branch must now re-run resolve-SG -> resolve-CIDR ->
+# authorize -> verify for the currently detected address.
+
+# (a) Already-running pinned id: the tagged SG is reused (not recreated) and
+#     tcp/22 is re-authorized for the freshly detected CIDR.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "reuse (running): up still succeeds" "0" "$RR_RC"
+assert_contains "reuse (running): still reported reused" "$RR_OUT" '"reused":true'
+RIGLOG="$(cat "$MOCK_LOG")"
+assert_eq   "reuse (running): nothing new was launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+assert_not_contains "reuse (running): the tagged SG is reused, not recreated" "$RIGLOG" "create-security-group"
+assert_contains "reuse (running): ingress re-authorized on the resolved SG" "$RIGLOG" "group-id sg-0existing"
+assert_contains "reuse (running): re-authorized for the CURRENT detected CIDR" "$RIGLOG" "cidr 104.7.12.215/32"
+assert_contains "reuse (running): the rule is tcp/22" "$RIGLOG" "protocol tcp --port 22"
+assert_contains "reuse (running): the rule is verified after authorizing" \
+  "$RIGLOG" "describe-security-groups --group-ids sg-0existing"
+
+# (b) Restarted pinned id (stopped -> start-instances): same refresh.
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "reuse (restarted pinned): up still succeeds" "0" "$RR_RC"
+RESTARTLOG="$(cat "$MOCK_LOG")"
+assert_contains "reuse (restarted pinned): the instance was started" "$RESTARTLOG" "start-instances"
+assert_contains "reuse (restarted pinned): ingress re-authorized for the current CIDR" \
+  "$RESTARTLOG" "cidr 104.7.12.215/32"
+assert_contains "reuse (restarted pinned): authorized against the resolved SG" \
+  "$RESTARTLOG" "group-id sg-0existing"
+
+# (c) Restarted TAG-DISCOVERED instance (no pinned id): same refresh.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="i-0found stopped" MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_IP=104.7.12.215 \
+  -- up --yes --json
+assert_eq   "reuse (tag-discovered): up still succeeds" "0" "$RR_RC"
+assert_contains "reuse (tag-discovered): reused the discovered instance" "$RR_OUT" '"instance_id":"i-0found"'
+TAGLOG="$(cat "$MOCK_LOG")"
+assert_contains "reuse (tag-discovered): the instance was started" "$TAGLOG" "start-instances"
+assert_contains "reuse (tag-discovered): ingress re-authorized for the current CIDR" \
+  "$TAGLOG" "cidr 104.7.12.215/32"
+
+# (d) Edge case: an explicit REPO_REMOTE_SECURITY_GROUP on a reuse path is
+#     idempotently re-authorized and re-verified too, never skipped — and still
+#     wins outright (no tag lookup, no creation).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running REPO_REMOTE_SECURITY_GROUP=sg-0pinned MOCK_CURL_IP=104.7.12.215 \
+  -- up --yes --json
+assert_eq   "reuse (explicit SG): up still succeeds" "0" "$RR_RC"
+EXPLLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "reuse (explicit SG): no SG is created" "$EXPLLOG" "create-security-group"
+assert_contains "reuse (explicit SG): ingress authorized on the explicit group" "$EXPLLOG" "group-id sg-0pinned"
+assert_contains "reuse (explicit SG): the explicit group is verified" \
+  "$EXPLLOG" "describe-security-groups --group-ids sg-0pinned"
+
+# (e) REPO_REMOTE_SSH_CIDR still wins outright on the reuse path (no echo
+#     lookup at all), exactly as it does on create.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing REPO_REMOTE_SSH_CIDR=198.51.100.44/32 \
+  -- up --yes --json
+assert_eq   "reuse (CIDR override): up still succeeds" "0" "$RR_RC"
+OVREUSELOG="$(cat "$MOCK_LOG")"
+assert_contains     "reuse (CIDR override): the override CIDR is authorized" "$OVREUSELOG" "cidr 198.51.100.44/32"
+assert_not_contains "reuse (CIDR override): no IP detection is performed" "$OVREUSELOG" "curl "
+
+# (f) A verification failure on the reuse path is just as loud as on create
+#     (exit 4) — a reused host whose group admits no SSH is not a success.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing MOCK_AWS_SG_INGRESS_EMPTY=1 \
+  -- up --yes --json
+assert_eq   "reuse: empty ingress after re-authorizing -> exit 4" "4" "$RR_RC"
+assert_contains "reuse: the failure names the missing tcp/22 rule" "$RR_ERR" "no tcp/22 ingress rule"
+assert_not_contains "reuse: no up result emitted on ingress-verification failure" "$RR_OUT" '"action":"up"'
+
+# (g) The refresh runs only for a REAL run: a dry run still touches nothing.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing -- up --json
+assert_eq   "dry run: exit 0" "0" "$RR_RC"
+assert_eq   "dry run: no ingress call is made" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+
+# (h) No group to refresh (none pinned, none tagged): the reuse path must NOT
+#     create one — it would not be attached to the already-running instance, so
+#     it would leak an unused group while looking like a repair (repo#176's
+#     "no new SG accumulates per invocation" still holds). It says so instead,
+#     and the run still succeeds.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=None -- up --yes --json
+assert_eq   "reuse (no resolvable SG): up still succeeds" "0" "$RR_RC"
+NOSGLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "reuse (no resolvable SG): no group is created" "$NOSGLOG" "create-security-group"
+assert_eq   "reuse (no resolvable SG): no ingress is authorized into thin air" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "reuse (no resolvable SG): the notice names the un-refreshed ingress" \
+  "$RR_ERR" "SSH ingress was NOT refreshed for this reused instance"
+assert_contains "reuse (no resolvable SG): the notice gives the manual remedy" \
+  "$RR_ERR" "authorize-security-group-ingress --group-id"
+
+# (i) SECURITY: refreshing ingress on reuse must never WIDEN it. When current-IP
+#     detection fails, the create path's documented 0.0.0.0/0 fallback would
+#     turn a working /32 on an existing group into an open rule — on a path that
+#     previously did not touch ingress at all. With a tcp/22 rule already
+#     present, the reuse path leaves the group exactly as it is instead.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_FAIL=1 -- up --yes --json
+assert_eq   "reuse (detection failed): up still succeeds" "0" "$RR_RC"
+assert_eq   "reuse (detection failed): the existing rule is NOT widened to 0.0.0.0/0" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "reuse (detection failed): says the ingress was left as-is" \
+  "$RR_ERR" "left EXACTLY as it is"
+assert_contains "reuse (detection failed): points at REPO_REMOTE_SSH_CIDR" \
+  "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
+
+# An EXPLICIT 0.0.0.0/0 opt-in is not a detection failure and is still honored
+# verbatim on the reuse path.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing REPO_REMOTE_SSH_CIDR=0.0.0.0/0 \
+  -- up --yes --json
+assert_eq   "reuse (explicit 0.0.0.0/0): up succeeds" "0" "$RR_RC"
+assert_contains "reuse (explicit 0.0.0.0/0): the opt-in is honored verbatim" \
+  "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+
+# With NO tcp/22 rule present at all there is nothing to preserve, so the
+# fallback still applies — the no-widening rule protects an existing rule, it
+# does not leave a reused host with no ingress at all. (The mock keeps
+# reporting an empty rule set afterward, so verification then fails loudly,
+# which is the pre-existing repo#176 contract.)
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_FAIL=1 \
+  MOCK_AWS_SG_INGRESS_EMPTY=1 -- up --yes --json
+assert_contains "reuse (detection failed, no existing rule): the fallback rule is applied" \
+  "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+assert_eq   "reuse (detection failed, no existing rule): verification still fails loudly" "4" "$RR_RC"
+
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1517,103 @@ assert_eq   "a rejected alias write leaves no lock dir behind" "" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- public IP: bounded retry, and a loud warning when it is exhausted (repo#451) --"
+# ---------------------------------------------------------------------------
+# The reported incident: the idle guard stopped the box, the next `up` restarted
+# it (a BRAND NEW public IP), and the single unretried describe-instances query
+# ran before AWS had propagated that address. write_ssh_alias() then correctly
+# refused to write a HostName-less stanza (repo#216) -- but that left the
+# PREVIOUS session's now-wrong HostName in place, with nothing in the output
+# saying the alias had not been refreshed.
+
+# (j) The IP appears only on the 3rd poll: `up` must keep polling (within its
+#     bounded budget) and write the EVENTUALLY-resolved IP, not give up on the
+#     first "None".
+LATE_CFG="$SCRATCH/late_ip_ssh_config"
+rm -f "$LATE_CFG" "$LATE_CFG.lock"
+run_rr MOCK_AWS_NEW_ID=i-0iplate REPO_REMOTE_SSH_CONFIG="$LATE_CFG" \
+  MOCK_AWS_PUBLIC_IP_AFTER=3 MOCK_AWS_PUBLIC_IP=203.0.113.88 \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=5 REPO_REMOTE_IP_POLL_INTERVAL=0 -- up --yes --json
+assert_eq   "late public IP: up succeeds" "0" "$RR_RC"
+assert_contains "late public IP: the resolved IP is reported" "$RR_OUT" '"public_ip":"203.0.113.88"'
+assert_contains "late public IP: the alias is written with the resolved IP" \
+  "$(cat "$LATE_CFG" 2>/dev/null)" "HostName 203.0.113.88"
+assert_eq   "late public IP: the poll actually retried (3 lookups)" "3" \
+  "$(grep -c 'Instances\[0\].PublicIpAddress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "late public IP: the retry is reported" "$RR_ERR" "resolved on attempt 3/5"
+assert_not_contains "late public IP: no stale-alias warning when it resolves" \
+  "$RR_ERR" "was NOT refreshed"
+
+# (k) The budget is BOUNDED: an IP that never arrives stops after exactly
+#     REPO_REMOTE_IP_POLL_ATTEMPTS lookups (never an unbounded loop).
+STALE_CFG="$SCRATCH/stale_ip_ssh_config"
+rm -f "$STALE_CFG" "$STALE_CFG.lock"
+printf 'Host repo-remote-myrepo\n    HostName 203.0.113.9\n    User ubuntu\n' >"$STALE_CFG"
+STALE_BEFORE="$(cat "$STALE_CFG")"
+run_rr MOCK_AWS_NEW_ID=i-0ipnever REPO_REMOTE_SSH_CONFIG="$STALE_CFG" MOCK_AWS_STATE=None \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=3 REPO_REMOTE_IP_POLL_INTERVAL=0 -- up --yes --json
+assert_eq   "exhausted budget: up still succeeds (non-fatal)" "0" "$RR_RC"
+assert_eq   "exhausted budget: exactly the configured number of lookups" "3" \
+  "$(grep -c 'Instances\[0\].PublicIpAddress' "$MOCK_LOG" 2>/dev/null)"
+# The distinct warning (k2): "the alias was not refreshed" is stated outright,
+# separately from the generic "@ <no public ip>" result line, and names both the
+# stale-HostName case and the no-public-IP-by-design case so they are
+# distinguishable by a reader.
+assert_contains "exhausted budget: warns the alias was NOT refreshed" "$RR_ERR" "was NOT refreshed"
+assert_contains "exhausted budget: the warning names the alias" "$RR_ERR" "repo-remote-myrepo"
+assert_contains "exhausted budget: the warning calls the HostName stale" "$RR_ERR" "STALE"
+assert_contains "exhausted budget: the warning names the private-subnet case too" \
+  "$RR_ERR" "no public IP by design"
+assert_contains "exhausted budget: the warning names the attempt count" "$RR_ERR" "after 3 attempt(s)"
+assert_eq   "exhausted budget: the stale SSH config is left untouched (repo#216 behavior)" \
+  "$STALE_BEFORE" "$(cat "$STALE_CFG")"
+
+# (k3) The same warning appears on the human (non-JSON) path, where it must be
+#      distinguishable from the generic "@ <no public ip>" result line.
+rm -f "$STALE_CFG" "$STALE_CFG.lock"
+run_rr MOCK_AWS_NEW_ID=i-0ipnever2 REPO_REMOTE_SSH_CONFIG="$STALE_CFG" MOCK_AWS_STATE=None \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=2 REPO_REMOTE_IP_POLL_INTERVAL=0 -- up --yes
+assert_eq   "exhausted budget (human output): up still succeeds" "0" "$RR_RC"
+assert_contains "exhausted budget (human output): the generic result line is still printed" \
+  "$RR_ERR" "<no public ip>"
+assert_contains "exhausted budget (human output): the distinct warning is printed too" \
+  "$RR_ERR" "was NOT refreshed"
+
+# (l) An outright API FAILURE is retried within the same budget and still
+#     degrades gracefully -- the repo#216 messages are preserved.
+run_rr MOCK_AWS_NEW_ID=i-0ipfailretry MOCK_AWS_PUBLIC_IP_FAIL=1 \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=2 REPO_REMOTE_IP_POLL_INTERVAL=0 -- up --yes --json
+assert_eq   "API failure: up still succeeds (non-fatal)" "0" "$RR_RC"
+assert_eq   "API failure: retried within the bounded budget" "2" \
+  "$(grep -c 'Instances\[0\].PublicIpAddress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "API failure: the underlying error is still surfaced" \
+  "$RR_ERR" "public IP lookup for i-0ipfailretry"
+assert_contains "API failure: still logs that it is continuing without an IP" \
+  "$RR_ERR" "continuing with no public IP for i-0ipfailretry"
+
+# (m) A malformed REPO_REMOTE_IP_POLL_ATTEMPTS falls back to the default
+#     budget rather than degenerating into "never poll" or an unbounded loop.
+POLLDEF_OUT="$(PATH="$MOCK_BIN:$PATH" MOCK_AWS_LOG="$SCRATCH/polldef.log" MOCK_AWS_STATE=None \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=not-a-number REPO_REMOTE_IP_POLL_INTERVAL=0 bash -c "
+  source '$RR'
+  NAME=myrepo
+  aws_wait_public_ip i-0polldefault
+" 2>&1)"
+assert_contains "malformed attempt count falls back to the built-in budget (6)" \
+  "$POLLDEF_OUT" "after 6 attempt(s)"
+POLLZERO_OUT="$(PATH="$MOCK_BIN:$PATH" MOCK_AWS_LOG="$SCRATCH/pollzero.log" MOCK_AWS_STATE=None \
+  REPO_REMOTE_IP_POLL_ATTEMPTS=0 REPO_REMOTE_IP_POLL_INTERVAL=0 bash -c "
+  source '$RR'
+  NAME=myrepo
+  aws_wait_public_ip i-0pollzero
+" 2>&1)"
+assert_contains "a zero attempt count falls back to the built-in budget (never 'no poll at all')" \
+  "$POLLZERO_OUT" "after 6 attempt(s)"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -1373,6 +1636,24 @@ assert_contains "remote.md documents the default marker path" \
 assert_contains "remote.md documents the marker's mtime semantics" "$MD" "mtime"
 assert_contains "remote.md recommends a short idle window for daemon/worker hosts" \
   "$MD" "REPO_REMOTE_IDLE_SHUTDOWN_MIN=20"
+
+# repo#451: the idle guard's background-job caveat, the reuse-path ingress
+# refresh, and the bounded public-IP poll are all implemented behavior — the doc
+# must state them so an agent reading remote.md gets the same model the script
+# enforces.
+assert_contains "remote.md warns that a nohup'd job does not hold the idle guard" \
+  "$MD" "nohup"
+assert_contains "remote.md explains who sees no session once the ssh command returns" \
+  "$MD" "no session at all"
+assert_contains "remote.md recommends a held session (tmux/screen)" "$MD" "tmux"
+assert_contains "remote.md recommends sizing the idle window to the job" \
+  "$MD" "Size the window to the job"
+assert_contains "remote.md states the ingress chain also runs on reuse" \
+  "$MD" "including one that REUSES an existing"
+assert_contains "remote.md documents the public-IP poll knobs" \
+  "$MD" "REPO_REMOTE_IP_POLL_ATTEMPTS"
+assert_contains "remote.md documents the not-refreshed alias warning" \
+  "$MD" "alias was not refreshed"
 
 # repo#164: the fleet-marker reuse guard and its --force override are part of
 # the implemented surface, so remote.md must document them too.
