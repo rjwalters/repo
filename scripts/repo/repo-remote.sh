@@ -98,6 +98,13 @@
 #                                      see "SSH alias lock" below, repo#213)
 #   REPO_REMOTE_SSH_LOCK_POLL_INTERVAL seconds between lock-acquisition
 #                                      retries (default 1)
+#   REPO_REMOTE_SSH_READY_TIMEOUT      total seconds the end-of-run SSH
+#                                      reachability probe waits for a
+#                                      still-booting guest before failing
+#                                      loudly (default 120; see
+#                                      aws_check_reachability, repo#449)
+#   REPO_REMOTE_SSH_READY_POLL_INTERVAL seconds between readiness probe
+#                                      attempts (default 5)
 #
 set -uo pipefail
 
@@ -896,16 +903,64 @@ aws_create() {
 # right after the SSH alias is written, instead of it surfacing as a bare
 # timeout on the caller's next attempt. AWS-only, mirroring the scope of the
 # rest of this fix (GCP already documents OS Login / IAP instead).
+#
+# Readiness wait (repo#449): a single 10s attempt fired immediately after
+# `run-instances` returns is a coin flip — a freshly booted guest routinely
+# refuses connections for tens of seconds while cloud-init and sshd come up,
+# which made `up` report a *false* provisioning failure on a perfectly good
+# instance. The probe therefore retries across a bounded, configurable window,
+# using the same deadline/poll-interval shape as acquire_ssh_alias_lock()
+# below, and only ever re-runs the `ssh` call: nothing in this function can
+# create, start, or otherwise touch the instance, so a readiness retry can
+# never relaunch anything.
+REPO_REMOTE_SSH_READY_TIMEOUT="${REPO_REMOTE_SSH_READY_TIMEOUT:-120}"
+REPO_REMOTE_SSH_READY_POLL_INTERVAL="${REPO_REMOTE_SSH_READY_POLL_INTERVAL:-5}"
+
+# ssh_error_is_boot_in_progress <ssh-stderr> -- true (0) only when the captured
+# stderr matches a known "the host is not listening yet" phrasing. Everything
+# else -- `Permission denied`, a bad key/user, an unrecognized message, or no
+# stderr at all -- is deliberately treated as a hard failure so an
+# authentication/configuration error surfaces immediately instead of silently
+# burning the whole retry budget. `ssh` exits 255 for both classes, so the
+# stderr text is the only available discriminator.
+ssh_error_is_boot_in_progress() {  # <ssh-stderr>
+  printf '%s' "$1" | grep -Eq \
+    'Connection refused|Operation timed out|Connection timed out|No route to host|Connection reset|Connection closed by remote host|Network is unreachable|Host is unreachable'
+}
+
 aws_check_reachability() {  # <ssh-alias> <ip>
-  if [[ -z "$2" ]]; then
+  local alias="$1" ip="$2"
+  if [[ -z "$ip" ]]; then
     log "no public IP resolved yet; skipping the end-of-run SSH reachability check"
     return 0
   fi
-  if ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$1" true >/dev/null 2>&1; then
-    log "SSH reachability check passed (${1})"
-  else
-    die 4 "SSH reachability check failed for ${1} (${2}) after provisioning. The instance was created/started and its SSH alias written, but SSH did not respond within 10s. Check the security group ingress rule (REPO_REMOTE_SSH_CIDR), REPO_REMOTE_SSH_KEY, and REPO_REMOTE_SSH_USER, or retry: ssh ${1}"
-  fi
+
+  local started; started="$(date +%s)"
+  local deadline=$(( started + REPO_REMOTE_SSH_READY_TIMEOUT ))
+  local attempts=0 err=""
+
+  while true; do
+    attempts=$(( attempts + 1 ))
+    if err="$(ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$alias" true 2>&1 >/dev/null)"; then
+      if (( attempts > 1 )); then
+        log "SSH reachability check passed (${alias}) after ${attempts} attempts / $(( $(date +%s) - started ))s of readiness wait"
+      else
+        log "SSH reachability check passed (${alias})"
+      fi
+      return 0
+    fi
+
+    if ! ssh_error_is_boot_in_progress "$err"; then
+      die 4 "SSH reachability check failed for ${alias} (${ip}) after provisioning. The failure does not look like a host that is still booting, so waiting longer will not help: ${err:-(ssh produced no error output)}. Check the security group ingress rule (REPO_REMOTE_SSH_CIDR), REPO_REMOTE_SSH_KEY, and REPO_REMOTE_SSH_USER, or retry: ssh ${alias}"
+    fi
+
+    if [[ $(date +%s) -ge $deadline ]]; then
+      die 4 "SSH reachability check failed for ${alias} (${ip}) after provisioning. The instance was created/started and its SSH alias written, but SSH did not respond within ${REPO_REMOTE_SSH_READY_TIMEOUT}s (${attempts} attempt(s)); last error: ${err:-(none)}. Check the security group ingress rule (REPO_REMOTE_SSH_CIDR), REPO_REMOTE_SSH_KEY, and REPO_REMOTE_SSH_USER, raise REPO_REMOTE_SSH_READY_TIMEOUT if this image is simply slow to boot, or retry: ssh ${alias}"
+    fi
+
+    log "SSH not ready yet on ${alias} (attempt ${attempts}: ${err:-no error output}); still booting -- retrying in ${REPO_REMOTE_SSH_READY_POLL_INTERVAL}s (up to ${REPO_REMOTE_SSH_READY_TIMEOUT}s total)"
+    sleep "$REPO_REMOTE_SSH_READY_POLL_INTERVAL"
+  done
 }
 
 aws_up() {
@@ -972,6 +1027,14 @@ aws_up() {
     log "SSH alias write for ${alias} was rejected (see error above); the SSH config was left untouched -- ssh ${alias} (or git-over-SSH via it) will not work until this is retried"
   fi
 
+  # The readiness wait inside aws_check_reachability applies to EVERY `up`, not
+  # just a freshly created instance (repo#449): a stopped -> started instance
+  # goes through the exact same boot sequence and refuses connections for the
+  # same window, so gating the retry on `reused == false` would leave the
+  # identical false failure on the reuse path. `reused` is therefore
+  # deliberately not passed down. Note this call is AFTER writeback_instance_id
+  # above on purpose -- the instance id must already be persisted to REPO_ENV
+  # before the probe can die, so a readiness timeout never orphans the box.
   aws_check_reachability "$alias" "$ip"
 
   emit_up_result "$iid" "$ip" "$alias" "$reused"

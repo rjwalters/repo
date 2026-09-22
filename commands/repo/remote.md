@@ -388,6 +388,21 @@ landed before it ever calls `run-instances`:
    `4`) if it doesn't succeed, so an unreachable instance is caught in-run
    rather than discovered on the next manual SSH attempt.
 
+   A freshly booted guest routinely refuses connections for tens of seconds
+   while cloud-init and `sshd` come up, so the probe is **retried across a
+   bounded window** rather than judged on a single attempt (repo#449):
+   `REPO_REMOTE_SSH_READY_TIMEOUT` (default `120`) seconds in total, one
+   attempt every `REPO_REMOTE_SSH_READY_POLL_INTERVAL` (default `5`) seconds.
+   Only "the host is not listening yet" errors (`Connection refused`,
+   `Operation timed out`, `No route to host`, …) are retried; an
+   authentication or configuration failure (`Permission denied`, or any
+   unrecognized error) fails **immediately** instead of burning the window on
+   something waiting cannot fix. The retry re-runs only the `ssh` probe — it
+   never relaunches or restarts the instance — and the instance id is written
+   back to the repo `.env` *before* the first attempt, so even a readiness
+   timeout leaves the created box addressable rather than orphaned. Raise
+   `REPO_REMOTE_SSH_READY_TIMEOUT` for an image that is simply slow to boot.
+
 #### The idle-shutdown guard
 
 The guard is a cron watchdog (`/usr/local/bin/repo-remote-idle-check`, run every
