@@ -310,6 +310,19 @@ RUNNING → offer reuse; STOPPED → offer to start.
    stop unless `--force` was given — see **Fleet-marked hosts: the reuse and
    teardown guard** below (the same guard applies to `--down`/`down`). A
    freshly created instance is never subject to this check.
+4. **A reused instance is re-aliased and its SSH ingress re-authorized, every
+   time.** A stop/start cycle (e.g. the idle guard powered the box off) assigns
+   a **new public IP**, and the operator's own IP may have changed since the
+   group's tcp/22 rule was first authorized — so on AWS, reuse re-runs the full
+   ingress chain for the *currently* detected CIDR (see **Security group and SSH
+   ingress (AWS)** below) and re-points the SSH alias at the freshly resolved
+   public IP. The public IP is polled with a short bounded retry
+   (`REPO_REMOTE_IP_POLL_ATTEMPTS` × `REPO_REMOTE_IP_POLL_INTERVAL`, default 6 ×
+   2s) because AWS does not always have the new address attached the moment the
+   instance reports `running`. If that budget is exhausted with still no IP,
+   `up` prints an explicit warning that the **alias was not refreshed** — the
+   previously written `HostName` is therefore stale — rather than silently
+   leaving the old value in place.
 
 ### 4. Create the instance (with confirmation)
 
@@ -403,6 +416,39 @@ landed before it ever calls `run-instances`:
    timeout leaves the created box addressable rather than orphaned. Raise
    `REPO_REMOTE_SSH_READY_TIMEOUT` for an image that is simply slow to boot.
 
+**Steps 1–5 run on every `up`, including one that REUSES an existing
+instance** — not only at creation. The authorized CIDR is pinned to whatever
+the operator's IP was when the rule was first written, and that address moves
+(an observed incident: `52.119.115.124` → `104.7.12.215` between sessions), so
+an instance created days ago and restarted today would otherwise still be
+admitting SSH only from an address that no longer reaches it — an indefinite
+SSH timeout whose only fix was revoking and re-authorizing the `/32` by hand.
+Re-running the chain on reuse re-authorizes for the current CIDR, so `up`
+self-heals. It is safe to repeat: the group is resolved via
+`REPO_REMOTE_SECURITY_GROUP` or the `repo-remote=<repo-name>` tag (never
+created anew per run), and a duplicate tcp/22 rule counts as success.
+
+**On reuse, the refresh never *widens* an existing rule.** Step 3's
+`0.0.0.0/0` fallback exists so a brand-new box isn't unreachable when IP
+detection fails. Applying it to a reused instance would instead take a working
+`/32` and open it to the world, on a path that used not to touch ingress at
+all — so when detection fails and the resolved group *already* has a tcp/22
+rule, `up` leaves that rule exactly as it is and prints a notice pointing at
+`REPO_REMOTE_SSH_CIDR`. An explicit `REPO_REMOTE_SSH_CIDR=0.0.0.0/0` opt-in is
+not a detection failure and is still honored verbatim; a group with no tcp/22
+rule at all has nothing to preserve, so the fallback still applies there.
+
+**On reuse, step 1 resolves only — it never creates.** If no group is pinned
+and none carries the `repo-remote=<repo-name>` tag, `up` prints a notice
+saying ingress was **not** refreshed (with the manual
+`authorize-security-group-ingress` command) and carries on. Creating a group
+there would be worse than doing nothing: a new group is not attached to an
+already-running instance, so it would neither restore SSH nor be reachable —
+it would just leak an unused group per repo while looking like a repair. The
+same limitation applies whenever a reused instance is attached to some *other*
+security group (created outside this tooling): the group refreshed here is not
+the one guarding it, and that group must be fixed by hand.
+
 #### The idle-shutdown guard
 
 The guard is a cron watchdog (`/usr/local/bin/repo-remote-idle-check`, run every
@@ -427,6 +473,29 @@ future daemon-presence veto is ever wanted, it must be added as a deliberate,
 documented change to `idle_guard_userdata()`; it is not implied by the current
 text. (This corrects an earlier problem statement that assumed a
 `pgrep -f loom-daemon` veto existed — it never did in this repo.)
+
+**⚠️ A backgrounded/`nohup` job does NOT hold the guard open.** Running work as
+`ssh <alias> 'nohup ./long-build.sh > build.log 2>&1 &'` is the classic way to
+lose a host mid-job: the moment that single non-interactive SSH command
+returns, the login shell that launched the job has already exited, so `who`
+reports **no session at all** — the first of the two activity signals is gone
+from that instant, not when the job finishes. The job is then protected *only*
+by its own CPU usage keeping the load average above `0.2`, with no
+process-name veto to fall back on, so any I/O-bound, download, or license-wait
+lull long enough to cover a full `REPO_REMOTE_IDLE_SHUTDOWN_MIN` window powers
+the box off mid-run. (Observed: a ~20-minute `nohup`'d build on an otherwise
+idle host, discovered only when the next SSH attempt timed out.) For work that
+may go CPU-idle, do one of:
+
+- **Hold a real session for the job's duration** — run it inside `tmux` (or
+  `screen`) on the host and keep the SSH connection open, or simply run it in
+  the foreground of an interactive session. A held session keeps `who`
+  non-empty regardless of CPU load, which is the only signal that is
+  unconditionally under your control.
+- **Size the window to the job** — set `REPO_REMOTE_IDLE_SHUTDOWN_MIN` to
+  comfortably exceed the job's longest expected quiet stretch (and remember
+  `0` disables the guard entirely, which is the right choice only for hosts
+  that must never self-shut-down).
 
 **Idle window — pick per host role:**
 

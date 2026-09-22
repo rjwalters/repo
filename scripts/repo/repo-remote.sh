@@ -105,6 +105,13 @@
 #                                      aws_check_reachability, repo#449)
 #   REPO_REMOTE_SSH_READY_POLL_INTERVAL seconds between readiness probe
 #                                      attempts (default 5)
+#   REPO_REMOTE_IP_POLL_ATTEMPTS       how many times `up` polls for the
+#                                      instance's public IP after it is running
+#                                      (default 6; see aws_wait_public_ip,
+#                                      repo#451)
+#   REPO_REMOTE_IP_POLL_INTERVAL       seconds between those polls (default 2;
+#                                      0 makes the suite's exhausted-budget
+#                                      case instant)
 #
 set -uo pipefail
 
@@ -454,6 +461,19 @@ gcp_fleet_marker() {  # <instance-name>
 # future daemon-presence veto is ever wanted it must be added deliberately here
 # and documented; it is not implied by the current logic.
 #
+# BACKGROUND JOBS DO NOT HOLD THIS GUARD (repo#451). A job started over a single
+# non-interactive SSH command — `ssh <alias> 'nohup make -j8 &'` and friends —
+# stops counting as activity via `who` the MOMENT that ssh command returns: the
+# login shell that ran it has already exited, so there is no session left for
+# `who` to report. From then on the job is protected ONLY by its own CPU usage
+# keeping the load average above 0.2, and there is no process-name veto to fall
+# back on. A long build with I/O-bound or license-wait lulls can dip under that
+# threshold for a full IDLE_MIN window and be powered off mid-run (the reported
+# incident: a ~20-minute nohup'd build killed by a 120-minute window's guard).
+# For work that may go CPU-idle, either hold a real session for its duration
+# (`tmux`/`screen` on the host, or an interactive SSH session left open) or size
+# REPO_REMOTE_IDLE_SHUTDOWN_MIN to the job.
+#
 # Idle-exit marker contract (published by this repo so a daemon side can conform
 # without this repo depending on it): when $IDLE_MARKER exists on-host, the guard
 # treats its mtime as an authoritative "idle since" timestamp and shuts down
@@ -687,6 +707,65 @@ aws_public_ip() {  # <instance-id>
   return "$rc"
 }
 
+# aws_wait_public_ip: poll aws_public_ip() with a BOUNDED retry budget, echoing
+# the resolved IP and returning 0, or echoing nothing and returning 1 when the
+# budget is exhausted (repo#451).
+#
+# Why a poll at all: a stop/start cycle (the idle guard stops the box; the next
+# `up` starts it again) assigns a BRAND NEW public IP, and AWS does not always
+# have it attached by the time `wait instance-running` returns. The single
+# unretried query this replaces could therefore observe "no IP yet" and hand
+# write_ssh_alias() nothing to write — which, by design (repo#216), leaves the
+# PREVIOUS session's now-wrong HostName in place. Nothing in the old output
+# distinguished that silent staleness from a host that has no public IP on
+# purpose, so the exhausted-budget case below says so explicitly.
+#
+# "Not yet" for retry purposes means any of: an empty value, the AWS CLI's
+# literal "None" rendering of a null scalar, or an outright API-call failure
+# (throttling / a transient error — exactly the case worth retrying).
+# aws_public_ip() still surfaces the underlying stderr on every failing attempt,
+# so nothing is swallowed; the budget is what keeps this from hanging.
+#
+# The budget is deliberately small (6 attempts, 2s apart => ~10s worst case) and
+# is overridable via REPO_REMOTE_IP_POLL_ATTEMPTS / REPO_REMOTE_IP_POLL_INTERVAL
+# so the test suite can drive both the late-IP and exhausted paths without real
+# sleeps. Both overrides are validated: a non-numeric (or zero) attempt count
+# falls back to the default rather than degenerating into "never poll" or an
+# unbounded loop.
+aws_wait_public_ip() {  # <instance-id> -> echoes the IP, or returns 1
+  local iid="$1" attempts interval i ip rc=0
+  attempts="${REPO_REMOTE_IP_POLL_ATTEMPTS:-6}"
+  interval="${REPO_REMOTE_IP_POLL_INTERVAL:-2}"
+  [[ "$attempts" =~ ^[0-9]+$ ]] && (( attempts >= 1 )) || attempts=6
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=2
+
+  for (( i = 1; i <= attempts; i++ )); do
+    ip="$(aws_public_ip "$iid")"; rc=$?
+    # Trim whitespace (the CLI appends a newline) and normalize "None" to empty.
+    ip="${ip#"${ip%%[![:space:]]*}"}"
+    ip="${ip%"${ip##*[![:space:]]}"}"
+    [[ "$ip" == "None" ]] && ip=""
+    if [[ $rc -eq 0 && -n "$ip" ]]; then
+      (( i > 1 )) && log "public IP for ${iid} resolved on attempt ${i}/${attempts}"
+      printf '%s' "$ip"
+      return 0
+    fi
+    (( i < attempts )) && sleep "$interval"
+  done
+
+  if [[ $rc -ne 0 ]]; then
+    # Preserved verbatim from the pre-poll implementation: the API call itself
+    # failed and the run continues anyway (the instance is up; the IP may
+    # resolve on a later `status`/`up`).
+    log "continuing with no public IP for ${iid} (see error above)"
+  fi
+  # The distinct, actionable warning the generic "@ <no public ip>" result line
+  # never gave (repo#451): say that the alias was NOT refreshed, so a silently
+  # stale HostName is distinguishable from a host with no public IP by design.
+  log "WARNING: no public IP for ${iid} after ${attempts} attempt(s) over ~$(( (attempts - 1) * interval ))s — the SSH alias 'repo-remote-${NAME}' was NOT refreshed. If this host previously had a public IP (e.g. it was just restarted after an idle shutdown), the HostName recorded in ${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config} is now STALE and 'ssh repo-remote-${NAME}' will reach the wrong address — re-run 'repo-remote up --yes' once AWS reports an IP. If this instance has no public IP by design (e.g. a private-subnet host), this is informational."
+  return 1
+}
+
 # ── AWS: security group resolve-or-create + SSH ingress (repo#176) ─────────
 # aws_create() previously only conditionally attached a PRE-EXISTING security
 # group via REPO_REMOTE_SECURITY_GROUP; if unset, run-instances fell back to
@@ -787,12 +866,79 @@ aws_authorize_ssh_ingress() {  # <sg-id> <cidr>
 # incident in-run: a security group whose ingress set was empty
 # ({port: null, cidr: []}), with SSH timing out indefinitely as the only
 # symptom. Fail loudly here instead, before any instance is even launched.
-aws_verify_ssh_ingress() {  # <sg-id>
+aws_has_ssh_ingress() {  # <sg-id> -> 0 when a tcp/22 rule is present
   local sg="$1" out
   out="$(aws ec2 describe-security-groups --group-ids "$sg" \
     --query 'SecurityGroups[0].IpPermissions[?ToPort==`22`]' --output text 2>/dev/null)"
-  [[ -n "$out" && "$out" != "None" ]] \
+  [[ -n "$out" && "$out" != "None" ]]
+}
+
+aws_verify_ssh_ingress() {  # <sg-id>
+  local sg="$1"
+  aws_has_ssh_ingress "$sg" \
     || die 4 "security group ${sg} has no tcp/22 ingress rule after provisioning — SSH would time out indefinitely. Check REPO_REMOTE_SECURITY_GROUP / REPO_REMOTE_SSH_CIDR, or add the rule manually with: aws ec2 authorize-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr <your-ip>/32"
+}
+
+# The whole ingress chain in one place: resolve the group, resolve the CIDR to
+# authorize, authorize it, prove it landed. Run on EVERY `up` — both when
+# creating (before run-instances, so the money-spending call is never made
+# against a group that cannot admit SSH) and when REUSING an existing instance
+# (repo#451).
+#
+# Why reuse needs it too: the authorized CIDR is pinned to whatever the
+# operator's IP was at ORIGINAL create time. Laptop IPs move (the reported
+# incident: 52.119.115.124 -> 104.7.12.215 between sessions), so restarting an
+# instance that was created days ago left ingress pointing at an address that no
+# longer reaches it — an SSH timeout whose only fix was revoking/re-authorizing
+# the /32 by hand. Re-running the chain on reuse re-authorizes for the CURRENTLY
+# detected CIDR, so `up` self-heals instead.
+#
+# Repeating it is safe: the group is RESOLVED (explicit REPO_REMOTE_SECURITY_GROUP,
+# else the repo-remote=<name> tag) rather than created per run, and a duplicate
+# tcp/22 rule is treated as success by aws_authorize_ssh_ingress.
+#
+# --no-create (the reuse path) additionally refuses to CREATE a group when none
+# resolves, and logs a notice instead. Creating one there would be worse than
+# doing nothing: the new group is not attached to the already-running instance,
+# so it would neither restore SSH nor be reachable — it would just leak an
+# unused group per repo while *looking* like the ingress had been repaired.
+# (repo#176's "no new SG accumulates per invocation" property, asserted by the
+# suite, says the same thing.) The same limitation applies whenever a reused
+# instance is attached to some OTHER group (created outside this tooling, or
+# before repo#176): the group refreshed here is not the one guarding it, and
+# that group has to be fixed by hand.
+#
+# --no-create also never WIDENS an existing rule on a failed IP detection — see
+# the inline note below. Refreshing ingress on reuse must not be able to turn a
+# working /32 into 0.0.0.0/0 just because an echo service was unreachable.
+aws_refresh_ssh_ingress() {  # [--no-create]
+  if [[ "${1:-}" == "--no-create" ]]; then
+    local sg="${REPO_REMOTE_SECURITY_GROUP:-}"
+    [[ -n "$sg" ]] || sg="$(aws_find_tagged_sg)"
+    if [[ -z "$sg" ]]; then
+      log "NOTICE: SSH ingress was NOT refreshed for this reused instance — no group is pinned via REPO_REMOTE_SECURITY_GROUP and none is tagged repo-remote=${NAME}, so there is no group this tooling owns to re-authorize (creating one would not be attached to an already-running instance). If SSH does not connect, authorize tcp/22 from your current address on the instance's own security group: aws ec2 authorize-security-group-ingress --group-id <its-sg> --protocol tcp --port 22 --cidr <your-ip>/32"
+      return 0
+    fi
+    RESOLVED_SG="$sg"
+    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
+    # Reuse must never WIDEN exposure. A 0.0.0.0/0 that came from *failed*
+    # detection (rather than an explicit REPO_REMOTE_SSH_CIDR opt-in) is the
+    # documented least-bad tradeoff when CREATING — the alternative is a brand
+    # new box nobody can reach. On reuse the group normally already admits SSH
+    # from an earlier run, so applying that fallback here would be a pure
+    # exposure increase on a path that previously touched ingress at all. So:
+    # if the rule is already there, leave it exactly as it is and say so.
+    if [[ -z "${SSH_CIDR:-}" && "$RESOLVED_SSH_CIDR" == "0.0.0.0/0" ]] \
+       && aws_has_ssh_ingress "$RESOLVED_SG"; then
+      log "NOTICE: current-IP detection failed, so SSH ingress on ${RESOLVED_SG} was left EXACTLY as it is rather than widened to 0.0.0.0/0 for this reused instance. If SSH cannot connect, set REPO_REMOTE_SSH_CIDR to the address you are connecting from and re-run."
+      return 0
+    fi
+  else
+    aws_resolve_or_create_sg                            # sets RESOLVED_SG
+    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
+  fi
+  aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
+  aws_verify_ssh_ingress "$RESOLVED_SG"
 }
 
 # Belt-and-suspenders SSH access (repo#177): append the resolved public key to
@@ -839,11 +985,9 @@ aws_create() {
   aws_resolve_keypair; key="$RESOLVED_KEY_NAME"
 
   # Resolve-or-create the security group and prove it actually allows SSH
-  # BEFORE spending money on run-instances (repo#176).
-  aws_resolve_or_create_sg                              # sets RESOLVED_SG
-  aws_resolve_ssh_cidr                                  # sets RESOLVED_SSH_CIDR
-  aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
-  aws_verify_ssh_ingress "$RESOLVED_SG"
+  # BEFORE spending money on run-instances (repo#176). The reuse paths in
+  # aws_up() run the same chain (repo#451).
+  aws_refresh_ssh_ingress                               # sets RESOLVED_SG
 
   udfile="$(mktemp)"; aws_userdata "$RESOLVED_PUB_KEY_LINE" >"$udfile"
   errfile="$(mktemp)"
@@ -1006,20 +1150,30 @@ aws_up() {
     aws_create           # sets CREATED_ID or dies (main-shell context)
     iid="$CREATED_ID"
     reused=false
+  else
+    # REUSE path (already-running pinned id, restarted pinned id, or restarted
+    # tag-discovered instance): re-authorize SSH ingress for the CURRENTLY
+    # detected CIDR (repo#451). aws_create() already ran this chain for the
+    # create path, pre-launch, so this is the reuse half of the same contract
+    # -- deliberately placed AFTER the fleet-marker gate above, which must
+    # still be able to refuse a run before it touches any cloud resource.
+    # --no-create: never conjure a group for a host that is already attached to
+    # one (see aws_refresh_ssh_ingress).
+    aws_refresh_ssh_ingress --no-create
   fi
 
   aws ec2 wait instance-running --instance-ids "$iid" >/dev/null 2>&1 || true
+  # Bounded poll rather than a single query (repo#451): a just-restarted
+  # instance's NEW public IP is not always propagated by the time `wait
+  # instance-running` returns, and an empty value here silently leaves the
+  # previous session's stale HostName in the SSH config. aws_wait_public_ip()
+  # logs the underlying API error (if any) plus an explicit "alias was NOT
+  # refreshed" warning when its budget is exhausted; the run still continues
+  # -- the instance is up, the IP may resolve on a later `status`/`up`, and
+  # write_ssh_alias() independently refuses to write a broken stanza for an
+  # empty IP either way (repo#216).
   local ip
-  if ! ip="$(aws_public_ip "$iid")"; then
-    # aws_public_ip already logged the underlying API error; treat it the
-    # same as "no public IP yet" here rather than dying -- the instance is up
-    # and reachable state may still resolve on a later `status`/`up` run, and
-    # write_ssh_alias() below independently refuses to write a broken stanza
-    # for an empty/None IP either way (repo#216).
-    log "continuing with no public IP for ${iid} (see error above)"
-    ip=""
-  fi
-  [[ "$ip" == "None" ]] && ip=""
+  ip="$(aws_wait_public_ip "$iid")" || ip=""
 
   writeback_instance_id "$iid"
   local alias
