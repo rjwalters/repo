@@ -1523,12 +1523,15 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
 #     command still yields a real later-line segment and still denies (safety
 #     floor preserved; matches the old per-record behaviour where each input line
 #     was its own record).
-#   - An INERT quoted span (no `$(` and no backtick) is copied VERBATIM, so its
-#     embedded newlines/separators stay literal and never manufacture a phantom
-#     segment out of quoted documentation prose (the false positive).
-#   - A quoted span carrying command substitution (`$(` or a backtick) keeps its
-#     separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
-#     smuggled payload is never hidden behind an opening quote. Its
+#   - An INERT quoted span is copied VERBATIM, so its embedded
+#     newlines/separators stay literal and never manufacture a phantom segment
+#     out of quoted documentation prose (the false positive). A span is inert
+#     when it carries no `$(` and no backtick — and a SINGLE-quoted span is
+#     ALWAYS inert regardless of its content (#443), because bash never expands
+#     or substitutes anything between `'...'`.
+#   - A DOUBLE-quoted span carrying command substitution (`$(` or a backtick)
+#     keeps its separators ACTIVE (walked char-by-char, exactly like qsplit()),
+#     so a smuggled payload is never hidden behind an opening quote. Its
 #     already-computed CLOSING quote index is remembered (#113) so the walk that
 #     reaches it recognises the span TERMINATOR instead of re-opening a phantom
 #     span there — the mis-read that used to swallow the whole rest of the
@@ -1752,7 +1755,44 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            # A SINGLE-quoted span is ALWAYS inert, `$(`/backtick or not (#443).
+            # (No apostrophes in this block: it lives inside a single-quoted awk
+            # source string, where one would terminate the string. S below stands
+            # for the single quote character.)
+            #
+            # Bash never expands or substitutes ANYTHING between S...S, so a
+            # $(mktemp -d) written there is literal text, not live code — the
+            # substitution probe below must therefore not apply to it. Marking an
+            # SQ span ACTIVE because its text merely CONTAINS the characters `$(`
+            # kept separators live inside quoted DATA, and a LITERAL `;` in that
+            # data then leaked out as a phantom top-level command boundary: the
+            # tail after it was re-segmented and classified as a real command, so
+            #   ssh <host> S TMPDIR=$(mktemp -d); rm -rf "$TMPDIR" S
+            # false-denied as a local rm with an unresolvable target, and
+            #   echo S X=$(true); rm -rf <some-path-outside-the-repo> S
+            # false-denied as a local out-of-repo rm. The SAME command WITHOUT a
+            # `$( )` in the quoted string was already allowed, so this was a
+            # quote-classification defect, not a missing remote-exec concept:
+            # nothing about `ssh` is load-bearing here and the identical false
+            # positive reproduced with a plain `echo`.
+            #
+            # The #3679/#3755 "keep separators ACTIVE inside a substitution-bearing
+            # span" floor is UNCHANGED for DOUBLE-quoted and unquoted spans, where
+            # `$( )` really does execute and a smuggled `; <destructive>` really
+            # does run — that is the #113 protection and it must not be weakened.
+            # There is no single-quoted equivalent to preserve: the shell cannot
+            # execute anything inside S...S, so nothing is being masked here.
+            # The catastrophic ALWAYS_BLOCK scan is unaffected either way — it
+            # reads the raw command string and never goes through this lexer, so a
+            # root-obliterating payload inside a single-quoted span still denies.
+            #
+            # Caveat, same family as the KNOWN LIMIT (#130) noted just below: a
+            # PHANTOM single quote (one the shell reads as ordinary text because it
+            # sits inside a double-quoted span) now reaches the inert branch even
+            # when the text it pairs with carries a substitution. Every member of
+            # that family needs an ODD quote count, so the shell rejects the
+            # command outright and nothing executes.
+            if (qc == SQ || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
                 # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
                 # it consumes whatever the forward scan paired with, which for a

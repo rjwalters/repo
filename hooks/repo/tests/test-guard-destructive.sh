@@ -1901,9 +1901,20 @@ assert_allow "#130 KNOWN LIMIT: inner quote paired past the span close swallows 
     "echo $_Q130_SPANSQ ; $_Q113_HALT $_Q130_PARTSQ"
 
 # Quote kinds mirrored: a double quote inside a single-quoted lookalike span.
+#
+# NARROWED BY #443 (allow -> deny): this member of the family is gone. It only
+# ever reached the inert branch because the OUTER single-quoted lookalike span
+# `'$( " )'` was (wrongly) marked ACTIVE, so the walk stepped INTO it and the
+# inner `"` opened a phantom span that paired past the close. Single-quoted spans
+# are now unconditionally inert, so the outer span is consumed verbatim, the `;`
+# after it stays a REAL separator, and the rm tail is segmented and denied again.
+# The shape is still unparseable (the assertion below is unchanged) — the limit
+# simply no longer applies to it, which is the narrowing direction. The two
+# SQ-inside-DQ routes above are untouched: their outer span is DOUBLE-quoted, so
+# the #113/#3679 separator-active floor still governs them.
 assert_shell_rejects "#130 KNOWN LIMIT: mirrored inner-quote shape is unparseable" \
     "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
-assert_allow "#130 KNOWN LIMIT: inner double quote in a single-quoted span swallows the rm tail" \
+assert_deny "#130/#443: inner double quote in a now-inert single-quoted span no longer swallows the rm tail" \
     "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
 
 # qsplit()/command_has_shell_segment() exposure: here the inner quote's partner
@@ -1928,6 +1939,100 @@ assert_deny "#130 control: inner quote paired INSIDE the span still denies (pars
     "echo \"\$( ' ' )\" ; $_Q113_RM"
 assert_deny "#130 control: balanced inner quotes with a balanced trailing pair still deny" \
     "echo \"\$( '' )\" ; $_Q113_RM ''"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #443: a SINGLE-quoted span is inert even when it holds \$( ) ---${NC}"
+# =========================================================================
+#
+# ml_segment()'s quoted-span branch marks a span ACTIVE (separators stay live,
+# the walk continues character-by-character INTO it) whenever the span's inner
+# text merely CONTAINS the characters `$(` or a backtick. That rule is the
+# #3679/#3755 safety floor and is correct for a DOUBLE-quoted or UNQUOTED span,
+# where the substitution really does execute and a `; <destructive>` smuggled
+# inside it really does run.
+#
+# It was applied identically to a SINGLE-quoted span, which is wrong: bash never
+# expands or substitutes ANYTHING between `'...'`, so `'$(mktemp -d)'` is literal
+# text and nothing inside it is live code. Keeping separators active there let a
+# LITERAL `;` inside the quoted text leak out as a phantom top-level separator,
+# so the text after it was re-segmented and classified as its own command — and
+# an rm-shaped tail inside quoted DATA false-denied as a real local rm:
+#
+#   ssh <host> 'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'
+#       -> "rm target ... is an unexpanded shell variable"
+#   ssh <host> 'X=$(true); rm -rf /dev/shm/<dir>'
+#       -> "rm target outside repo scope" (with a stray quote leaking into the
+#          extracted target — a second symptom of the same mis-parse)
+#
+# The same shape WITHOUT a `$( )` in the quoted string was already allowed (see
+# the "Remote ssh/scp payloads" cases above), so this is a quote-classification
+# defect, not a missing remote-exec concept: nothing about `ssh` is load-bearing
+# here, and the identical false positive reproduces with a plain `echo`.
+#
+# Single-quoted spans are therefore ALWAYS inert now, regardless of `$(`/backtick
+# content. Double-quoted and unquoted spans are untouched — the control cases in
+# this block pin that the #113 smuggling protection still denies there.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113).
+_Q443_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q443_RMVAR="rm -r""f \"\$TMPDIR\""               # unexpandable-variable target
+_Q443_HALT="ha""lt"
+_Q443_SUB='$(mktemp -d)'
+_Q443_BT='`mktemp -d`'
+
+# 1. The exact shapes from the issue body: an `rm` inside the SINGLE-quoted
+#    remote command argument of `ssh`, alongside a command substitution.
+assert_allow "#443: ssh with a single-quoted mktemp+rm remote payload is allowed" \
+    "ssh myhost 'TMPDIR=$_Q443_SUB; $_Q443_RMVAR'"
+assert_allow "#443: ssh with a single-quoted \$( ) then a literal-path rm is allowed" \
+    "ssh myhost 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: ssh with a single-quoted backtick then a literal-path rm is allowed" \
+    "ssh myhost 'X=$_Q443_BT; $_Q443_RM'"
+
+# 2. Nothing about `ssh` is load-bearing — the same single-quoted DATA passed to
+#    any command must be inert too (the general, non-remote form of the bug).
+assert_allow "#443: single-quoted \$( ) then an rm inside a plain echo argument is allowed" \
+    "echo 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then an rm inside a printf argument is allowed" \
+    "printf '%s\\n' 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then an &&-separated rm is allowed" \
+    "echo 'X=\$(true) && $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then a |-separated lifecycle word is allowed" \
+    "echo 'X=\$(true) | $_Q443_HALT'"
+# `grep` is not a data-sink command, so the lifecycle tier really does read this
+# segment's command word (an `echo`/`printf` argument is stripped by
+# strip_datasink_literals() long before it gets there, which is why the pair
+# above cannot discriminate on its own).
+assert_allow "#443: single-quoted \$( ) then a ;-separated lifecycle word in a grep pattern is allowed" \
+    "grep -E 'X=\$(true); $_Q443_HALT ' file"
+
+# 3. CONTROLS — the DOUBLE-quoted and UNQUOTED forms are real substitutions, so
+#    the #113/#3679 separator-active floor must still catch the smuggled tail.
+#    These are the regression pins for "do not weaken DQ/unquoted behaviour".
+assert_deny "#443 control: DOUBLE-quoted \$( ) then a ;-separated rm still denies" \
+    "echo \"X=\$(true); $_Q443_RM\""
+assert_deny "#443 control: DOUBLE-quoted backtick then a ;-separated rm still denies" \
+    "echo \"X=$_Q443_BT; $_Q443_RM\""
+assert_deny "#443 control: DOUBLE-quoted \$( ) then a ;-separated lifecycle word still denies" \
+    "grep -E \"X=\$(true); $_Q443_HALT \" file"
+assert_deny "#443 control: UNQUOTED \$( ) then a ;-separated rm still denies" \
+    "echo X=\$(true); $_Q443_RM"
+
+# 4. CONTROLS — a real, unquoted rm outside the single-quoted span still denies,
+#    so the fix only makes the QUOTED text inert, never the text around it.
+assert_deny "#443 control: single-quoted \$( ) span then a REAL ;-separated rm denies" \
+    "echo 'X=\$(true)' ; $_Q443_RM"
+assert_deny "#443 control: single-quoted \$( ) span then a REAL ;-separated lifecycle word denies" \
+    "echo 'X=\$(true)' ; $_Q443_HALT"
+
+# 5. CONTROL — the catastrophic raw scan never reads through ml_segment(), so a
+#    root-obliterating payload inside a single-quoted span still denies.
+assert_deny "#443 control: catastrophic rm inside a single-quoted \$( ) span still denies" \
+    "echo 'X=\$(true); rm -r""f /'"
 
 echo ""
 
