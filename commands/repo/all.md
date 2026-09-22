@@ -204,6 +204,24 @@ the end. Unpushed work on the working branch, a dirty tree, and an
 already-on-default-but-merely-behind run all land here, and none of them
 behave any differently than they did before this check existed.
 
+**One narrow exception to "say nothing": a dirty tree in a Loom-managed repo.**
+There, a dirty primary checkout is not merely a tree this stage declines to
+switch — it is a tree other processes actively rewrite. A sweep runs
+`check-main-clean.sh --quarantine`, which stashes the primary clone's entire
+uncommitted delta (labelled `loom-quarantine: run=<sweep-id> issue=<N>`) to give
+its worktrees a clean base, regardless of which branch that delta sits on. That
+is a finding rather than a fix, so — like `diverged_on_default` above — it does
+not need permission to say, and it changes nothing about eligibility:
+
+```
+Reset: not eligible for early switch — tree dirty; Loom-managed repo, so uncommitted work here can be quarantined by a sweep mid-run
+```
+
+Say it once, here, so the Docs stage's choice of where to put its fixes (stage 4)
+reads as a consequence rather than a surprise. Detect the same way [[docs]] does
+(`.loom/` root with `worktrees/`, or a running `loom-daemon`, and not already
+inside a `.loom-managed` worktree); in any other repo this line never appears.
+
 **If `diverged_on_default=yes`**, this is the shape this issue exists for: the
 checkout is already on the default branch, so there is no branch to switch
 to — but Scrub, Docs, Tidy, and Update tools are still about to run against a
@@ -271,6 +289,17 @@ Bring the documentation back in line with reality: content accuracy (stale
 prose, out-of-date command/feature tables, CHANGELOG drift), README structure,
 and internal cross-references. This is the explicit, named home for the doc
 fixes the audit surfaced — apply the ones the user approves.
+
+**Report where those fixes landed, not only that they were applied.** In a
+Loom-managed repo [[docs]] picks a destination up front — its "Loom-managed
+repo: land fixes where a sweep cannot take them" step: a commit in a dedicated
+worktree, a commit on an otherwise-clean current branch, or uncommitted plus an
+explicit quarantine warning. [[gitignore]] and [[links]] follow the identical
+ladder, so the same choice governs the rule fixes stage 1 applied and any link
+fixes made here. Carry that destination into this stage's line and into the
+final summary — a branch or worktree name when the fixes were committed,
+`uncommitted, at risk` when they were not. In a repo that is not Loom-managed
+there is no destination to name and the line is exactly what it always was.
 
 ### 5. Tidy (see [[tidy]])
 
@@ -387,6 +416,35 @@ Reset:        synced early (feature/x → main, was 6 behind), tree clean, 4 bra
 
 Never drop the pruning reporting just because the switch moved earlier, and
 never describe the same switch in both places.
+
+### Where the fixes live (Loom-managed repos)
+
+The example above is a repo that is not Loom-managed, so `N fixed` is the whole
+story. In a Loom-managed one it is not: uncommitted edits in the primary
+checkout are quarantined by the next sweep's `check-main-clean.sh --quarantine`
+(stash label `loom-quarantine: run=<sweep-id> issue=<N>`), so `2 fixed` can be
+true when it prints and false ten minutes later. The Docs stage therefore picks
+a destination up front — see [[docs]]' "Loom-managed repo: land fixes where a
+sweep cannot take them", which [[gitignore]] and [[links]] follow identically —
+and **the summary names that destination**:
+
+| Where the fixes landed | Summary line |
+|---|---|
+| Committed in a dedicated worktree | `Docs: 2 fixed on feature/issue-448 (worktree .loom/worktrees/issue-448, a1b2c3d)` |
+| Committed on the current branch | `Docs: 2 fixed, committed on main (a1b2c3d)` |
+| Left uncommitted in the primary checkout | `Docs: 2 fixed — uncommitted, at risk` |
+| Not a Loom-managed repo | `Docs: 2 fixed (README table, CHANGELOG entry)` — unchanged |
+
+The same applies to the `Audit:` line when stage 1 applied gitignore rule fixes:
+name where those landed too, on the same three shapes.
+
+The `uncommitted, at risk` row carries the warning [[docs]] prints, once, on its
+own line beneath the summary — it is the one arm where the run ends with work
+that something else may take:
+
+```
+Loom-managed repo: uncommitted doc fixes in the primary checkout can be quarantined by a sweep — commit or stash them now.
+```
 
 ### Re-verify before printing
 

@@ -21,6 +21,7 @@
 # commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
+# commands/repo/tests/test-loom-quarantine-destination.sh,
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
 # commands/repo/tests/test-resync-installed.sh,
@@ -615,6 +616,45 @@ else
     PASS=$((PASS + VP_PASS))
     FAIL=$((FAIL + VP_FAIL))
     record_suite "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_NOTE"
+fi
+
+# The Loom-managed destination contract shared by docs.md / gitignore.md /
+# links.md, plus all.md's "Where the fixes live" summary block and its stage-2
+# dirty-tree note (repo#448) — the decision that keeps a reported fix from being
+# quarantined by the next sweep. Same delegation shape as the suites above.
+echo
+echo "-- Loom-managed fix destination (delegated suite) --"
+LQ_TEST="$TESTS_DIR/../../../commands/repo/tests/test-loom-quarantine-destination.sh"
+if [[ ! -f "$LQ_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-loom-quarantine-destination.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-loom-quarantine-destination.sh" "$LQ_TEST"
+else
+    LQ_OUT="$(bash "$LQ_TEST" 2>&1)"
+    LQ_STATUS=$?
+    LQ_PASS="$(suite_count Passed "$LQ_OUT")"
+    LQ_FAIL="$(suite_count Failed "$LQ_OUT")"
+    # Skips are neither pass nor fail — surfaced as a note only, same as above.
+    LQ_SKIP="$(suite_count Skipped "$LQ_OUT")"
+    LQ_NOTE="Loom-managed destination contract"
+    [[ "$LQ_SKIP" =~ ^[0-9]+$ && "$LQ_SKIP" -gt 0 ]] && LQ_NOTE+=" — $LQ_SKIP skipped"
+    if ! [[ "$LQ_PASS" =~ ^[0-9]+$ && "$LQ_FAIL" =~ ^[0-9]+$ ]]; then
+        LQ_PASS=0
+        LQ_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-loom-quarantine-destination.sh" "$LQ_STATUS"
+        strip_ansi "$LQ_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$LQ_STATUS" -ne 0 || "$LQ_FAIL" -ne 0 ]]; then
+        [[ "$LQ_FAIL" -eq 0 ]] && LQ_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-loom-quarantine-destination.sh" "$LQ_PASS" "$LQ_FAIL" "$LQ_STATUS"
+        strip_ansi "$LQ_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-loom-quarantine-destination.sh" "$LQ_PASS"
+    fi
+    PASS=$((PASS + LQ_PASS))
+    FAIL=$((FAIL + LQ_FAIL))
+    record_suite "test-loom-quarantine-destination.sh" "$LQ_PASS" "$LQ_FAIL" "$LQ_NOTE"
 fi
 
 # /repo:all's conditional early sync-and-switch: the eligibility conjunction
