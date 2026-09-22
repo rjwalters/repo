@@ -1389,6 +1389,107 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
     if (cap) res = res "\n" seg
     return res
 }
+# subst_heads(s) — the FIRST (or only) command of every `$( … )`/backtick
+# substitution in s, as "\n"-prefixed segments to append after the outer stream
+# (repo#439). The exact complement of subst_inner(), which deliberately emits
+# only the commands a separator INSIDE a substitution starts and leaves the
+# text BEFORE that first separator to the enclosing segment.
+#
+# THE GAP THIS CLOSES. A command substitution is EXECUTED by the shell
+# regardless of the quoting around it, so the "quoted text is inert data"
+# redaction that is correct for `echo "rm -rf /"` (repo#53) must never apply to
+# a span carrying `$(` or a backtick — the invariant qsplit() already honours by
+# keeping such a span-s separators ACTIVE, and the one the guard-equivalence
+# harness header states outright. extract_write_targets() did not honour it for
+# a substitution holding a SINGLE simple command: with no separator inside,
+# subst_inner() emitted nothing, the whole span stayed one quoted token of the
+# outer segment, and mask_gt()/mask_ws() then masked its `>` and its spaces as
+# quoted data. From a worktree cwd, `echo "$(id > <main>/e.sh)"`,
+# `echo "$(cp /tmp/s <main>/e.sh)"` and the backtick spelling therefore ALLOWED
+# a write into the main checkout that the shell really performs — the #4178
+# worktree-isolation escape, reachable purely by quoting (the same asymmetry
+# repo#197 fixed for the catastrophic literals). Re-emitting the head as its own
+# segment puts it in front of the write-idiom scan with its tokens intact.
+#
+# One segment per substitution, running from just after its opener (`$(` or an
+# opening backtick) to whichever comes first: the first unescaped `;`/`&`/`|` at
+# that substitution-s OWN depth, or the substitution-s close.
+#
+# Bytes are appended to EVERY still-open enclosing capture as well, so a nested
+# substitution appears verbatim inside its parent-s head and no token is torn in
+# half — the #436 token-integrity property this must not regress (a redirect
+# target `"/tmp/out-$(echo $F|tr -d x).json"` stays whole in the outer stream,
+# and the head emitted here, `echo $F`, carries no write idiom).
+#
+# A plain `(` subshell never starts a head: it only nests when a substitution is
+# already open (subst_depth()-s rule), and `$((` arithmetic reads as `$(` plus a
+# plain `(`, so `$((1>2))` emits `(1>2)` as one whitespace-bounded token, which
+# the token-anchored `>` scan cannot misread as a redirection operator.
+#
+# Quote-BLIND, exactly like subst_depth()/subst_inner() and the `index(inner,
+# "$(")` probe in qsplit(): a `$( … )` inside SINGLE quotes is not expanded by
+# the real shell, but treating it as a substitution here is the conservative
+# direction this lexer already takes everywhere else, and consistency with
+# subst_depth() matters more than recovering that one allow.
+function subst_heads(s,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
+    BQ = sprintf("%c", 96)   # backtick
+    subst_depth(s, d)
+    n = length(s)
+    split("", cseg)          # cseg[k] — text captured for the head at depth k
+    split("", con)           # con[k]  — that capture is still open
+    res = ""
+    top = 0                  # deepest capture slot currently in play
+    i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        dep = d[i]
+        # A byte SHALLOWER than an open capture is that substitution-s own
+        # closing `)`/backtick: the head ends there.
+        while (top > dep) {
+            if (con[top]) { res = res "\n" cseg[top]; con[top] = 0; cseg[top] = "" }
+            top--
+        }
+        # `$(` opener. Both bytes belong to the ENCLOSING heads (verbatim
+        # nesting), never to the head they open.
+        if (c == "$" && i < n && substr(s, i + 1, 1) == "(" && !bs_escaped(s, i)) {
+            for (k = 1; k <= top; k++) if (con[k]) cseg[k] = cseg[k] "$("
+            top = d[i]       # the inner depth subst_depth() recorded
+            con[top] = 1
+            cseg[top] = ""
+            i += 2
+            continue
+        }
+        # Backtick opener — an opener raises the depth, a closer lowers it, so
+        # d[i] > d[i-1] distinguishes the two without re-deriving the pairing.
+        if (c == BQ && !bs_escaped(s, i) && dep > (i > 1 ? d[i - 1] : 0)) {
+            for (k = 1; k <= top; k++) if (con[k]) cseg[k] = cseg[k] c
+            top = dep
+            con[top] = 1
+            cseg[top] = ""
+            i++
+            continue
+        }
+        # A separator at the capture-s OWN depth ends the head; whatever it
+        # starts is subst_inner()-s segment, not this function-s.
+        if (dep > 0 && con[dep] && (c == ";" || c == "&" || c == "|") && !bs_escaped(s, i)) {
+            res = res "\n" cseg[dep]
+            con[dep] = 0
+            cseg[dep] = ""
+            for (k = 1; k < dep; k++) if (con[k]) cseg[k] = cseg[k] c
+            i++
+            continue
+        }
+        for (k = 1; k <= top; k++) if (con[k]) cseg[k] = cseg[k] c
+        i++
+    }
+    # Unclosed `$(`/backtick: emit what was captured rather than dropping it —
+    # the same fail-closed direction subst_inner() takes for unbalanced input.
+    while (top > 0) {
+        if (con[top]) { res = res "\n" cseg[top]; con[top] = 0 }
+        top--
+    }
+    return res
+}
 function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
@@ -5076,7 +5177,24 @@ extract_write_targets() {
         # false-positive fixes. This gives the confinement tier the SAME
         # interpreter-awareness the catastrophic tier already has (#5198/#5205).
         buf = mask_heredoc_bodies_selective(buf)
-        $0 = qsplit(buf)   # quote-aware segmentation (#3755)
+        # Quote-aware segmentation (#3755), plus the FIRST command of every
+        # `$( … )`/backtick substitution as its own appended segment (repo#439).
+        #
+        # qsplit() alone surfaces only what a separator INSIDE a substitution
+        # starts (subst_inner(), #436) — so a substitution holding a SINGLE
+        # simple command stayed one quoted token of the outer segment, and
+        # mask_gt()/mask_ws() below then masked its `>` and its spaces as
+        # quoted data. The shell EXECUTES a substitution whatever quoting wraps
+        # it, so `echo "$(id > <main>/e.sh)"` really did write into the main
+        # checkout from a worktree cwd and this scan saw nothing (repo#439).
+        # subst_heads() re-emits that head with its tokens intact; the outer
+        # stream is untouched, so the #436 token-integrity fix still holds.
+        #
+        # Scoped HERE rather than inside qsplit() on purpose: qsplit()-s other
+        # consumers (command_has_shell_segment(), resolve_stash_cwd()) answer
+        # different questions, and handing them new segments would widen denies
+        # this issue did not measure.
+        $0 = qsplit(buf) subst_heads(buf)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.
         #

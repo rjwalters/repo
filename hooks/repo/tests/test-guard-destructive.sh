@@ -4520,6 +4520,110 @@ fi
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- repo#439: a quoted SINGLE-command \$( ) is still a write ---${NC}"
+# =========================================================================
+#
+# #436 (above) made qsplit() re-emit the commands a separator INSIDE a
+# substitution starts, so `echo "$(id|tee <main>/evil.sh)"` denies. But a
+# substitution holding ONE simple command has no separator, so subst_inner()
+# emitted nothing: the whole span stayed a single quoted token of the outer
+# segment, and mask_gt()/mask_ws() then masked its `>` and its spaces as quoted
+# DATA. From a worktree cwd,
+#   echo "$(id > <main>/e.sh)"      echo "$(cp /tmp/s <main>/e.sh)"
+# and the backtick spelling were therefore ALLOWED — while the shell, which
+# executes a substitution whatever quoting wraps it, really did write into the
+# main checkout. The UNQUOTED spelling of the identical command always denied,
+# so quoting alone defeated the #4178 confinement: the same asymmetry repo#197
+# fixed for the catastrophic literals.
+#
+# subst_heads() now re-emits the FIRST command of every substitution as its own
+# segment, so the head reaches extract_write_targets() with its tokens intact.
+read -r WTC439_MAIN WTC439_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- (a) The reported escape: every write idiom, inside a DOUBLE-QUOTED
+# ---- single-command substitution, targeting the main checkout.
+assert_deny_tag "#439: quoted \$( ) with a single > into main denies" \
+    "echo \"\$(id > $WTC439_MAIN/e.sh)\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: quoted \$( ) with a single >> into main denies" \
+    "echo \"\$(id >> $WTC439_MAIN/e.sh)\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: quoted \$( ) with a single cp into main denies" \
+    "echo \"\$(cp /tmp/s.txt $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439: quoted \$( ) with a single mv into main denies" \
+    "echo \"\$(mv /tmp/s.txt $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439: quoted \$( ) with a single tee into main denies" \
+    "echo \"\$(tee $WTC439_MAIN/e.sh)\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: quoted \$( ) with a single sed -i into main denies" \
+    "echo \"\$(sed -i s/a/b/ $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439: BACKTICK span with a single > into main denies" \
+    "echo \"\`id > $WTC439_MAIN/e.sh\`\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: BACKTICK span with a single cp into main denies" \
+    "echo \"\`cp /tmp/s.txt $WTC439_MAIN/e.sh\`\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+# Not only behind `echo`: the substitution is executed wherever it appears.
+assert_deny_tag "#439: substitution in an assignment RHS still denies" \
+    "OUT=\"\$(id > $WTC439_MAIN/e.sh)\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: substitution nested one level deeper still denies" \
+    "echo \"\$(echo \$(id > $WTC439_MAIN/e.sh))\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+# SINGLE-quoted spelling: the real shell would not expand it, but this lexer is
+# quote-BLIND about substitutions everywhere (subst_depth()'s documented rule),
+# so it denies here too — the conservative direction, matching qsplit().
+assert_deny_tag "#439: single-quoted \$( ) into main denies (quote-blind, fail-closed)" \
+    "echo '\$(id > $WTC439_MAIN/e.sh)'" "$WTC439_WT" "worktree-write-confinement"
+
+# ---- (b) No widened deny: a write that stays in the acting worktree, or lands
+# ---- in /tmp scratch, is still ALLOWED in exactly these shapes.
+assert_allow "#439: quoted \$( ) writing INSIDE the acting worktree is allowed" \
+    "echo \"\$(id > $WTC439_WT/ok.sh)\"" "$WTC439_WT"
+assert_allow "#439: quoted \$( ) cp INSIDE the acting worktree is allowed" \
+    "echo \"\$(cp /tmp/s.txt $WTC439_WT/ok.sh)\"" "$WTC439_WT"
+assert_allow "#439: quoted \$( ) writing to /tmp scratch is allowed" \
+    'echo "$(id > /tmp/loom-439-scratch.txt)"' "$WTC439_WT"
+assert_allow "#439: backtick span writing to /tmp scratch is allowed" \
+    'echo "`id > /tmp/loom-439-scratch.txt`"' "$WTC439_WT"
+assert_allow "#439: a relative write from the worktree cwd is allowed" \
+    'echo "$(id > out.txt)"' "$WTC439_WT"
+assert_allow "#439: a substitution with no write idiom at all is allowed" \
+    'echo "$(git log --oneline)"' "$WTC439_WT"
+assert_allow "#439: plain quoted text (no substitution) is untouched" \
+    'echo "a > b is data, not a redirect"' "$WTC439_WT"
+
+# ---- (c) Token integrity (#436) must survive: re-emitting the head must not
+# ---- tear the ENCLOSING token, so a quoted /tmp target carrying a
+# ---- substitution is still resolved whole and still allowed.
+assert_allow "#439: #436's quoted /tmp target with a piping \$( ) still allowed" \
+    'echo hi > "/tmp/out-$(echo x|tr -d x).json"' "$WTC439_WT"
+assert_allow "#439: quoted /tmp target with a SINGLE-command \$( ) is allowed" \
+    'echo hi > "/tmp/out-$(echo x).json"' "$WTC439_WT"
+assert_allow "#439: quoted /tmp target with a NESTED \$( ) is allowed" \
+    'echo hi > "/tmp/out-$(echo $(echo x)).json"' "$WTC439_WT"
+assert_allow "#439: \$(( )) arithmetic is not a command head" \
+    'echo "$((1 > 2))"' "$WTC439_WT"
+# …and the enclosing token is still judged: the same shape aimed at the main
+# checkout keeps denying (the #436 (b) property, re-pinned against this change).
+assert_deny_tag "#439: quoted main-checkout target with a single-command \$( ) denies" \
+    "echo hi > \"$WTC439_MAIN/out-\$(echo x).json\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+
+# ---- (d) The #436 separator cases must not regress — the head and the
+# ---- post-separator segments are complementary, never a replacement.
+assert_deny_tag "#439: tee into main after a | INSIDE the substitution still denies" \
+    "echo \"\$(id|tee $WTC439_MAIN/evil.sh)\"" "$WTC439_WT" "worktree-write-confinement"
+assert_deny_tag "#439: a write in the HEAD before a | is now seen too" \
+    "echo \"\$(id > $WTC439_MAIN/evil.sh|cat)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+
+git -C "$WTC439_MAIN" worktree remove --force "$WTC439_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC439_MAIN" && "$WTC439_MAIN" != "/" && -d "$WTC439_MAIN" ]]; then
+    rm -rf "$WTC439_MAIN"
+fi
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
