@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "dependencies": {
+    "provider": "renovate",
+    "dependabotAlerts": true,
+    "dependabotSecurityUpdates": false,
+    "renovate": {
+      "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+      "extends": ["config:recommended"],
+      "minimumReleaseAge": "14 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required",
+      "internalChecksFilter": "strict",
+      "automerge": false,
+      "automergeType": "pr",
+      "vulnerabilityAlerts": {
+        "enabled": true,
+        "minimumReleaseAge": "1 day",
+        "automerge": false
+      }
+    }
+  }
+}

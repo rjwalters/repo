@@ -276,6 +276,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh"
+  echo "  $TARGET/.claude/skills/repo/scripts/repo-org-policy.py"
   echo "  $TARGET/.claude/skills/repo/scripts/resync-installed.sh"
   echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
@@ -588,6 +589,12 @@ install_file "$SOURCE_ROOT/scripts/repo/repo-scrub-forks.sh" \
   "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" "scripts/repo/repo-scrub-forks.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" 2>/dev/null || true
 success "Installed .claude/skills/repo/scripts/repo-scrub-forks.sh"
+
+# Organization-policy deployment runs from a client without a source checkout.
+install_file "$SOURCE_ROOT/scripts/repo/repo-org-policy.py" \
+  "$TARGET/.claude/skills/repo/scripts/repo-org-policy.py" "scripts/repo/repo-org-policy.py"
+chmod +x "$TARGET/.claude/skills/repo/scripts/repo-org-policy.py" 2>/dev/null || true
+success "Installed .claude/skills/repo/scripts/repo-org-policy.py"
 
 # 3e. Consumer-side resync script — requirement C7 of INSTALLER-CONTRACT.md.
 # Same colocation + chmod rationale as the scripts above. This is what lets a

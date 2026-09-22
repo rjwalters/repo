@@ -2,6 +2,7 @@
 
 # Dependencies
 node_modules
+__pycache__/
 
 # Loom-installed Claude Code config (settings.json, agents/, commands/loom/) plus
 # Repo Skills dev-mode symlinks — machine-local, refreshed by install; do not commit

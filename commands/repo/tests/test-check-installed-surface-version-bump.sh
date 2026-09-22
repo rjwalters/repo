@@ -99,7 +99,7 @@ assert_contains "failure output mentions the no-surface-change marker escape hat
 echo ""
 echo "-- case 4: skills/, hooks/, lib/, install.sh, uninstall.sh, scripts/repo/ are all watched --"
 # ---------------------------------------------------------------------------
-for path in "skills/repo/SKILL.md" "hooks/repo/guard.sh" "lib/foo.sh" "install.sh" "uninstall.sh" "scripts/repo/repo-remote.sh"; do
+for path in "skills/repo/SKILL.md" "hooks/repo/guard.sh" "lib/foo.sh" "install.sh" "uninstall.sh" "scripts/repo/repo-remote.sh" "policies/default.json"; do
     make_fixture
     mkdir -p "$REPO/$(dirname "$path")"
     echo "changed" >> "$REPO/$path"

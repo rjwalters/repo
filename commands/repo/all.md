@@ -19,7 +19,7 @@ keeping the same safety gates on destructive steps that each uses on its own.
 
 It deliberately does **not** launch cloud dev sessions ([[remote]]) — that
 provisions paid infrastructure and is never part of a routine hygiene pass. And
-it only ever runs [[deps]]' read-only half (`--check`): scaffolding Dependabot
+it only ever runs [[deps]]' read-only half (`--check`): configuring dependency automation
 config, flipping repository flags, and merging bot PRs all stay behind
 `/repo:deps`' own confirmations.
 
@@ -320,44 +320,23 @@ Two currency checks run here, both report-first.
 **Installed tool packages** (see [[update-tools]]): check Loom, Anvil, Repo
 itself, … against their sources. Report what's behind and offer to update.
 
-**Third-party dependencies** (see [[deps]]): run the report-only form,
-`[[deps]] --check`. Report three independent items — never collapsed into one
-"Dependabot: on":
+**Third-party dependencies** (see [[deps]]): run `[[deps]] --check`. Report the
+installed organization policy/source, detected provider (Renovate, Dependabot,
+or intentional mixed coverage), config/app status, vulnerability alerts,
+security PR ownership, cooldown and automerge policy, and open dependency PRs.
+These are independent states: an intentionally disabled Dependabot security-PR
+flag is expected when Renovate owns fixes. Missing Dependabot config does not
+mean automation is absent.
 
-- whether `.github/dependabot.yml` is present (that file governs **version**
-  updates only),
-- the repo-level **security-updates** flag — report it **UNKNOWN (needs
-  admin)**, not `disabled`, when the token can't read the setting, exactly as
-  [[deps]] does; "can't see it" and "it's off" are different answers,
-- the **count of open Dependabot PRs**, split into how many are real forward
-  majors and how many are **stale** — proposing a version the manifest on the
-  base branch already satisfies (or exceeds). [[deps]]' stale check does this
-  comparison; a stale PR is never counted as a major and is **never** presented
-  here as pending upgrade work. This split matters right after a bulk-update
-  merge — the exact moment someone runs `/repo:all` to confirm the repo is
-  clean — because Dependabot's still-open PRs from a pre-merge scan are stale,
-  and reporting them as majors is a false upgrade-pressure signal.
+Summarize open PRs as real forward majors, other pending work, and genuinely
+stale PRs. Use [[deps]]' base-manifest **and lockfile** comparison; a permissive
+manifest range alone cannot establish that a lockfile security update is stale.
+Full diff/CI triage remains with `/repo:deps --review`.
 
-Those counts — open, real majors, stale — are all `/repo:all` needs. Computing
-the stale count requires [[deps]]' cheap per-PR manifest comparison (base-branch
-manifest vs. the PR's target), but the rest of the per-PR classification table
-(ecosystem, CI status, diff notes) stays with `/repo:deps --review`, which is a
-separate, confirm-gated activity.
-
-Only `--check` runs from here. `/repo:all` **never** scaffolds
-`.github/dependabot.yml`, **never** flips a repository flag, and **never**
-merges a Dependabot PR. Those are [[deps]]' always-confirm-first actions and
-stay out of the sweep entirely — if any of them is warranted, say so and let
-the user run `/repo:deps` themselves. Under `--ask` this half is unchanged;
-it is already report-only, so there is nothing to confirm.
-
-Dependabot is a GitHub feature, and [[deps]] refuses to run against another
-forge. So if `origin` is not a GitHub remote, skip this half, report it on its
-own line, and continue — it never fails the stage or the run:
-
-```
-Deps: check skipped (not a GitHub remote)
-```
+This stage is always report-only, including under `--ask`: it does not deploy
+organization policy, change client files/settings, or merge PRs. Refer policy
+drift to [[org-policy]] and client adoption to [[deps]]. If origin is not GitHub,
+report `Deps: check skipped (not a GitHub remote)` and continue the sweep.
 
 ### 7. Reset (see [[reset]])
 
@@ -393,7 +372,7 @@ Scrub:        1 at HEAD deferred (identity: docs/runbook.md:41); 63 history-only
 Docs:         2 fixed (README table, CHANGELOG entry), 1 deferred: docs/analysis/ missing README
 Tidy:         freed 240 MB (build/, .cache/, 3 empty dirs)
 Tools:        Anvil updated 1.4.0 → 1.5.1; Loom current
-Deps:         dependabot.yml present, security updates OFF, 3 open PRs (0 majors, 2 stale — already satisfied by manifest)
+Deps:         Renovate, org policy current, alerts ON, security PRs: Renovate, age: 14d/1d, automerge OFF, 3 open PRs (0 majors, 2 stale)
 Reset:        on main (up to date), tree clean, 4 branches deleted, 1 stash kept
 Skipped:      remote (never part of /repo:all); deps install/review (confirm-first — run /repo:deps); scrub --deep/--owner/--forks (run /repo:scrub)
 ```
