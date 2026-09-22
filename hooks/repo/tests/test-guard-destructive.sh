@@ -2147,6 +2147,111 @@ assert_allow "#450 control: apostrophes inside a substitution-free double-quoted
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #453: a nested \$( ) quote must not PHANTOM-CLOSE the active span ---${NC}"
+# =========================================================================
+#
+# #450 (above) scoped the #443 inert-span branch with `acn == 0`. That term is
+# NECESSARY but it is not SUFFICIENT, because `acn` itself was derived from a
+# close index that could be WRONG.
+#
+# ml_segment() records where an active span really ends via trusted_close(),
+# which (pre-#453) resolved the close by scanning forward for the next
+# unescaped quote of the same kind. Inside a DOUBLE-quoted span that scan can
+# land on a `"` that belongs to a NESTED `$( )`/backtick substitution — a
+# string opened and parsed by the INNER shell, not by the shell that opened
+# this span. Accepting it is a PHANTOM close: `acn` drops to 0 while the walk
+# is still inside live, executing code, `acn == 0` then wrongly reports "top
+# level", and the very next apostrophe re-enters the #443 inert branch — which
+# copies the stretch verbatim straight over a real, running `$( )`. That is the
+# #450 hole reached by a different route.
+#
+# Measured on the pre-#453 lexer (instrumented ml_segment(), shape 1 below):
+#
+#   open span at i=6 qc=["] naive-ci=16 trusted_close=16 -> acn=1
+#   close-consumed at i=16 -> acn 1->0        <-- i=16 is the INNER "), depth 1
+#   INERT branch fires at i=18 qc=['] acn=0 inner=[z $(true; <destructive>) w]
+#
+# The fix is in trusted_close(): for a double-quoted span it now also SKIPS a
+# same-kind quote sitting at a deeper `$( )`/backtick nesting depth than the
+# span's own opener (depths precomputed by subst_depth(), moved into the shared
+# _ESCAPE_AWK source string so both lexers get it). `acn == 0` is unchanged and
+# still load-bearing — the depth check is what makes `acn` accurate enough for
+# it to mean what it says.
+#
+# CRITICAL — do not "simplify" either half away. The `acn == 0` term without
+# the depth check is this block; the depth check without `acn == 0` is #450.
+#
+# As with #450 (and unlike the #130 KNOWN LIMIT family) these shapes are NOT
+# unparseable: quotes are balanced, bash parses them and the substitution
+# really executes. `assert_shell_accepts` pins that mechanically.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113/#443/#450).
+_Q453_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q453_RM_ETC="rm -r""f /etc/orphaned-build-dir"   # outside-repo absolute path
+_Q453_HALT="ha""lt"
+
+# 1. The three repro shapes from the issue body. Each has a nested double-quoted
+#    string inside a `$( )` that the pre-#453 forward scan mistook for the OUTER
+#    span's close.
+_Q453_A="echo \"x \$(echo \"y'z \$(true; $_Q453_RM) w'v\") q\""
+_Q453_B="echo \"\$(echo \"a'b \$(true; $_Q453_RM) c'd\")\""
+_Q453_C="echo \"\$(cat \"f'g \$(true; $_Q453_RM_ETC) h'i\")\""
+
+assert_shell_accepts "#453: nested-\$( ) shape A is parseable (so the deny matters)" \
+    "$_Q453_A"
+assert_deny "#453: rm smuggled past a phantom close (leading text before the nested \$( )) denies" \
+    "$_Q453_A"
+
+assert_shell_accepts "#453: nested-\$( ) shape B is parseable (so the deny matters)" \
+    "$_Q453_B"
+assert_deny "#453: rm smuggled past a phantom close (substitution opens the span) denies" \
+    "$_Q453_B"
+
+assert_shell_accepts "#453: nested-\$( ) shape C is parseable (so the deny matters)" \
+    "$_Q453_C"
+assert_deny "#453: /etc rm smuggled past a phantom close (cat inner command) denies" \
+    "$_Q453_C"
+
+# 2. The same defect reached through a BACKTICK outer substitution, and on the
+#    lifecycle tier, so this is not pinned only on rm-scope. (`grep` is not a
+#    data-sink command, so the lifecycle tier really does read the smuggled
+#    segment's command word.)
+_Q453_BT="echo \"x \$(echo \"y'z \`true; $_Q453_RM\` w'v\") q\""
+assert_shell_accepts "#453: nested backtick variant is parseable" \
+    "$_Q453_BT"
+assert_deny "#453: rm smuggled past a phantom close via a nested backtick denies" \
+    "$_Q453_BT"
+
+_Q453_LIFECYCLE="grep -E \"x \$(echo \"y'z \$(true; $_Q453_HALT ) w'v\") q\" file"
+assert_shell_accepts "#453: lifecycle-tier nested variant is parseable" \
+    "$_Q453_LIFECYCLE"
+assert_deny "#453: lifecycle word smuggled past a phantom close denies" \
+    "$_Q453_LIFECYCLE"
+
+# 3. CONTROLS — the depth check narrows ONLY the double-quote case, and only
+#    when the candidate close is genuinely deeper. A single-quoted span's close
+#    is always the very next single-quote byte (single quotes do not nest and
+#    admit no expansion), so depth-filtering must NOT apply to it — otherwise
+#    every #443 shape whose payload contains a `$(` would lose its close and
+#    stop being inert.
+assert_allow "#453 control: top-level single-quoted payload containing \$( ) is still inert" \
+    "echo 'X=\$(true); $_Q453_RM'"
+assert_allow "#453 control: ssh single-quoted payload containing \$( ) is still inert" \
+    "ssh myhost 'X=\$(true); $_Q453_RM'"
+
+# 4. CONTROL — a double-quoted span whose close is at the SAME depth as its
+#    opener is unaffected: the naive scan and the depth-aware scan agree, so
+#    ordinary nested substitutions keep segmenting exactly as before.
+assert_deny "#453 control: same-depth nested \$( ) close still segments (payload denies)" \
+    "echo \"\$(echo \"inner\") \" ; $_Q453_RM"
+assert_allow "#453 control: benign nested double-quoted substitution still allows" \
+    "echo \"outer \$(echo \"inner \$(date)\") tail\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 regression guard: catastrophic commands STILL deny ---${NC}"
 # =========================================================================
 
