@@ -33,6 +33,17 @@
 #   repo-remote status|--status [--json] [aws|gcp]   List instances this command
 #       created (tagged repo-remote=<name>) with state; no mutation.
 #
+#   repo-remote verify|--verify [--json] [aws|gcp]   Prove the SSH alias still
+#       reaches THIS repo's instance before anything is trusted to it. Opens one
+#       SSH session over repo-remote-<name>, asks the host for its OWN instance
+#       id, and compares it with the id this repo expects (a pinned
+#       REPO_REMOTE_INSTANCE_ID, else the repo-remote=<name> tag). Exits 6 on a
+#       mismatch AND on any answer it cannot establish (unreachable host, no
+#       identity source) — it fails CLOSED, because "I could not tell" is not
+#       evidence that the host is the right one. See "Host-identity
+#       verification" below. No cloud mutation; no cloud call at all when the
+#       instance id is pinned.
+#
 #   repo-remote down|--down [--yes] [--force] [--json] [aws|gcp]   Teardown.
 #       Without --yes: a DRY-RUN listing of exactly what would stop/terminate
 #       (fleet-marked instances, if any, are annotated but never block a dry
@@ -73,6 +84,37 @@
 # a dry run (which touches no cloud resource at all) — a `down` dry run
 # annotates any fleet-marked instances in its listing instead of blocking.
 #
+# Host-identity verification (repo#458): an EC2 auto-assigned public IPv4 is
+# RELEASED when the instance stops and a different one is assigned on its next
+# start — and the released address is handed to whoever starts an instance next,
+# very possibly another AWS customer entirely. The SSH alias this script writes
+# is therefore only as fresh as the last `up` (or `verify`) run: nothing keeps it
+# current between sessions. In the incident behind this check, a stopped/started
+# box's old address came back up on a stranger's instance, the unchanged alias
+# resolved, ssh connected, key auth succeeded, and three agents wrote work
+# products to a machine that was not theirs. Every signal the tooling had said
+# "fine".
+#
+# So `up` (after it writes the alias) and the standalone `verify` subcommand both
+# ask the reached host for its OWN instance id and compare it against the id this
+# repo expects. The id is read, in order, from: the marker file this tool drops at
+# provision time (REPO_REMOTE_HOST_ID_FILE, default /etc/repo-remote-instance-id),
+# the instance metadata service (IMDSv2, then IMDSv1, then GCP's), and finally
+# cloud-init's /var/lib/cloud/data/instance-id — so an instance provisioned before
+# the marker existed is still verifiable. A MISMATCH always exits 6, in both
+# paths; --force does NOT override it (that flag is the fleet-marker override and
+# nothing else). The two paths differ only on an answer that could not be
+# established at all:
+#   verify  — exits 6. Fails CLOSED: it exists precisely to be run before an
+#             agent trusts a session it did not just create.
+#   up      — warns loudly and continues. `up` resolved the IP from the cloud API
+#             and rewrote the alias in the SAME run, so the alias is fresh by
+#             construction there; failing the run on an IMDS-locked-down or
+#             pre-marker box would break provisioning for no safety gain.
+# Pinning REPO_REMOTE_INSTANCE_ID is the recommended configuration for any
+# session expected to survive a stop/start: it makes the expectation explicit
+# rather than re-derived from a tag that a fleet host can also be wearing.
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure)
@@ -80,6 +122,9 @@
 #   4  cloud operation failed
 #   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
 #      fleet-marked instance (pass --force to override)
+#   6  host-identity verification failed — the host reachable at the SSH alias
+#      is not the instance this repo expects, or its identity could not be
+#      established (NOT overridable with --force)
 #   64 usage error
 #
 # Testability hooks (honored so the suite can exercise the full contract against
@@ -112,6 +157,12 @@
 #   REPO_REMOTE_IP_POLL_INTERVAL       seconds between those polls (default 2;
 #                                      0 makes the suite's exhausted-budget
 #                                      case instant)
+#   REPO_REMOTE_HOST_ID_FILE           on-host path of the instance-id marker
+#                                      written at provision time and read back
+#                                      by `verify` (default
+#                                      /etc/repo-remote-instance-id; repo#458)
+#   REPO_REMOTE_VERIFY_SSH_TIMEOUT     ConnectTimeout for the single
+#                                      host-identity probe session (default 10)
 #
 set -uo pipefail
 
@@ -541,6 +592,145 @@ echo "* * * * * root /usr/local/bin/repo-remote-idle-check" >/etc/cron.d/repo-re
 EOF
 }
 
+# ── host-identity verification (repo#458) ───────────────────────────────────
+# See "Host-identity verification" in the header block for the incident and the
+# contract. The short version: an SSH alias is a cached IP, an auto-assigned EC2
+# public IP is released on stop, and the tooling's other checks (does the alias
+# resolve? does ssh connect? does auth succeed?) ALL pass on a stranger's box
+# that inherited the address. The host's own instance id is the one thing that
+# cannot be inherited with the IP, so it is what gets compared.
+#
+# Deliberately NOT a heuristic (hostname, uptime, "does our repo exist here") —
+# those are guesses that a coincidentally-similar host can satisfy. This asks
+# the cloud's own authority for the host's identity and compares exact strings.
+REPO_REMOTE_HOST_ID_FILE="${REPO_REMOTE_HOST_ID_FILE:-/etc/repo-remote-instance-id}"
+REPO_REMOTE_VERIFY_SSH_TIMEOUT="${REPO_REMOTE_VERIFY_SSH_TIMEOUT:-10}"
+
+# The user-data fragment that records the instance's OWN id on disk at boot.
+# The id is NOT interpolated from this script (it isn't known until after
+# run-instances returns anyway) — the host reads it from its metadata service,
+# so the marker can only ever name the box it is actually sitting on. Best
+# effort: if IMDS is unreachable the marker is simply not written and the probe
+# below falls back to querying IMDS itself at verify time.
+host_identity_userdata() {
+  cat <<EOF
+# repo-remote host-identity marker (repo#458): lets a later session prove this
+# SSH alias still reaches THIS instance and not a stranger's box that inherited
+# the public IP released when this one was stopped.
+RR_MARKER='${REPO_REMOTE_HOST_ID_FILE}'
+RR_TOK="\$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
+RR_ID="\$(curl -sf -m 5 -H "X-aws-ec2-metadata-token: \${RR_TOK}" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+[ -n "\$RR_ID" ] || RR_ID="\$(curl -sf -m 5 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+if [ -n "\$RR_ID" ]; then
+  printf '%s\n' "\$RR_ID" >"\$RR_MARKER"
+  chmod 644 "\$RR_MARKER"
+fi
+EOF
+}
+
+# The POSIX-sh script executed ON the remote host to report its identity.
+# Ordered cheapest-and-most-specific first; exits 1 (printing nothing) when it
+# can name no identity at all, which the caller treats as "unverified", never as
+# "verified".
+host_identity_probe() {
+  # Only the marker path is interpolated; everything else is literal.
+  cat <<EOF
+rr_marker='${REPO_REMOTE_HOST_ID_FILE}'
+EOF
+  cat <<'EOF'
+if [ -r "$rr_marker" ]; then head -n1 "$rr_marker"; exit 0; fi
+rr_imds=http://169.254.169.254
+rr_tok="$(curl -s -m 5 -X PUT "$rr_imds/latest/api/token" -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
+if [ -n "$rr_tok" ]; then
+  rr_id="$(curl -sf -m 5 -H "X-aws-ec2-metadata-token: $rr_tok" "$rr_imds/latest/meta-data/instance-id" 2>/dev/null || true)"
+  if [ -n "$rr_id" ]; then printf '%s\n' "$rr_id"; exit 0; fi
+fi
+rr_id="$(curl -sf -m 5 "$rr_imds/latest/meta-data/instance-id" 2>/dev/null || true)"
+if [ -n "$rr_id" ]; then printf '%s\n' "$rr_id"; exit 0; fi
+rr_id="$(curl -sf -m 5 -H 'Metadata-Flavor: Google' "$rr_imds/computeMetadata/v1/instance/name" 2>/dev/null || true)"
+if [ -n "$rr_id" ]; then printf '%s\n' "$rr_id"; exit 0; fi
+if [ -r /var/lib/cloud/data/instance-id ]; then head -n1 /var/lib/cloud/data/instance-id; exit 0; fi
+exit 1
+EOF
+}
+
+# remote_host_identity <alias> -- sets REMOTE_HOST_IDENTITY to the id the host
+# reports and returns 0; returns 1 with it empty when the identity could not be
+# established. The ssh stderr is captured into REMOTE_HOST_IDENTITY_ERR so the
+# refusal can say WHY rather than just "failed".
+#
+# Results come back through globals rather than stdout DELIBERATELY: a caller
+# writing `id="$(remote_host_identity …)"` would run this in a subshell, and the
+# captured stderr — the whole point of REMOTE_HOST_IDENTITY_ERR — would be
+# discarded with that subshell. Runs ONE ssh session; nothing here can create,
+# start, or otherwise touch a cloud resource.
+REMOTE_HOST_IDENTITY=""
+REMOTE_HOST_IDENTITY_ERR=""
+remote_host_identity() {  # <alias>
+  local alias="$1" script out rc errf
+  REMOTE_HOST_IDENTITY=""
+  REMOTE_HOST_IDENTITY_ERR=""
+  script="$(host_identity_probe)"
+  errf="$(mktemp)"
+  out="$(ssh -o ConnectTimeout="$REPO_REMOTE_VERIFY_SSH_TIMEOUT" -o BatchMode=yes \
+             -o StrictHostKeyChecking=accept-new "$alias" 'sh -s' <<<"$script" 2>"$errf")"
+  rc=$?
+  REMOTE_HOST_IDENTITY_ERR="$(cat "$errf" 2>/dev/null)"
+  rm -f "$errf"
+  # An instance id is a single bare token; normalize away CR/whitespace and any
+  # trailing chatter so a cosmetic difference can never read as a mismatch.
+  out="$(printf '%s' "$out" | head -n1 | tr -d '[:space:]')"
+  [[ $rc -eq 0 && -n "$out" ]] || return 1
+  REMOTE_HOST_IDENTITY="$out"
+  return 0
+}
+
+# verify_host_identity <alias> <expected-id> <expected-source> [strict|advisory]
+# Sets HOST_ID_OBSERVED to what the host actually said (empty when unknown).
+# A MISMATCH exits 6 in BOTH modes — that is the incident, and --force does not
+# override it. The modes differ only on an identity that could not be
+# established: strict (the `verify` subcommand) exits 6 too, advisory (the tail
+# of `up`) warns and returns 0. See the header block for why.
+HOST_ID_OBSERVED=""
+verify_host_identity() {
+  local alias="$1" expected="$2" src="$3" mode="${4:-strict}" got=""
+  HOST_ID_OBSERVED=""
+
+  if remote_host_identity "$alias"; then
+    got="$REMOTE_HOST_IDENTITY"
+    HOST_ID_OBSERVED="$got"
+  else
+    local why="${REMOTE_HOST_IDENTITY_ERR:-the host answered but named no identity source (no ${REPO_REMOTE_HOST_ID_FILE} marker and no reachable instance metadata service)}"
+    if [[ "$mode" == strict ]]; then
+      printf '%s\n' "repo-remote: ERROR: could not establish the identity of the host reachable at ssh alias '${alias}'." >&2
+      log "  expected instance: ${expected} (${src})"
+      log "  reason: ${why}"
+      log "  Failing closed: an unverifiable host is NOT evidence that the alias still points at your instance. An EC2 auto-assigned public IP is released when the instance stops, so a stale alias can resolve to an unrelated AWS customer's box (repo#458)."
+      log "  Re-run 'repo-remote up --yes' to re-resolve the public IP and rewrite the alias, then verify again."
+      exit 6
+    fi
+    log "WARNING: could not verify the host identity of ${alias} (expected ${expected}); ${why}"
+    log "  The alias was rewritten from this run's freshly resolved address, so it is current as of now — but before trusting a LATER reconnect over it, run: repo-remote verify"
+    return 0
+  fi
+
+  if [[ "$got" != "$expected" ]]; then
+    # Same "repo-remote: ERROR:" shape as die(), but spelled out over several
+    # lines because the remediation is the actionable part (cf.
+    # fleet_marker_gate above).
+    printf '%s\n' "repo-remote: ERROR: HOST IDENTITY MISMATCH for ssh alias '${alias}'." >&2
+    log "  expected instance:     ${expected} (${src})"
+    log "  host at that alias is: ${got}"
+    log "  An auto-assigned EC2 public IP is released when its instance stops and reassigned on the next start — very possibly to another AWS customer's instance. The alias resolving and ssh connecting therefore prove NOTHING about which machine you reached (repo#458)."
+    log "  Do NOT read from or write to this alias: work written through it lands on somebody else's host."
+    log "  Fix: re-run 'repo-remote up --yes' to re-resolve the public IP and rewrite the alias, then re-run 'repo-remote verify'."
+    log "  If ${expected} is not the box you meant, correct REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env}."
+    log "  --force does NOT override this check (it is the fleet-marker override only)."
+    exit 6
+  fi
+  return 0
+}
+
 # ── AWS provider ────────────────────────────────────────────────────────────
 aws_authenticate() {
   aws sts get-caller-identity >/dev/null 2>&1 \
@@ -961,12 +1151,15 @@ EOF
 
 # Build the full AWS EC2 user-data script for a newly created instance:
 # ALWAYS injects the resolved SSH public key into authorized_keys
-# (unconditional belt-and-suspenders, repo#177), then folds in the
+# (unconditional belt-and-suspenders, repo#177) and ALWAYS records the
+# host-identity marker (repo#458 — unconditional for the same reason: the check
+# that reads it must not depend on optional configuration), then folds in the
 # idle-shutdown guard's cron watchdog when idle_guard_enabled (repo#163's
 # IDLE_MIN<=0 opt-out still applies to THAT section only).
 aws_userdata() {  # <pubkey-line>
   printf '#!/bin/bash\n'
   authorized_keys_userdata "$1"
+  host_identity_userdata
   if idle_guard_enabled; then
     # idle_guard_userdata() emits its own leading shebang; strip it since the
     # combined script only needs the ONE shebang emitted above.
@@ -1191,7 +1384,53 @@ aws_up() {
   # before the probe can die, so a readiness timeout never orphans the box.
   aws_check_reachability "$alias" "$ip"
 
+  # Host-identity verification (repo#458). Reaching SOMETHING at the alias is
+  # not the same as reaching THIS instance: the probe above is satisfied by any
+  # host that answers, including a stranger's box that inherited the public IP
+  # released when this instance was last stopped. So confirm the box at the
+  # other end says it is $iid before `up` reports success.
+  #
+  # Advisory mode: a MISMATCH still exits 6 (that is the incident — the alias
+  # this run just wrote does not reach the instance this run just resolved),
+  # but an identity it could not establish is a warning, because `up` rewrote
+  # the alias from a freshly-resolved address in this very run. `verify` is the
+  # fail-closed half, for the reconnect case where nothing re-derived the IP.
+  if [[ -n "$ip" ]]; then
+    verify_host_identity "$alias" "$iid" "this run's resolved instance" advisory
+    if [[ -n "$HOST_ID_OBSERVED" ]]; then
+      log "host identity verified: ${alias} reaches ${HOST_ID_OBSERVED}"
+    fi
+  else
+    log "WARNING: no public IP resolved, so ${alias} was not refreshed and its host identity could not be verified -- whatever HostName it still carries is from a previous session and may now resolve to an unrelated instance. Re-run 'repo-remote up --yes' once the IP is available, then 'repo-remote verify', before using it."
+  fi
+
   emit_up_result "$iid" "$ip" "$alias" "$reused"
+}
+
+# `verify` (repo#458): resolve the instance id this repo EXPECTS at the alias,
+# then prove the host actually reachable there agrees. A pinned
+# REPO_REMOTE_INSTANCE_ID needs no cloud call at all, which is the point of
+# recommending the pin: verification stays cheap enough to run before every
+# session, and the expectation is explicit rather than re-derived from a tag
+# that some other host may also be wearing.
+aws_verify() {
+  local expected="" src=""
+  if [[ -n "$INSTANCE_ID" ]]; then
+    expected="$INSTANCE_ID"
+    src="pinned REPO_REMOTE_INSTANCE_ID"
+  else
+    aws_authenticate
+    local found; found="$(aws_find_tagged)"
+    if [[ -n "$found" ]]; then
+      expected="$(printf '%s' "$found" | awk '{print $1}')"
+      src="discovered via the repo-remote=${NAME} tag"
+    fi
+  fi
+  [[ -n "$expected" ]] || die 2 "nothing to verify against: REPO_REMOTE_INSTANCE_ID is not set and no instance is tagged repo-remote=${NAME}. Pin REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env} (the recommended configuration for any session that outlives a stop/start), or run 'repo-remote up --yes' to provision one."
+
+  local alias="repo-remote-${NAME}"
+  verify_host_identity "$alias" "$expected" "$src" strict
+  emit_verify_result "$alias" "$expected" "$HOST_ID_OBSERVED" "$src"
 }
 
 aws_status() {
@@ -1314,6 +1553,24 @@ gcp_status() {
     --filter="labels.repo-remote=${NAME}" \
     --format='value(name,status,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP,creationTimestamp)' 2>/dev/null || true)"
   emit_status_result "$rows"
+}
+
+# GCP analogue of aws_verify (repo#458). GCP's identity token is the instance
+# NAME (what the metadata server's instance/name key reports), and gcp_up()
+# derives that name deterministically as repo-remote-<name> — so, unlike AWS,
+# there is nothing to discover and no cloud call is ever needed here.
+gcp_verify() {
+  local expected src
+  if [[ -n "$INSTANCE_ID" ]]; then
+    expected="$INSTANCE_ID"
+    src="pinned REPO_REMOTE_INSTANCE_ID"
+  else
+    expected="repo-remote-${NAME}"
+    src="the instance name derived from this repo"
+  fi
+  local alias="repo-remote-${NAME}"
+  verify_host_identity "$alias" "$expected" "$src" strict
+  emit_verify_result "$alias" "$expected" "$HOST_ID_OBSERVED" "$src"
 }
 
 gcp_down() {
@@ -1563,6 +1820,27 @@ emit_up_result() {  # <id> <ip> <alias> <reused>
   fi
 }
 
+emit_verify_result() {  # <alias> <expected-id> <observed-id> <source>
+  local alias="$1" expected="$2" observed="$3" src="$4"
+  if [[ "$JSON_OUT" == true ]]; then
+    printf '{'
+    printf '"action":"verify",'
+    printf '"provider":"%s",' "$(json_escape "$PROVIDER")"
+    printf '"name":"%s",' "$(json_escape "$NAME")"
+    printf '"ssh_alias":"%s",' "$(json_escape "$alias")"
+    printf '"expected_instance_id":"%s",' "$(json_escape "$expected")"
+    printf '"host_instance_id":"%s",' "$(json_escape "$observed")"
+    printf '"identity_source":"%s",' "$(json_escape "$src")"
+    # Only ever emitted on the success path -- verify_host_identity() exits 6
+    # before reaching here on a mismatch or an unverifiable host, so this field
+    # is never false and a caller can gate on its presence alone.
+    printf '"verified":true'
+    printf '}\n'
+  else
+    log "host identity verified: ssh alias ${alias} reaches ${observed} (expected ${expected} — ${src})"
+  fi
+}
+
 emit_status_result() {  # <rows: id state type ip launch, tab/space separated per line>
   local rows="$1"
   if [[ "$JSON_OUT" == true ]]; then
@@ -1635,9 +1913,10 @@ usage() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      up|status|down) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
+      up|status|down|verify) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
       --status)       ACTION="status" ;;
       --down)         ACTION="down" ;;
+      --verify)       ACTION="verify" ;;
       --yes|-y)       YES=true ;;
       --force)        FORCE=true ;;
       --json)         JSON_OUT=true ;;
@@ -1648,7 +1927,7 @@ parse_args() {
     esac
     shift
   done
-  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | down; see --help)"
+  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | verify | down; see --help)"
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -1676,6 +1955,16 @@ main() {
       case "$PROVIDER" in
         aws) aws_status ;;
         gcp) gcp_status ;;
+        *)   die 2 "unknown provider '$PROVIDER'" ;;
+      esac
+      ;;
+    verify)
+      # No cost gate: `verify` spends nothing and mutates nothing — it opens one
+      # SSH session and compares strings (repo#458).
+      [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for verify"
+      case "$PROVIDER" in
+        aws) aws_verify ;;
+        gcp) gcp_verify ;;
         *)   die 2 "unknown provider '$PROVIDER'" ;;
       esac
       ;;

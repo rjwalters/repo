@@ -327,6 +327,28 @@ for a in "$@"; do
   fi
 done
 
+# The host-identity probe (repo#458) is the OTHER non-reachability ssh call:
+# repo-remote.sh runs it as `ssh <opts> <alias> 'sh -s'` with the probe script
+# on stdin. It is matched (and answered) BEFORE the readiness-probe counter
+# below so a verify call never inflates the probe count a repo#449 test
+# asserts on.
+#   MOCK_SSH_HOST_ID    -- what the reached host reports as its own instance
+#                          id. UNSET (the default) means "the host answered but
+#                          could name no identity source", which is what every
+#                          pre-existing scenario sees.
+#   MOCK_SSH_VERIFY_FAIL=1 -- the probe connection itself fails (unreachable
+#                          host), which must fail CLOSED, never pass silently.
+for a in "$@"; do
+  if [[ "$a" == "sh -s" ]]; then
+    if [[ "${MOCK_SSH_VERIFY_FAIL:-0}" == 1 ]]; then
+      printf 'ssh: connect to host mock port 22: Connection refused\n' >&2
+      exit 255
+    fi
+    printf '%s' "${MOCK_SSH_HOST_ID:-}"
+    exit 0
+  fi
+done
+
 # Everything past here is a real connection attempt, i.e. an
 # aws_check_reachability() readiness probe (repo#449). Count them in a
 # per-run file (reset by run_rr) so a test can assert exactly how many
@@ -1614,6 +1636,164 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- host-identity verification: the stale-alias guard (repo#458) --"
+# ---------------------------------------------------------------------------
+# The reported incident: an instance was stopped and started again. An EC2
+# auto-assigned public IPv4 is RELEASED on stop, so the address the SSH alias
+# still carried came back up on a DIFFERENT customer's instance. The alias
+# resolved, ssh connected, auth succeeded -- and three agents wrote work
+# products to a stranger's machine. Nothing in the tooling warned, because
+# every check it had (does the alias resolve? does ssh connect?) passed.
+#
+# The fix is a check on the ONE thing that cannot be inherited with an IP: the
+# host's own instance id, read back over the session and compared against the
+# id this repo expects. These tests pin down that it fails LOUDLY on a
+# mismatch and fails CLOSED when it cannot get an answer at all.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
+
+# (a) The host reports the pinned id -> verified, exit 0, machine-readable.
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- verify --json
+assert_eq   "verify: matching host identity -> exit 0" "0" "$RR_RC"
+assert_eq   "verify: emits the verify action" "verify" "$(json_field "$RR_OUT" action)"
+assert_eq   "verify: reports the expected instance id" "i-0pinnedbox" "$(json_field "$RR_OUT" expected_instance_id)"
+assert_eq   "verify: reports what the host itself said" "i-0pinnedbox" "$(json_field "$RR_OUT" host_instance_id)"
+assert_eq   "verify: reports the alias it checked" "repo-remote-myrepo" "$(json_field "$RR_OUT" ssh_alias)"
+assert_contains "verify: says the id came from the pin" "$RR_OUT" "REPO_REMOTE_INSTANCE_ID"
+assert_eq   "verify: a pinned id needs no cloud call at all" "0" \
+  "$(grep -c 'describe-instances' "$MOCK_LOG" 2>/dev/null)"
+
+# (b) THE incident: the alias resolves and ssh succeeds, but the box at the
+#     other end is somebody else's. This must refuse, loudly, non-zero.
+run_rr MOCK_SSH_HOST_ID=i-0strangersbox -- verify --json
+assert_eq   "verify: host identity MISMATCH -> exit 6 (refuses)" "6" "$RR_RC"
+assert_contains "the refusal is unmistakable" "$RR_ERR" "HOST IDENTITY MISMATCH"
+assert_contains "the refusal names the expected instance" "$RR_ERR" "i-0pinnedbox"
+assert_contains "the refusal names the instance actually reached" "$RR_ERR" "i-0strangersbox"
+assert_contains "the refusal names the alias" "$RR_ERR" "repo-remote-myrepo"
+assert_contains "the refusal explains the released-public-IP mechanism" "$RR_ERR" "released"
+assert_contains "the refusal says not to write anything through the alias" "$RR_ERR" "Do NOT"
+assert_contains "the refusal gives the remediation (re-run up)" "$RR_ERR" "repo-remote up --yes"
+assert_not_contains "a mismatch emits no success result" "$RR_OUT" '"verified":true'
+
+# (c) --force is the fleet-marker override and NOTHING else: it must not talk
+#     a mismatched host into being accepted.
+run_rr MOCK_SSH_HOST_ID=i-0strangersbox -- verify --force --json
+assert_eq   "verify: --force does NOT relax the identity check" "6" "$RR_RC"
+assert_contains "verify: --force still reports the mismatch" "$RR_ERR" "HOST IDENTITY MISMATCH"
+
+# (d) Fail CLOSED: an unreachable host is not evidence that the host is the
+#     right one, so "cannot tell" must never be reported as "verified".
+run_rr MOCK_SSH_VERIFY_FAIL=1 -- verify --json
+assert_eq   "verify: unreachable host -> exit 6 (fails closed, never silently passes)" "6" "$RR_RC"
+assert_contains "verify: says the identity could not be established" "$RR_ERR" "could not"
+assert_contains "verify: surfaces the underlying ssh error" "$RR_ERR" "Connection refused"
+assert_not_contains "verify: an unreachable host emits no success result" "$RR_OUT" '"verified":true'
+
+# (e) Same fail-closed rule when the host answers but can name no identity
+#     source (no marker file, no reachable metadata service).
+run_rr -- verify --json
+assert_eq   "verify: host reports no identity at all -> exit 6" "6" "$RR_RC"
+assert_contains "verify: names the marker file it looked for" "$RR_ERR" "/etc/repo-remote-instance-id"
+
+# (f) No pin and no tagged instance: there is nothing to verify AGAINST, which
+#     is a config problem (exit 2), not a silent pass.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="" MOCK_SSH_HOST_ID=i-0whatever -- verify --json
+assert_eq   "verify: nothing to verify against -> exit 2" "2" "$RR_RC"
+assert_contains "verify: points at REPO_REMOTE_INSTANCE_ID pinning" "$RR_ERR" "REPO_REMOTE_INSTANCE_ID"
+
+# (g) Unpinned but tag-discoverable: the discovered id is the expectation.
+run_rr MOCK_AWS_FIND="i-0taggedbox running" MOCK_SSH_HOST_ID=i-0taggedbox -- verify --json
+assert_eq   "verify: tag-discovered instance matches -> exit 0" "0" "$RR_RC"
+assert_eq   "verify: expectation came from the tag" "i-0taggedbox" "$(json_field "$RR_OUT" expected_instance_id)"
+run_rr MOCK_AWS_FIND="i-0taggedbox running" MOCK_SSH_HOST_ID=i-0someoneelse -- verify --json
+assert_eq   "verify: tag-discovered instance mismatched -> exit 6" "6" "$RR_RC"
+
+# (h) GCP verifies the same way, against the instance NAME the alias should be
+#     pointing at (gcp_up derives repo-remote-<name>).
+write_shared "REPO_REMOTE_PROVIDER=gcp" "GCP_PROJECT=p" "GCP_ZONE=us-central1-a" \
+             "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=e2-standard-4"
+run_rr MOCK_SSH_HOST_ID=repo-remote-myrepo -- verify --json
+assert_eq   "verify (gcp): matching instance name -> exit 0" "0" "$RR_RC"
+run_rr MOCK_SSH_HOST_ID=some-other-vm -- verify --json
+assert_eq   "verify (gcp): mismatched instance name -> exit 6" "6" "$RR_RC"
+assert_contains "verify (gcp): the refusal names the host actually reached" "$RR_ERR" "some-other-vm"
+
+# (i) The probe itself: it must prefer the marker file this tool drops, then
+#     fall back to the instance metadata service, so an instance provisioned
+#     BEFORE the marker existed is still verifiable.
+PROBE="$(bash -c "source '$RR'; host_identity_probe")"
+assert_contains "probe reads the marker file first" "$PROBE" "/etc/repo-remote-instance-id"
+assert_contains "probe falls back to IMDSv2 (token request)" "$PROBE" "latest/api/token"
+assert_contains "probe falls back to the EC2 instance-id metadata key" "$PROBE" "meta-data/instance-id"
+assert_contains "probe also handles GCP metadata" "$PROBE" "Metadata-Flavor: Google"
+assert_contains "probe exits non-zero when it can name no identity" "$PROBE" "exit 1"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- host-identity verification is wired into \`up\` (repo#458) --"
+# ---------------------------------------------------------------------------
+# AC2: the check must not depend on an agent remembering to run it. `up` is the
+# one command every session-start sequence already runs, so it verifies the
+# alias it just wrote before reporting success.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (j) The created instance answers with its own id -> `up` says so and succeeds.
+run_rr MOCK_AWS_NEW_ID=i-0freshbox MOCK_AWS_PUBLIC_IP=203.0.113.80 MOCK_SSH_HOST_ID=i-0freshbox \
+  -- up --yes --json
+assert_eq   "up: verified host identity -> exit 0" "0" "$RR_RC"
+assert_contains "up: reports the identity it verified" "$RR_ERR" "host identity verified"
+assert_contains "up: names the instance id it confirmed" "$RR_ERR" "i-0freshbox"
+
+# (k) The alias `up` just wrote reaches a DIFFERENT box -> refuse, exit 6.
+run_rr MOCK_AWS_NEW_ID=i-0freshbox MOCK_AWS_PUBLIC_IP=203.0.113.80 MOCK_SSH_HOST_ID=i-0strangersbox \
+  -- up --yes --json
+assert_eq   "up: identity mismatch after provisioning -> exit 6" "6" "$RR_RC"
+assert_contains "up: the refusal is the same loud one" "$RR_ERR" "HOST IDENTITY MISMATCH"
+
+# (l) A host that can name no identity does NOT fail `up` -- `up` resolved the
+#     IP from the cloud API and rewrote the alias in this same run, so the
+#     alias is fresh by construction; an unverifiable answer is a warning, and
+#     the standalone `verify` (which fails closed) is what a later reconnect
+#     must run. Anything stricter would break `up` on every instance
+#     provisioned before the marker existed with IMDS locked down.
+run_rr MOCK_AWS_NEW_ID=i-0quietbox MOCK_AWS_PUBLIC_IP=203.0.113.81 -- up --yes --json
+assert_eq   "up: unverifiable identity is non-fatal" "0" "$RR_RC"
+assert_contains "up: but it warns loudly" "$RR_ERR" "could not verify"
+assert_contains "up: and names the command that fails closed" "$RR_ERR" "repo-remote verify"
+
+# (m) No public IP resolved -> the alias was NOT refreshed, so it may still
+#     carry the PREVIOUS session's address. `up` must say the identity is
+#     unverified rather than imply the alias is good.
+run_rr MOCK_AWS_NEW_ID=i-0noipbox MOCK_AWS_PUBLIC_IP_FAIL=1 -- up --yes --json
+assert_eq   "up with no public IP still succeeds (unchanged, repo#216)" "0" "$RR_RC"
+assert_contains "up: warns the stale alias was not identity-verified" "$RR_ERR" "could not"
+
+# (n) The marker itself: a created instance records its OWN id at boot, so a
+#     later session has a source that does not depend on IMDS still being
+#     reachable.
+run_rr MOCK_AWS_NEW_ID=i-0markerbox MOCK_AWS_PUBLIC_IP=203.0.113.82 MOCK_SSH_HOST_ID=i-0markerbox \
+  -- up --yes --json
+UD="$(cat "$MOCK_LOG.userdata" 2>/dev/null)"
+assert_contains "user-data writes the host-identity marker" "$UD" "/etc/repo-remote-instance-id"
+assert_contains "the marker value is read from the instance metadata service" "$UD" "meta-data/instance-id"
+assert_contains "the marker write uses IMDSv2 (token first)" "$UD" "latest/api/token"
+assert_contains "the idle guard is still installed alongside it" "$UD" "repo-remote-idle-check"
+assert_contains "authorized_keys injection is still there too" "$UD" "authorized_keys"
+
+# (o) The marker path is overridable (so a test/host with a read-only /etc can
+#     move it) and the override reaches BOTH the user-data and the probe.
+run_rr MOCK_AWS_NEW_ID=i-0altmarker MOCK_AWS_PUBLIC_IP=203.0.113.83 \
+  MOCK_SSH_HOST_ID=i-0altmarker REPO_REMOTE_HOST_ID_FILE=/opt/rr-id -- up --yes --json
+assert_contains "user-data honors REPO_REMOTE_HOST_ID_FILE" "$(cat "$MOCK_LOG.userdata" 2>/dev/null)" "/opt/rr-id"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -1679,6 +1859,25 @@ assert_contains "remote.md documents always attaching a resolved key pair" \
   "$MD" "always attach a key pair"
 assert_contains "remote.md documents the key pair is derived from REPO_REMOTE_SSH_KEY" \
   "$MD" "resolved from"
+
+# repo#458: the host-identity check, the IP-churn-on-stop property that makes
+# it necessary, and the pinning recommendation are all implemented surface —
+# remote.md must document them so an agent reading the prose gets the same
+# model the script enforces.
+assert_contains "remote.md documents the verify subcommand" "$MD" "repo-remote verify"
+assert_contains "remote.md documents the identity-mismatch exit code" "$MD" "exit \`6\`"
+assert_contains "remote.md states an auto-assigned public IP is released on stop" \
+  "$MD" "released"
+assert_contains "remote.md warns the released IP can land on another customer's instance" \
+  "$MD" "another AWS customer"
+assert_contains "remote.md states the alias is only as fresh as the last up/verify" \
+  "$MD" "only as fresh as"
+assert_contains "remote.md recommends pinning REPO_REMOTE_INSTANCE_ID as the default" \
+  "$MD" "Pin \`REPO_REMOTE_INSTANCE_ID\`"
+assert_contains "remote.md documents the host-identity marker file" \
+  "$MD" "/etc/repo-remote-instance-id"
+assert_contains "remote.md makes verification part of opening the session" \
+  "$MD" "before you trust the session"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).
