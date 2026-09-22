@@ -84,12 +84,19 @@ run_rr() {
     while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
     shift
     : >"$MOCK_LOG"
+    : >"$MOCK_LOG.sshprobes"          # per-run ssh probe counter (repo#449)
     local errf; errf="$(mktemp)"
+    # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
+    # real 120s readiness window (repo#449); the assignments below come BEFORE
+    # "${envs[@]}", and `env` applies assignments left-to-right, so any test
+    # that passes its own value still wins.
     RR_OUT="$(cd "$REPO" && env \
         PATH="$MOCK_BIN:$PATH" \
         XDG_CONFIG_HOME="$XDG" \
         REPO_REMOTE_SSH_CONFIG="$SCRATCH/ssh_config" \
         REPO_REMOTE_SSH_KEY="$SSH_KEY_FIXTURE" \
+        REPO_REMOTE_SSH_READY_TIMEOUT=0 \
+        REPO_REMOTE_SSH_READY_POLL_INTERVAL=0 \
         MOCK_AWS_LOG="$MOCK_LOG" \
         "${envs[@]}" \
         bash "$RR" "$@" 2>"$errf")"
@@ -267,7 +274,8 @@ chmod +x "$MOCK_BIN/gcloud"
 # and mock `ssh` (backs aws_check_reachability's end-of-run probe). Both
 # default to a benign success so every pre-existing scenario below — which
 # doesn't care about either — is unaffected; specific tests override via
-# MOCK_CURL_FAIL / MOCK_CURL_IP / MOCK_SSH_FAIL.
+# MOCK_CURL_FAIL / MOCK_CURL_IP / MOCK_SSH_FAIL / MOCK_SSH_FAIL_COUNT /
+# MOCK_SSH_STDERR.
 # ---------------------------------------------------------------------------
 cat >"$MOCK_BIN/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -292,7 +300,32 @@ for a in "$@"; do
     exit 0
   fi
 done
-[[ "${MOCK_SSH_FAIL:-0}" == 1 ]] && exit 255
+
+# Everything past here is a real connection attempt, i.e. an
+# aws_check_reachability() readiness probe (repo#449). Count them in a
+# per-run file (reset by run_rr) so a test can assert exactly how many
+# attempts the retry loop burned, and emit the failure on STDERR -- the
+# retry loop classifies boot-in-progress vs. hard failure purely from that
+# text, so a silent `exit 255` is NOT a faithful mock of either.
+PROBES="${MOCK_AWS_LOG:-/dev/null}.sshprobes"
+n=0
+[[ -f "$PROBES" ]] && n="$(wc -l <"$PROBES" | tr -d ' ')"
+n=$(( n + 1 ))
+printf 'probe\n' >>"$PROBES"
+
+# MOCK_SSH_STDERR: exact stderr text for a failing probe (defaults to the
+#   OpenSSH "still booting" phrasing the retry loop must retry on).
+# MOCK_SSH_FAIL_COUNT=<k>: fail the first k probes, then succeed.
+# MOCK_SSH_FAIL=1: fail every probe.
+fail_msg="${MOCK_SSH_STDERR:-ssh: connect to host mock port 22: Connection refused}"
+if [[ -n "${MOCK_SSH_FAIL_COUNT:-}" ]] && (( n <= MOCK_SSH_FAIL_COUNT )); then
+  printf '%s\n' "$fail_msg" >&2
+  exit 255
+fi
+if [[ "${MOCK_SSH_FAIL:-0}" == 1 ]]; then
+  printf '%s\n' "$fail_msg" >&2
+  exit 255
+fi
 exit 0
 MOCK
 chmod +x "$MOCK_BIN/ssh"
@@ -516,6 +549,80 @@ run_rr MOCK_AWS_NEW_ID=i-0reachskip MOCK_AWS_STATE=None -- up --yes --json
 assert_eq   "no public IP -> up still succeeds (probe skipped)" "0" "$RR_RC"
 assert_not_contains "no probe attempted without a public IP" "$(cat "$MOCK_LOG")" "ssh "
 assert_contains "a skip notice is logged" "$RR_ERR" "skipping the end-of-run SSH reachability check"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- fresh-instance SSH readiness wait (repo#449) --"
+# ---------------------------------------------------------------------------
+# A freshly booted guest refuses connections for tens of seconds while
+# cloud-init/sshd come up. The probe must WAIT (bounded, configurable) rather
+# than report a false provisioning failure on the very first refusal -- while
+# still failing loudly on a genuinely unreachable host, and failing
+# IMMEDIATELY on an auth/config error that no amount of waiting can fix.
+#
+# ssh_probe_count -> number of real connection attempts in the last run_rr
+# (the mock appends one line per probe; `ssh -G` config-parse calls excluded).
+ssh_probe_count() { wc -l <"$MOCK_LOG.sshprobes" | tr -d ' '; }
+
+# (a) Two connection-refused attempts, then success: `up` succeeds, the retry
+#     actually happened, and exactly ONE instance was launched across it.
+run_rr MOCK_AWS_NEW_ID=i-0readyretry MOCK_AWS_STATE=203.0.113.30 \
+       MOCK_SSH_FAIL_COUNT=2 \
+       REPO_REMOTE_SSH_READY_TIMEOUT=30 REPO_REMOTE_SSH_READY_POLL_INTERVAL=0 \
+       -- up --yes --json
+assert_eq "connection-refused then success -> up succeeds (no false failure)" "0" "$RR_RC"
+assert_eq "the probe retried past the refusals (3 attempts)" "3" "$(ssh_probe_count)"
+assert_contains "a retry notice explains the wait" "$RR_ERR" "still booting"
+assert_contains "success names the number of attempts" "$RR_ERR" "after 3 attempts"
+# The retry loop must NEVER relaunch: exactly one run-instances across the run.
+assert_eq "exactly one instance launched across the retry sequence" \
+          "1" "$(grep -c 'run-instances' "$MOCK_LOG")"
+assert_eq "no extra start-instances issued during the retry" \
+          "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+assert_eq "the created instance id is reported" "i-0readyretry" "$(json_field "$RR_OUT" instance_id)"
+
+# Drop the id the run just wrote back, so the next scenario creates afresh
+# instead of taking the pinned-reuse path.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (b) Permanent refusal: still a loud exit-4 die once the window is exhausted,
+#     naming the configured window -- never a silent success, never a warning.
+run_rr MOCK_AWS_NEW_ID=i-0readytimeout MOCK_AWS_STATE=203.0.113.31 \
+       MOCK_SSH_FAIL=1 \
+       REPO_REMOTE_SSH_READY_TIMEOUT=1 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 \
+       -- up --yes --json
+assert_eq   "permanent refusal -> still a loud failure (exit 4)" "4" "$RR_RC"
+assert_contains "failure names the reachability check" "$RR_ERR" "SSH reachability check failed"
+assert_contains "failure names the configured wait window" "$RR_ERR" "within 1s"
+assert_contains "failure points at the tunable" "$RR_ERR" "REPO_REMOTE_SSH_READY_TIMEOUT"
+assert_contains "failure still names the ingress/key/user knobs" "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
+# It retried (more than the single pre-#449 attempt) before giving up.
+[[ "$(ssh_probe_count)" -ge 2 ]] \
+  && ok "the window was actually retried before dying ($(ssh_probe_count) attempts)" \
+  || no "expected >= 2 probe attempts before the deadline, got $(ssh_probe_count)"
+# ...and the instance id is STILL written back, so a readiness timeout never
+# orphans a box the caller has already paid for.
+assert_contains "instance id is persisted despite the readiness timeout" \
+                "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0readytimeout"
+assert_eq "no relaunch while the readiness window was being exhausted" \
+          "1" "$(grep -c 'run-instances' "$MOCK_LOG")"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (c) An authentication failure is NOT boot-in-progress: it must fail on the
+#     FIRST attempt rather than burning the whole retry budget on an error
+#     that waiting can never fix.
+run_rr MOCK_AWS_NEW_ID=i-0readyauth MOCK_AWS_STATE=203.0.113.32 \
+       MOCK_SSH_FAIL=1 MOCK_SSH_STDERR="ubuntu@203.0.113.32: Permission denied (publickey)." \
+       REPO_REMOTE_SSH_READY_TIMEOUT=60 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 \
+       -- up --yes --json
+assert_eq   "auth failure -> loud failure (exit 4)" "4" "$RR_RC"
+assert_eq   "auth failure is NOT retried (exactly one attempt)" "1" "$(ssh_probe_count)"
+assert_contains "the failure explains waiting will not help" "$RR_ERR" "still booting, so waiting longer will not help"
+assert_contains "the failure surfaces ssh's own error text" "$RR_ERR" "Permission denied"
+assert_contains "the failure names the key/user knobs" "$RR_ERR" "REPO_REMOTE_SSH_KEY"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
