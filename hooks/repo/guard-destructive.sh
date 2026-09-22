@@ -1526,9 +1526,12 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
 #   - An INERT quoted span is copied VERBATIM, so its embedded
 #     newlines/separators stay literal and never manufacture a phantom segment
 #     out of quoted documentation prose (the false positive). A span is inert
-#     when it carries no `$(` and no backtick — and a SINGLE-quoted span is
-#     ALWAYS inert regardless of its content (#443), because bash never expands
-#     or substitutes anything between `'...'`.
+#     when it carries no `$(` and no backtick — and a TOP-LEVEL single-quoted
+#     span is inert regardless of its content (#443), because bash never expands
+#     or substitutes anything between `'...'`. "Top-level" is load-bearing
+#     (#450): an apostrophe met while an ACTIVE span is still open is literal
+#     text to the shell, not an opener, so its span may hold live code and is
+#     NOT treated as inert.
 #   - A DOUBLE-quoted span carrying command substitution (`$(` or a backtick)
 #     keeps its separators ACTIVE (walked char-by-char, exactly like qsplit()),
 #     so a smuggled payload is never hidden behind an opening quote. Its
@@ -1755,7 +1758,8 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            # A SINGLE-quoted span is ALWAYS inert, `$(`/backtick or not (#443).
+            # A TOP-LEVEL SINGLE-quoted span is inert, `$(`/backtick or not
+            # (#443, scoped to the top level of the walk by #450).
             # (No apostrophes in this block: it lives inside a single-quoted awk
             # source string, where one would terminate the string. S below stands
             # for the single quote character.)
@@ -1786,13 +1790,31 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
             # reads the raw command string and never goes through this lexer, so a
             # root-obliterating payload inside a single-quoted span still denies.
             #
-            # Caveat, same family as the KNOWN LIMIT (#130) noted just below: a
-            # PHANTOM single quote (one the shell reads as ordinary text because it
-            # sits inside a double-quoted span) now reaches the inert branch even
-            # when the text it pairs with carries a substitution. Every member of
-            # that family needs an ODD quote count, so the shell rejects the
-            # command outright and nothing executes.
-            if (qc == SQ || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
+            # The SQ branch is scoped to the TOP LEVEL of the walk (`acn == 0`)
+            # — #450, a regression the unscoped form shipped with. Only there is
+            # an unescaped S guaranteed to be a real OPENER whose span the shell
+            # genuinely treats as inert, which is the only shape #443 was ever
+            # about (every #443 payload is a top-level single-quoted argument).
+            #
+            # Reached while an ACTIVE span is still open, that S is a PHANTOM
+            # quote: inside a double-quoted span bash reads it as ordinary
+            # literal text, so the forward scan above pairs it with some
+            # unrelated LATER S, and the stretch between them can hold genuinely
+            # live, executing code. Copying that stretch verbatim made the lexer
+            # skip a real $( ) that bash actually runs:
+            #
+            #   echo "donSt $(true; <recursive-force rm of an out-of-repo path>) wonSt"
+            #
+            # That is parseable (the apostrophes are balanced), the substitution
+            # really executes, and the guard allowed it — a deny before #443
+            # became an allow after it. The earlier claim that every such shape
+            # needs an ODD quote count and so cannot parse was simply wrong; the
+            # #450 test block pins the parseability mechanically next to the deny.
+            # So: an S reached with `acn > 0` stays on the legacy active-walk path
+            # below, where separators remain live and the smuggled payload is
+            # still segmented and classified. Do NOT drop the `acn == 0` term as
+            # a simplification — it is the entire scoping of the #443 branch.
+            if ((qc == SQ && acn == 0) || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
                 # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
                 # it consumes whatever the forward scan paired with, which for a

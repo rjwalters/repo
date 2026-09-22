@@ -1825,6 +1825,26 @@ assert_shell_rejects() {
     fi
 }
 
+# The inverse of the helper above: pin that bash really DOES parse a command, so
+# a deny assertion next to it is protecting a shape that genuinely executes
+# (used by the #450 block, whose whole point is that its payload is parseable —
+# it is NOT a member of the unparseable #130 family).
+assert_shell_accepts() {
+    local description="$1"
+    local cmd="$2"
+    TOTAL=$((TOTAL + 1))
+    if bash -n <<<"$cmd" 2>/dev/null; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: bash parses it (the deny below guards a real, executable shape)"
+        echo -e "       Got: bash REJECTED it (syntax error)"
+    fi
+}
+
 _Q113_STRAY='"'           # a STRAY unmatched double quote after the span
 _Q113_STRAYBS='\\\\"'     # an escaped-backslash run, then a stray quote
 _Q113_TRAILQ='"trailing"' # the later quote pair the stray one reaches first
@@ -2033,6 +2053,96 @@ assert_deny "#443 control: single-quoted \$( ) span then a REAL ;-separated life
 #    root-obliterating payload inside a single-quoted span still denies.
 assert_deny "#443 control: catastrophic rm inside a single-quoted \$( ) span still denies" \
     "echo 'X=\$(true); rm -r""f /'"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #450: #443 inertness applies only at the TOP LEVEL of the walk ---${NC}"
+# =========================================================================
+#
+# #443 made a single-quoted span inert in ml_segment(). Bash really does never
+# substitute inside `'...'`, so that is correct — but ONLY for a quote that is a
+# real opener, i.e. one reached at the TOP LEVEL of the walk (no ACTIVE span
+# open). As first merged, the test was `qc == SQ || <no substitution inside>`,
+# evaluated regardless of `acn`, so it also fired on an apostrophe encountered
+# while a LIVE double-quoted span was still open.
+#
+# Inside a double-quoted span an apostrophe is ordinary literal text to bash. Its
+# forward-scan "partner" is therefore some unrelated later apostrophe, with
+# genuinely LIVE, executing code between them. Treating that stretch as inert
+# made the lexer copy it verbatim and skip over a real `$( )` that bash actually
+# runs — turning a pre-#443 deny into an allow:
+#
+#   echo "don<apostrophe>t $(true; <recursive-force rm of an out-of-repo path>) won<apostrophe>t"
+#
+# The condition is now scoped with `acn == 0`, so an apostrophe reached while an
+# ACTIVE span is open stays on the legacy active-walk path (separators stay live,
+# the smuggled payload is segmented and classified). Every #443 shape is a
+# TOP-LEVEL single-quoted span, so all of them remain inert and allowed — the
+# block above pins that and must stay green alongside this one.
+#
+# CRITICAL — do not "simplify" the `acn == 0` term back out of that condition.
+# These cases exist precisely so that widening cannot land silently again.
+#
+# Unlike the #130 KNOWN LIMIT family, these shapes are NOT unparseable: the
+# apostrophes are balanced, bash parses the command and the substitution really
+# executes. `assert_shell_accepts` pins that mechanically, so the deny below is
+# protecting a shape that genuinely runs rather than one the shell would reject.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113/#443).
+_Q450_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q450_RM_ETC="rm -r""f /etc/orphaned-build-dir"   # outside-repo absolute path
+_Q450_HALT="ha""lt"
+
+# 1. The exact repro shapes from the issue body. Apostrophes sit INSIDE a live
+#    double-quoted span, on both sides of a real, executing `$( )`.
+_Q450_A="echo \"don't \$(true; $_Q450_RM) won't\""
+_Q450_B="echo \"it's \$(id; $_Q450_RM_ETC) fine's\""
+
+assert_shell_accepts "#450: apostrophe-in-live-DQ-span shape A is parseable (so the deny matters)" \
+    "$_Q450_A"
+assert_deny "#450: rm smuggled between apostrophes inside a live double-quoted \$( ) denies" \
+    "$_Q450_A"
+
+assert_shell_accepts "#450: apostrophe-in-live-DQ-span shape B is parseable (so the deny matters)" \
+    "$_Q450_B"
+assert_deny "#450: /etc rm smuggled between apostrophes inside a live double-quoted \$( ) denies" \
+    "$_Q450_B"
+
+# 2. Same shape via a BACKTICK substitution — the other half of the liveness
+#    probe — and on the lifecycle tier, so this is not pinned only on rm-scope.
+_Q450_BT_CMD="echo \"don't \`true; $_Q450_RM\` won't\""
+assert_shell_accepts "#450: backtick variant is parseable" \
+    "$_Q450_BT_CMD"
+assert_deny "#450: rm smuggled between apostrophes inside a live double-quoted backtick denies" \
+    "$_Q450_BT_CMD"
+
+# `grep` is not a data-sink command, so the lifecycle tier really does read this
+# segment's command word (an `echo` argument is stripped by
+# strip_datasink_literals() long before it gets there).
+_Q450_LIFECYCLE="grep -E \"don't \$(true; $_Q450_HALT ) fine's\" file"
+assert_shell_accepts "#450: lifecycle-tier variant is parseable" \
+    "$_Q450_LIFECYCLE"
+assert_deny "#450: lifecycle word smuggled between apostrophes inside a live \$( ) denies" \
+    "$_Q450_LIFECYCLE"
+
+# 3. CONTROLS — the narrowing is scoped to an OPEN active span, nothing more.
+#    A top-level single-quoted span is still inert even when an ACTIVE
+#    double-quoted span was opened and CLOSED earlier in the same command: `acn`
+#    is back to 0 by then, so #443 still governs. (An `acn`-blind "any DQ span
+#    seen" reading of the fix would break this and re-open #443.)
+assert_allow "#450 control: single-quoted \$( ) span after a CLOSED active DQ span is still inert" \
+    "echo \"\$(id)\" 'X=\$(true); $_Q450_RM'"
+assert_allow "#450 control: ssh single-quoted payload after a CLOSED active DQ span is still inert" \
+    "echo \"\$(id)\" && ssh myhost 'X=\$(true); $_Q450_RM'"
+
+# 4. CONTROL — an apostrophe inside a double-quoted span with NO substitution
+#    changes nothing: that span is inert on the second half of the condition,
+#    which this fix does not touch.
+assert_allow "#450 control: apostrophes inside a substitution-free double-quoted span still allow" \
+    "echo \"don't worry; it's only documentation about $_Q450_RM\""
 
 echo ""
 
