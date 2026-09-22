@@ -40,6 +40,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  organization-policy:
+    name: Validate organization Renovate policies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Validate all effective organization profiles
+        run: python3 policies/validate-renovate.py npm exec --yes --package=renovate@44.106.0 -- renovate-config-validator
+      - name: Verify security and routine release-age behavior
+        run: npm exec --yes --package=renovate@44.106.0 -- node policies/test-release-age.mjs
+
   test:
     name: pnpm test (guard/handoff/loss-check suite)
     runs-on: ubuntu-latest

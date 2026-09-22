@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.2 (2026-09-22)
+
+- Add `/repo:org-policy`: preview canonical preferences from `rjwalters/repo/policies/`
+  and publish an organization `.github` policy PR from any client repository.
+  Deployments record their source revision, preserve unrelated files, reject
+  stale previews, and reuse unchanged branches/PRs on retry.
+- Default to 14-day routine updates and one-day advisory-backed security fixes;
+  keep automatic merging a separate opt-in. Organization overrides remain in
+  the canonical source, while deployed presets are traceable snapshots.
+- Make `/repo:deps` and `/repo:all` aware of organization policy and Renovate,
+  preserve intentional Dependabot coverage during migration, and check locked
+  versions before declaring dependency PRs stale.
+
 ## 0.11.1 (2026-08-20)
 
 - **Repo Skills installs for Codex CLI as well as Claude Code (#285, PR #288).** `install.sh` packaged the workflows for Claude Code only. It now also writes a repo-scoped Codex skill at `.agents/skills/repo/` — `SKILL.md` with Codex-native frontmatter plus `commands/repo/*.md` copied unchanged into `references/` — so the one canonical workflow source is discoverable from both runtimes. The target format was confirmed against Codex's own docs rather than inferred: Codex scans `.agents/skills` from the cwd up to the repo root using the open Agent Skills format, so this is a plain file write with no manifest, no config registration, and nothing outside the target repo. `uninstall.sh` and `resync-installed.sh` cover the new surface, `lib/codex-skill.sh` is the single emitter all three share, and a cross-runtime parity test (#286, PR #318) pins that `/repo:followups` and the Codex `repo` skill resolve to the same `SKILL.md` body. New `skills/README.md` (#287) documents which frontmatter fields are runtime-neutral and which are Claude-specific.

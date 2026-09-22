@@ -1461,6 +1461,23 @@ fi
 
 echo
 echo "==============================="
+echo "-- Organization policy resolution and publication (delegated suite) --"
+OP_TEST="$TESTS_DIR/../../../commands/repo/tests/test_org_policy.py"
+OP_OUT="$(python3 "$OP_TEST" 2>&1)"
+OP_STATUS=$?
+OP_PASS="$(suite_count Passed "$OP_OUT")"
+OP_FAIL="$(suite_count Failed "$OP_OUT")"
+if ! [[ "$OP_PASS" =~ ^[0-9]+$ && "$OP_FAIL" =~ ^[0-9]+$ ]]; then
+    OP_PASS=0; OP_FAIL=1
+fi
+if [[ "$OP_STATUS" -ne 0 || "$OP_FAIL" -ne 0 ]]; then
+    [[ "$OP_FAIL" -eq 0 ]] && OP_FAIL=1
+    printf '%s\n' "$OP_OUT" | tail -40
+fi
+PASS=$((PASS + OP_PASS)); FAIL=$((FAIL + OP_FAIL))
+record_suite "test_org_policy.py" "$OP_PASS" "$OP_FAIL" "canonical policy and GitHub publication"
+printf '  organization policy: %s passed, %s failed\n' "$OP_PASS" "$OP_FAIL"
+echo
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
 echo "==============================="

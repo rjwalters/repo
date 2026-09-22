@@ -194,6 +194,18 @@ C7_SH="$TOOL_ROOT/scripts/resync-installed.sh"
 C7_OK=true
 if [[ -x "$C7_SH" ]]; then ok "resync-installed.sh is installed and executable"; else no "resync-installed.sh is installed and executable"; C7_OK=false; fi
 
+ORG_POLICY_HELPER="$TOOL_ROOT/scripts/repo-org-policy.py"
+if [[ -x "$ORG_POLICY_HELPER" ]] && python3 "$ORG_POLICY_HELPER" --help >/dev/null 2>&1; then
+    ok "organization policy helper runs from a client install"
+else
+    no "organization policy helper runs from a client install"
+fi
+if [[ -f "$C3_T/.agents/skills/repo/references/org-policy.md" ]]; then
+    ok "organization policy command is discoverable in the Codex install"
+else
+    no "organization policy command is discoverable in the Codex install"
+fi
+
 C7_BEFORE="$(tree_fingerprint "$C3_T/.claude")"
 C7_OUT="$( cd "$C3_T" && HOME="$FAKE_HOME" bash "$C7_SH" --dry-run 2>&1 )"
 C7_RC=$?
