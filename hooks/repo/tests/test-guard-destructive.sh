@@ -60,6 +60,8 @@ for _guard_env_var in \
     REPO_RM_SCOPE LOOM_RM_SCOPE \
     REPO_FORCE_SCOPE LOOM_FORCE_SCOPE \
     REPO_DEFAULT_BRANCH LOOM_DEFAULT_BRANCH \
+    REPO_GUARD_TMPFS_SCRATCH LOOM_GUARD_TMPFS_SCRATCH \
+    REPO_GUARD_MOUNTS_FILE LOOM_GUARD_MOUNTS_FILE \
     LOOM_WORKTREE_ROOT; do
     unset "$_guard_env_var"
 done
@@ -5239,6 +5241,279 @@ assert_deny_env "#311: grep's own quoted DDL pattern still denies (ask copy unto
 
 assert_deny "#311: sed's own quoted DDL pattern still denies (ask copy untouched)" \
     "sed -n 's|DROP TABLE users|x|p' schema.sql"
+
+echo ""
+
+# =========================================================================
+# repo#454 — tmpfs/ramfs build & scratch dir assignments
+#
+# The guard classifies a resolved build/scratch dir against the kernel's
+# mount table and denies when it lands on a RAM-backed filesystem. There is
+# no portable way for a test to create a real tmpfs mount (and a test that
+# only ran on a tmpfs-having Linux host would never run in this repo's CI,
+# which is where it matters), so every case here drives a FIXTURE mount
+# table through REPO_GUARD_MOUNTS_FILE. That makes these cases run
+# identically on macOS and Linux.
+#
+# Three contract families, straight from the issue's acceptance criteria:
+#   - a resolved tmpfs/ramfs path DENIES, and the message names an on-disk
+#     alternative;
+#   - a disk-backed path is SILENT;
+#   - an unreadable/absent mount table is SILENT ("unmeasurable must not
+#     deny" — this is the macOS/no-`/proc/mounts` contract).
+# =========================================================================
+
+echo -e "\n${YELLOW}repo#454: tmpfs build/scratch dir assignments${NC}"
+
+# A fixture /proc/mounts. The tmpfs `/tmp` row is load-bearing: the guard
+# must classify by mount TYPE, so an entirely ordinary-looking path on a
+# systemd-style tmpfs /tmp has to be caught exactly like /dev/shm is. The
+# disk-backed rows give the silent cases something real to resolve onto.
+TMPFS_FIXTURE_MOUNTS="$(mktemp)"
+cat > "$TMPFS_FIXTURE_MOUNTS" <<'EOF'
+/dev/sda1 / ext4 rw,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev,size=8G 0 0
+ramfs /mnt/ram ramfs rw,relatime 0 0
+/dev/sda2 /home ext4 rw,relatime 0 0
+/dev/sdb1 /mnt/disk\040volume ext4 rw,relatime 0 0
+EOF
+
+# A plausible on-disk cwd for these cases. It is NOT a real directory and
+# does not need to be: the classification is lexical against the fixture
+# table, exactly as it is against a real /proc/mounts.
+TMPFS_CWD="/home/u/repo"
+
+# Run the guard with the fixture mount table plus any extra `VAR=value`
+# assignments the case needs. run_guard_env() above takes only ONE env
+# assignment, and every case here needs at least the fixture path.
+run_guard_tmpfs() {
+    local cmd="$1"; local cwd="${2:-$TMPFS_CWD}"
+    shift                                   # drop cmd
+    [[ $# -gt 0 ]] && shift                 # drop cwd, when one was passed
+    make_input "$cmd" "$cwd" | env REPO_GUARD_MOUNTS_FILE="$TMPFS_FIXTURE_MOUNTS" "$@" "$GUARD" 2>&1 || true
+}
+
+# assert_tmpfs_deny <description> <command> [cwd] [extra env...]
+assert_tmpfs_deny() {
+    local description="$1"; local cmd="$2"; local cwd="${3:-$TMPFS_CWD}"
+    shift 2
+    [[ $# -gt 0 ]] && shift
+    TOTAL=$((TOTAL + 1))
+    local output
+    output=$(run_guard_tmpfs "$cmd" "$cwd" "$@")
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (cwd: $cwd)"
+        echo -e "       Expected: deny"
+        echo -e "       Got: $output"
+    fi
+}
+
+# assert_tmpfs_allow <description> <command> [cwd] [extra env...]
+assert_tmpfs_allow() {
+    local description="$1"; local cmd="$2"; local cwd="${3:-$TMPFS_CWD}"
+    shift 2
+    [[ $# -gt 0 ]] && shift
+    TOTAL=$((TOTAL + 1))
+    local output
+    output=$(run_guard_tmpfs "$cmd" "$cwd" "$@")
+    if ! echo "$output" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (cwd: $cwd)"
+        echo -e "       Expected: allow (no decision)"
+        echo -e "       Got: $output"
+    fi
+}
+
+# --- Family 1: a resolved tmpfs/ramfs path denies ---
+
+assert_tmpfs_deny "#454: CARGO_TARGET_DIR into /dev/shm denies (the loom#8512 incident shape)" \
+    "CARGO_TARGET_DIR=/dev/shm/loom-build cargo build --release"
+
+assert_tmpfs_deny "#454: classification is by mount TYPE — a tmpfs /tmp denies too" \
+    "CARGO_TARGET_DIR=/tmp/cargo-target cargo build"
+
+assert_tmpfs_deny "#454: TMPDIR into a tmpfs denies (generic scratch root, any build tool)" \
+    "TMPDIR=/dev/shm/scratch make -j8"
+
+assert_tmpfs_deny "#454: --target-dir <path> (space-separated) into a tmpfs denies" \
+    "cargo build --target-dir /dev/shm/t"
+
+assert_tmpfs_deny "#454: --target-dir=<path> (equals form) into a tmpfs denies" \
+    "cargo check --target-dir=/tmp/t"
+
+assert_tmpfs_deny "#454: a ramfs mount denies exactly like tmpfs" \
+    "CARGO_TARGET_DIR=/mnt/ram/build cargo test"
+
+assert_tmpfs_deny "#454: export CARGO_TARGET_DIR=<tmpfs> denies (same hazard, different hat)" \
+    "export CARGO_TARGET_DIR=/dev/shm/x && cargo build"
+
+assert_tmpfs_deny "#454: env-wrapped assignment denies" \
+    "env CARGO_TARGET_DIR=/dev/shm/x cargo build"
+
+assert_tmpfs_deny "#454: sudo -E env TMPDIR=<tmpfs> denies" \
+    "sudo -E env TMPDIR=/dev/shm/s make"
+
+assert_tmpfs_deny "#454: the assignment is found in a later shell segment too" \
+    "cd /home/u/repo && CARGO_TARGET_DIR=/dev/shm/b cargo build"
+
+assert_tmpfs_deny "#454: a quoted assignment value is unquoted before classifying" \
+    "CARGO_TARGET_DIR='/dev/shm/b' cargo build"
+
+assert_tmpfs_deny "#454: .. traversal into a tmpfs is normalized, not evaded" \
+    "CARGO_TARGET_DIR=/home/u/../../dev/shm/x cargo build"
+
+assert_tmpfs_deny "#454: longest-prefix wins — a path under tmpfs /dev/shm is not classified by /" \
+    "CARGO_TARGET_DIR=/dev/shm cargo build"
+
+assert_tmpfs_deny "#454: writing a tmpfs build.target-dir into .cargo/config.toml denies" \
+    'echo "target-dir = \"/dev/shm/t\"" >> .cargo/config.toml'
+
+assert_tmpfs_deny "#454: the same config write via tee denies" \
+    "printf 'target-dir = \"/dev/shm/t\"\n' | tee -a .cargo/config.toml"
+
+assert_tmpfs_deny "#454: the same config write via sed -i denies" \
+    "sed -i 's|^target-dir.*|target-dir = \"/dev/shm/t\"|' .cargo/config.toml"
+
+# The deny must name a sanctioned on-disk alternative, not merely refuse.
+TOTAL=$((TOTAL + 1))
+_tmpfs_msg=$(run_guard_tmpfs "CARGO_TARGET_DIR=/dev/shm/x cargo build" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null || echo "")
+if [[ "$_tmpfs_msg" == *"$TMPFS_CWD/target"* ]] && [[ "$_tmpfs_msg" == *"on-disk"* ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #454: the deny message names the sanctioned on-disk location"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #454: the deny message names the sanctioned on-disk location"
+    echo -e "       Expected the message to name an on-disk $TMPFS_CWD/target"
+    echo -e "       Got: $_tmpfs_msg"
+fi
+
+# --- Family 2: a disk-backed path is silent ---
+
+assert_tmpfs_allow "#454: an on-disk CARGO_TARGET_DIR is silent" \
+    "CARGO_TARGET_DIR=/home/u/repo/target cargo build --release"
+
+assert_tmpfs_allow "#454: an on-disk --target-dir is silent" \
+    "cargo build --target-dir /home/u/other/target"
+
+assert_tmpfs_allow "#454: an on-disk TMPDIR is silent" \
+    "TMPDIR=/home/u/tmp make"
+
+assert_tmpfs_allow "#454: a plain cargo build with no assignment is silent" \
+    "cargo build --release"
+
+assert_tmpfs_allow "#454: an on-disk build.target-dir config write is silent" \
+    'echo "target-dir = \"/home/u/t\"" >> .cargo/config.toml'
+
+assert_tmpfs_allow "#454: prose merely mentioning a tmpfs target-dir is not a config write" \
+    'echo "never set target-dir = /dev/shm/t, it pins RAM"'
+
+# #461 review — shape 4's three substrings (TOML key, cargo config filename,
+# write idiom) used to be checked independently ANYWHERE in the command, so
+# a command that merely mentions all three without ever writing into a cargo
+# config false-denied. Both reproductions from the review:
+assert_tmpfs_allow "#461: a PR comment describing the hazard is not itself a config write" \
+    'gh pr comment 461 --body "the deny fires when target-dir = /dev/shm/t lands in .cargo/config.toml; use > /dev/null to hide"'
+
+assert_tmpfs_allow "#461: writing prose to an unrelated file that merely mentions both substrings is silent" \
+    'echo "in .cargo/config.toml, target-dir = /dev/shm/t is a hazard" > notes.md'
+
+assert_tmpfs_allow "#454: an unexpanded shell variable is unknowable, so no opinion" \
+    'CARGO_TARGET_DIR=$SCRATCH/x cargo build'
+
+# #461 second review — shape 3's --target-dir scan was not anchored to the
+# segment's command word, so any command whose TEXT happened to contain
+# "--target-dir <tmpfs-path>" was denied, even when nothing was actually
+# invoking cargo. Four reproductions from the review, all silent once the
+# scan is anchored on toks[j] being cargo/cross:
+assert_tmpfs_allow "#461: prose about --target-dir via a non-cargo command word is not a cargo invocation" \
+    "echo cargo build --target-dir /dev/shm/x"
+
+assert_tmpfs_allow "#461: a commit message mentioning --target-dir is not a cargo invocation" \
+    'git commit -am "note: cargo build --target-dir /dev/shm/x is denied"'
+
+assert_tmpfs_allow "#461: a sed -i doc edit mentioning --target-dir is not a cargo invocation" \
+    'sed -i "s|old|cargo build --target-dir /dev/shm/x|" README.md'
+
+assert_tmpfs_allow "#461: a heredoc body mentioning --target-dir is not a cargo invocation" \
+    "$(printf 'cat > /tmp/notes.md <<EOF\nUse cargo build --target-dir /dev/shm/x\nEOF')"
+
+# The anchor must not weaken the genuine positives: a real cargo/cross
+# invocation still denies, including when it is not the first command in
+# the shell segment.
+assert_tmpfs_deny "#461: a real cargo invocation after an unrelated command still denies" \
+    'python3 -c "print(1)" && cargo build --target-dir /dev/shm/x'
+
+# The "already in RAM" exemption: when the acting cwd is itself on the same
+# RAM mount, the assignment redirects nothing into RAM that wasn't already
+# there, and the on-disk alternative the message would name does not exist.
+assert_tmpfs_allow "#454: a relative target-dir under an already-tmpfs cwd is exempt" \
+    "cargo build --target-dir target" \
+    "/tmp/scratch-repo"
+
+# --- Family 3: unmeasurable must not deny ---
+
+TOTAL=$((TOTAL + 1))
+_tmpfs_out=$(make_input "CARGO_TARGET_DIR=/dev/shm/x cargo build" "$TMPFS_CWD" \
+    | env REPO_GUARD_MOUNTS_FILE="$TMPFS_FIXTURE_MOUNTS.missing" "$GUARD" 2>&1 || true)
+if ! echo "$_tmpfs_out" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #454: an absent mount table is silent (no /proc/mounts => no opinion)"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #454: an absent mount table is silent (no /proc/mounts => no opinion)"
+    echo -e "       Got: $_tmpfs_out"
+fi
+
+TOTAL=$((TOTAL + 1))
+_tmpfs_unreadable="$(mktemp)"
+printf 'tmpfs /dev/shm tmpfs rw 0 0\n' > "$_tmpfs_unreadable"
+chmod 000 "$_tmpfs_unreadable" 2>/dev/null || true
+if [[ -r "$_tmpfs_unreadable" ]]; then
+    # Running as root (or on a filesystem that ignores mode bits): the
+    # chmod cannot make the file unreadable, so this case cannot be staged.
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #454: unreadable mount table is silent (SKIPPED — cannot revoke read access here)"
+else
+    _tmpfs_out=$(make_input "CARGO_TARGET_DIR=/dev/shm/x cargo build" "$TMPFS_CWD" \
+        | env REPO_GUARD_MOUNTS_FILE="$_tmpfs_unreadable" "$GUARD" 2>&1 || true)
+    if ! echo "$_tmpfs_out" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: #454: an unreadable mount table is silent"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: #454: an unreadable mount table is silent"
+        echo -e "       Got: $_tmpfs_out"
+    fi
+fi
+chmod 644 "$_tmpfs_unreadable" 2>/dev/null || true
+rm -f "$_tmpfs_unreadable"
+
+# --- Family 4: the opt-out toggle ---
+
+assert_tmpfs_allow "#454: REPO_GUARD_TMPFS_SCRATCH=0 opts out" \
+    "CARGO_TARGET_DIR=/dev/shm/x cargo build" \
+    "$TMPFS_CWD" REPO_GUARD_TMPFS_SCRATCH=0
+
+assert_tmpfs_allow "#454: the legacy LOOM_GUARD_TMPFS_SCRATCH=0 name opts out too" \
+    "CARGO_TARGET_DIR=/dev/shm/x cargo build" \
+    "$TMPFS_CWD" LOOM_GUARD_TMPFS_SCRATCH=0
+
+assert_tmpfs_deny "#454: REPO_GUARD_TMPFS_SCRATCH=1 wins over the legacy name" \
+    "CARGO_TARGET_DIR=/dev/shm/x cargo build" \
+    "$TMPFS_CWD" LOOM_GUARD_TMPFS_SCRATCH=0 REPO_GUARD_TMPFS_SCRATCH=1
+
+rm -f "$TMPFS_FIXTURE_MOUNTS"
 
 echo ""
 

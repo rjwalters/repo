@@ -555,6 +555,15 @@ guard_cfg_array() {
 #   worktree-write-confinement)                 target PATH from this scan;
 #                                               masking that argument blinds the
 #                                               confinement deny. => cp|mv|tee|sed
+#   tmpfs_scratch_assignments            DENY   yes — no exclusion needed. It
+#   (tmpfs-scratch-dir, shapes 1-3,             reads a leading `VAR=` run and a
+#   #454/#461)                                  `--target-dir` flag value, neither
+#                                               of which mask_ask_positional_args()
+#                                               can reach: that function only masks
+#                                               a QUOTED argument immediately after
+#                                               an allowlisted command word (plus
+#                                               its flags), never a `VAR=value`
+#                                               token or a flag's own value.
 #
 # The deny-tier rows are why this set is hardcoded rather than advisory: with
 # `positionalMaskAllowlist: ["cp"]` configured and no exclusion,
@@ -6295,6 +6304,312 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
             done <<< "$_FORCE_OPS"
             # No protected/ambiguous target matched — fall through to allow.
         fi
+    fi
+fi
+
+# =============================================================================
+# TMPFS BUILD/SCRATCH DIR — deny an assignment that parks build output in RAM
+# (repo#454, split out of rjwalters/loom#8512 via rjwalters/loom#8570)
+#
+# THE INCIDENT: a sweep parked a Cargo target dir in `/dev/shm`. `/dev/shm` is
+# a tmpfs — a RAM-backed filesystem — so the 6.2 GB of build output written
+# there was 6.2 GB of the host's memory, held for 2.5 days after the build
+# exited (nothing deletes a scratch dir nobody remembers creating), and it
+# drove a 15.7 GiB worker into a kernel OOM-kill storm. Loom has since added a
+# RECLAIM pass (`loom_daemon::tmpfs_reclaim`) that frees an orphan six hours
+# after its last write. This block is the PREVENTION half: six hours of a small
+# host's RAM is still six hours, and no reclaim can help at all while a build is
+# actively writing into RAM it should never have been pointed at.
+#
+# WHAT IS CLASSIFIED — an EXPLICIT build/scratch-dir assignment carried by the
+# command itself, in any of the four shapes the incident family can take:
+#   1. a same-command (or `env`/`export`/`sudo`-prefixed) `CARGO_TARGET_DIR=…`
+#   2. the same for `TMPDIR=…` (the generic scratch root — covers every build
+#      tool, not just cargo, which is why this block is NOT cargo-specific)
+#   3. `--target-dir <path>` / `--target-dir=<path>` anywhere in the segment
+#   4. a `target-dir = <path>` line being WRITTEN into a cargo config file
+#      (`.cargo/config.toml`) — the persistent form of the same mistake
+#
+# CLASSIFY BY MOUNT TYPE, NEVER BY PATH PREFIX. A hardcoded `/dev/shm` check
+# would be both over- and under-inclusive: a systemd host very commonly mounts
+# `/tmp` as tmpfs (so `TMPDIR=/tmp/build` is the same hazard under a completely
+# ordinary-looking path), while a disk-backed bind mount at `/dev/shm/…` is not
+# a hazard at all. So the resolved path is matched against the LONGEST-PREFIX
+# entry of the kernel's own mount table and gated on its fs type being `tmpfs`
+# or `ramfs`.
+#
+# UNMEASURABLE MUST NOT DENY. There is no `/proc/mounts` on macOS (and none in
+# a sandbox that hides it). "Unknown" means NO OPINION — the block exits
+# silently, exactly the contract Loom's own tmpfs_reclaim pass uses. This is
+# also why the whole block is a no-op on every developer Mac: it can only ever
+# fire where it can actually read the mount table.
+#
+# THE "ALREADY IN RAM" EXEMPTION. If the acting cwd is itself on the SAME RAM
+# mount as the resolved target dir, the assignment is not redirecting anything
+# into RAM that wasn't already there (a whole checkout under a tmpfs `/tmp` is a
+# different, pre-existing situation), and the deny message's advice — "use the
+# on-disk default `<repo>/target` instead" — would be nonsense, because that
+# default is on the same tmpfs. Staying silent there keeps the deny honest: it
+# fires only when there IS a sanctioned on-disk alternative to name.
+#
+# Tier is DENY, not ask: the failure is host-wide, silent, and outlives the
+# command by days, while refusing costs nothing (no work is lost — the build
+# simply has to name an on-disk path), and an ask is unanswerable in the
+# headless sweeps where this actually happens.
+#
+# Gated by tmpfs_scratch_guard_enabled() (guards.tmpfsScratch /
+# REPO_GUARD_TMPFS_SCRATCH / LOOM_GUARD_TMPFS_SCRATCH), consulted only AFTER
+# the cheap substring pre-check has matched, so the jq config read never
+# touches the hot path.
+# =============================================================================
+_TMPFS_SCRATCH_CACHE=""
+tmpfs_scratch_guard_enabled() {
+    guard_toggle_enabled _TMPFS_SCRATCH_CACHE tmpfsScratch true LOOM_GUARD_TMPFS_SCRATCH REPO_GUARD_TMPFS_SCRATCH
+}
+
+# The mount table to classify against. `/proc/mounts` is the kernel's live view
+# on Linux; the env override exists so this block's tests can drive a FIXTURE
+# table (there is no portable way to create a real tmpfs mount in a test, and a
+# test that only ran on a tmpfs-having Linux host would be a test that never
+# ran in CI). REPO_* wins over the legacy LOOM_* name, same precedence contract
+# as every other toggle in this file.
+tmpfs_mount_table_path() {
+    printf '%s' "${REPO_GUARD_MOUNTS_FILE:-${LOOM_GUARD_MOUNTS_FILE:-/proc/mounts}}"
+}
+
+# =============================================================================
+# _mount_entry_for_path() — longest-prefix mount lookup.
+#
+# Args: $1 = an ABSOLUTE, already-normalize_abs_path'd path; $2 = mount table.
+# Prints "<fstype><TAB><mountpoint>" for the mount that actually backs that
+# path, or nothing at all when the table is unreadable/has no covering entry.
+# "Nothing" is the unmeasurable signal the caller treats as no-opinion.
+#
+# Longest-prefix is the whole point: `/dev/shm` and `/` both "match" a path
+# under `/dev/shm`, and only the longer one describes the filesystem the bytes
+# land on. Ties go to the LAST entry, because a later mount at the same
+# mountpoint is an overmount that shadows the earlier one.
+#
+# Mountpoints in /proc/mounts are octal-escaped (a space is `\040`), so they are
+# decoded before comparison. The decode is written out by hand rather than using
+# awk's strtonum(), which is a gawk extension absent from the one-true-awk that
+# ships as /usr/bin/awk on macOS and the BSDs.
+# =============================================================================
+_mount_entry_for_path() {
+    local path="$1" table="$2"
+    [[ -n "$path" && -n "$table" && -r "$table" ]] || return 1
+    awk -v path="$path" '
+        function decode(s,   out, i, n, c, code) {
+            if (index(s, "\\") == 0) return s
+            out = ""; n = length(s); i = 1
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (c == "\\" && i + 3 <= n && substr(s, i + 1, 3) ~ /^[0-7][0-7][0-7]$/) {
+                    code = (substr(s, i + 1, 1) + 0) * 64 + (substr(s, i + 2, 1) + 0) * 8 + (substr(s, i + 3, 1) + 0)
+                    out = out sprintf("%c", code)
+                    i += 4
+                } else {
+                    out = out c
+                    i++
+                }
+            }
+            return out
+        }
+        BEGIN { bestlen = -1; bestfs = ""; bestmp = "" }
+        NF >= 3 {
+            mp = decode($2); fs = $3
+            ok = 0
+            if (mp == "/") ok = (substr(path, 1, 1) == "/")
+            else if (path == mp) ok = 1
+            else if (substr(path, 1, length(mp) + 1) == mp "/") ok = 1
+            if (ok && length(mp) >= bestlen) { bestlen = length(mp); bestfs = fs; bestmp = mp }
+        }
+        END { if (bestlen >= 0) printf "%s\t%s\n", bestfs, bestmp }
+    ' "$table" 2>/dev/null
+}
+
+# =============================================================================
+# tmpfs_scratch_assignments() — extract explicit build/scratch-dir assignments.
+#
+# Prints one `<name><TAB><value>` line per assignment found, where <name> is the
+# human-facing spelling used in the deny message (`CARGO_TARGET_DIR`, `TMPDIR`,
+# `--target-dir`). Values keep their raw spelling (relative paths are resolved
+# by the caller, which is the only place that knows the cwd).
+#
+# Segmentation reuses this file's own qsplit() so a `foo && CARGO_TARGET_DIR=…
+# cargo build` is seen as two segments and the assignment is still read from the
+# segment it actually belongs to. Leading `VAR=value` runs are walked in the
+# same order a shell reads them, and `sudo` / `env` / `export` prefixes are
+# stepped over (each may carry its own flags before the assignments resume) —
+# `export CARGO_TARGET_DIR=/dev/shm/x && cargo build` is the same hazard as the
+# same-command form and must not escape by wearing a different hat.
+# =============================================================================
+tmpfs_scratch_assignments() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_QSPLIT_AWK"'
+    function unq(v) {
+        sub(/^["\047]/, "", v); sub(/["\047]$/, "", v)
+        return v
+    }
+    function emitassign(t,   nm, vl) {
+        nm = substr(t, 1, index(t, "=") - 1)
+        if (nm != "CARGO_TARGET_DIR" && nm != "TMPDIR") return
+        vl = unq(substr(t, index(t, "=") + 1))
+        if (vl == "") return
+        print nm "\t" vl
+    }
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            j = 1
+            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { emitassign(toks[j]); j++ }
+            # `sudo`, `env` and `export` may each be followed by their own
+            # flags and then by a further run of assignments; loop so a
+            # `sudo -E env TMPDIR=… cargo build` is fully unwrapped.
+            while (j <= m && (toks[j] == "sudo" || toks[j] == "env" || toks[j] == "export")) {
+                j++
+                while (j <= m && toks[j] ~ /^-/) j++
+                while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { emitassign(toks[j]); j++ }
+            }
+            # `--target-dir` is a cargo flag and is meaningless outside a
+            # cargo invocation; anchor on the command word so this scan does
+            # not fire on prose or write targets that merely mention the flag
+            # text (git commit -am, sed -i, heredoc bodies, #461 review).
+            if (!(toks[j] == "cargo" || toks[j] == "cross")) continue
+            for (k = j; k <= m; k++) {
+                if (toks[k] ~ /^--target-dir=/) {
+                    v = unq(substr(toks[k], index(toks[k], "=") + 1))
+                    if (v != "") print "--target-dir\t" v
+                } else if (toks[k] == "--target-dir" && k < m) {
+                    v = unq(toks[k + 1])
+                    if (v != "") print "--target-dir\t" v
+                }
+            }
+        }
+    }'
+}
+
+# Cheap substring pre-check: nothing below runs — not the mount-table read, not
+# the config read — unless the command literally carries one of the assignment
+# spellings. Note `CARGO_TARGET_DIR` does not contain the lowercase
+# `target-dir`, so both spellings are needed here. The pre-check reads the
+# comment-stripped copy (the superset) rather than COMMAND_ASK_SCAN, because
+# shape 4 below deliberately scans that superset — gating the whole block on
+# the masked copy would skip shape 4 entirely.
+if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" == *"TMPDIR="* || \
+      "$COMMAND_NO_COMMENT" == *"target-dir"* ]]; then
+    _TMPFS_MOUNTS="$(tmpfs_mount_table_path)"
+    # Unmeasurable => no opinion. This is the macOS/no-/proc/mounts exit, and it
+    # is checked FIRST so a host that cannot classify never even reads config.
+    if [[ -r "$_TMPFS_MOUNTS" ]] && tmpfs_scratch_guard_enabled; then
+        _TMPFS_ASSIGNMENTS="$(tmpfs_scratch_assignments "$COMMAND_ASK_SCAN")" || _TMPFS_ASSIGNMENTS=""
+
+        _TMPFS_BASE="${CWD:-$REPO_ROOT}"
+        [[ -n "$_TMPFS_BASE" ]] || _TMPFS_BASE="$PWD"
+
+        # Shape 4: a `target-dir = <path>` line being written INTO a cargo
+        # config file. The three substrings this used to gate on (TOML key,
+        # cargo config filename, write idiom — each checked independently
+        # ANYWHERE in the command) are uncorrelated and false-deny on ordinary
+        # prose ABOUT this hazard, because nothing ties the write idiom to the
+        # config file or either to the TOML key (#461 review):
+        #   gh pr comment 461 --body "target-dir = /dev/shm/x lands in
+        #     .cargo/config.toml; use > /dev/null to hide"
+        #   echo "in .cargo/config.toml, target-dir = /dev/shm/x is a hazard" > notes.md
+        # Neither writes into a cargo config — the first writes nothing at all
+        # (its only `>` is inside the quoted --body value), the second writes
+        # notes.md — yet both satisfied all three substrings.
+        #
+        # So gate on extract_write_targets()'s RESOLVED destination instead of
+        # hoping the substrings imply each other: it already tokenizes every
+        # `>`/`>>`/tee/sed -i/cp/mv target in the command, and its `>` scan is
+        # independently quote-aware (mask_gt(), #4245) — a `>` inside a quoted
+        # argument is never treated as a redirection operator, which is why
+        # the --body example above naturally yields no write target at all.
+        # This reads COMMAND_NO_COMMENT, NOT COMMAND_ASK_SCAN, on purpose: the
+        # canonical spelling of this write is `echo 'target-dir = "…"' >>
+        # .cargo/config.toml`, and strip_datasink_literals() redacts exactly
+        # that quoted echo argument, which would hide the TOML value extracted
+        # below (COMMAND_ASK_SCAN's own literal-text redaction plays no part
+        # in extract_write_targets()'s quote-awareness, which is independent
+        # of it).
+        if [[ "$COMMAND_NO_COMMENT" == *"target-dir"* ]] && \
+           printf '%s' "$COMMAND_NO_COMMENT" | grep -qE '(\.cargo/config(\.toml)?|config\.toml)'; then
+            _TMPFS_CARGO_CONFIG_WRITE=""
+            _TMPFS_WRITE_TARGETS="$(extract_write_targets "$COMMAND_NO_COMMENT" "$_TMPFS_BASE" | head -20)" || _TMPFS_WRITE_TARGETS=""
+            while IFS=$'\037' read -r _wcwd _wtarget; do
+                [[ -n "$_wtarget" ]] || continue
+                _wabs="$_wtarget"
+                [[ "$_wabs" != /* ]] && _wabs="${_wcwd:-$_TMPFS_BASE}/$_wabs"
+                [[ "$_wabs" == /* ]] || continue
+                _wabs="$(normalize_abs_path "$_wabs")"
+                case "$_wabs" in
+                    */.cargo/config.toml|*/.cargo/config) _TMPFS_CARGO_CONFIG_WRITE=1; break ;;
+                esac
+            done <<< "$_TMPFS_WRITE_TARGETS"
+
+            if [[ -n "$_TMPFS_CARGO_CONFIG_WRITE" ]]; then
+                # The quote class is a RUN (`*`, and it includes a literal
+                # backslash) rather than a single optional quote, because the
+                # `echo "target-dir = \"…\"" >> …` spelling reaches this scan with
+                # its inner quotes still backslash-escaped — matching only one
+                # unescaped quote character would capture the backslash as the
+                # whole path and silently classify nothing.
+                _TMPFS_TOML_VALUES="$(printf '%s' "$COMMAND_NO_COMMENT" \
+                    | grep -oE '(^|[^-[:alnum:]])target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*[^\"'"'"'[:space:],]+' \
+                    | sed -E 's/.*target-dir[[:space:]]*=[[:space:]]*[\"'"'"']*//')" || _TMPFS_TOML_VALUES=""
+                while IFS= read -r _tmpfs_tv; do
+                    [[ -n "$_tmpfs_tv" ]] || continue
+                    _TMPFS_ASSIGNMENTS+=$'\n'"build.target-dir"$'\t'"$_tmpfs_tv"
+                done <<< "$_TMPFS_TOML_VALUES"
+            fi
+        fi
+
+        # The acting cwd's own mount, for the "already in RAM" exemption above.
+        _TMPFS_CWD_MP=""
+        if [[ "$_TMPFS_BASE" == /* ]]; then
+            _tmpfs_cwd_entry="$(_mount_entry_for_path "$(normalize_abs_path "$_TMPFS_BASE")" "$_TMPFS_MOUNTS")" || _tmpfs_cwd_entry=""
+            [[ -n "$_tmpfs_cwd_entry" ]] && _TMPFS_CWD_MP="${_tmpfs_cwd_entry#*$'\t'}"
+        fi
+
+        while IFS=$'\t' read -r _tmpfs_name _tmpfs_value; do
+            [[ -n "$_tmpfs_name" && -n "$_tmpfs_value" ]] || continue
+            # An unexpanded shell variable / substitution is unknowable to a
+            # static scan — same no-opinion rule as an unreadable mount table.
+            case "$_tmpfs_value" in
+                *'$'*|*'`'*) continue ;;
+            esac
+            _tmpfs_abs="$_tmpfs_value"
+            [[ "$_tmpfs_abs" != /* ]] && _tmpfs_abs="$_TMPFS_BASE/$_tmpfs_abs"
+            [[ "$_tmpfs_abs" == /* ]] || continue
+            _tmpfs_abs="$(normalize_abs_path "$_tmpfs_abs")"
+            _tmpfs_entry="$(_mount_entry_for_path "$_tmpfs_abs" "$_TMPFS_MOUNTS")" || _tmpfs_entry=""
+            [[ -n "$_tmpfs_entry" ]] || continue
+            _tmpfs_fs="${_tmpfs_entry%%$'\t'*}"
+            _tmpfs_mp="${_tmpfs_entry#*$'\t'}"
+            case "$_tmpfs_fs" in
+                tmpfs|ramfs) ;;
+                *) continue ;;
+            esac
+            # Already-in-RAM exemption: nothing is being redirected into RAM,
+            # and there would be no on-disk alternative to recommend.
+            [[ -n "$_TMPFS_CWD_MP" && "$_TMPFS_CWD_MP" == "$_tmpfs_mp" ]] && continue
+            # The suggested fix differs by assignment: CARGO_TARGET_DIR / --target-dir
+            # are cargo-specific, so the repo's on-disk `target/` is the natural
+            # default; TMPDIR is a generic scratch root with no such default, so
+            # naming `<repo>/target` there would be inapplicable advice (#461 review).
+            if [[ "$_tmpfs_name" == "TMPDIR" ]]; then
+                _tmpfs_advice="point it at a disk-backed scratch path instead (e.g. ${REPO_ROOT:-$_TMPFS_BASE}/.tmp)"
+            else
+                _tmpfs_suggest="${REPO_ROOT:-$_TMPFS_BASE}/target"
+                _tmpfs_advice="drop the assignment to build into the default $_tmpfs_suggest, or point it at another disk-backed path (e.g. an on-disk [build] target-dir in .cargo/config.toml)"
+            fi
+            deny "BLOCKED: $_tmpfs_name=$_tmpfs_value resolves to $_tmpfs_abs, which is on a RAM-backed $_tmpfs_fs mount ($_tmpfs_mp). Build/scratch output written there consumes the host's memory for as long as it exists, and nothing deletes it when the build ends (rjwalters/loom#8512: a 6.2 GB target dir left in /dev/shm pinned RAM for 2.5 days and drove a worker into an OOM-kill storm). Use an on-disk location instead: $_tmpfs_advice. Set guards.tmpfsScratch:false in .claude/skills/repo/config.json if this host deliberately builds in RAM." "tmpfs-scratch-dir:$_tmpfs_name"
+        done <<< "$_TMPFS_ASSIGNMENTS"
     fi
 fi
 
