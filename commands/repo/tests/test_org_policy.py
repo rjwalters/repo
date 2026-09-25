@@ -42,6 +42,13 @@ class FakeGitHub:
         self.user_installations = []
         self.org_installations_status = None
         self.users_status = None
+        # The invoking client repository: a known sibling of the target in the
+        # same account. Its visibility constrains the preset's visibility, and
+        # admin on it is the evidence used to disambiguate a 404 on the target.
+        self.client_visible = True
+        self.client_private = False
+        self.client_admin = True
+        self.client_status = None
 
     @property
     def writes(self):
@@ -70,6 +77,15 @@ class FakeGitHub:
             revision = query["ref"][0]
             files = self.files if revision == self.base else self.commits[revision]["files"]
             return self.file_response(files.get(name))
+        if (route.startswith("repos/") and route.count("/") == 2
+                and route not in (target_root, source_root)):
+            # Any sibling repository in the account — the invoking client.
+            if self.client_status is not None:
+                raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.client_status}")
+            if not self.client_visible:
+                return None
+            return {"full_name": route.removeprefix("repos/"), "private": self.client_private,
+                    "permissions": {"admin": self.client_admin}}
         if route == "users/example":
             if self.users_status is not None:
                 raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.users_status}")
@@ -138,6 +154,10 @@ class PolicyTests(unittest.TestCase):
     def plan(self, **kwargs):
         return policy.make_plan(self.api, "example/client", **kwargs)
 
+    @staticmethod
+    def first_line(result):
+        return result.splitlines()[0]
+
     def test_preview_is_read_only_and_has_agreed_age_policy(self):
         plan = self.plan()
         config = json.loads(plan["after"]["renovate-config.json"])
@@ -184,15 +204,95 @@ class PolicyTests(unittest.TestCase):
 
     def test_absent_org_requires_explicit_visibility(self):
         self.api.exists = False
+        with self.assertRaisesRegex(policy.PolicyError, "--create-repository"):
+            self.plan()
+        self.assertEqual(self.plan(create_repository="public")["createRepository"], "public")
+        self.assertEqual(self.api.writes, [])
+
+    def test_admin_on_visible_sibling_reports_target_as_likely_absent(self):
+        self.api.exists = False
+        self.api.client_admin = True
+        with self.assertRaisesRegex(policy.PolicyError, "appears absent"):
+            self.plan()
+        # Evidence, never a guarantee: GitHub conflates both cases in one 404.
+        with self.assertRaisesRegex(policy.PolicyError, "evidence, not proof"):
+            self.plan()
+        self.assertIn("repos/example/client", [call[0] for call in self.api.calls])
+
+    def test_absence_stays_ambiguous_without_admin_on_the_sibling(self):
+        self.api.exists = False
+        self.api.client_admin = False
         with self.assertRaisesRegex(policy.PolicyError, "absent or inaccessible"):
             self.plan()
-        self.assertEqual(self.plan(create_repository="private")["createRepository"], "private")
+        with self.assertRaisesRegex(policy.PolicyError, "cannot tell which"):
+            self.plan()
+
+    def test_absence_stays_ambiguous_when_the_sibling_is_invisible(self):
+        self.api.exists = False
+        self.api.client_visible = False
+        with self.assertRaisesRegex(policy.PolicyError, "absent or inaccessible"):
+            self.plan()
+
+    def test_absence_is_inconclusive_when_the_access_probe_fails(self):
+        self.api.exists = False
+        self.api.client_status = 403
+        with self.assertRaisesRegex(policy.PolicyError, "inconclusive"):
+            self.plan()
+
+    def test_absence_on_a_third_party_personal_account_is_not_called_absent(self):
+        self.api.exists = False
+        self.api.owner_type = "User"
+        self.api.viewer_login = "someone-else"
+        with self.assertRaisesRegex(policy.PolicyError, "absent or inaccessible"):
+            self.plan()
+
+    def test_absence_on_the_callers_own_account_is_called_absent(self):
+        self.api.exists = False
+        self.api.owner_type = "User"
+        self.api.viewer_login = "example"
+        with self.assertRaisesRegex(policy.PolicyError, "appears absent"):
+            self.plan()
+
+    def test_private_preset_refused_for_a_public_client(self):
+        self.api.exists = False
+        self.api.client_private = False
+        with self.assertRaisesRegex(policy.PolicyError, "public"):
+            self.plan(create_repository="private")
+        with self.assertRaisesRegex(policy.PolicyError, "--create-repository public"):
+            self.plan(create_repository="private")
         self.assertEqual(self.api.writes, [])
+
+    def test_private_preset_allowed_for_a_private_client(self):
+        self.api.exists = False
+        self.api.client_private = True
+        self.assertEqual(self.plan(create_repository="private")["createRepository"], "private")
+
+    def test_public_preset_never_blocked_by_client_visibility(self):
+        self.api.exists = False
+        for private in (True, False):
+            with self.subTest(client_private=private):
+                self.api.client_private = private
+                plan = self.plan(create_repository="public")
+                self.assertEqual(plan["createRepository"], "public")
+
+    def test_unverifiable_client_visibility_warns_instead_of_silently_creating_private(self):
+        self.api.exists = False
+        self.api.client_visible = False
+        with patch("sys.stderr", new_callable=io.StringIO) as err:
+            plan = self.plan(create_repository="private")
+        self.assertEqual(plan["createRepository"], "private")
+        self.assertIn("could not verify", err.getvalue())
+
+    def test_existing_target_never_reads_client_visibility_or_absence_evidence(self):
+        # The common path stays as cheap as before: no extra sibling/account
+        # lookups when the target already exists.
+        self.plan(create_repository="private")
+        self.assertNotIn("repos/example/client", [call[0] for call in self.api.calls])
 
     def test_apply_preserves_unrelated_files_and_opens_pr_without_changing_default(self):
         plan = self.plan()
         result = policy.apply_plan(self.api, plan)
-        self.assertEqual(result, "https://github.com/example/.github/pull/1")
+        self.assertEqual(self.first_line(result), "https://github.com/example/.github/pull/1")
         committed = next(iter(self.api.commits.values()))["files"]
         self.assertEqual(committed["README.md"], "Preserve me\n")
         self.assertEqual(set(committed), {"README.md"} | policy.MANAGED_FILES)
@@ -208,10 +308,13 @@ class PolicyTests(unittest.TestCase):
 
     def test_different_clients_reuse_the_same_organization_pr(self):
         first = self.plan()
-        url = policy.apply_plan(self.api, first)
+        url = self.first_line(policy.apply_plan(self.api, first))
         count = len(self.api.writes)
         second = policy.make_plan(self.api, "EXAMPLE/another-client")
-        self.assertEqual(policy.apply_plan(self.api, second), url)
+        result = policy.apply_plan(self.api, second)
+        self.assertEqual(self.first_line(result), url)
+        # The handoff names the client that invoked this apply, not the first one.
+        self.assertIn("example/another-client", result)
         self.assertEqual(len(self.api.writes), count)
 
     def test_retry_does_not_accept_unrelated_changes_on_existing_branch(self):
@@ -270,6 +373,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_create_organization_repo_uses_explicit_visibility(self):
         self.api.exists = False
+        self.api.client_private = True
         policy.apply_plan(self.api, self.plan(create_repository="private"))
         endpoint, _, payload = self.api.writes[0]
         self.assertEqual(endpoint, "orgs/example/repos")
@@ -380,6 +484,27 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("NOT installed", out.getvalue())
         self.assertIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
+
+    def test_new_pr_hands_off_to_deps_and_says_the_pr_must_merge_first(self):
+        result = policy.apply_plan(self.api, self.plan())
+        self.assertIn("/repo:deps --install", result)
+        self.assertIn("example/client", result)
+        self.assertIn("merge", result)
+
+    def test_reused_pr_hands_off_to_deps_and_says_the_pr_must_merge_first(self):
+        plan = self.plan()
+        policy.apply_plan(self.api, plan)
+        reused = policy.apply_plan(self.api, plan)
+        self.assertIn("/repo:deps --install", reused)
+        self.assertIn("merge", reused)
+
+    def test_no_op_hands_off_to_deps_without_claiming_a_pending_pr(self):
+        plan = self.plan()
+        self.api.files.update(plan["after"])
+        result = policy.apply_plan(self.api, self.plan())
+        self.assertIn("nothing to publish", result)
+        self.assertIn("/repo:deps --install", result)
+        self.assertIn("No organization PR is pending", result)
 
     def test_apply_cli_requires_opt_in_without_reading_plan(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/repo/repo-org-policy.py"),
