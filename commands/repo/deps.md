@@ -78,7 +78,8 @@ unless migration is authorized. With no provider or organization policy, offer
 missing `dependabot.yml` means dependencies are unmanaged.
 
 Report separately: deployed policy source/revision and drift, provider/config,
-app operation, dependency graph, vulnerability alerts, security PR provider,
+**GitHub App installation status** (Renovate path only — see below), app
+operation, dependency graph, vulnerability alerts, security PR provider,
 effective release-age rules, automerge/required checks, and open bot PRs.
 `dependabotSecurityUpdates: false` is expected when Renovate owns security PRs;
 it is not a finding that should be "fixed" by enabling a second provider.
@@ -165,12 +166,28 @@ preset not yet available"**, distinct from an ordinary adoption gap. Once the
 preset is confirmed live, report each repo's actual state — already adopted,
 or a real adoption gap now that adoption is actually possible.
 
+#### App installation is also a once-per-survey org-level fact
+
+Run the App-installation check below once per survey too, against the survey's
+OWNER, and put its result in the report header beside the preset line. The
+failure this guards against is the single-repo one at org scale: a survey can
+truthfully report a live preset and a column of adopted repos while **no repo
+in it will ever receive a PR**, because the App was never installed. A
+`renovate-only`, preset-adopted row is not evidence the App is installed.
+
+```bash
+python3 .claude/skills/repo/scripts/repo-org-policy.py check-app --owner OWNER
+```
+
 #### Report format
 
 ```
 ORG MIGRATION SURVEY — OWNER (14 repos, 1 archived excluded)
 ==============================================================
 Preset (OWNER/.github renovate-config.json): live on default branch
+Renovate GitHub App: NOT installed — no PRs will be raised for ANY repo below
+  until it is. Install: https://github.com/apps/renovate (organization
+  owner/admin required).
 
 | Repo          | State           | Preset adopted            | Open bot PRs |
 |---------------|-----------------|----------------------------|--------------|
@@ -200,7 +217,30 @@ Reuse steps 2–3 below for ecosystem/ownership detection and label validation.
 - Confirm the organization policy PR is merged and its preset is readable by
   the Renovate installation. Config presence alone does not prove an active
   GitHub App or a successful scan: inspect onboarding, the Dependency Dashboard,
-  and job logs. App installation may require an organization administrator.
+  and job logs. **All three of those are simply absent, not contradictory,
+  when the App was never installed at all** — so check installation directly
+  rather than inferring it from their absence:
+
+  ```bash
+  python3 .claude/skills/repo/scripts/repo-org-policy.py check-app --repo OWNER/REPO
+  ```
+
+  This is the same [[org-policy]]-owned check `/repo:org-policy` runs on its
+  own `plan`/`apply` — reused here rather than duplicated, since a client
+  repo's Renovate installation lives on the same organization/user account
+  `org-policy` already checks. Report the result as a distinct line, not
+  folded into "policy: OK":
+  - **Installed** — proceed normally.
+  - **NOT installed** — state this plainly, e.g. `Renovate: policy published,
+    app NOT installed — no PRs will be raised until it is`, name the install
+    URL (`https://github.com/apps/renovate`), and note that installing it
+    requires an organization owner/admin — who may not be the person running
+    this command. Continue the rest of this path anyway (config reconciliation
+    below is still correct groundwork), but do not report overall success.
+  - **UNKNOWN** — this token cannot see the installations endpoint for that
+    account (non-admin org member, or a personal account other than the
+    caller's own). Report it as unresolved, not as either "installed" or "not
+    installed".
 - Update the existing active Renovate config (do not add a competing file) to
   extend the deployed `dependencies.renovatePreset`, usually
   `github>OWNER/.github:renovate-config`. Preserve intentional client exceptions
