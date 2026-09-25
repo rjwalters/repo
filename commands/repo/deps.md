@@ -677,6 +677,11 @@ Rules:
 Report the decision explicitly: which label was chosen, or which were rejected
 and why.
 
+Carry the outcome forward. If it is **no `labels:` key** — every candidate was
+refused — and step 2a found a `.loom/` root, that fallback has a review-routing
+consequence on this repo; report it under "Check how dependency PRs interact
+with Loom" below rather than letting the run end on plain success.
+
 ### 4. Offer to scaffold the config (confirm first)
 
 Only ecosystems that survived step 2a's filtering — repo-owned manifests with
@@ -964,6 +969,32 @@ natural wrong assumption, and it is safety-relevant:
   into an auto-merge pipeline is a policy decision for the repo's owner, not a
   side effect of a hygiene command — and any label used for it still has to
   pass the step 3 description check.
+- **Report it as a finding when step 3 ended with no `labels:` key.** On a
+  Loom-managed repo that fallback is not free: Loom routes PRs into review *by
+  label*, and every Loom routing label is spelled `… Applied by: <party>`, so
+  step 3 refuses all of them. The config that results is correct and inert —
+  the bot's PRs carry no label, so nothing routes them for review. Do not let
+  that end as plain success; state the consequence and who can resolve it:
+
+  ```
+  LOOM ROUTING
+  ============
+  Bot PRs on this repo will not be routed for review: every candidate routing
+  label is reserved (`Applied by: ...`), so the config was scaffolded without a
+  `labels:` key. Dependency PRs will therefore sit unreviewed by Loom.
+  Resolution is a human's, not this command's: the repo owner can explicitly
+  choose a bot-applied label to route on.
+  ```
+
+  This is **informational, never an error**, and never something to auto-fix:
+  no `gh label create`, no applying a reserved label anyway, no failing the run
+  over it — Safety Rule 3 is unchanged. Naming the human decision is the point,
+  and it is the same one step 3 already states: if a repo wants a bot-applied
+  label used here, "that is a policy call for a human to make explicitly."
+  Report nothing when step 3 *did* approve a label (routing already works), and
+  nothing on a repo with no `.loom/` root — like the rest of this section, the
+  finding is gated on the `.loom/` tool root from step 2a's
+  `install-metadata.json` scan.
 
 ## Safety Rules
 
