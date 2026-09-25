@@ -962,9 +962,15 @@ So after the per-PR pass, do one **cross-PR** pass: build the
 dependency → proposed-version map for every open PR and compare the maps.
 
 ```bash
-# Per PR, the set of (dependency, new version) pairs it proposes — from the
-# manifest hunks, not the title, so grouped PRs are covered too.
-for n in <PR numbers>; do echo "== #$n"; gh pr diff "$n" -- package.json; done
+# Per PR, the (dependency, new version) pairs it proposes — from the manifest
+# hunks, not the title, so grouped PRs are covered too. `gh pr diff` takes no
+# pathspec (`cobra.MaximumNArgs(1)`), so filtering to one file has to go
+# through the files API instead.
+for n in <PR numbers>; do
+  echo "== #$n"
+  gh api "repos/OWNER/REPO/pulls/$n/files" --paginate \
+    --jq '.[] | select(.filename == "package.json") | .patch'
+done
 ```
 
 A PR is **superseded** when, for *every* dependency it touches, some other open
@@ -1108,10 +1114,12 @@ $ gh pr update-branch 210
 X Cannot update PR branch due to conflicts
 ```
 
-`gh pr update-branch` only fast-forwards a clean branch onto its base; it has
-no conflict resolution, so it cannot recover a conflicted branch at all. The
-supported recovery is to **ask the bot to redo the branch**, which it does by
-recomputing the update against the current base:
+`gh pr update-branch` asks GitHub to merge the base into the PR branch (or
+rebase onto it with `--rebase`). Neither mode can accept a conflict
+resolution — the API has no channel for one — so both fail outright on a
+conflicted branch rather than recovering it. The supported recovery is to
+**ask the bot to redo the branch**, which it does by recomputing the update
+against the current base:
 
 ```bash
 gh pr comment <N> --body "@dependabot rebase"     # Dependabot
