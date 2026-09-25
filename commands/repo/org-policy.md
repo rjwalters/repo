@@ -41,11 +41,19 @@ client: the helper fetches canonical JSON at one immutable GitHub commit.
    affects shared organization policy, not just the invoking repository.
 2. Run the helper's `plan` command. For `--check`, omit `--output` and stop after
    the report. An absent/inaccessible target is not proof that creation is
-   needed; verify access first. If creating `.github` is intended, establish
-   public/private visibility and use `--create-repository public|private`.
-   Shared policy contains no credentials. A public preset is easiest to reuse
-   across public and private clients; private presets require appropriate app
-   access and cannot be consumed from public repositories.
+   needed; verify access first. The helper does that disambiguation itself (see
+   "Absent versus inaccessible target" below) and reports which case its
+   evidence favors — read its verdict rather than re-deriving it by hand, and
+   treat a `cannot tell which`/`inconclusive` verdict as "still unverified". If
+   creating `.github` is intended, establish public/private visibility and use
+   `--create-repository public|private`. Shared policy contains no credentials.
+   A public preset is easiest to reuse across public and private clients;
+   private presets require appropriate app access and cannot be consumed from
+   public repositories — so `--create-repository private` is **refused** when
+   the invoking client is public, rather than producing an `extends` reference
+   that fails at Renovate runtime. When the client's own visibility cannot be
+   read, the helper warns instead of refusing; confirm it by hand before
+   continuing.
 3. For an install, save a plan at a new temporary path. Show its complete diff,
    source revision, target, and repository creation/visibility if applicable.
    Use existing authorization when it covers that target and these changes;
@@ -61,6 +69,13 @@ client: the helper fetches canonical JSON at one immutable GitHub commit.
 5. Report the PR URL and whether it is merged. The policy becomes active on
    the default branch after merge; opening a PR is not an installed policy.
    Follow the repository's normal merge workflow when merging is authorized.
+   `apply` closes its own output with the next command for the invoking client
+   (`/repo:deps --install`) and whether the organization PR still has to merge
+   first — include that line in the report, and do not substitute a
+   hand-written client `renovate.json` for it (that skips Dependabot
+   reconciliation, `ignorePaths` for installer-owned roots, and security-PR
+   ownership). The same closing line appears on a no-op apply, saying no
+   organization PR is pending.
 6. Every `plan` and `apply` invocation also prints a Renovate GitHub App
    installation line (see "Renovate App installation check" below) — include
    it verbatim in the final report. A published/merged policy proves nothing
@@ -82,6 +97,34 @@ python3 .claude/skills/repo/scripts/repo-org-policy.py apply \
 Those plans cannot be applied: publish the source and regenerate from GitHub.
 Do not use a stale client-bundled template as a fallback when GitHub is
 unavailable. Authentication/rate-limit failures are errors, not missing policy.
+
+## Absent versus inaccessible target
+
+GitHub answers 404 both for a repository that does not exist and for a private
+one the caller cannot see, so `OWNER/.github` returning 404 never proves that
+creation is the right next step. Rather than naming both cases and stopping,
+`plan` runs the same check an operator would run by hand — the account type of
+`OWNER`, and whether the caller has admin on the invoking client, a known
+sibling repository in that same account — and reports which case its evidence
+favors:
+
+```text
+rulehunt/.github appears absent rather than hidden: rulehunt is an organization
+and you have admin on the sibling repository rulehunt/rulehunt, so a private
+rulehunt/.github would normally be visible. GitHub answers 404 for both an
+absent and a hidden repository, so this is evidence, not proof. To create it,
+plan again with --create-repository public (or private)
+```
+
+| Verdict | Meaning |
+|---|---|
+| `appears absent rather than hidden` | Evidence favors creation, but GitHub's 404 conflation means this is evidence, not proof. |
+| `is absent or inaccessible, and this token cannot tell which` | A hidden repository cannot be ruled out (no admin on the sibling, or the sibling itself is invisible, or a third-party personal account). |
+| `is absent or inaccessible, and the access check was inconclusive` | The check itself could not answer (the account or sibling could not be read). |
+
+Only the first verdict is evidence for creating the repository. For the other
+two, establish access before passing `--create-repository`; the message names
+the specific gap it could not close.
 
 ## Renovate App installation check
 
