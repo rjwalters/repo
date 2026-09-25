@@ -93,6 +93,20 @@ in that client. Existing clients must adopt that reference once. Future
 organization policy updates then reach those clients when Renovate resolves
 the preset, without reinstalling Repo Skills.
 
+A client's `extends` reference cannot resolve until this organization PR has
+actually **merged** on `OWNER/.github`'s default branch — opening it is not
+enough (step 5 above). Adopting the preset earlier is not a partial win; it is
+a reference that fails to resolve. When migrating more than one client, use
+[[deps]]'s `--all-repos` fan-out survey to see this ordering enforced across
+every repo in the org at once — it reports every repo's preset-adoption state
+as "not adopted — preset not yet available" (rather than a plain adoption gap)
+until this PR is merged, and reports each repo's actual `dependabot-only` /
+`both-active` / `renovate-only` / `unmanaged` migration state alongside it.
+That survey is report-only; it never writes to a surveyed repo. Per-repo
+adoption itself is still done with plain [[deps]] against that one client, as
+described above — `--all-repos` only tells you where each client currently
+stands.
+
 Check for an existing `OWNER/renovate-config/default.json` before relying on
 automatic onboarding: Renovate discovers it ahead of `.github` presets. Use
 the explicit reference above for uniform client adoption. If the helper finds

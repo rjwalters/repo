@@ -36,7 +36,14 @@ and confirm first. `--check` is always report-only.
 /repo:deps --install        # Only setup reconciliation (policy + config + settings)
 /repo:deps --review         # Only the PR-triage half
 /repo:deps --review 123     # Triage one PR in depth
+/repo:deps --all-repos               # Fan-out survey: migration state across the current repo's org, report-only
+/repo:deps --all-repos --owner OWNER # Same, for an explicit org/owner
 ```
+
+`--all-repos` is a distinct mode from everything else above: it surveys many
+repos instead of acting on the invoking one, and it is **always** report-only
+— see "Fan-out survey" below. All other flags operate on the single repo
+`/repo:deps` is run from, as before.
 
 ## Prerequisites
 
@@ -75,6 +82,115 @@ app operation, dependency graph, vulnerability alerts, security PR provider,
 effective release-age rules, automerge/required checks, and open bot PRs.
 `dependabotSecurityUpdates: false` is expected when Renovate owns security PRs;
 it is not a finding that should be "fixed" by enabling a second provider.
+
+### Fan-out survey — org-wide migration report (`--all-repos`)
+
+Everything else in this command operates on the single repo it is run from.
+`--all-repos` is a different mode: it answers "where does the org-wide
+Dependabot→Renovate migration stand, across every repo?" It is a **read-only
+survey** — it never writes to, configures, or merges anything in any of the
+repos it enumerates. To act on what the survey finds, run `/repo:deps`
+(optionally `--install`/`--review`) against that one repo; this mode only ever
+reports.
+
+#### Enumerate the org's repos
+
+Derive OWNER from an explicit `--owner OWNER`, or from `origin` of the
+invoking repo when omitted — the same derivation [[org-policy]] uses for its
+own client-owner default. Page through every repo; a single unpaged request
+silently drops repos past the first page in a larger org:
+
+```bash
+# Organization account
+gh api orgs/OWNER/repos --paginate --jq '.[] | select(.archived == false) | .full_name'
+
+# Personal account — the org endpoint 404s for a user account, so fall back
+# rather than guessing which kind of account OWNER is
+gh api users/OWNER/repos --paginate --jq '.[] | select(.archived == false) | .full_name'
+```
+
+Exclude archived repos from the survey by default and say so in the report
+header (e.g. "14 repos, 1 archived excluded") rather than silently shrinking
+the count. A repo the invoking token cannot see at all never appears in this
+listing — that is expected, not a gap to report. A repo that *is* listed but
+then fails a per-repo read below (private repo whose contents/settings the
+token can list but not read, a repo that went private after listing) is a
+different failure and does need reporting — see "could not check" below.
+
+#### Classify each repo's migration state
+
+For every enumerated repo, run the same detection this command already
+performs on the invoking repo in step 0 and step 1 above — `.github/dependabot.yml`
+/ `.github/dependabot.yaml` presence, the dedicated `automated-security-fixes`
+flag, and Renovate config presence (`renovate.json`, `renovate.json5`,
+`.github/renovate.json[5]`, `.renovaterc[.json]`, `.renovaterc.json5`, the
+`renovate` key in `package.json`, per step 0's detection list). Classify each
+repo into exactly one state:
+
+| State | Meaning |
+|---|---|
+| `dependabot-only` | Dependabot version-update config and/or the security-updates flag present; no active Renovate config |
+| `both-active` | Both Dependabot (config or security flag) and an active Renovate config present — the dangerous mid-migration state where two updaters can race |
+| `renovate-only` | Active Renovate config present; no Dependabot version-update config. The security-updates flag is independent (step 1) and does not by itself make a repo `both-active` |
+| `unmanaged` | Neither provider configured |
+| `could not check` | A per-repo read failed (403, network, or similar); report the failure explicitly rather than guessing a state or silently dropping the row |
+
+Also report, per repo:
+
+- **Preset adopted?** — whether the repo's Renovate config `extends` the
+  deployed `github>OWNER/.github:renovate-config` preset (see [[org-policy]]
+  "Installed files and client adoption"). Apply the ordering check below
+  before reporting this column as a plain gap.
+- **Open bot dependency PRs** — a count, using the same author-filter step 7
+  already uses (`app/dependabot`, `app/renovate`, or the configured
+  self-hosted identity for that repo).
+
+#### Ordering check: the org preset must be merged before any client can adopt it
+
+Compute this once per survey run, not once per repo. A client's
+`extends: "github>OWNER/.github:renovate-config"` only resolves once
+`OWNER/.github`'s organization policy PR — the one [[org-policy]] `--install`
+opens, titled `chore: reconcile organization dependency policy` — has merged
+on that repo's default branch. Confirm the preset is actually live rather than
+assuming a merged PR:
+
+```bash
+gh api repos/OWNER/.github/contents/renovate-config.json --jq '.sha' 2>/dev/null
+# present on the default branch → preset is live; absent → not yet published/merged
+```
+
+If the preset is **not yet live**, no repo in the survey can be "eligible to
+adopt" it yet: report every repo's preset-adoption column as **"not adopted —
+preset not yet available"**, distinct from an ordinary adoption gap. Once the
+preset is confirmed live, report each repo's actual state — already adopted,
+or a real adoption gap now that adoption is actually possible.
+
+#### Report format
+
+```
+ORG MIGRATION SURVEY — OWNER (14 repos, 1 archived excluded)
+==============================================================
+Preset (OWNER/.github renovate-config.json): live on default branch
+
+| Repo          | State           | Preset adopted            | Open bot PRs |
+|---------------|-----------------|----------------------------|--------------|
+| OWNER/alpha   | renovate-only   | yes                        | 2            |
+| OWNER/beta    | both-active     | no                         | 5            |
+| OWNER/gamma   | dependabot-only | no                         | 1            |
+| OWNER/delta   | unmanaged       | no                         | 0            |
+| OWNER/epsilon | could not check | — (403 reading contents)  | —            |
+```
+
+Never propose or make a write from this mode, even with authorization already
+covering single-repo writes elsewhere. Point at running `/repo:deps`
+(optionally `--install`/`--review`) against a specific repo as the next step
+for any row that needs action; a `both-active` row that needs a deliberate,
+tracked Dependabot shutdown is a candidate for [[followups]]-style per-repo
+tracking, filed against that repo, not this survey.
+
+`--all-repos` is unconditionally report-only regardless of `--check` — `--check`
+has nothing further to restrict here, since this mode never writes in the
+first place.
 
 ### Renovate setup path
 
