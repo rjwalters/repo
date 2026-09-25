@@ -311,6 +311,8 @@ target repo, title, and full body, and file only what is approved.
     the ecosystems Renovate now covers (version updates), **or**
   - `automated-security-fixes` enabled while the deployed policy's
     `dependencies.dependabotSecurityUpdates` is `false` (security updates).
+    `paused` counts as enabled here: the authorization is still in place and
+    GitHub can resume it at any time, so the shutdown is still pending.
 
 **The alerts flag is never a trigger on its own.** This path deliberately keeps
 the dependency graph and Dependabot *alerts* enabled and grants Renovate read
@@ -464,14 +466,42 @@ Check and report both:
 ```bash
 git ls-files '.github/dependabot.yml' '.github/dependabot.yaml'   # version updates
 
-# Security updates — a dedicated endpoint, NOT a security_and_analysis key:
-# returns a definitive {"enabled": bool}; 403 → needs admin (see UNKNOWN note below)
-gh api repos/OWNER/REPO/automated-security-fixes --jq '.enabled'
+# Security updates — a dedicated endpoint, NOT a security_and_analysis key.
+# Read the WHOLE object, never `--jq '.enabled'` alone: it answers with TWO
+# fields, {"enabled": bool, "paused": bool}, encoding three states (below);
+# 403 → needs admin (see UNKNOWN note below)
+gh api repos/OWNER/REPO/automated-security-fixes
 
 # Alerts — likewise a dedicated endpoint, NOT a security_and_analysis key:
 #   204 → enabled, 404 → disabled
 gh api repos/OWNER/REPO/vulnerability-alerts -i 2>/dev/null | head -1
 ```
+
+**Security updates are three states, not two.** `automated-security-fixes`
+answers with two booleans, and they encode **three** states rather than an
+on/off pair — report the one matching the payload, and never collapse `paused`
+into `enabled`:
+
+| Response | Report as | What it means |
+|---|---|---|
+| `{"enabled": true, "paused": false}` | `enabled` | Dependabot raises a fix PR when a new CVE lands |
+| `{"enabled": true, "paused": true}` | `paused` | The flag is on, but **no fix PRs are being raised right now** |
+| `{"enabled": false, "paused": …}` | `disabled` | No automatic CVE fix PRs, and none authorized |
+| `403` | `UNKNOWN (needs admin)` | Not a state — a permission failure (see below) |
+
+GitHub sets `paused` itself; it is not a setting anyone wrote. GitHub pauses
+Dependabot on a repo it judges idle — typically one whose open Dependabot PRs
+have gone untouched for an extended period — so `paused` is a state a repo
+*drifts into*, which is exactly why reading only `.enabled` hides it. A paused
+repo reads identically to an actively-patched one on `.enabled` alone, while
+producing the same observable outcome as a disabled one: no fix PRs arriving.
+
+**Do not prescribe step 5's enable write for `paused`.** The flag is already
+`enabled`, so `PUT /automated-security-fixes` is a **no-op** against it. GitHub
+resumes on its own once someone engages with the repo's Dependabot PRs (merge,
+close, or comment on one), so report `paused` with that as the next action —
+and if there are no open Dependabot PRs to engage with, say that too rather than
+offering a write that will change nothing.
 
 Read both flags from their dedicated endpoints, never from `security_and_analysis`.
 That object is an unreliable source for either one, for two different reasons:
@@ -501,6 +531,18 @@ DEPENDABOT
 | vulnerability alerts (repo flag)| disabled (404)                          |
 | security updates (repo flag)    | disabled — no automatic CVE fix PRs     |
 | Open Dependabot PRs             | 0                                       |
+```
+
+The `security updates (repo flag)` row takes one of four values — one per row of
+the state table above. The `paused` rendering is the one an `.enabled`-only read
+cannot produce, and it is a distinct row value, never an annotation on
+`enabled`:
+
+```
+| security updates (repo flag)    | enabled — fix PRs raised on new CVEs    |
+| security updates (repo flag)    | paused — enabled, but GitHub is raising no fix PRs |
+| security updates (repo flag)    | disabled — no automatic CVE fix PRs     |
+| security updates (repo flag)    | UNKNOWN (needs admin) — endpoint returned 403 |
 ```
 
 Reserve **UNKNOWN (needs admin)** for an actual permission failure — a `403`
@@ -769,6 +811,11 @@ gh api -X PUT repos/OWNER/REPO/automated-security-fixes
 Both need admin. On a 403, report that the flag needs a repo admin and move on
 — never present a failed write as success. Re-read the flags afterward and show
 the before/after.
+
+**Do not offer the security-updates write when step 1 reported the flag as
+already `enabled` but `paused`** — the `PUT` is a no-op there, and offering it
+presents a resumption that will not happen as a fix. Report step 1's paused
+next action instead.
 
 ### 6. Check for PRs immediately after the config lands
 

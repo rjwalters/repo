@@ -38,8 +38,9 @@
 # commands/repo/tests/test-check-label-descriptions.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
 # commands/repo/tests/test-release-notes-extraction.sh,
-# commands/repo/tests/test-tidy-mcp-dist-demotion.sh, and
-# commands/repo/tests/test-assert-matches-sigpipe.sh.
+# commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
+# commands/repo/tests/test-assert-matches-sigpipe.sh, and
+# commands/repo/tests/test-deps-security-updates-paused.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1494,6 +1495,42 @@ else
     PASS=$((PASS + VB_PASS))
     FAIL=$((FAIL + VB_FAIL))
     record_suite "test-check-installed-surface-version-bump.sh" "$VB_PASS" "$VB_FAIL" "installed-surface VERSION-bump gate"
+fi
+
+# /repo:deps step 1's three-state security-updates read — GET
+# /automated-security-fixes answers {"enabled": bool, "paused": bool}, and a
+# `--jq '.enabled'`-only read reported a paused repo (no fix PRs arriving)
+# identically to an actively-patched one (repo#479). Same delegation shape as
+# every suite above.
+echo
+echo "-- deps security-updates paused state (delegated suite) --"
+DP_TEST="$TESTS_DIR/../../../commands/repo/tests/test-deps-security-updates-paused.sh"
+if [[ ! -f "$DP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-deps-security-updates-paused.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-deps-security-updates-paused.sh" "$DP_TEST"
+else
+    DP_OUT="$(bash "$DP_TEST" 2>&1)"
+    DP_STATUS=$?
+    DP_PASS="$(suite_count Passed "$DP_OUT")"
+    DP_FAIL="$(suite_count Failed "$DP_OUT")"
+    if ! [[ "$DP_PASS" =~ ^[0-9]+$ && "$DP_FAIL" =~ ^[0-9]+$ ]]; then
+        DP_PASS=0
+        DP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-deps-security-updates-paused.sh" "$DP_STATUS"
+        strip_ansi "$DP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$DP_STATUS" -ne 0 || "$DP_FAIL" -ne 0 ]]; then
+        [[ "$DP_FAIL" -eq 0 ]] && DP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-deps-security-updates-paused.sh" "$DP_PASS" "$DP_FAIL" "$DP_STATUS"
+        strip_ansi "$DP_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-deps-security-updates-paused.sh" "$DP_PASS"
+    fi
+    PASS=$((PASS + DP_PASS))
+    FAIL=$((FAIL + DP_FAIL))
+    record_suite "test-deps-security-updates-paused.sh" "$DP_PASS" "$DP_FAIL" "deps security-updates paused state"
 fi
 
 echo
