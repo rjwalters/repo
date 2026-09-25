@@ -203,7 +203,9 @@ covering single-repo writes elsewhere. Point at running `/repo:deps`
 (optionally `--install`/`--review`) against a specific repo as the next step
 for any row that needs action; a `both-active` row that needs a deliberate,
 tracked Dependabot shutdown is a candidate for [[followups]]-style per-repo
-tracking, filed against that repo, not this survey.
+tracking, filed against that repo, not this survey — which is exactly what the
+Renovate path's "Deferred Dependabot shutdown" step below offers to do, one
+repo at a time, when run against that repo.
 
 `--all-repos` is unconditionally report-only regardless of `--check` — `--check`
 has nothing further to restrict here, since this mode never writes in the
@@ -284,8 +286,9 @@ organization deployments, client files, flags, or merges.
 scrollback, and a terminal transcript is not a handoff. Once the session ends,
 nothing in the repo, the organization policy, or an issue tracker records that
 this repo is sitting in the `both-active` state the `--all-repos` survey calls
-the dangerous one — reached, here, by following this path's documented happy
-path. So close the Renovate path by **offering to file** that deferral as an
+the dangerous one — a state this path reaches by being followed *correctly*,
+not by anyone skipping a step. So close this path by **offering to file** that
+deferral as an
 issue, against the **client repo** (the repo `/repo:deps` is running against,
 never upstream and never `OWNER/.github` — it is the client's migration to
 finish). This is the per-repo version of the tracking the `--all-repos` survey
