@@ -68,7 +68,16 @@ assert_not_contains() {  # <label> <haystack> <needle>
     if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected [$3] present"; fi
 }
 assert_matches() {  # <label> <haystack> <ere>
-    if printf '%s\n' "$2" | grep -qE -- "$3"; then ok "$1"; else no "$1" "no match for /$3/"; fi
+    # repo#466: this used to be `printf '%s\n' "$2" | grep -qE -- "$3"`. Under
+    # `set -o pipefail` that pipeline's reported status is whichever stage
+    # exits last/nonzero; `grep -q` exits (and closes its stdin) the instant
+    # it finds the first match, and printf writing into a now-closed pipe can
+    # receive SIGPIPE (exit 141) before it finishes — so a genuine match could
+    # still report FAIL. A bash here-string has no separate writer process to
+    # receive SIGPIPE: `$2` is fed to grep via a temp file/fd bash sets up
+    # itself, so `$?` here is grep's own exit status, full stop. `<<<` appends
+    # exactly one trailing newline, same as the `printf '%s\n'` it replaces.
+    if grep -qE -- "$3" <<< "$2"; then ok "$1"; else no "$1" "no match for /$3/"; fi
 }
 # flatten() (repo#363): whitespace-flatten a file for doc-drift assertions
 # against prose that wraps across lines. Was byte-for-byte duplicated in
