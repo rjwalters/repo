@@ -20,6 +20,8 @@ from urllib.parse import quote, urlencode, urlparse
 
 SOURCE_REPO = "rjwalters/repo"
 MANAGED_FILES = {"repo-policy.json", "renovate-config.json"}
+RENOVATE_APP_SLUG = "renovate"
+RENOVATE_INSTALL_URL = "https://github.com/apps/renovate"
 
 
 class PolicyError(Exception):
@@ -167,6 +169,52 @@ def render(policy, source, owner):
     }
 
 
+def check_app_installed(api, owner, app_slug=RENOVATE_APP_SLUG):
+    """Report whether a GitHub App is installed on an organization/user account.
+
+    Published policy and an authorized client config prove nothing about
+    whether the App that is supposed to act on them is actually installed —
+    that is a separate, org-owner-gated step this helper does not perform.
+    Returns True/False when the installations endpoint answers definitively,
+    or None when it cannot be determined from here (insufficient permissions,
+    or a personal account other than the caller's own — `user/installations`
+    only lists the authenticated user's own installations, and there is no
+    equivalent endpoint for an arbitrary third-party personal account).
+    """
+    try:
+        account = api.api(f"users/{owner}")
+    except PolicyError:
+        return None
+    account_type = account.get("type") if account else None
+    try:
+        if account_type == "Organization":
+            installations = api.api(f"orgs/{owner}/installations")
+        elif account_type == "User":
+            viewer = api.api("user")
+            if not viewer or viewer.get("login", "").lower() != owner.lower():
+                return None
+            installations = api.api("user/installations")
+        else:
+            return None
+    except PolicyError:
+        return None
+    entries = (installations or {}).get("installations", [])
+    return any(entry.get("app_slug") == app_slug for entry in entries)
+
+
+def app_status_line(installed, app_slug=RENOVATE_APP_SLUG, install_url=RENOVATE_INSTALL_URL):
+    name = app_slug.capitalize()
+    if installed is True:
+        return f"{name} GitHub App: installed."
+    if installed is False:
+        return (f"{name} GitHub App: NOT installed — policy published, but no PRs will be "
+                f"raised until it is. Install: {install_url} (requires an organization "
+                "owner/admin, who may not be the person running this command).")
+    return (f"{name} GitHub App: UNKNOWN — could not verify installation from here "
+            f"(insufficient permissions, or a personal account other than the caller's own). "
+            f"Install (if missing): {install_url}")
+
+
 def snapshot(api, target):
     metadata = api.api(f"repos/{target}", missing_ok=True)
     if metadata is None:
@@ -216,7 +264,7 @@ def changed(plan):
     return plan["before"] != plan["after"]
 
 
-def show_plan(plan):
+def show_plan(api, plan):
     print(f"Source: {SOURCE_REPO} ({plan['source'].get('revision', 'local preview')})")
     print(f"Client: {plan['client']}  Target: {plan['target']}")
     if plan["createRepository"]:
@@ -227,6 +275,10 @@ def show_plan(plan):
             fromfile=f"{plan['target']}/{name} (current)",
             tofile=f"{plan['target']}/{name} (proposed)")), end="")
     print("Policy PR required." if changed(plan) else "Organization policy is current.")
+    # Config presence never proves the App that acts on it is installed —
+    # report that separately so "policy published" and "policy published but
+    # inert" cannot read the same in this output.
+    print(app_status_line(check_app_installed(api, plan["client"].split("/")[0])))
 
 
 def apply_plan(api, plan):
@@ -319,21 +371,35 @@ def main():
     apply = subs.add_parser("apply", help="publish the saved plan as an organization PR")
     apply.add_argument("--plan", type=Path, required=True)
     apply.add_argument("--yes", action="store_true", help="authorize this reviewed plan")
+    check_app = subs.add_parser(
+        "check-app", help="report whether a GitHub App (default: renovate) is installed for an owner")
+    check_app.add_argument("--repo", help="client OWNER/REPO to derive the owner from; defaults to origin")
+    check_app.add_argument("--owner", help="explicit organization/user login; overrides --repo")
+    check_app.add_argument("--app-slug", default=RENOVATE_APP_SLUG,
+                           help="GitHub App slug to check (default: renovate)")
     args = parser.parse_args()
     try:
         api = GitHub()
         if args.command == "plan":
             plan = make_plan(api, client_repo(args.repo), args.source_dir, args.create_repository)
-            show_plan(plan)
+            show_plan(api, plan)
             if args.output:
                 # A fresh path prevents overwriting an unrelated user file.
                 with args.output.open("x") as out:
                     out.write(dump(plan))
                 print(f"Saved plan: {args.output}")
-        else:
+        elif args.command == "apply":
             if not args.yes:
                 raise PolicyError("Review the saved plan, then pass --yes to publish its changes")
-            print(apply_plan(api, json.loads(args.plan.read_text())))
+            plan = json.loads(args.plan.read_text())
+            print(apply_plan(api, plan))
+            print(app_status_line(check_app_installed(api, plan["client"].split("/")[0])))
+        else:
+            owner = args.owner or client_repo(args.repo).split("/")[0]
+            # Absence is a report, never an error: this call is purely
+            # informational and must not make an otherwise-healthy plan/apply
+            # run look like it failed.
+            print(app_status_line(check_app_installed(api, owner, args.app_slug), args.app_slug))
         return 0
     except (PolicyError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"repo-org-policy: {exc}", file=sys.stderr)

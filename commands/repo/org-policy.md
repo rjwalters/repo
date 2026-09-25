@@ -61,6 +61,12 @@ client: the helper fetches canonical JSON at one immutable GitHub commit.
 5. Report the PR URL and whether it is merged. The policy becomes active on
    the default branch after merge; opening a PR is not an installed policy.
    Follow the repository's normal merge workflow when merging is authorized.
+6. Every `plan` and `apply` invocation also prints a Renovate GitHub App
+   installation line (see "Renovate App installation check" below) — include
+   it verbatim in the final report. A published/merged policy proves nothing
+   about whether the App that reads it is actually installed on the target
+   organization/user; treat "policy published" and "policy published, app
+   NOT installed" as distinct outcomes, not the same success.
 
 ```bash
 # Run from the client repository. Use a new directory so plan.json is absent.
@@ -77,6 +83,36 @@ Those plans cannot be applied: publish the source and regenerate from GitHub.
 Do not use a stale client-bundled template as a fallback when GitHub is
 unavailable. Authentication/rate-limit failures are errors, not missing policy.
 
+## Renovate App installation check
+
+Config presence proves nothing about whether Renovate ever runs: a policy PR
+can merge cleanly, a client's `renovate.json` can extend the preset validly,
+and the organization can still be entirely inert if the **Renovate GitHub
+App** itself was never installed on that organization/user. Both `plan` and
+`apply` verify this automatically and print one line, e.g.:
+
+```text
+Renovate GitHub App: NOT installed — policy published, but no PRs will be
+raised until it is. Install: https://github.com/apps/renovate (requires an
+organization owner/admin, who may not be the person running this command).
+```
+
+or, when it resolves to `installed.`/`UNKNOWN` instead. Absent is a report, not
+an error — do not treat it as a failed `plan`/`apply`, and do not silently drop
+it from the final summary. Run the check standalone (e.g. to re-verify after
+an admin installs the App, without regenerating a policy plan) with:
+
+```bash
+python3 .claude/skills/repo/scripts/repo-org-policy.py check-app \
+  --owner OWNER   # or: --repo OWNER/PROJECT to derive the owner from origin
+```
+
+`UNKNOWN` means this token cannot see the installations endpoint for that
+account — a non-admin org member, or any personal account other than the
+caller's own (`user/installations` only lists installations for whoever is
+authenticated) — not that the App is confirmed present. Report `UNKNOWN`
+as-is rather than treating it as either outcome.
+
 ## Installed files and client adoption
 
 The organization PR manages exactly two root files in `OWNER/.github`:
@@ -86,7 +122,10 @@ The organization PR manages exactly two root files in `OWNER/.github`:
   source repository, commit, and source-file SHA-256 digests.
 
 The helper does **not** install the Renovate GitHub App, change repository flags,
-enable auto-merge, or migrate client repositories. After the organization PR
+enable auto-merge, or migrate client repositories — it only **reports** whether
+the App is installed (see "Renovate App installation check" above). Installing
+it at `https://github.com/apps/renovate` requires an organization owner/admin,
+who may not be the person running this command. After the organization PR
 merges, use [[deps]] to reconcile the invoking client. Its `renovate.json`
 extends `github>OWNER/.github:renovate-config`; explicit client exceptions stay
 in that client. Existing clients must adopt that reference once. Future

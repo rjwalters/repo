@@ -7,6 +7,7 @@ All GitHub calls use an in-memory API double; this suite cannot publish to GitHu
 import base64
 import copy
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -36,6 +37,11 @@ class FakeGitHub:
         self.trees = {}
         self.prs = []
         self.owner_type = "Organization"
+        self.viewer_login = "example"
+        self.org_installations = []
+        self.user_installations = []
+        self.org_installations_status = None
+        self.users_status = None
 
     @property
     def writes(self):
@@ -65,13 +71,21 @@ class FakeGitHub:
             files = self.files if revision == self.base else self.commits[revision]["files"]
             return self.file_response(files.get(name))
         if route == "users/example":
+            if self.users_status is not None:
+                raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.users_status}")
             return {"type": self.owner_type}
         if route == "user":
-            return {"login": "example"}
+            return {"login": self.viewer_login}
         if route in ("orgs/example/repos", "user/repos"):
             assert method == "POST" and not self.exists
             self.exists = True
             return {"name": ".github"}
+        if route == "orgs/example/installations":
+            if self.org_installations_status is not None:
+                raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.org_installations_status}")
+            return {"installations": [{"app_slug": slug} for slug in self.org_installations]}
+        if route == "user/installations":
+            return {"installations": [{"app_slug": slug} for slug in self.user_installations]}
         if route.startswith(f"{target_root}/git/ref/heads/"):
             branch = route.split("/git/ref/heads/", 1)[1]
             return {"object": {"sha": self.refs[branch]}} if branch in self.refs else None
@@ -303,6 +317,69 @@ class PolicyTests(unittest.TestCase):
             policy.GitHub().api("repos/example/.github/pulls", "POST", payload)
             self.assertEqual(json.loads(run.call_args.kwargs["input"]), payload)
             self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_app_installed_on_organization(self):
+        self.api.org_installations = ["codecov", "renovate"]
+        self.assertIs(policy.check_app_installed(self.api, "example"), True)
+
+    def test_app_not_installed_on_organization(self):
+        self.api.org_installations = ["codecov"]
+        self.assertIs(policy.check_app_installed(self.api, "example"), False)
+        self.assertIn("orgs/example/installations", [c[0] for c in self.api.calls])
+
+    def test_app_status_unknown_when_org_installations_forbidden(self):
+        self.api.org_installations_status = 403
+        self.assertIsNone(policy.check_app_installed(self.api, "example"))
+
+    def test_app_status_unknown_when_owner_lookup_fails(self):
+        self.api.users_status = 404
+        self.assertIsNone(policy.check_app_installed(self.api, "example"))
+
+    def test_app_installed_on_own_personal_account(self):
+        self.api.owner_type = "User"
+        self.api.viewer_login = "example"
+        self.api.user_installations = ["renovate"]
+        self.assertIs(policy.check_app_installed(self.api, "example"), True)
+
+    def test_app_status_unknown_for_third_party_personal_account(self):
+        self.api.owner_type = "User"
+        self.api.viewer_login = "someone-else"
+        self.assertIsNone(policy.check_app_installed(self.api, "example"))
+        self.assertNotIn("user/installations", [c[0] for c in self.api.calls])
+
+    def test_app_status_line_names_install_url_and_admin_requirement_when_absent(self):
+        line = policy.app_status_line(False)
+        self.assertIn(policy.RENOVATE_INSTALL_URL, line)
+        self.assertIn("organization owner/admin", line)
+        self.assertIn("NOT installed", line)
+
+    def test_app_status_line_distinguishes_installed_from_unknown(self):
+        self.assertIn("installed", policy.app_status_line(True).lower())
+        self.assertNotIn("NOT installed", policy.app_status_line(True))
+        self.assertIn("UNKNOWN", policy.app_status_line(None))
+
+    def test_plan_report_includes_app_installation_status(self):
+        self.api.org_installations = []
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            policy.show_plan(self.api, self.plan())
+        self.assertIn("NOT installed", out.getvalue())
+        self.assertIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
+
+    def test_check_app_cli_reports_absence_without_erroring(self):
+        # Drive the real CLI end to end, but through the same subprocess.run
+        # double the other CLI-level tests use, so this stays a hermetic
+        # unit test rather than a live call to the real `gh`/GitHub.
+        responses = iter([
+            subprocess.CompletedProcess([], 0, json.dumps({"type": "Organization"}), ""),
+            subprocess.CompletedProcess([], 0, json.dumps({"installations": []}), ""),
+        ])
+        with patch.object(policy.subprocess, "run", side_effect=lambda *a, **k: next(responses)), \
+                patch.object(sys, "argv", ["repo-org-policy.py", "check-app", "--owner", "example"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = policy.main()
+        self.assertEqual(code, 0)
+        self.assertIn("NOT installed", out.getvalue())
+        self.assertIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
 
     def test_apply_cli_requires_opt_in_without_reading_plan(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/repo/repo-org-policy.py"),
