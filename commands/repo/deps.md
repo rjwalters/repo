@@ -203,7 +203,9 @@ covering single-repo writes elsewhere. Point at running `/repo:deps`
 (optionally `--install`/`--review`) against a specific repo as the next step
 for any row that needs action; a `both-active` row that needs a deliberate,
 tracked Dependabot shutdown is a candidate for [[followups]]-style per-repo
-tracking, filed against that repo, not this survey.
+tracking, filed against that repo, not this survey — which is exactly what the
+Renovate path's "Deferred Dependabot shutdown" step below offers to do, one
+repo at a time, when run against that repo.
 
 `--all-repos` is unconditionally report-only regardless of `--check` — `--check`
 has nothing further to restrict here, since this mode never writes in the
@@ -254,7 +256,9 @@ Reuse steps 2–3 below for ecosystem/ownership detection and label validation.
   shown in step 1. Treat `dependencies.dependabotSecurityUpdates` as desired
   state: disable Dependabot PR generation only after Renovate's fix coverage is
   verified for this client's ecosystems and lockfiles. Report pending migration
-  instead of temporarily removing all security-fix automation.
+  instead of temporarily removing all security-fix automation — and record that
+  pending migration somewhere that outlives this session, per "Deferred
+  Dependabot shutdown" below.
 - During migration, remove/disable the overlapping Dependabot version-update
   entries once Renovate is operational. Retain any deliberately assigned
   Dependabot-only coverage and inspect old PRs individually; do not bulk-close
@@ -275,6 +279,174 @@ Reuse steps 2–3 below for ecosystem/ownership detection and label validation.
 Show concrete config/settings changes before applying authorized setup. Continue
 with the common PR review below. Under `--check`, make no changes, including
 organization deployments, client files, flags, or merges.
+
+#### Deferred Dependabot shutdown — offer to file a tracking issue (confirm first)
+
+"Report pending migration" above leaves the second half of the migration in
+scrollback, and a terminal transcript is not a handoff. Once the session ends,
+nothing in the repo, the organization policy, or an issue tracker records that
+this repo is sitting in the `both-active` state the `--all-repos` survey calls
+the dangerous one — a state this path reaches by being followed *correctly*,
+not by anyone skipping a step. So close this path by **offering to file** that
+deferral as an
+issue, against the **client repo** (the repo `/repo:deps` is running against,
+never upstream and never `OWNER/.github` — it is the client's migration to
+finish). This is the per-repo version of the tracking the `--all-repos` survey
+points at for a `both-active` row.
+
+Offer, never file automatically: filing is an outward-facing write, so it takes
+the same confirm-first posture as every other write in this command — show the
+target repo, title, and full body, and file only what is approved.
+
+**When to run it.** At the end of this path, after the reports above, when
+**both** of the following hold:
+
+- Renovate is the selected provider and an active Renovate config is present
+  here, *and*
+- Dependabot still generates — or is still authorized to generate — PRs, in
+  either of these two independent forms (step 1 reports all three Dependabot
+  signals separately; read them from their dedicated endpoints, not from
+  `security_and_analysis`):
+  - a tracked `.github/dependabot.yml[.yaml]` whose `updates:` entries overlap
+    the ecosystems Renovate now covers (version updates), **or**
+  - `automated-security-fixes` enabled while the deployed policy's
+    `dependencies.dependabotSecurityUpdates` is `false` (security updates).
+
+**The alerts flag is never a trigger on its own.** This path deliberately keeps
+the dependency graph and Dependabot *alerts* enabled and grants Renovate read
+access to them, so `vulnerability-alerts` being on is the intended end state,
+not an outstanding migration step. A repo whose only remaining Dependabot
+signal is alerts is `renovate-only` and gets no offer.
+
+**Do not guess past an unresolved read.** If the deployed policy was absent or
+unreadable (step 0 keeps those distinct from "policy says false"), or if
+`automated-security-fixes` returned `403` so the flag is UNKNOWN (needs admin,
+step 1), that signal is not evidence of a pending shutdown: report it as
+unresolved and do not offer on the strength of it. A version-update config,
+which is read from the git index rather than a permissioned endpoint, still
+triggers the offer on its own.
+
+**Under `--check`, skip this step entirely** — do not run the dedup search, do
+not draft a body, do not offer. `--check` is report-only, and filing an issue
+is a write to another repo. Report the pending migration as a finding and stop
+there. `--all-repos` never reaches this step at all: that mode is
+unconditionally report-only and acts on no repo it enumerates.
+
+##### 1. Dedup first — never re-offer what is already tracked
+
+Before drafting anything, check the client repo for an open item already
+covering this migration, using the same REST search recipe [[followups]] uses
+for dedup (`gh api search/issues`, not `gh issue list --search`, which is
+GraphQL-backed and exhausts first on a busy agent host):
+
+```bash
+gh api "search/issues?q=repo:OWNER/REPO+state:open+dependabot+renovate+migration&per_page=30" \
+  --jq '.items[] | "#\(.number) \(.title) \(.html_url)"'
+```
+
+Pull requests are deliberately in scope — `search/issues` returns both, and an
+open PR that removes `.github/dependabot.yml` is a *stronger* dedup signal than
+an open issue, because the work is already in flight. Check `html_url` for
+`/pull/` vs `/issues/` to tell which, and say so when reporting a match.
+
+- **Match found** — report it (`Dependabot shutdown: already tracked in #N`)
+  and make no offer. Re-running `/repo:deps` on a repo with an open tracking
+  item must never produce a second one.
+- **Near-match** — flag it with its number/URL and let the user choose: file
+  anyway, skip, or comment on the existing one. Never silently file over it and
+  never silently drop it.
+- **No match** — draft the body below and offer it.
+
+Widen the terms if the first query is empty and a differently-worded issue is
+plausible (`+disable+dependabot`, `+both-active`); search is a third rate-limit
+bucket again, so an extra query costs nothing from the `core` budget the filing
+step needs.
+
+##### 2. The body must make acting on it later a decision, not a re-investigation
+
+Whoever picks this up will not have this session's output. Draft the body with
+all four of these, filled in from what this run actually observed — not as a
+generic "finish the migration" stub:
+
+- **Which Dependabot surfaces are still active**, as the three independent
+  items step 1 reports, each with its observed value: the version-update config
+  (which path, which ecosystems), the security-updates flag, and the alerts
+  flag — marking alerts as **deliberately retained**, so a later reader does not
+  "finish the job" by turning off the alerting Renovate depends on.
+- **What must be verified before disabling anything**: that Renovate has
+  actually opened PRs for *this* repo's ecosystems (not merely that its config
+  is present and the App is installed), and that its fix coverage includes
+  lockfile-only security updates — the case where the advisory is resolved by a
+  transitive bump with no manifest change, which is exactly the coverage
+  Dependabot is being kept around for.
+- **The concrete commands/settings to flip them off**, so the follow-up is
+  mechanical:
+
+  ```bash
+  # Version updates: delete the config, or drop only the overlapping
+  # `updates:` entries if some coverage is deliberately Dependabot-only.
+  git rm .github/dependabot.yml
+
+  # Security updates: the same dedicated endpoint step 1 reads, DELETE to
+  # disable (needs admin; a 403 means it needs a repo admin, not that it failed
+  # silently).
+  gh api --method DELETE repos/OWNER/REPO/automated-security-fixes
+
+  # Alerts: leave ENABLED. Renovate reads them. Listed here only so nobody
+  # reaches for `gh api --method DELETE repos/OWNER/REPO/vulnerability-alerts`
+  # while "turning Dependabot off".
+  ```
+
+- **A pointer back to the deployed desired state**: the organization policy's
+  `dependencies.dependabotSecurityUpdates: false` in root `repo-policy.json` on
+  `OWNER/.github`, named with the revision this run read, plus the note that
+  `/repo:deps` will re-report this repo as `both-active` until it is done.
+
+Scrub the body before proposing it, per [[followups]]' authoring-time rule:
+this body is drafted from a working session and filed into a repo that may be
+public, and an issue body is only `removable-by-deletion` afterward. Keep it to
+this repo's own observable configuration state — no session counts, no other
+clients' names.
+
+##### 3. File it with the REST recipe, not `gh issue create`
+
+On approval, file exactly as [[followups]] step 5 does — write the body to a
+**literal** scratch path (never a shell variable as the redirect target or the
+`--input` argument; the destructive-write guard denies an unexpanded-variable
+write target), then POST it through REST:
+
+```bash
+# Write the body to /tmp/deps-dependabot-shutdown.md with your own file-write
+# capability — not a shell heredoc (a body containing backticks or `$(…)` is
+# still shell input and gets tokenized).
+
+jq -n --arg t "Finish Dependabot→Renovate migration: disable Dependabot PR generation" \
+  --rawfile b /tmp/deps-dependabot-shutdown.md \
+  '{title: $t, body: $b, labels: []}' > /tmp/deps-dependabot-shutdown-payload.json
+
+gh api --method POST "repos/OWNER/REPO/issues" \
+  --input /tmp/deps-dependabot-shutdown-payload.json --jq '.html_url'
+```
+
+`labels: []` is deliberate, matching [[followups]]: this is outward-facing
+tracking, not pipeline work, so it applies no `loom:*` (or other) labels and
+leaves triage to the client repo. Do not substitute `gh issue create` (GraphQL,
+and the pool you least want to lose *after* the user has approved) and do not
+pass the body as `--body @path` or `-f body=@path` — both post the literal
+string `@path` rather than the file's contents. Print the resulting issue URL
+in the report.
+
+##### 4. Report an existing tracking issue as resolvable once the evidence is in
+
+When a tracking item is already open (the dedup match above) and this run
+observes the migration actually finished — no overlapping version-update
+config, `automated-security-fixes` disabled, Renovate raising PRs for this
+repo's ecosystems — say so: `Dependabot shutdown: #N appears resolvable
+(dependabot.yml absent, security-updates off, N open Renovate PRs)`. Offer, on
+the same confirm-first terms, to post that evidence as a comment via the same
+REST shape (`gh api --method POST repos/OWNER/REPO/issues/<n>/comments --input
+<payload>`; `gh issue comment` is GraphQL-backed). Never close the issue
+automatically, and never post the comment under `--check`.
 
 ## Steps — Dependabot install / verify
 
@@ -815,3 +987,7 @@ natural wrong assumption, and it is safety-relevant:
 6. **Never auto-merge a major** — majors get their own confirmation, always.
    Red or pending CI is never merged.
 7. **Never push or merge under `--check`** — report-only means report-only.
+8. **Never file an issue without confirmation, and never re-file one already
+   tracked** — the deferred-Dependabot-shutdown issue is offered, with its full
+   body shown, only after the [[followups]]-style dedup search comes back empty
+   for the client repo, and never under `--check` or `--all-repos`.
