@@ -37,8 +37,9 @@
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
-# commands/repo/tests/test-release-notes-extraction.sh, and
-# commands/repo/tests/test-tidy-mcp-dist-demotion.sh.
+# commands/repo/tests/test-release-notes-extraction.sh,
+# commands/repo/tests/test-tidy-mcp-dist-demotion.sh, and
+# commands/repo/tests/test-assert-matches-sigpipe.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1387,6 +1388,42 @@ else
     PASS=$((PASS + JE_PASS))
     FAIL=$((FAIL + JE_FAIL))
     record_suite "test-json-escape-parity.sh" "$JE_PASS" "$JE_FAIL" "json_escape() copy parity"
+fi
+
+# assert_matches() SIGPIPE regression (repo#466): pins that lib/assert.sh's
+# assert_matches() no longer relies on piping `printf` into `grep -qE` in a
+# way that can raise SIGPIPE in printf under `set -o pipefail` (which caused
+# genuine matches to intermittently report FAIL). Same delegation shape as
+# every suite above.
+echo
+echo "-- assert_matches() SIGPIPE flake regression (delegated suite) --"
+AM_TEST="$TESTS_DIR/../../../commands/repo/tests/test-assert-matches-sigpipe.sh"
+if [[ ! -f "$AM_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-assert-matches-sigpipe.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-assert-matches-sigpipe.sh" "$AM_TEST"
+else
+    AM_OUT="$(bash "$AM_TEST" 2>&1)"
+    AM_STATUS=$?
+    AM_PASS="$(suite_count Passed "$AM_OUT")"
+    AM_FAIL="$(suite_count Failed "$AM_OUT")"
+    if ! [[ "$AM_PASS" =~ ^[0-9]+$ && "$AM_FAIL" =~ ^[0-9]+$ ]]; then
+        AM_PASS=0
+        AM_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-assert-matches-sigpipe.sh" "$AM_STATUS"
+        strip_ansi "$AM_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$AM_STATUS" -ne 0 || "$AM_FAIL" -ne 0 ]]; then
+        [[ "$AM_FAIL" -eq 0 ]] && AM_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-assert-matches-sigpipe.sh" "$AM_PASS" "$AM_FAIL" "$AM_STATUS"
+        strip_ansi "$AM_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-assert-matches-sigpipe.sh" "$AM_PASS"
+    fi
+    PASS=$((PASS + AM_PASS))
+    FAIL=$((FAIL + AM_FAIL))
+    record_suite "test-assert-matches-sigpipe.sh" "$AM_PASS" "$AM_FAIL" "assert_matches() SIGPIPE flake regression"
 fi
 
 # scripts/version.sh — this repo's single source of truth for VERSION,
