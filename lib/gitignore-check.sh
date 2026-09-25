@@ -38,6 +38,16 @@
 # "ignored" is the correct, intended state for them, not a defect to repair
 # (repo#425). `logs/` is never a source path this installer ships from, so the
 # exclusion cannot shadow real payload.
+#
+# Since repo#482 that "ignored" state no longer depends on the consumer having
+# thought to write a rule for it: the hooks drop a `*`-only `.gitignore` into
+# the logs directory as they create it, so the directory ignores its own
+# contents (that file included) in every consumer repo. Nothing here changes as
+# a result — the exclusion below already skips the whole `logs/` subtree
+# regardless of what is inside it or which .gitignore rule would match, so C9
+# behaves identically whether the ignore comes from the hooks' own file or from
+# a consumer rule written before repo#482. Both arrangements are covered by
+# commands/repo/tests/test-installer-contract.sh's C9 section.
 warn_gitignored_payload() {
   local target="$1"
   shift

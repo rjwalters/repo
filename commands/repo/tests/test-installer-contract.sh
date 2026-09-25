@@ -344,6 +344,16 @@ fi
 # left behind by the installed guard hooks running between installs, and a
 # consumer deliberately ignoring it (it carries absolute filesystem paths) is
 # the CORRECT state, not a defect the warning should flag.
+#
+# DELIBERATELY REAFFIRMED under repo#482 (which asked whether this case should
+# survive the fix, rather than leaving the answer implicit): the hooks now ship
+# their OWN self-ignoring `.gitignore` into that directory, so a consumer no
+# longer has to write the rule seeded below by hand. This case stays because
+# the consumer-authored rule is still a legal, supported arrangement — every
+# repo that added one before repo#482 still has it, and the C9 sweep must keep
+# staying silent about it whether the ignore comes from the consumer's root
+# .gitignore (here) or from the hooks' own file (the C9_SELFIG case after it).
+# The fix is purely additive: it never requires removing an existing rule.
 C9_RUNTIME="$SCRATCH/c9-runtime"; new_target "$C9_RUNTIME"
 cat >"$C9_RUNTIME/.gitignore" <<'EOF'
 # guard-hook decision logs (machine-local)
@@ -366,6 +376,61 @@ if [[ "$C9_RUNTIME_OUT" != *"guard-decisions.log"* ]]; then
     ok "the runtime log path is not named anywhere in C9 output"
 else
     no "the runtime log path is not named anywhere in C9 output" "$C9_RUNTIME_OUT"
+    C9_OK=false
+fi
+
+# repo#482 — the same runtime-log path, in a consumer that has NO .gitignore
+# rule of its own (the ordinary case: nothing in the installed payload ever told
+# them to add one). Before the fix the guard's first log write left an untracked
+# file under the tool root forever, which is enough on its own to stall an
+# installed-surface resync that gates on a clean `git status --porcelain`. The
+# hooks now drop a `*`-only .gitignore into the logs directory as they create
+# it, so the directory ignores its own contents wherever it appears.
+#
+# This runs the REAL installed guard hook (not a simulated log write) so the
+# assertion covers the shipped behaviour end to end.
+C9_SELFIG="$SCRATCH/c9-selfignore"; new_target "$C9_SELFIG"
+HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_SELFIG" >/dev/null 2>&1 </dev/null
+if [[ -f "$C9_SELFIG/.gitignore" ]] && grep -qE 'logs|\.log' "$C9_SELFIG/.gitignore"; then
+    no "the fresh target carries no logs rule of its own (fixture precondition)" \
+        "$(cat "$C9_SELFIG/.gitignore")"
+    C9_OK=false
+else
+    ok "the fresh target carries no logs rule of its own (fixture precondition)"
+fi
+C9_SELFIG_LOGS="$C9_SELFIG/.claude/skills/repo/logs"
+jq -nc --arg w "$C9_SELFIG" '{tool_name:"Bash", tool_input:{command:"rm -rf /"}, cwd:$w}' \
+    | env REPO_GUARD_DECISION_LOG=1 \
+      bash "$C9_SELFIG/.claude/skills/repo/hooks/guard-destructive.sh" >/dev/null 2>&1
+if [[ -f "$C9_SELFIG_LOGS/guard-decisions.log" ]]; then
+    ok "the installed guard hook writes its decision log under the tool root"
+else
+    no "the installed guard hook writes its decision log under the tool root" \
+        "$(ls -a "$C9_SELFIG_LOGS" 2>&1)"
+    C9_OK=false
+fi
+C9_SELFIG_STATUS="$( git -C "$C9_SELFIG" status --porcelain 2>&1 | grep -F 'skills/repo/logs' || true )"
+if [[ -z "$C9_SELFIG_STATUS" ]]; then
+    ok "a guard-hook run leaves no untracked runtime log behind (self-ignoring logs/)"
+else
+    no "a guard-hook run leaves no untracked runtime log behind (self-ignoring logs/)" \
+        "$C9_SELFIG_STATUS"
+    C9_OK=false
+fi
+C9_SELFIG_RULE="$( git -C "$C9_SELFIG" check-ignore -v .claude/skills/repo/logs/guard-decisions.log 2>/dev/null || true )"
+if [[ "$C9_SELFIG_RULE" == *".claude/skills/repo/logs/.gitignore:"* ]]; then
+    ok "the matching rule is the hooks' own shipped logs/.gitignore, not a consumer rule"
+else
+    no "the matching rule is the hooks' own shipped logs/.gitignore, not a consumer rule" \
+        "${C9_SELFIG_RULE:-<no match>}"
+    C9_OK=false
+fi
+# ...and C9 itself is unchanged by any of that: still silent about runtime logs.
+C9_SELFIG_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_SELFIG" 2>&1 </dev/null )"
+if [[ "$C9_SELFIG_OUT" != *"INSTALLER-CONTRACT.md C9"* && "$C9_SELFIG_OUT" != *"guard-decisions.log"* ]]; then
+    ok "a self-ignored runtime log does not trigger the C9 warning either"
+else
+    no "a self-ignored runtime log does not trigger the C9 warning either" "$C9_SELFIG_OUT"
     C9_OK=false
 fi
 
