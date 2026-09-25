@@ -5243,6 +5243,115 @@ assert_deny "#311: sed's own quoted DDL pattern still denies (ask copy untouched
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- repo#482: the logs directory ignores its own contents ---${NC}"
+# =========================================================================
+#
+# The guard's two log files live in a directory NO installer ever creates —
+# ensure_log_dir() mkdir's it on the first write, at .claude/skills/repo/logs/
+# in a real install. Nothing in the installed payload ignored it, so every
+# consumer had to add the same .gitignore rule by hand, and one that never did
+# carried an untracked runtime log in `git status` forever (which stalls any
+# installed-surface resync gating on a clean `git status --porcelain`).
+# ensure_log_dir() now drops a `*`-only .gitignore in as it creates the
+# directory, so the directory ignores its own contents — that .gitignore
+# included — and no consumer rule is needed.
+
+gi_assert() {  # <description> <status: 0=pass> [detail-on-fail]
+    TOTAL=$((TOTAL + 1))
+    if [[ "$2" -eq 0 ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $1"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $1"
+        [[ -n "${3:-}" ]] && echo -e "       ${3}"
+    fi
+}
+
+GI_DIR="$(mktemp -d)"
+
+# (a) Creating the decision log creates a .gitignore beside it whose only rule
+# is `*` (the whole directory, this file included).
+_gi_logs="$GI_DIR/a/logs"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_logs/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$_gi_logs/guard-decisions.log" && -f "$_gi_logs/.gitignore" ]] && \
+   [[ "$(grep -v '^#' "$_gi_logs/.gitignore" | grep -v '^[[:space:]]*$')" == "*" ]]; then
+    gi_assert "a fresh log-dir creation leaves a '*'-only .gitignore beside the log" 0
+else
+    gi_assert "a fresh log-dir creation leaves a '*'-only .gitignore beside the log" 1 \
+        "dir: $(ls -a "$_gi_logs" 2>&1)"
+fi
+
+# (b) The end-to-end property the fix exists for: in a git repo carrying NO
+# .gitignore rule of its own, a guard run that writes a log leaves
+# `git status --porcelain` completely clean — log file and .gitignore both.
+_gi_repo="$GI_DIR/repo"
+mkdir -p "$_gi_repo/.claude/skills/repo/hooks"
+git -C "$_gi_repo" init -q
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        LOOM_GUARD_DECISION_LOG_FILE="$_gi_repo/.claude/skills/repo/logs/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+_gi_status="$(git -C "$_gi_repo" status --porcelain 2>&1)"
+if [[ -f "$_gi_repo/.claude/skills/repo/logs/guard-decisions.log" && -z "$_gi_status" ]]; then
+    gi_assert "a written guard log leaves 'git status --porcelain' clean with no consumer rule" 0
+else
+    gi_assert "a written guard log leaves 'git status --porcelain' clean with no consumer rule" 1 \
+        "status: ${_gi_status:-<empty>}"
+fi
+
+# (c) Self-healing: a logs directory that already exists WITHOUT a .gitignore
+# (an install that predates this fix) gets one on the next write.
+_gi_pre="$GI_DIR/pre/logs"
+mkdir -p "$_gi_pre"
+printf 'stale\n' >"$_gi_pre/guard-decisions.log"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_pre/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$_gi_pre/.gitignore" ]]; then
+    gi_assert "a pre-existing logs dir with no .gitignore is healed on the next write" 0
+else
+    gi_assert "a pre-existing logs dir with no .gitignore is healed on the next write" 1 \
+        "dir: $(ls -a "$_gi_pre" 2>&1)"
+fi
+
+# (d) A .gitignore already in the logs directory is NEVER overwritten — a
+# consumer who put their own rules there keeps them.
+_gi_own="$GI_DIR/own/logs"
+mkdir -p "$_gi_own"
+printf '# consumer-owned\n*.log\n' >"$_gi_own/.gitignore"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_own/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ "$(cat "$_gi_own/.gitignore")" == "# consumer-owned"$'\n'"*.log" ]]; then
+    gi_assert "an existing .gitignore in the logs dir is left untouched" 0
+else
+    gi_assert "an existing .gitignore in the logs dir is left untouched" 1 \
+        "content: $(cat "$_gi_own/.gitignore" 2>&1)"
+fi
+
+# (e) Fail-open is preserved: an unwritable log directory still denies, exits 0,
+# and of course writes no .gitignore anywhere it could not write.
+_gi_rc=0
+_gi_out="$(make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="/nonexistent-dir-482/a/b/decisions.log" \
+        "$GUARD" 2>/dev/null)" || _gi_rc=$?
+if [[ "$_gi_rc" -eq 0 ]] && \
+   [[ "$(printf '%s' "$_gi_out" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" == "deny" ]] && \
+   [[ ! -e "/nonexistent-dir-482" ]]; then
+    gi_assert "fail-open: an unwritable log dir still denies, exits 0, writes nothing" 0
+else
+    gi_assert "fail-open: an unwritable log dir still denies, exits 0, writes nothing" 1 \
+        "rc=$_gi_rc out=$_gi_out"
+fi
+
+[[ -n "$GI_DIR" && "$GI_DIR" != "/" && -d "$GI_DIR" ]] && rm -rf "$GI_DIR"
+
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
