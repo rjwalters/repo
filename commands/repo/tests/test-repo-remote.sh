@@ -770,13 +770,21 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # (b) Permanent refusal: still a loud exit-4 die once the window is exhausted,
 #     naming the configured window -- never a silent success, never a warning.
+#     A 1s timeout with a 1s poll interval (repo#463) left ~0 margin: the
+#     retry loop's deadline check uses whole-second `date +%s` arithmetic, so
+#     if the first probe's own fork/exec overhead crosses a second boundary
+#     before the deadline check runs, the loop can die after exactly ONE
+#     attempt instead of the two the assertion below requires -- flaky only
+#     under load (a busy CI runner), never reproducible on an idle box. A
+#     2s timeout keeps the scenario fast while giving a full extra poll
+#     interval of slack before the deadline can be reached.
 run_rr MOCK_AWS_NEW_ID=i-0readytimeout MOCK_AWS_STATE=203.0.113.31 \
        MOCK_SSH_FAIL=1 \
-       REPO_REMOTE_SSH_READY_TIMEOUT=1 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 \
+       REPO_REMOTE_SSH_READY_TIMEOUT=2 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 \
        -- up --yes --json
 assert_eq   "permanent refusal -> still a loud failure (exit 4)" "4" "$RR_RC"
 assert_contains "failure names the reachability check" "$RR_ERR" "SSH reachability check failed"
-assert_contains "failure names the configured wait window" "$RR_ERR" "within 1s"
+assert_contains "failure names the configured wait window" "$RR_ERR" "within 2s"
 assert_contains "failure points at the tunable" "$RR_ERR" "REPO_REMOTE_SSH_READY_TIMEOUT"
 assert_contains "failure still names the ingress/key/user knobs" "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
 # It retried (more than the single pre-#449 attempt) before giving up.
