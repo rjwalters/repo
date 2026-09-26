@@ -58,6 +58,7 @@ stashes, untracked files) always need an explicit opt-in.
 |---------|----------------------|
 | /repo:reset | Done with a task — get back on main, synced, stale state reviewed |
 | /repo:followups | End of session — file follow-on work surfaced this session as issues, here or in the right upstream tool repo |
+| /repo:decide | Blocked on the operator — put the decision as ranked options (best to worst, each with why) they can answer with a number |
 | /repo:handoff | Rolling the session (context full, CLI update) — preserve what only the session knows, then restart |
 | /repo:tidy  | Working tree cluttered with build artifacts and temp files |
 | /repo:remote | Need a cloud dev box (GCP/AWS) with this repo ready to go |

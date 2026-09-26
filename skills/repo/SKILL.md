@@ -36,6 +36,7 @@ costs.
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | [[deps]] | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
 | [[org-policy]] | Preview or deploy canonical rjwalters/repo preferences to the client's GitHub owner/.github repository through a policy PR |
+| [[decide]] | Put operator decisions to the operator as ranked options — best to worst, each with why — so they can answer with a number |
 | [[followups]] | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | [[branches]] | Branch & worktree hygiene — merged PRs, orphaned branches, stale worktrees |
 | [[gitignore]] | Gitignore hygiene — over-ignored files, under-ignored build artifacts |
