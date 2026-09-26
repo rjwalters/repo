@@ -169,8 +169,11 @@ REPO_REMOTE_FLEET_TAG_KEY=Fleet           # tag (AWS) / label (GCP) key that mar
 REPO_REMOTE_FLEET_TAG_VALUE=loom          # required value for that key; empty means "any non-empty value counts"
 
 # --- SSH ingress (AWS only; see "Security group and SSH ingress" below) ---
-REPO_REMOTE_SSH_CIDR=                     # optional: pin the SG's SSH-ingress CIDR (e.g. 203.0.113.7/32, or
-                                           # 0.0.0.0/0 as a deliberate opt-in); overrides current-IP detection outright
+REPO_REMOTE_SSH_CIDR=                     # optional: pin the SG's SSH-ingress CIDR (e.g. 203.0.113.7/32);
+                                           # overrides current-IP detection outright. Validated — see below
+REPO_REMOTE_SSH_MIN_PREFIX=32             # narrowest IPv4 prefix accepted for SSH ingress (default 32 = one address;
+                                           # set e.g. 24 to allow a known ISP block)
+REPO_REMOTE_ALLOW_WORLD_SSH=              # "1" opts in, loudly, to a CIDR wider than the minimum (0.0.0.0/0, ::/0)
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -406,24 +409,54 @@ landed before it ever calls `run-instances`:
    `repo-remote=<repo-name>` from a prior run; otherwise create one with that
    tag. This makes repeated `up` runs idempotent — no new SG accumulates per
    invocation.
-2. **Resolve the CIDR.** `REPO_REMOTE_SSH_CIDR`, if set, wins outright
-   (including an explicit `0.0.0.0/0` opt-in). Otherwise, detect the current
-   IP via an HTTPS echo service (`checkip.amazonaws.com`) and use it as a
-   `/32` — but treat that detection as **unverified**: there is no reliable
-   way for this tooling to confirm the detected address is the one SSH egress
-   will actually use. Behind an HTTPS proxy it commonly isn't (an increasingly
-   common failure mode on agent hosts) — the echo service returns the proxy's
-   address, producing a correct-looking `/32` rule that can never match. If
-   detection fails outright (or you know it will be unreliable), set
-   `REPO_REMOTE_SSH_CIDR` yourself.
-3. **Fall back loudly, never silently.** If IP detection fails and
-   `REPO_REMOTE_SSH_CIDR` is unset, the rule falls back to `0.0.0.0/0` (SSH
-   remains key-only auth, so this is a scan-noise tradeoff, not an auth
-   bypass) with an explicit printed notice — never a `/32` that looks correct
-   but can never match.
-4. **Authorize idempotently.** `authorize-security-group-ingress` for tcp/22
-   from the resolved CIDR; a duplicate rule on a reused group counts as
-   success.
+2. **Resolve the CIDR.** `REPO_REMOTE_SSH_CIDR`, if set, wins outright.
+   Otherwise, detect the current IP via an HTTPS echo service
+   (`checkip.amazonaws.com`) and use it as a `/32` — but treat that detection
+   as **unverified**: there is no reliable way for this tooling to confirm the
+   detected address is the one SSH egress will actually use. Behind an HTTPS
+   proxy it commonly isn't (an increasingly common failure mode on agent
+   hosts) — the echo service returns the proxy's address, producing a
+   correct-looking `/32` rule that can never match. If detection fails
+   outright (or you know it will be unreliable), set `REPO_REMOTE_SSH_CIDR`
+   yourself.
+3. **Validate the CIDR, and fail closed.** Whatever the source, the CIDR is
+   checked before anything is authorized from it, and a CIDR that cannot be
+   established is a **refusal**, not a wider rule:
+   - An IPv4 prefix wider than `REPO_REMOTE_SSH_MIN_PREFIX` (default `32` — a
+     single address) is **refused** (exit `2`). Raise the knob deliberately
+     for a known block (`REPO_REMOTE_SSH_MIN_PREFIX=24`) rather than widening
+     by accident.
+   - `0.0.0.0/0`, `::/0`, and anything else wider than that minimum are
+     accepted **only** with `REPO_REMOTE_ALLOW_WORLD_SSH=1`, and that opt-in
+     prints a `WARNING` naming the exposure so it is visible in the run log.
+   - A malformed value (`not-a-cidr`, a missing prefix length) is a loud
+     config failure (exit `2`), never something that reaches the AWS API.
+   - **If IP detection fails and `REPO_REMOTE_SSH_CIDR` is unset, the run
+     fails closed** (exit `2`, naming `REPO_REMOTE_SSH_CIDR` as the fix) and
+     creates **no** ingress rule and **no** instance. There is deliberately no
+     `0.0.0.0/0` fallback: one flaky HTTPS call is not consent to open tcp/22
+     to the internet, and an account-wide audit cannot tell an accidental
+     opening from a deliberate one. (Before this, detection failure fell back
+     to `0.0.0.0/0` with only a printed notice.)
+4. **Authorize idempotently, and label the rule.** `authorize-security-group-ingress`
+   for tcp/22 from the resolved CIDR, via `--ip-permissions` so the rule
+   carries a `Description` of `repo-remote:<repo-name>:<YYYY-MM-DD>`; a
+   duplicate rule on a reused group counts as success. That marker is what
+   makes each rule traceable to its owner in an audit — and what step 4a keys
+   on.
+
+   4a. **Replace, don't accumulate.** Before authorizing the current address,
+   any tcp/22 rule on the group whose `Description` carries this tooling's
+   `repo-remote:<repo-name>:` marker — i.e. one *this* tooling wrote on an
+   earlier run — is revoked. Without this, every `up` from a new address added
+   a `/32` and removed none, so a few weeks of roaming left a group admitting
+   every address the operator had ever had. A rule for the address being
+   authorized now is kept (a repeat run from the same place does not flap it),
+   and **rules without that marker are never touched** — an operator-added or
+   pre-existing rule is not this tooling's to revoke. A revoke that fails
+   (e.g. credentials without `RevokeSecurityGroupIngress`) is a loud notice
+   with the manual command, not a failed `up`: it leaves a stale-but-narrow
+   rule behind, never a wider one.
 5. **Verify before spending money.** `describe-security-groups` on the
    resolved group must show a tcp/22 rule, or the run fails loudly (exit `4`)
    before `run-instances` is ever called — this is what would have caught the
@@ -461,15 +494,17 @@ self-heals. It is safe to repeat: the group is resolved via
 `REPO_REMOTE_SECURITY_GROUP` or the `repo-remote=<repo-name>` tag (never
 created anew per run), and a duplicate tcp/22 rule counts as success.
 
-**On reuse, the refresh never *widens* an existing rule.** Step 3's
-`0.0.0.0/0` fallback exists so a brand-new box isn't unreachable when IP
-detection fails. Applying it to a reused instance would instead take a working
-`/32` and open it to the world, on a path that used not to touch ingress at
-all — so when detection fails and the resolved group *already* has a tcp/22
-rule, `up` leaves that rule exactly as it is and prints a notice pointing at
-`REPO_REMOTE_SSH_CIDR`. An explicit `REPO_REMOTE_SSH_CIDR=0.0.0.0/0` opt-in is
-not a detection failure and is still honored verbatim; a group with no tcp/22
-rule at all has nothing to preserve, so the fallback still applies there.
+**On reuse, the refresh never *widens* an existing rule.** No path widens on a
+failed detection any more (step 3), but reuse is the case where *doing nothing*
+is better than failing: when detection fails and the resolved group *already*
+has a tcp/22 rule, `up` leaves that rule exactly as it is and prints a notice
+pointing at `REPO_REMOTE_SSH_CIDR` — the previously-working `/32` is more
+likely to be right than anything this run could guess. A group with **no**
+tcp/22 rule at all has nothing to preserve and nothing safe to invent, so that
+case fails closed (exit `2`) instead. An explicit, opted-in
+`REPO_REMOTE_SSH_CIDR=0.0.0.0/0` is not a detection failure and is still
+honored verbatim; the same validation gate in step 3 applies on this path too,
+so an un-opted-in `0.0.0.0/0` is refused here exactly as it is at create time.
 
 **On reuse, step 1 resolves only — it never creates.** If no group is pinned
 and none carries the `repo-remote=<repo-name>` tag, `up` prints a notice

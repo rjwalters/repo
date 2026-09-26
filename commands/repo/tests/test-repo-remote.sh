@@ -128,7 +128,18 @@ case "$1 $2" in
   "ec2 describe-images")
     echo "${MOCK_AWS_AMI:-ami-0ubuntu2204}"; exit 0 ;;
   "ec2 describe-security-groups")
-    if printf '%s' "$*" | grep -q -- '--group-ids'; then
+    if printf '%s' "$*" | grep -qF 'starts_with(Description'; then
+      # Tool-owned rule lookup (aws_tool_owned_ssh_cidrs, repo#487): the CIDRs
+      # of tcp/22 rules whose Description carries the repo-remote:<name>:
+      # marker. MOCK_AWS_SG_OWNED_CIDRS is a space-separated list; unset means
+      # "this group has no rule this tooling owns" (the common case: a freshly
+      # created group, or one whose only rules an operator added by hand).
+      if [[ -n "${MOCK_AWS_SG_OWNED_CIDRS:-}" ]]; then
+        printf '%s\n' "${MOCK_AWS_SG_OWNED_CIDRS}"
+      else
+        printf 'None\n'
+      fi
+    elif printf '%s' "$*" | grep -q -- '--group-ids'; then
       # Post-authorize verification (aws_verify_ssh_ingress): a tcp/22 ingress
       # rule must be present, or repo-remote.sh must die loudly (repo#176 AC1).
       if [[ "${MOCK_AWS_SG_INGRESS_EMPTY:-0}" == 1 ]]; then
@@ -150,6 +161,14 @@ case "$1 $2" in
   "ec2 authorize-security-group-ingress")
     if [[ "${MOCK_AWS_INGRESS_DUP:-0}" == 1 ]]; then
       echo "An error occurred (InvalidPermission.Duplicate) when calling the AuthorizeSecurityGroupIngress operation" >&2
+      exit 254
+    fi
+    exit 0 ;;
+  "ec2 revoke-security-group-ingress")
+    # repo#487: revoking this tooling's own stale tcp/22 rules is best-effort —
+    # MOCK_AWS_REVOKE_FAIL drives the "left in place, loud NOTICE" branch.
+    if [[ "${MOCK_AWS_REVOKE_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the RevokeSecurityGroupIngress operation" >&2
       exit 254
     fi
     exit 0 ;;
@@ -494,7 +513,11 @@ assert_contains "the created SG's name embeds the repo name"          "$SGLOG" "
 # (b) A tcp/22 ingress request is issued against the resolved SG.
 assert_contains "an ingress request is issued"          "$SGLOG" "authorize-security-group-ingress"
 assert_contains "the ingress request targets the created SG" "$SGLOG" "group-id sg-0created"
-assert_contains "the ingress request is for tcp/22"      "$SGLOG" "protocol tcp --port 22"
+assert_contains "the ingress request is for tcp/22"      "$SGLOG" "IpProtocol=tcp,FromPort=22,ToPort=22"
+# repo#487: every rule this tooling writes is labelled with an owner marker, so
+# an account-wide audit can trace each tcp/22 rule back to its owner.
+assert_contains "the ingress rule carries this tooling's owner Description" \
+  "$SGLOG" "Description=repo-remote:myrepo:"
 assert_contains "the created SG is attached to the instance" "$SGLOG" "security-group-ids sg-0created"
 
 # (c) A previously-tagged SG is reused instead of creating a new one
@@ -540,35 +563,145 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- SSH-ingress CIDR: current-IP detection, override, and fallback (repo#176) --"
+echo "-- SSH-ingress CIDR: detection, validated override, fail-closed (repo#176, repo#487) --"
 # ---------------------------------------------------------------------------
 # (a) Default path: current IP is detected via the HTTPS echo service and
 #     used as a /32.
 run_rr MOCK_AWS_NEW_ID=i-0cidrdetect MOCK_AWS_STATE=None MOCK_CURL_IP=198.51.100.9 -- up --yes --json
 assert_eq   "detected-IP path succeeds" "0" "$RR_RC"
 assert_contains "detected IP is used as a /32 ingress CIDR" \
-  "$(cat "$MOCK_LOG")" "cidr 198.51.100.9/32"
+  "$(cat "$MOCK_LOG")" "CidrIp=198.51.100.9/32"
 
-# (b) REPO_REMOTE_SSH_CIDR overrides detection outright -- including an
-#     explicit 0.0.0.0/0 opt-in -- and no echo-service lookup is made at all.
+# (b) REPO_REMOTE_SSH_CIDR overrides detection outright, and no echo-service
+#     lookup is made at all.
 run_rr MOCK_AWS_NEW_ID=i-0cidroverride MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=203.0.113.55/32 -- up --yes --json
 assert_eq   "REPO_REMOTE_SSH_CIDR override succeeds" "0" "$RR_RC"
 OVLOG="$(cat "$MOCK_LOG")"
-assert_contains     "the override CIDR is used for ingress" "$OVLOG" "cidr 203.0.113.55/32"
+assert_contains     "the override CIDR is used for ingress" "$OVLOG" "CidrIp=203.0.113.55/32"
 assert_not_contains "detection is skipped when the override is set" "$OVLOG" "curl "
 
+# (c) repo#487 SECURITY: a world-open override is REFUSED unless
+#     REPO_REMOTE_ALLOW_WORLD_SSH=1 explicitly opts in. "SSH open to the
+#     internet" must never happen because a config file had a stale value in
+#     it — and an auditor must be able to tell an accidental opening from a
+#     deliberate one.
 run_rr MOCK_AWS_NEW_ID=i-0cidrallopen MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=0.0.0.0/0 -- up --yes --json
-assert_eq   "an explicit 0.0.0.0/0 opt-in succeeds" "0" "$RR_RC"
-assert_contains "0.0.0.0/0 opt-in is honored verbatim" "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+assert_eq   "REPO_REMOTE_SSH_CIDR=0.0.0.0/0 alone is refused (exit 2)" "2" "$RR_RC"
+assert_contains "the refusal names the offending CIDR" "$RR_ERR" "0.0.0.0/0"
+assert_contains "the refusal names the minimum-prefix knob" "$RR_ERR" "REPO_REMOTE_SSH_MIN_PREFIX"
+assert_contains "the refusal names the opt-in knob"    "$RR_ERR" "REPO_REMOTE_ALLOW_WORLD_SSH=1"
+assert_eq   "a refused override authorizes NOTHING" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_eq   "a refused override launches no instance" "0" \
+  "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
 
-# (c) IP-detection failure (no REPO_REMOTE_SSH_CIDR set) falls back to
-#     0.0.0.0/0 with an explicit printed notice -- never a silently-broken
-#     /32 that can never match.
-run_rr MOCK_AWS_NEW_ID=i-0cidrfallback MOCK_AWS_STATE=None MOCK_CURL_FAIL=1 -- up --yes --json
-assert_eq   "detection failure still provisions (fallback, not a hard error)" "0" "$RR_RC"
-assert_contains "fallback CIDR is 0.0.0.0/0"        "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
-assert_contains "an explicit fallback notice is printed" "$RR_ERR" "NOTICE"
-assert_contains "the notice explains detection failed"   "$RR_ERR" "could not detect current IP"
+# A prefix merely WIDER than the minimum (not world-open) is refused the same
+# way -- the gate is the prefix length, not a 0.0.0.0/0 special case.
+run_rr MOCK_AWS_NEW_ID=i-0cidrwide MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=203.0.113.0/24 -- up --yes --json
+assert_eq   "a /24 override is refused under the default /32 minimum" "2" "$RR_RC"
+assert_contains "the refusal names the required minimum" "$RR_ERR" "/32 minimum"
+
+# ...and is ACCEPTED when the minimum is deliberately relaxed to match.
+run_rr MOCK_AWS_NEW_ID=i-0cidrwideok MOCK_AWS_STATE=None \
+  REPO_REMOTE_SSH_CIDR=203.0.113.0/24 REPO_REMOTE_SSH_MIN_PREFIX=24 -- up --yes --json
+assert_eq   "a /24 override succeeds with REPO_REMOTE_SSH_MIN_PREFIX=24" "0" "$RR_RC"
+assert_contains "the /24 is authorized once allowed" "$(cat "$MOCK_LOG")" "CidrIp=203.0.113.0/24"
+
+# ...and the explicit world-open opt-in works, loudly.
+run_rr MOCK_AWS_NEW_ID=i-0cidrworld MOCK_AWS_STATE=None \
+  REPO_REMOTE_SSH_CIDR=0.0.0.0/0 REPO_REMOTE_ALLOW_WORLD_SSH=1 -- up --yes --json
+assert_eq   "0.0.0.0/0 with REPO_REMOTE_ALLOW_WORLD_SSH=1 succeeds" "0" "$RR_RC"
+assert_contains "the world-open opt-in is honored verbatim" "$(cat "$MOCK_LOG")" "CidrIp=0.0.0.0/0"
+assert_contains "the world-open opt-in is logged loudly" "$RR_ERR" "WARNING"
+assert_contains "the warning names the opt-in that allowed it" "$RR_ERR" "REPO_REMOTE_ALLOW_WORLD_SSH=1"
+
+# An all-of-IPv6 ::/0 is refused on the same grounds.
+run_rr MOCK_AWS_NEW_ID=i-0cidrv6 MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=::/0 -- up --yes --json
+assert_eq   "REPO_REMOTE_SSH_CIDR=::/0 is refused (exit 2)" "2" "$RR_RC"
+assert_contains "the ::/0 refusal says it is all of IPv6" "$RR_ERR" "all of IPv6"
+
+# A syntactically bogus override is a loud config failure, not something that
+# reaches the AWS API.
+run_rr MOCK_AWS_NEW_ID=i-0cidrbogus MOCK_AWS_STATE=None REPO_REMOTE_SSH_CIDR=not-a-cidr -- up --yes --json
+assert_eq   "a malformed REPO_REMOTE_SSH_CIDR is refused (exit 2)" "2" "$RR_RC"
+assert_contains "the malformed-CIDR failure names the variable" "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
+
+# (d) repo#487 SECURITY: IP-detection failure with no REPO_REMOTE_SSH_CIDR set
+#     FAILS CLOSED. The old behavior silently fell back to 0.0.0.0/0, so one
+#     flaky HTTPS call during `up` left tcp/22 open to the world.
+run_rr MOCK_AWS_NEW_ID=i-0cidrfailclosed MOCK_AWS_STATE=None MOCK_CURL_FAIL=1 -- up --yes --json
+assert_eq   "create + detection failure fails closed (exit 2)" "2" "$RR_RC"
+assert_contains "the failure explains detection failed"  "$RR_ERR" "could not detect the current IP"
+assert_contains "the failure refuses 0.0.0.0/0 by name"  "$RR_ERR" "Refusing to fall back to 0.0.0.0/0"
+assert_contains "the failure names the fix"              "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
+FCLOG="$(cat "$MOCK_LOG")"
+assert_eq   "no ingress rule is created on detection failure" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_not_contains "no 0.0.0.0/0 reaches the AWS API"   "$FCLOG" "CidrIp=0.0.0.0/0"
+assert_eq   "no instance is launched on detection failure" "0" \
+  "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- SSH ingress replaces rather than accumulates (repo#487) --"
+# ---------------------------------------------------------------------------
+# Each `up` from a new address used to ADD a /32 and never remove the old one,
+# so a roaming laptop left a group admitting every address it had ever had.
+# The refresh now revokes this tooling's OWN earlier tcp/22 rules (identified
+# by the repo-remote:<name>: Description marker) before authorizing the
+# current address.
+
+# (a) A prior tool-owned rule for a DIFFERENT address is revoked, and the
+#     current address is authorized.
+run_rr MOCK_AWS_NEW_ID=i-0revoke MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "revoke-then-authorize still succeeds" "0" "$RR_RC"
+REVLOG="$(cat "$MOCK_LOG")"
+assert_contains "the stale tool-owned /32 is revoked" \
+  "$REVLOG" "revoke-security-group-ingress --group-id sg-0existing"
+assert_contains "the revoke targets the stale CIDR" "$REVLOG" "CidrIp=52.119.115.124/32"
+assert_contains "the current address is then authorized" "$REVLOG" "CidrIp=104.7.12.215/32"
+assert_contains "the revoke is reported to the operator" "$RR_ERR" "revoked this tooling's stale SSH ingress rule"
+# Two properties of the owned-rule query the mock cannot evaluate but a real
+# AWS CLI absolutely can, both of which silently broke it in development:
+#   * without the `| ` pipe the filter is applied element-wise to each IpRange
+#     OBJECT rather than to the flattened list, and matches nothing at all;
+#   * without the `Description != null` short-circuit, a description-less rule
+#     (extremely common on a real group) makes starts_with() raise a
+#     JMESPathTypeError that fails the whole describe call.
+assert_contains "the owned-rule query stops the projection with a pipe" \
+  "$REVLOG" "IpRanges[] | [?"
+assert_contains "the owned-rule query is null-safe for description-less rules" \
+  "$REVLOG" "Description != null &&"
+
+# (b) Rules WITHOUT this tooling's marker are somebody else's and are never
+#     touched: the owned-rule query returns nothing, so nothing is revoked.
+run_rr MOCK_AWS_NEW_ID=i-0noowned MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "unmarked (operator-added) rules leave up succeeding" "0" "$RR_RC"
+assert_eq   "no unmarked rule is ever revoked" "0" \
+  "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+
+# (c) A rule this tooling owns for the address it is about to authorize is NOT
+#     revoked -- a repeat run from the same address must not flap the rule.
+run_rr MOCK_AWS_NEW_ID=i-0samecidr MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=104.7.12.215/32 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a repeat run from the same address succeeds" "0" "$RR_RC"
+assert_eq   "the still-current rule is not revoked" "0" \
+  "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+
+# (d) A failed revoke is best-effort: a loud NOTICE, never a failed `up`. It
+#     leaves a stale-but-NARROW rule behind, never a wider one, so an operator
+#     whose credentials lack RevokeSecurityGroupIngress can still provision.
+run_rr MOCK_AWS_NEW_ID=i-0revokefail MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32 MOCK_AWS_REVOKE_FAIL=1 MOCK_CURL_IP=104.7.12.215 \
+  -- up --yes --json
+assert_eq   "a failed revoke does not fail the run" "0" "$RR_RC"
+assert_contains "a failed revoke prints a loud NOTICE" "$RR_ERR" "could not revoke this tooling's stale SSH ingress rule"
+assert_contains "the NOTICE hands over the manual revoke command" "$RR_ERR" "aws ec2 revoke-security-group-ingress --group-id sg-0existing"
+assert_contains "the current address is still authorized" "$(cat "$MOCK_LOG")" "CidrIp=104.7.12.215/32"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
@@ -883,8 +1016,8 @@ RIGLOG="$(cat "$MOCK_LOG")"
 assert_eq   "reuse (running): nothing new was launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG" 2>/dev/null)"
 assert_not_contains "reuse (running): the tagged SG is reused, not recreated" "$RIGLOG" "create-security-group"
 assert_contains "reuse (running): ingress re-authorized on the resolved SG" "$RIGLOG" "group-id sg-0existing"
-assert_contains "reuse (running): re-authorized for the CURRENT detected CIDR" "$RIGLOG" "cidr 104.7.12.215/32"
-assert_contains "reuse (running): the rule is tcp/22" "$RIGLOG" "protocol tcp --port 22"
+assert_contains "reuse (running): re-authorized for the CURRENT detected CIDR" "$RIGLOG" "CidrIp=104.7.12.215/32"
+assert_contains "reuse (running): the rule is tcp/22" "$RIGLOG" "IpProtocol=tcp,FromPort=22,ToPort=22"
 assert_contains "reuse (running): the rule is verified after authorizing" \
   "$RIGLOG" "describe-security-groups --group-ids sg-0existing"
 
@@ -894,7 +1027,7 @@ assert_eq   "reuse (restarted pinned): up still succeeds" "0" "$RR_RC"
 RESTARTLOG="$(cat "$MOCK_LOG")"
 assert_contains "reuse (restarted pinned): the instance was started" "$RESTARTLOG" "start-instances"
 assert_contains "reuse (restarted pinned): ingress re-authorized for the current CIDR" \
-  "$RESTARTLOG" "cidr 104.7.12.215/32"
+  "$RESTARTLOG" "CidrIp=104.7.12.215/32"
 assert_contains "reuse (restarted pinned): authorized against the resolved SG" \
   "$RESTARTLOG" "group-id sg-0existing"
 
@@ -907,7 +1040,7 @@ assert_contains "reuse (tag-discovered): reused the discovered instance" "$RR_OU
 TAGLOG="$(cat "$MOCK_LOG")"
 assert_contains "reuse (tag-discovered): the instance was started" "$TAGLOG" "start-instances"
 assert_contains "reuse (tag-discovered): ingress re-authorized for the current CIDR" \
-  "$TAGLOG" "cidr 104.7.12.215/32"
+  "$TAGLOG" "CidrIp=104.7.12.215/32"
 
 # (d) Edge case: an explicit REPO_REMOTE_SECURITY_GROUP on a reuse path is
 #     idempotently re-authorized and re-verified too, never skipped — and still
@@ -928,7 +1061,7 @@ run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing REPO_REMOTE_SSH_CIDR
   -- up --yes --json
 assert_eq   "reuse (CIDR override): up still succeeds" "0" "$RR_RC"
 OVREUSELOG="$(cat "$MOCK_LOG")"
-assert_contains     "reuse (CIDR override): the override CIDR is authorized" "$OVREUSELOG" "cidr 198.51.100.44/32"
+assert_contains     "reuse (CIDR override): the override CIDR is authorized" "$OVREUSELOG" "CidrIp=198.51.100.44/32"
 assert_not_contains "reuse (CIDR override): no IP detection is performed" "$OVREUSELOG" "curl "
 
 # (f) A verification failure on the reuse path is just as loud as on create
@@ -975,24 +1108,35 @@ assert_contains "reuse (detection failed): says the ingress was left as-is" \
 assert_contains "reuse (detection failed): points at REPO_REMOTE_SSH_CIDR" \
   "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
 
-# An EXPLICIT 0.0.0.0/0 opt-in is not a detection failure and is still honored
-# verbatim on the reuse path.
+# An EXPLICIT, opted-in 0.0.0.0/0 is not a detection failure and is still
+# honored verbatim on the reuse path (repo#487 adds the opt-in requirement; it
+# does not change what happens once the operator has opted in).
+run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing REPO_REMOTE_SSH_CIDR=0.0.0.0/0 \
+  REPO_REMOTE_ALLOW_WORLD_SSH=1 -- up --yes --json
+assert_eq   "reuse (opted-in 0.0.0.0/0): up succeeds" "0" "$RR_RC"
+assert_contains "reuse (opted-in 0.0.0.0/0): the opt-in is honored verbatim" \
+  "$(cat "$MOCK_LOG")" "CidrIp=0.0.0.0/0"
+
+# And WITHOUT the opt-in the same reuse run is refused — the validation gate
+# applies on every path, not just at create time.
 run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing REPO_REMOTE_SSH_CIDR=0.0.0.0/0 \
   -- up --yes --json
-assert_eq   "reuse (explicit 0.0.0.0/0): up succeeds" "0" "$RR_RC"
-assert_contains "reuse (explicit 0.0.0.0/0): the opt-in is honored verbatim" \
-  "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
+assert_eq   "reuse (un-opted-in 0.0.0.0/0): refused (exit 2)" "2" "$RR_RC"
+assert_eq   "reuse (un-opted-in 0.0.0.0/0): nothing is authorized" "0" \
+  "$(grep -c 'authorize-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
 
-# With NO tcp/22 rule present at all there is nothing to preserve, so the
-# fallback still applies — the no-widening rule protects an existing rule, it
-# does not leave a reused host with no ingress at all. (The mock keeps
-# reporting an empty rule set afterward, so verification then fails loudly,
-# which is the pre-existing repo#176 contract.)
+# repo#487: with NO tcp/22 rule present at all there is nothing to preserve —
+# and, since the 0.0.0.0/0 fallback is gone, nothing this run can safely
+# invent either. It fails CLOSED (exit 2) rather than opening the box to the
+# world. (Before repo#487 this path applied the world-open fallback and then
+# failed verification with exit 4.)
 run_rr MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing MOCK_CURL_FAIL=1 \
   MOCK_AWS_SG_INGRESS_EMPTY=1 -- up --yes --json
-assert_contains "reuse (detection failed, no existing rule): the fallback rule is applied" \
-  "$(cat "$MOCK_LOG")" "cidr 0.0.0.0/0"
-assert_eq   "reuse (detection failed, no existing rule): verification still fails loudly" "4" "$RR_RC"
+assert_eq   "reuse (detection failed, no existing rule): fails closed (exit 2)" "2" "$RR_RC"
+assert_not_contains "reuse (detection failed, no existing rule): no world-open rule is written" \
+  "$(cat "$MOCK_LOG")" "CidrIp=0.0.0.0/0"
+assert_contains "reuse (detection failed, no existing rule): names REPO_REMOTE_SSH_CIDR as the fix" \
+  "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
@@ -1834,6 +1978,28 @@ assert_contains "remote.md documents the public-IP poll knobs" \
   "$MD" "REPO_REMOTE_IP_POLL_ATTEMPTS"
 assert_contains "remote.md documents the not-refreshed alias warning" \
   "$MD" "alias was not refreshed"
+
+# repo#487: the SSH-ingress posture (fail closed on failed detection, validated
+# override with a loud opt-in, revoke-before-authorize keyed on an owner marker)
+# is implemented behavior. The doc has to describe THAT, not the old
+# fall-back-to-0.0.0.0/0 model, or an agent reading remote.md will believe a
+# failed IP lookup still provisions a reachable box.
+assert_contains "remote.md documents the minimum-prefix knob" \
+  "$MD" "REPO_REMOTE_SSH_MIN_PREFIX"
+assert_contains "remote.md documents the world-open opt-in knob" \
+  "$MD" "REPO_REMOTE_ALLOW_WORLD_SSH"
+assert_contains "remote.md documents the validate-and-fail-closed step" \
+  "$MD" "Validate the CIDR, and fail closed"
+assert_contains "remote.md states a failed detection creates no rule and no instance" \
+  "$MD" "creates **no** ingress rule and **no** instance"
+assert_contains "remote.md says a flaky lookup is not consent to open tcp/22" \
+  "$MD" "not consent to open tcp/22"
+assert_contains "remote.md documents the per-rule owner Description marker" \
+  "$MD" "repo-remote:<repo-name>:<YYYY-MM-DD>"
+assert_contains "remote.md documents replace-don't-accumulate on refresh" \
+  "$MD" "Replace, don't accumulate"
+assert_contains "remote.md states unmarked rules are never revoked" \
+  "$MD" "rules without that marker are never touched"
 
 # repo#164: the fleet-marker reuse guard and its --force override are part of
 # the implemented surface, so remote.md must document them too.
