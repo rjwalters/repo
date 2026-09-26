@@ -117,7 +117,11 @@
 #
 # Exit codes:
 #   0  success (including a dry-run plan)
-#   2  missing / invalid required config (the cost gate; loud failure)
+#   2  missing / invalid required config (the cost gate; loud failure) — also
+#      the SSH-ingress fail-closed refusals: current-IP detection failed and no
+#      REPO_REMOTE_SSH_CIDR was pinned, or the pinned CIDR is wider than
+#      REPO_REMOTE_SSH_MIN_PREFIX without REPO_REMOTE_ALLOW_WORLD_SSH=1
+#      (repo#487)
 #   3  provider authentication failed
 #   4  cloud operation failed
 #   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
@@ -224,6 +228,8 @@ IS_GPU=false
 FLEET_TAG_KEY=""   # tag/label key that marks a managed fleet host ("" disables)
 FLEET_TAG_VALUE="" # required value for that key ("" = any non-empty value)
 SSH_CIDR=""        # AWS only: pinned SSH-ingress CIDR override (see aws_resolve_ssh_cidr)
+SSH_MIN_PREFIX=""  # AWS only: narrowest IPv4 prefix length accepted for SSH ingress (default 32)
+ALLOW_WORLD_SSH="" # AWS only: "1" opts in to an SSH-ingress CIDR wider than SSH_MIN_PREFIX
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -379,9 +385,16 @@ resolve_settings() {
   FLEET_TAG_VALUE="${REPO_REMOTE_FLEET_TAG_VALUE-loom}"
 
   # AWS-only SSH-ingress CIDR override (repo#176). Unset (the default) means
-  # "detect it"; see aws_resolve_ssh_cidr for the detection + fallback logic.
-  # An explicit 0.0.0.0/0 is a valid, deliberate opt-in (still key-only auth).
+  # "detect it"; see aws_resolve_ssh_cidr for the detection logic, which now
+  # fails CLOSED rather than falling back to 0.0.0.0/0 (repo#487).
   SSH_CIDR="${REPO_REMOTE_SSH_CIDR:-}"
+  # Narrowest IPv4 prefix length accepted for SSH ingress (repo#487). The
+  # default 32 means "a single address"; raise the allowed width deliberately
+  # (e.g. 24 for a known ISP block) rather than by accident. Anything wider
+  # than this — 0.0.0.0/0 included — additionally requires
+  # REPO_REMOTE_ALLOW_WORLD_SSH=1.
+  SSH_MIN_PREFIX="${REPO_REMOTE_SSH_MIN_PREFIX:-32}"
+  ALLOW_WORLD_SSH="${REPO_REMOTE_ALLOW_WORLD_SSH:-0}"
 
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
@@ -1010,20 +1023,69 @@ aws_resolve_or_create_sg() {
   log "created security group ${RESOLVED_SG} (tagged repo-remote=${NAME})"
 }
 
+# Validate an SSH-ingress CIDR before anything is authorized from it
+# (repo#487). Exposure decisions must be DELIBERATE: this tooling refuses any
+# IPv4 prefix wider than REPO_REMOTE_SSH_MIN_PREFIX (default 32 — a single
+# address) and any all-of-IPv6 `::/0`, so a stray `0.0.0.0/0` in a config file
+# cannot quietly open tcp/22 to the internet. REPO_REMOTE_ALLOW_WORLD_SSH=1 is
+# the explicit, loudly-logged escape hatch for an operator who really does
+# want a wider rule (a known ISP block, a bastion-free CI network).
+#
+# Rejection is exit 2 ("invalid required config") rather than 4: the remedy is
+# always a config change, never a retry.
+aws_validate_ssh_cidr() {  # <cidr> <source-label>
+  local cidr="$1" src="$2" prefix min="${SSH_MIN_PREFIX:-32}"
+
+  [[ "$min" =~ ^[0-9]+$ && "$min" -ge 1 && "$min" -le 32 ]] \
+    || die 2 "REPO_REMOTE_SSH_MIN_PREFIX must be an integer from 1 to 32 (got '${min}')"
+
+  if [[ "$cidr" == *:* ]]; then
+    # IPv6. Only a /0 ("the whole internet") is judged here; narrower IPv6
+    # prefixes are passed through unchanged.
+    prefix="${cidr##*/}"
+    [[ "$cidr" == */* && "$prefix" =~ ^[0-9]+$ ]] \
+      || die 2 "${src} is not a valid CIDR: '${cidr}' (expected <address>/<prefix-length>)"
+    [[ "$prefix" -ne 0 ]] && return 0
+    if [[ "${ALLOW_WORLD_SSH:-0}" == 1 ]]; then
+      log "WARNING: REPO_REMOTE_ALLOW_WORLD_SSH=1 — authorizing SSH ingress from ${cidr}, i.e. ALL of IPv6. Every host on the internet may reach tcp/22 on this instance (key-only auth is the only thing left in front of it)."
+      return 0
+    fi
+    die 2 "refusing to authorize SSH ingress from ${cidr} (${src}): that is all of IPv6. Pin a specific address instead, or set REPO_REMOTE_ALLOW_WORLD_SSH=1 to opt in deliberately."
+  fi
+
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
+    || die 2 "${src} is not a valid IPv4 CIDR: '${cidr}' (expected a.b.c.d/0-32)"
+  prefix="${cidr##*/}"
+  [[ "$prefix" -ge "$min" ]] && return 0
+
+  if [[ "${ALLOW_WORLD_SSH:-0}" == 1 ]]; then
+    local scope=""
+    [[ "$cidr" == "0.0.0.0/0" ]] && scope="That is the ENTIRE INTERNET. "
+    log "WARNING: REPO_REMOTE_ALLOW_WORLD_SSH=1 — authorizing SSH ingress from ${cidr}, which is WIDER than the /${min} minimum (REPO_REMOTE_SSH_MIN_PREFIX). ${scope}Key-only auth is the only thing left in front of tcp/22 on this instance."
+    return 0
+  fi
+  die 2 "refusing to authorize SSH ingress from ${cidr} (${src}): /${prefix} is wider than the required /${min} minimum (REPO_REMOTE_SSH_MIN_PREFIX). Pin a narrower CIDR, raise REPO_REMOTE_SSH_MIN_PREFIX deliberately, or set REPO_REMOTE_ALLOW_WORLD_SSH=1 to opt in to the wider rule."
+}
+
 # Resolve the CIDR to authorize for SSH ingress into RESOLVED_SSH_CIDR. An
-# explicit REPO_REMOTE_SSH_CIDR always wins (including an explicit 0.0.0.0/0
-# opt-in). Otherwise a best-effort current-IP lookup via an HTTPS echo service
-# is treated as UNVERIFIED: there is no reliable way for this script to
-# confirm the detected address is the one SSH egress will actually use —
-# behind an HTTPS proxy it commonly isn't (the reported incident: the echo
-# service returned the proxy's address, not the SSH egress address, producing
-# a correct-looking /32 that could never match). When detection itself fails
-# outright, fall back to 0.0.0.0/0 (SSH stays key-only auth, so this is a
-# scan-noise tradeoff, not an auth bypass) with an explicit notice rather than
-# silently creating a /32 that can never match.
+# explicit REPO_REMOTE_SSH_CIDR always wins — after validation (see
+# aws_validate_ssh_cidr). Otherwise a best-effort current-IP lookup via an
+# HTTPS echo service is treated as UNVERIFIED: there is no reliable way for
+# this script to confirm the detected address is the one SSH egress will
+# actually use — behind an HTTPS proxy it commonly isn't (the reported
+# incident: the echo service returned the proxy's address, not the SSH egress
+# address, producing a correct-looking /32 that could never match).
+#
+# When detection itself fails outright this FAILS CLOSED (repo#487): returns 1
+# with RESOLVED_SSH_CIDR left empty and lets the caller decide. It must never
+# fall back to 0.0.0.0/0 — a single flaky HTTPS call is not consent to open
+# tcp/22 to the internet, and a consumer auditing its security groups cannot
+# tell an accidental opening from a deliberate one.
 RESOLVED_SSH_CIDR=""
 aws_resolve_ssh_cidr() {
+  RESOLVED_SSH_CIDR=""
   if [[ -n "${SSH_CIDR:-}" ]]; then
+    aws_validate_ssh_cidr "$SSH_CIDR" "REPO_REMOTE_SSH_CIDR"
     RESOLVED_SSH_CIDR="$SSH_CIDR"
     log "using REPO_REMOTE_SSH_CIDR override for SSH ingress: ${RESOLVED_SSH_CIDR}"
     return 0
@@ -1033,23 +1095,85 @@ aws_resolve_ssh_cidr() {
   url="${REPO_REMOTE_IP_ECHO_URL:-https://checkip.amazonaws.com}"
   ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')"
   if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    aws_validate_ssh_cidr "${ip}/32" "the detected current IP"
     RESOLVED_SSH_CIDR="${ip}/32"
     log "detected current IP ${ip} via ${url} for SSH ingress (unverified — behind an HTTPS proxy this can be a different address than the one SSH egress actually uses; if SSH cannot connect afterward, set REPO_REMOTE_SSH_CIDR explicitly)"
-  else
-    RESOLVED_SSH_CIDR="0.0.0.0/0"
-    log "NOTICE: could not detect current IP via ${url}; falling back to SSH ingress from 0.0.0.0/0 (SSH remains key-only auth). Set REPO_REMOTE_SSH_CIDR to pin a specific CIDR instead."
+    return 0
   fi
+  return 1
 }
 
-# Idempotently authorize tcp/22 from the resolved CIDR. A duplicate rule on a
-# reused security group is success, not an error.
+# The single message every fail-closed detection failure prints (repo#487), so
+# the create and reuse paths cannot drift in what they tell the operator.
+aws_die_no_ssh_cidr() {
+  die 2 "could not detect the current IP via ${REPO_REMOTE_IP_ECHO_URL:-https://checkip.amazonaws.com}, so there is no address to authorize SSH ingress from. Refusing to fall back to 0.0.0.0/0. Set REPO_REMOTE_SSH_CIDR to the address you connect from (e.g. REPO_REMOTE_SSH_CIDR=203.0.113.7/32) and re-run."
+}
+
+# Every tcp/22 rule this tooling writes carries a Description marked with this
+# prefix (repo#487), so an audit can trace each rule to its owner and so the
+# refresh below knows which rules are ITS OWN and may be replaced. A rule
+# without this marker was added by somebody else and is never touched.
+ssh_rule_marker_prefix() { printf 'repo-remote:%s:' "$NAME"; }
+ssh_rule_description()   { printf 'repo-remote:%s:%s' "$NAME" "$(date -u +%Y-%m-%d)"; }
+
+# Idempotently authorize tcp/22 from the resolved CIDR, labelled with the
+# owner marker. A duplicate rule on a reused security group is success, not an
+# error. --ip-permissions (rather than the simpler --protocol/--port/--cidr
+# trio) is required because only that form can carry a per-rule Description.
 aws_authorize_ssh_ingress() {  # <sg-id> <cidr>
-  local sg="$1" cidr="$2" out rc
-  out="$(aws ec2 authorize-security-group-ingress \
-    --group-id "$sg" --protocol tcp --port 22 --cidr "$cidr" 2>&1)"; rc=$?
+  local sg="$1" cidr="$2" out rc desc
+  desc="$(ssh_rule_description)"
+  out="$(aws ec2 authorize-security-group-ingress --group-id "$sg" \
+    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${cidr},Description=${desc}}]" 2>&1)"; rc=$?
   if [[ $rc -ne 0 ]] && ! printf '%s' "$out" | grep -q 'InvalidPermission.Duplicate'; then
     die 4 "aws ec2 authorize-security-group-ingress failed for ${sg} (tcp/22 from ${cidr}): ${out:-unknown error}"
   fi
+}
+
+# List the CIDRs of tcp/22 rules on <sg> that THIS tooling wrote (their
+# Description starts with the repo-remote:<name>: marker), one per line.
+# Rules with any other Description — or none at all — are somebody else's and
+# are deliberately excluded.
+#
+# Two non-obvious details in the JMESPath, both load-bearing:
+#   * the `| ` pipe STOPS the `IpRanges[]` projection before the filter. Without
+#     it the filter is applied element-wise to each IpRange *object* (which is
+#     not a list), so the query silently matches nothing at all.
+#   * `Description != null &&` short-circuits before starts_with(). A rule with
+#     no Description is extremely common on a real group, and starts_with(null)
+#     is a hard JMESPathTypeError that fails the whole describe call.
+aws_tool_owned_ssh_cidrs() {  # <sg-id>
+  local sg="$1" marker
+  marker="$(ssh_rule_marker_prefix)"
+  aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?ToPort==\`22\`].IpRanges[] | [?Description != null && starts_with(Description, '${marker}')].CidrIp" \
+    --output text 2>/dev/null \
+    | tr '[:space:]' '\n' | grep -vE '^(None)?$' || true
+}
+
+# Replace, don't accumulate (repo#487). Each `up` from a new address used to
+# ADD a /32 and never remove the old one, so a group roamed across a few weeks
+# of coffee shops ended up admitting every address the operator had ever had.
+# Revoke this tooling's OWN earlier tcp/22 rules before authorizing the
+# current address; keep <keep-cidr> (the rule we are about to authorize) so a
+# repeat run from the same address doesn't flap it.
+#
+# Best-effort by design: a failed revoke is a loud NOTICE, not a fatal error.
+# It leaves a stale-but-narrow rule in place (never a wider one), and an
+# operator whose credentials lack RevokeSecurityGroupIngress should still be
+# able to provision.
+aws_revoke_stale_ssh_ingress() {  # <sg-id> <keep-cidr>
+  local sg="$1" keep="$2" cidr out rc
+  while read -r cidr; do
+    [[ -n "$cidr" && "$cidr" != "$keep" ]] || continue
+    out="$(aws ec2 revoke-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${cidr}}]" 2>&1)"; rc=$?
+    if [[ $rc -ne 0 ]]; then
+      log "NOTICE: could not revoke this tooling's stale SSH ingress rule (tcp/22 from ${cidr}) on ${sg}: ${out:-unknown error}. It is left in place; revoke it by hand with: aws ec2 revoke-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr ${cidr}"
+    else
+      log "revoked this tooling's stale SSH ingress rule on ${sg} (tcp/22 from ${cidr}) — superseded by ${keep}"
+    fi
+  done < <(aws_tool_owned_ssh_cidrs "$sg")
 }
 
 # Post-authorize verification — this is what would have caught the reported
@@ -1100,7 +1224,15 @@ aws_verify_ssh_ingress() {  # <sg-id>
 #
 # --no-create also never WIDENS an existing rule on a failed IP detection — see
 # the inline note below. Refreshing ingress on reuse must not be able to turn a
-# working /32 into 0.0.0.0/0 just because an echo service was unreachable.
+# working /32 into 0.0.0.0/0 just because an echo service was unreachable. Since
+# repo#487 NO path can do that: a failed detection resolves to nothing at all
+# and the run fails closed (exit 2) unless there is already a rule to preserve.
+#
+# The chain also REPLACES rather than accumulates (repo#487): every rule this
+# tooling writes is labelled `repo-remote:<name>:<date>`, and the labelled rules
+# from earlier runs are revoked before the current address is authorized, so a
+# roaming laptop can no longer leave a group admitting every address it ever
+# had. Rules without that label belong to somebody else and are never touched.
 aws_refresh_ssh_ingress() {  # [--no-create]
   if [[ "${1:-}" == "--no-create" ]]; then
     local sg="${REPO_REMOTE_SECURITY_GROUP:-}"
@@ -1110,23 +1242,26 @@ aws_refresh_ssh_ingress() {  # [--no-create]
       return 0
     fi
     RESOLVED_SG="$sg"
-    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
-    # Reuse must never WIDEN exposure. A 0.0.0.0/0 that came from *failed*
-    # detection (rather than an explicit REPO_REMOTE_SSH_CIDR opt-in) is the
-    # documented least-bad tradeoff when CREATING — the alternative is a brand
-    # new box nobody can reach. On reuse the group normally already admits SSH
-    # from an earlier run, so applying that fallback here would be a pure
-    # exposure increase on a path that previously touched ingress at all. So:
-    # if the rule is already there, leave it exactly as it is and say so.
-    if [[ -z "${SSH_CIDR:-}" && "$RESOLVED_SSH_CIDR" == "0.0.0.0/0" ]] \
-       && aws_has_ssh_ingress "$RESOLVED_SG"; then
-      log "NOTICE: current-IP detection failed, so SSH ingress on ${RESOLVED_SG} was left EXACTLY as it is rather than widened to 0.0.0.0/0 for this reused instance. If SSH cannot connect, set REPO_REMOTE_SSH_CIDR to the address you are connecting from and re-run."
-      return 0
+    # Reuse must never WIDEN exposure, and since repo#487 no path widens on a
+    # failed detection at all — detection failure resolves to NOTHING rather
+    # than to 0.0.0.0/0. On reuse the group normally already admits SSH from an
+    # earlier run, so the right move is to leave that rule exactly as it is and
+    # say so; only a group with no tcp/22 rule at all (nothing to preserve, and
+    # nothing this run can safely invent) is a hard failure.
+    if ! aws_resolve_ssh_cidr; then
+      if aws_has_ssh_ingress "$RESOLVED_SG"; then
+        log "NOTICE: current-IP detection failed, so SSH ingress on ${RESOLVED_SG} was left EXACTLY as it is rather than changed for this reused instance. If SSH cannot connect, set REPO_REMOTE_SSH_CIDR to the address you are connecting from and re-run."
+        return 0
+      fi
+      aws_die_no_ssh_cidr
     fi
   else
     aws_resolve_or_create_sg                            # sets RESOLVED_SG
-    aws_resolve_ssh_cidr                                # sets RESOLVED_SSH_CIDR
+    aws_resolve_ssh_cidr || aws_die_no_ssh_cidr         # sets RESOLVED_SSH_CIDR
   fi
+  # Replace, don't accumulate: drop this tooling's own earlier /32s first
+  # (repo#487), then authorize the address actually in use now.
+  aws_revoke_stale_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_verify_ssh_ingress "$RESOLVED_SG"
 }
