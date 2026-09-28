@@ -33,7 +33,18 @@
 #     have different repairs; a merged message sends the operator to the
 #     wrong one.
 #   - The jq predicate drifts from install.sh's merge_settings_sessionstart_hook,
-#     so writer and installer disagree on what "wired" means.
+#     so writer and installer disagree on what "wired" means. Case 5 no longer
+#     takes this on trust: it EXTRACTS both jq programs and compares them, the
+#     one assertion the first revision of this file was missing (repo#494
+#     review). Pinning the function name, install path and matcher list -- all
+#     of which case 10 still does -- did not catch a predicate-shape change.
+#   - The coexistence predicate gets dropped. merge_settings_sessionstart_hook
+#     has TWO predicates: the idempotency test, and an early return that DEFERS
+#     when a differently-pathed session-start-handoff.sh is already wired. A
+#     preflight checking only the first FALSE-BLOCKS that repo -- it reports no
+#     reader, sends the operator to install.sh, and install.sh defers again, so
+#     the operator loops while a reader was present all along. That branch has
+#     existed since the hook's first commit (#34).
 #   - A partial wiring (startup but not resume) gets treated as acceptable.
 #     install.sh treats it as incomplete and completes it; so must this.
 #   - --force loses its obligation to tell the truth in the restart block,
@@ -46,8 +57,11 @@
 #   3  it checks the script's existence AND executability
 #   4  it checks the settings.json wiring for BOTH startup and resume, and
 #      names a partial wiring a failure
-#   5  it cross-references install.sh's merge_settings_sessionstart_hook so
-#      the predicates cannot drift
+#   5  it cross-references install.sh's merge_settings_sessionstart_hook AND
+#      the jq programs in the two files are literally equal after
+#      normalization -- enforced, not asserted in prose
+#  5b  the coexistence branch is handled: a foreign-pathed hook is a
+#      satisfied reader, not a blocking failure
 #   6  it records WHY the script check cannot be replaced by the wiring check
 #      (tracked settings.json + gitignored skills dir)
 #   7  failures are reported per-half with distinct repairs
@@ -146,12 +160,104 @@ assert_matches "a partial wiring is a failure, not a pass" "$PRE_SECTION" \
     '[Pp]artial'
 
 # ---------------------------------------------------------------------------
-# 5. The predicates are cross-referenced, not re-invented
+# 5. The predicates are not re-invented -- and that is ENFORCED, not asserted
+#
+# The first revision of this file pinned the function name, the install path
+# and the matcher list, and called the predicates undriftable. A review
+# mutation that changed install.sh's predicate shape left all 35 cases green
+# (repo#494). Prose cross-referencing is not enforcement; comparing the
+# programs is. Both files carry the two jq programs as literal text, so
+# extract and compare them.
 # ---------------------------------------------------------------------------
 echo
-echo "-- 5. no drift from the installer --"
+echo "-- 5. no drift from the installer (enforced) --"
 assert_contains "cross-references install.sh's wiring function" "$PRE_SECTION" \
     "merge_settings_sessionstart_hook"
+
+# Normalize a jq program to a drift-detecting canonical form: strip comments,
+# collapse all whitespace, and neutralize the ONE intended difference -- the
+# installer parameterizes the matcher list as $sources (fed from
+# SESSIONSTART_SOURCES), while the doc inlines ["startup","resume"].
+norm_jq() {  # reads stdin
+    sed 's/#.*$//' \
+      | tr '\n' ' ' \
+      | sed -e 's/\$sources/MATCHERS/g' \
+            -e 's/\["startup","resume"\]/MATCHERS/g' \
+            -e 's/\[ *"startup" *, *"resume" *\]/MATCHERS/g' \
+      | tr -s ' ' \
+      | sed "s/'[^']*\$//" \
+      | sed -e 's/^ *//' -e 's/ *$//'
+}
+
+# The idempotency predicate: the `(.hooks.SessionStart // []) as $ss |` form.
+extract_idem() {  # <file>
+    awk '/\(\.hooks\.SessionStart \/\/ \[\]\) as \$ss \|/{f=1}
+         f{print}
+         f && /\x27/ && !/as \$ss/{exit}' "$1" 2>/dev/null \
+      | sed -n '1,6p'
+}
+
+# The coexistence predicate: the one carrying the test("...") regex.
+extract_coex() {  # <file>
+    grep -A2 -B2 'test("session-start-handoff' "$1" 2>/dev/null \
+      | grep -E '\(\.hooks\.SessionStart|any\(|test\(|\.command'
+}
+
+IDEM_DOC="$(extract_idem "$HANDOFF" | norm_jq)"
+IDEM_INS="$(extract_idem "$INSTALL" | norm_jq)"
+if [[ -z "$IDEM_DOC" || -z "$IDEM_INS" ]]; then
+    no "idempotency predicate extractable from both files" \
+       "doc=[${IDEM_DOC:0:60}] install=[${IDEM_INS:0:60}]"
+else
+    ok "idempotency predicate extractable from both files"
+    assert_eq "idempotency predicate is identical in handoff.md and install.sh" \
+        "$IDEM_INS" "$IDEM_DOC"
+fi
+
+COEX_DOC="$(extract_coex "$HANDOFF" | norm_jq)"
+COEX_INS="$(extract_coex "$INSTALL" | norm_jq)"
+if [[ -z "$COEX_DOC" || -z "$COEX_INS" ]]; then
+    no "coexistence predicate extractable from both files" \
+       "doc=[${COEX_DOC:0:60}] install=[${COEX_INS:0:60}]"
+else
+    ok "coexistence predicate extractable from both files"
+    assert_eq "coexistence predicate is identical in handoff.md and install.sh" \
+        "$COEX_INS" "$COEX_DOC"
+fi
+
+# The regex escaping is the easiest thing to get wrong when hand-copying a jq
+# program between a markdown fence and a bash single-quoted string.
+assert_contains "the doc's coexistence regex is escaped exactly as install.sh's" \
+    "$PRE_SECTION" 'test("session-start-handoff\\.sh")'
+
+# ---------------------------------------------------------------------------
+# 5b. Coexistence is a satisfied reader, not a blocking failure
+# ---------------------------------------------------------------------------
+echo
+echo "-- 5b. the coexistence branch --"
+PRE_FLAT="$(printf '%s' "$PRE_SECTION" | tr '\n' ' ' | tr -s ' ')"
+assert_matches "step 0 knows install.sh has TWO predicates, not one" "$PRE_FLAT" \
+    '\*{0,2}[Tt]wo\*{0,2} +predicates'
+# Structural, not vocabulary: a rewrite that reverts to blocking on
+# coexistence has to change these, whereas the word "defer" can survive
+# anywhere in the section and prove nothing (repo#494 review, mutation M3).
+assert_contains "both predicates are labelled, so neither can quietly vanish" \
+    "$PRE_SECTION" "2a."
+assert_contains "the coexistence predicate is labelled 2b" "$PRE_SECTION" "2b."
+assert_matches "2b is declared mandatory, not an optional extra" "$PRE_FLAT" \
+    '2b is not optional'
+assert_matches "a foreign-pathed hook is a satisfied reader, not a failure" "$PRE_FLAT" \
+    'satisfied reader'
+assert_matches "the preflight continues past 2b rather than stopping" "$PRE_FLAT" \
+    'report the foreign path as \*{0,2}information\*{0,2} and[[:space:]]*continue'
+# The repair table is the other place a revert would show: a 2b pass must not
+# be reachable as a blocking row.
+assert_matches "the repair table scopes the no-wiring row to 2a AND 2b failing" \
+    "$PRE_FLAT" '2a and 2b both fail'
+assert_matches "records the false-block / operator-loop consequence" "$PRE_SECTION" \
+    '[Ff]alse block|loops?\b'
+assert_matches "half 1 follows the hook that will actually run" "$PRE_SECTION" \
+    'point half 1 at|that script rather than|the one that will run'
 
 # ---------------------------------------------------------------------------
 # 6. The rationale that makes half 1 non-redundant
@@ -198,6 +304,15 @@ assert_contains "mentions REPO_HANDOFF_SIBLING_ROOT" "$PRE_SECTION" \
 assert_matches "the advisories are explicitly non-blocking" "$PRE_SECTION" \
     'never block|advisory|non-blocking'
 assert_matches "--dry-run still runs the preflight" "$PRE_SECTION" '\-\-dry-run'
+# The gitignore check auto-fixes (it is the archetypal safe fix, and step 4
+# would have done it anyway) -- but --dry-run's contract is that the run
+# writes nothing, so the auto-fix must be suppressed there (repo#494 review).
+assert_matches "the gitignore check auto-fixes rather than blocks" "$PRE_FLAT" \
+    'auto-fixes\*{0,2} rather than blocks'
+assert_matches "--dry-run suppresses the gitignore auto-fix" "$PRE_FLAT" \
+    'add nothing|apply no repair'
+assert_not_contains "the gitignore row is no longer a blocking repair row" \
+    "$PRE_SECTION" "| \`.claude/handoff.md\` not gitignored |"
 
 # ---------------------------------------------------------------------------
 # 10. What handoff.md now depends on still exists and still says so
