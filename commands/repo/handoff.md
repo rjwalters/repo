@@ -110,8 +110,8 @@ sentence here even when compressing:
   `.claude/skills/repo/hooks/`, and 2b makes it defer on the wiring, so the
   dangling entry survives. Fix or delete the foreign entry by hand first.
 - **Check 4 auto-fixes** rather than blocks — adding the entry is the
-  archetypal safe fix and step 4 would have done it anyway. Under `--dry-run`,
-  report it and add nothing.
+  archetypal safe fix and step 4 would have done it anyway. Say that it was
+  added. Under `--dry-run`, report it and add nothing.
 
 A **partial** wiring — one matcher but not the other, with no foreign hook — is
 a failure, exactly as the installer treats it as incomplete and finishes it.
