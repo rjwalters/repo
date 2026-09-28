@@ -67,6 +67,11 @@
 #   7  failures are reported per-half with distinct repairs, and the two
 #      cases install.sh CANNOT repair (a missing foreign 2b script; a
 #      malformed settings.json) are not sent to it
+#  7b  the converse and the remainder (repo#498): the one case install.sh CAN
+#      repair but the table sent to a by-hand fix (an ABSENT settings.json) is
+#      routed to it, the jq-WRITE-failure terminal state is named, and the
+#      stale-script repair row -- which had no check behind it -- is out of
+#      the "Failing check" table
 #   8  --force proceeds but must correct the step-5 restart block
 #   9  the gitignore check and the REPO_HANDOFF_SIBLING_ROOT advisory are
 #      present, and the advisory does not block
@@ -296,6 +301,75 @@ assert_matches "malformed settings.json is separated from 'not wired'" "$PRE_FLA
     'malformed .?\.claude/settings\.json'
 assert_matches "install.sh is not offered as the repair for invalid JSON" "$PRE_FLAT" \
     'not valid JSON \| By hand'
+
+# ---------------------------------------------------------------------------
+# 7b. The residual states the table used to get wrong (repo#498)
+#
+# merge_settings_sessionstart_hook has three early returns AND a non-returning
+# terminal state. Case 7 above covers two early returns. These are the rest:
+#
+#   - An ABSENT settings.json. `jq -e .` fails identically for "missing" and
+#     "malformed", so a missing file was routed to the malformed row's by-hand
+#     repair -- which is false: install.sh runs
+#     `[[ -f "$settings" ]] || echo '{}' >"$settings"` BEFORE its invalid-JSON
+#     guard, so a missing file is created, wired and scripted in one re-install.
+#     Reachable on a fresh clone of any repo that tracks .claude/commands/ via
+#     a `!` negation while gitignoring the rest of .claude/.
+#   - The jq-WRITE failure: the fourth terminal state does not return early, it
+#     warns "Failed to update ... left unchanged" and wires nothing. With 2a and
+#     2b both failing, the table sends the operator to install.sh, which fails
+#     the same way -- the operator loop of #494, one branch deeper. The table
+#     must name it so a still-failing preflight after a repair is legible.
+#   - A repair row with no check behind it: "Script present but stale vs.
+#     source" sat under a "Failing check" heading, but step 0 only ever runs
+#     `test -x` and nothing it runs can produce "stale".
+# ---------------------------------------------------------------------------
+echo
+echo "-- 7b. the residual install.sh terminal states (repo#498) --"
+
+# (1) Absent settings.json is disambiguated from malformed, and routed to
+#     install.sh rather than to a by-hand fix.
+assert_matches "step 0 probes for an ABSENT settings.json" "$PRE_SECTION" \
+    '^test -f \.claude/settings\.json'
+L_TESTF="$(grep -nE '^test -f \.claude/settings\.json' "$HANDOFF" | head -1 | cut -d: -f1)"
+L_JQDOT="$(grep -nE '^jq -e \. \.claude/settings\.json' "$HANDOFF" | head -1 | cut -d: -f1)"
+if [[ -n "$L_TESTF" && -n "$L_JQDOT" && "$L_TESTF" -lt "$L_JQDOT" ]]; then
+    ok "the existence probe precedes the malformed-JSON probe"
+else
+    no "the existence probe precedes the malformed-JSON probe" \
+       "test -f@${L_TESTF:-none} jq -e .@${L_JQDOT:-none}"
+fi
+assert_matches "the table carries a distinct row for a missing settings.json" \
+    "$PRE_FLAT" 'No `\.claude/settings\.json` at all \| `install\.sh`'
+assert_matches "a missing settings.json is repaired by install.sh, not by hand" \
+    "$PRE_FLAT" '[Aa]bsent is fully repaired by'
+# The reason it is repairable is an ORDERING fact inside the installer; record
+# it, so a future edit cannot re-merge "missing" back into "malformed".
+assert_matches "records that install.sh creates {} BEFORE its JSON guard" \
+    "$PRE_FLAT" '\*before\* its invalid-JSON guard'
+
+# (2) The jq-write failure branch is named, and not sold as install.sh-repairable.
+assert_matches "the jq-write-failure terminal state is named" "$PRE_FLAT" \
+    'Failed to update \.claude/settings\.json'
+assert_matches "the jq-write-failure state is not sold as self-repairing" \
+    "$PRE_FLAT" 'self-diagnosing but not self-repairing'
+
+# (3) Staleness has no probe, so it is not a "Failing check" row.
+assert_not_contains "staleness is no longer a 'Failing check' table row" \
+    "$PRE_SECTION" "| Script present but stale vs. source |"
+assert_matches "staleness is declared unchecked, with the reason" "$PRE_FLAT" \
+    'does not check\*{0,2} whether the installed script is'
+# Structural, not vocabulary: the /repo:update-tools mention must sit AFTER the
+# repair table, not inside it. A row reinstated above would flip this.
+L_TABLE_END="$(grep -nE '^\| `\.claude/settings\.json` is not valid JSON' "$HANDOFF" \
+    | head -1 | cut -d: -f1)"
+L_UPDTOOLS="$(grep -n '/repo:update-tools' "$HANDOFF" | head -1 | cut -d: -f1)"
+if [[ -n "$L_TABLE_END" && -n "$L_UPDTOOLS" && "$L_UPDTOOLS" -gt "$L_TABLE_END" ]]; then
+    ok "/repo:update-tools sits below the repair table, not in it"
+else
+    no "/repo:update-tools sits below the repair table, not in it" \
+       "table end@${L_TABLE_END:-none} update-tools@${L_UPDTOOLS:-none}"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. --force keeps the restart block honest

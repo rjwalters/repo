@@ -101,15 +101,29 @@ can wire ours.
 A **partial** wiring — one matcher but not the other, with no foreign hook —
 is a failure, exactly as the installer treats it as incomplete and finishes it.
 
-Both predicates are `jq -e`, so a malformed `.claude/settings.json` fails them
-exactly the way an unwired one does. `install.sh` has a guard ahead of both
-that refuses to touch invalid JSON and returns having wired nothing, so it
-cannot repair that case either. Separate it out before reaching for the table
-below:
+Both predicates are `jq -e`, so an **absent** `.claude/settings.json` and a
+malformed `.claude/settings.json` both fail them exactly the way a
+valid-but-unwired one does. Three states, and they do **not** share a repair.
+Separate them before reaching for the table below, in the order the installer
+resolves them:
 
 ```bash
+test -f .claude/settings.json              # absent, or present?
 jq -e . .claude/settings.json >/dev/null   # malformed, or genuinely unwired?
 ```
+
+**Absent is fully repaired by `install.sh`** — do not send it to a by-hand
+fix. `merge_settings_sessionstart_hook` creates an empty `{}` settings file
+*before* its invalid-JSON guard runs, so a missing file is created, both
+matchers are wired, and the script is copied, all in one re-install. This
+state is reachable, not theoretical: a repo that tracks `.claude/commands/`
+through a `!` negation while gitignoring the rest of `.claude/` has the
+`/repo:handoff` command and no settings file at all on every fresh clone or
+`git clean -xdf`.
+
+**Malformed is not repairable by `install.sh`.** That same guard refuses to
+touch invalid JSON and returns having wired nothing, so a re-install changes
+nothing and reports the same warning each time.
 
 `test-handoff-preflight.sh` extracts the jq programs from this file and from
 `install.sh` and asserts they are equal after normalization, so the two cannot
@@ -146,23 +160,43 @@ the wrong one:
 
 | Failing check | Repair |
 |---|---|
-| No script at the installed path (2a's target), or not executable | `./install.sh <repo>` — re-copies it |
-| 2b matched, but the *foreign* script is missing or not executable | By hand: fix or delete that entry in `.claude/settings.json`, then `./install.sh <repo>` |
-| No wiring at all (2a and 2b both fail) | `./install.sh <repo>` — merges it |
-| Partial wiring, no foreign hook | `./install.sh <repo>` — completes it |
-| Script present but stale vs. source | `/repo:update-tools` |
-| `.claude/settings.json` is not valid JSON | By hand — `install.sh` returns without wiring anything |
+| No script at the installed path, or not executable | `install.sh` re-copies it |
+| 2b matched, but the *foreign* script is missing or not executable | By hand (above) |
+| No `.claude/settings.json` at all | `install.sh` creates and wires one |
+| No wiring at all (2a and 2b both fail) | `install.sh` merges it |
+| Partial wiring, no foreign hook | `install.sh` completes it |
+| `.claude/settings.json` is not valid JSON | By hand — `install.sh` wires nothing |
+
+`install.sh` in that table means re-running the Repo Skills installer against
+this repo — `./install.sh <repo>` from a Repo Skills checkout.
+
+It has one further terminal state no check above can see in advance: if its
+rewrite `jq` fails (a full disk, a `mktemp` failure), it warns `Failed to
+update .claude/settings.json — left unchanged` and wires nothing. So an
+`install.sh` row that leaves this preflight *still* failing, with that warning
+in the installer's output, is not the wrong row — it is that state. It is
+self-diagnosing but not self-repairing: clear the underlying cause and re-run,
+or wire the two matchers by hand. Re-running the preflight after every repair
+is what surfaces it.
 
 Offer to run the repair, then re-run the preflight. `--force` proceeds anyway
 and must say plainly, in the step-5 restart block, that the note will **not**
 be announced on restart and has to be read by hand.
 
-Two advisory notes that never block:
+Three advisory notes that never block:
 
 - If `REPO_HANDOFF_SIBLING_ROOT` is unset, say so once. It is the opt-in
   fallback that reports a pending note in a *sibling* checkout (path and age
   only), and it is the only thing standing between "no note in this repo" and
   "no note anywhere" — a distinction that has already cost a real handoff.
+- Step 0 **does not check** whether the installed script is *stale* relative
+  to the Repo Skills source. `test -x` cannot see staleness, and the source
+  checkout is not reachable from every consumer, so there is no probe here to
+  fail — this is why staleness is not a row in the table above. A wired,
+  executable hook that predates a fix in
+  `hooks/repo/session-start-handoff.sh` still runs and still announces the
+  note, so mention `/repo:update-tools` as a follow-up if the version matters
+  and move on.
 - Under `--dry-run`, run every check for real and report the verdict, but
   apply no repair — not even the gitignore one. The checks are read-only, and
   knowing the reader is missing is the single most useful thing a dry run can
@@ -222,8 +256,9 @@ reset actually did — any earlier and it is speculative.
    been observed to slip past it). The mechanism that actively announces the
    note is the `session-start-handoff.sh` **SessionStart hook** — whose
    presence and wiring step 0 has already verified rather than assumed —
-   which surfaces the note as session context on startup and resume — the full body inlined when the note is small, a header outline plus
-   an oversize warning when it is large.
+   which surfaces the note as session context on startup and resume — the
+   full body inlined when the note is small, a header outline plus an
+   oversize warning when it is large.
 
 **Both halves are repo-scoped, and that is the point** — a note belongs to the
 repo it was written in, and is invisible from any other one. The cost is that
