@@ -1022,6 +1022,27 @@ assert_contains "env REPO_REMOTE_ENV_FILE wins over the shared file's" "$(cat "$
 assert_not_contains "shared-named file untouched when env overrides" "$(cat "$FAKEHOME/cfg/remote.env")" "i-0envwins"
 printf '%s\n' "$SHARED_BACKUP" >"$SHARED"
 
+# (c2) A tilde that reaches the script UNEXPANDED, so expand_tilde() is what
+#      does the work (repo#496). Case (c) writes an *unquoted* assignment into
+#      the shared file, which bash expands itself while sourcing — the value is
+#      already absolute before expand_tilde() ever sees it. These two paths are
+#      not: `env FOO='~/x'` (no expansion of an assignment's value by `env`),
+#      and a *quoted* assignment in the shared file.
+run_rr HOME="$FAKEHOME" REPO_REMOTE_ENV_FILE='~/cfg/from-env.env' \
+       REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge MOCK_AWS_NEW_ID=i-0tildeenv MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "literal ~/ from the environment: up succeeds" "0" "$RR_RC"
+assert_contains "literal ~/ from the environment is expanded to \$HOME (expand_tilde)" \
+                "$(cat "$FAKEHOME/cfg/from-env.env" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0tildeenv"
+[[ ! -e "$REPO/~" ]] && ok "literal ~/: no literal '~' directory created in the repo" \
+                      || no "literal ~/: created a literal '~' directory in $REPO"
+# ...and the same for a quoted value in the shared file, which bash leaves alone.
+printf '%s\n' "$SHARED_BACKUP" 'REPO_REMOTE_ENV_FILE="~/cfg/from-shared.env"' >"$SHARED"
+run_rr HOME="$FAKEHOME" REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge \
+       MOCK_AWS_NEW_ID=i-0tildeshared MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "quoted ~/ in the shared file is expanded to \$HOME (expand_tilde)" \
+                "$(cat "$FAKEHOME/cfg/from-shared.env" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0tildeshared"
+printf '%s\n' "$SHARED_BACKUP" >"$SHARED"
+
 # (d) REPO_REMOTE_NO_WRITEBACK=1: an existing .env is left untouched.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 run_rr REPO_REMOTE_NO_WRITEBACK=1 MOCK_AWS_NEW_ID=i-0nowb MOCK_AWS_STATE=None -- up --yes --json

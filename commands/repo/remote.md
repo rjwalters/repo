@@ -318,13 +318,25 @@ region/zone) without printing secret values.
 Load the shared file first, then the per-repo file (`REPO_REMOTE_ENV_FILE` if
 set, else the repo `.env`) on top, into the environment
 for the provisioning calls only — scoped to this command, never persisted to
-the VM. Repo values override shared ones because the repo file is sourced last:
+the VM. Repo values override shared ones because the repo file is sourced last.
+`REPO_REMOTE_ENV_FILE` itself resolves the other way round — the caller's
+environment value is captured *before* the shared file is sourced, so it wins
+over one the shared file sets — and a leading `~`/`~/` is expanded explicitly
+(the shell does not expand it inside a quoted or environment-supplied value):
 
 ```bash
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env"
+ENV_FILE_FROM_ENV="${REPO_REMOTE_ENV_FILE:-}"                  # capture BEFORE sourcing
 set -a
 [ -f "$CONFIG_HOME" ] && . "$CONFIG_HOME"                      # shared cloud creds + defaults
-REPO_FILE="${REPO_REMOTE_ENV_FILE:-$(git rev-parse --show-toplevel)/.env}"   # REPO_REMOTE_ENV_FILE: env or shared file
+set +a
+# environment value first, then whatever the shared file set, else <git-root>/.env
+REPO_FILE="${ENV_FILE_FROM_ENV:-${REPO_REMOTE_ENV_FILE:-$(git rev-parse --show-toplevel)/.env}}"
+case "$REPO_FILE" in                                           # expand a leading ~ / ~/
+  "~")   REPO_FILE="$HOME" ;;
+  "~/"*) REPO_FILE="$HOME/${REPO_FILE#\~/}" ;;
+esac
+set -a
 [ -f "$REPO_FILE" ] && . "$REPO_FILE"                          # per-repo (overrides)
 set +a
 ```
