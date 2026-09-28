@@ -28,14 +28,25 @@
 # exactly what the mismatch warning tells the operator.
 REPO_SKILLS_LAYOUT_VERSION=2
 
-# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list>
+# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list> [guard_hook_installed]
 #
 # The TRACKED file. Every field here is a property of the release + the selected
-# command set, so two machines installing the same version with the same
-# --skills= filter produce byte-identical output and consumer history stays
+# command set (or, for `filtered`/`guardHookInstalled`, a deliberate decision
+# made once at install time that a later resync must keep respecting — see
+# INSTALLER-CONTRACT.md C7), so two machines installing the same version with
+# the same options produce byte-identical output and consumer history stays
 # clean. Never add a path, hostname, or timestamp to this function.
+#
+# `guardHookInstalled` (repo#490): whether hooks/repo/guard-destructive.sh was
+# actually copied into the target, or the install deferred to a
+# destructive-command guard some OTHER tool already wired into
+# .claude/settings.json (Loom, most commonly). Defaults to true — the historical
+# behavior — so a pre-repo#490 call site (or a metadata read with the field
+# absent) is treated as "the guard was installed", matching what every install
+# before this field existed actually did.
 metadata_tracked_json() {
-  local version="$1" commit="$2" dev="$3" filtered="$4" commands="$5" commands_json
+  local version="$1" commit="$2" dev="$3" filtered="$4" commands="$5" \
+        guard_hook_installed="${6:-true}" commands_json
   commands_json="$(printf '%s\n' "$commands" | sed '/^$/d; s/.*/"&"/' | paste -sd, -)"
   echo "{"
   echo "  \"version\": \"$version\","
@@ -43,6 +54,7 @@ metadata_tracked_json() {
   echo "  \"layout_version\": $REPO_SKILLS_LAYOUT_VERSION,"
   echo "  \"dev\": $dev,"
   echo "  \"filtered\": $filtered,"
+  echo "  \"guardHookInstalled\": $guard_hook_installed,"
   echo "  \"commands\": [$commands_json]"
   echo "}"
 }

@@ -338,6 +338,32 @@ install_file() {  # <source-abs> <dest-abs> <label>
   fi
 }
 
+# existing_guard_wired <settings-file> <our-cmd>
+# True (0) when a destructive-command guard matching guard-destructive.sh is
+# ALREADY wired under a PreToolUse/Bash hook in <settings-file>, under some
+# command OTHER than our own <our-cmd>. Two call sites need this exact test
+# kept in lock-step (repo#490), or the decisions they make can silently
+# disagree with each other:
+#   1. below, ahead of copying hooks/repo/guard-destructive.sh into the target
+#      — skip the copy entirely when nothing will ever run it;
+#   2. merge_settings_hook's own coexistence branch — skip adding a second
+#      PreToolUse entry.
+# A single implementation is what makes that guarantee possible.
+#
+# The `.command != $c` filter matters on a REPEAT install: by the second run
+# our own hook IS already wired, and without excluding it here every reinstall
+# would misdetect its own prior wiring as "another" guard and quietly stop
+# copying/maintaining its own file.
+existing_guard_wired() {
+  local settings="$1" cmd="$2"
+  [[ -f "$settings" ]] || return 1
+  jq -e --arg c "$cmd" '
+        (.hooks.PreToolUse // []) | any(.[]?;
+          (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
+            ((.command // "") | test("guard-destructive\\.sh")) and (.command != $c))))
+      ' "$settings" >/dev/null 2>&1
+}
+
 # Idempotently wire the guard-destructive.sh PreToolUse/Bash hook into the
 # target's .claude/settings.json WITHOUT clobbering anything else in the file.
 # Unlike Loom (which owns and wholesale-copies its settings.json), Repo Skills
@@ -365,12 +391,11 @@ merge_settings_hook() {
 
   # Coexistence: another guard-destructive.sh (e.g. Loom's .loom/hooks copy) is
   # already wired under a Bash matcher. Defer to it rather than double-guard —
-  # two guards would both fire on every command and risk a double-prompt.
-  if jq -e '
-        (.hooks.PreToolUse // []) | any(.[]?;
-          (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
-            (.command // "") | test("guard-destructive\\.sh"))))
-      ' "$settings" >/dev/null 2>&1; then
+  # two guards would both fire on every command and risk a double-prompt. Same
+  # predicate the pre-copy gate above used to decide whether to even ship our
+  # own hooks/repo/guard-destructive.sh (repo#490) — one implementation, so the
+  # two decisions can never drift apart.
+  if existing_guard_wired "$settings" "$cmd"; then
     info "A destructive-command guard is already wired in .claude/settings.json — deferring to it (not adding a duplicate)"
     return
   fi
@@ -455,6 +480,18 @@ merge_settings_sessionstart_hook() {
   fi
 }
 
+# Decide, up front, whether hooks/repo/guard-destructive.sh is even going to be
+# copied. Computed here — ahead of both the metadata write (step 3) and the
+# actual copy (step 3b) — so the SAME boolean lands in install-metadata.json
+# for resync-installed.sh to respect on every later refresh (repo#490): a
+# target where another guard is already wired must never receive a copy of a
+# script nothing will ever run.
+if existing_guard_wired "$SETTINGS_JSON" "$HOOK_CMD"; then
+  GUARD_HOOK_INSTALLED=false
+else
+  GUARD_HOOK_INSTALLED=true
+fi
+
 # 1. Skill file
 mkdir -p "$TARGET/.claude/skills/repo"
 install_file "$SOURCE_ROOT/skills/repo/SKILL.md" "$TARGET/.claude/skills/repo/SKILL.md" ".claude/skills/repo/SKILL.md"
@@ -478,10 +515,17 @@ success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude
 # full one, and would either never deliver newly-added commands or silently
 # widen a filtered install (INSTALLER-CONTRACT.md C7).
 #
+# `guardHookInstalled` records the SAME kind of deliberate decision, computed
+# above (before this section) via existing_guard_wired(): whether hooks/repo/
+# guard-destructive.sh was actually copied in, or the install deferred to a
+# guard another tool already wired. Without it, resync-installed.sh has no way
+# to tell "never installed here" from "deliberately deferred" and would keep
+# re-adding a file nothing runs (repo#490).
+#
 # The field list itself lives in lib/metadata.sh so the resync writes the same
 # shape — see that file for why one emitter matters here.
 metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
-  "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" \
+  "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
   >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
 
@@ -550,11 +594,21 @@ fi
 # needs explicit removal. render+copy drops the exec bit (the hook has no
 # template placeholders, so assert_no_placeholders passes), so re-set it; in dev
 # mode install_file symlinks and the chmod is a harmless no-op on the source.
+#
+# Copying is gated on GUARD_HOOK_INSTALLED (computed above, before the metadata
+# write): when another guard is already wired, nothing in the target would ever
+# run our copy, so shipping it is dead weight (repo#490). `mkdir -p` still runs
+# unconditionally — session-start-handoff.sh (3c, right below) lands in the same
+# directory regardless of this decision.
 mkdir -p "$TARGET/.claude/skills/repo/hooks"
-install_file "$SOURCE_ROOT/hooks/repo/guard-destructive.sh" \
-  "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" "hooks/repo/guard-destructive.sh"
-chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
-success "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+if [[ "$GUARD_HOOK_INSTALLED" == true ]]; then
+  install_file "$SOURCE_ROOT/hooks/repo/guard-destructive.sh" \
+    "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" "hooks/repo/guard-destructive.sh"
+  chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
+  success "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+else
+  info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it)"
+fi
 merge_settings_hook
 
 # 3c. SessionStart handoff hook + settings.json wiring. Same colocation and
@@ -658,7 +712,7 @@ else
   # gitignored-and-untracked file would double the C6 bookkeeping for no extra
   # information.
   metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
-    "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" \
+    "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
     >"$CODEX_SKILL_DIR/install-metadata.json"
   success "Wrote $CODEX_SKILL_REL/install-metadata.json"
   CODEX_HINT=" In Codex CLI the same workflows are the \`$CODEX_SKILL_SLUG\` skill (\`/skills\`, or type \`\$$CODEX_SKILL_SLUG\`)."

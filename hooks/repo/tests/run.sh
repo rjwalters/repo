@@ -16,7 +16,8 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
-# test-install-sidecar-untracking.sh, test-install-codex-skill.sh,
+# test-install-sidecar-untracking.sh, test-install-guard-coexistence.sh,
+# test-install-codex-skill.sh,
 # test-skill-parity.sh, test-shell-wrapper.sh,
 # commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
@@ -386,6 +387,45 @@ else
     PASS=$((PASS + SC_PASS))
     FAIL=$((FAIL + SC_FAIL))
     record_suite "test-install-sidecar-untracking.sh" "$SC_PASS" "$SC_FAIL" "sidecar untracking"
+fi
+
+# install.sh's guard-hook coexistence branch (repo#490): skip copying
+# hooks/repo/guard-destructive.sh (and record the decision in
+# install-metadata.json) when another destructive-command guard is already
+# wired in the target's .claude/settings.json. Same delegation shape as the two
+# suites above — it drives install.sh and resync-installed.sh against scratch
+# git repos.
+echo
+echo "-- install.sh guard-hook coexistence (delegated suite) --"
+GC_TEST="$TESTS_DIR/test-install-guard-coexistence.sh"
+if [[ ! -f "$GC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-install-guard-coexistence.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-install-guard-coexistence.sh" "$GC_TEST"
+else
+    GC_OUT="$(bash "$GC_TEST" 2>&1)"
+    GC_STATUS=$?
+    GC_PASS="$(suite_count Passed "$GC_OUT")"
+    GC_FAIL="$(suite_count Failed "$GC_OUT")"
+    if ! [[ "$GC_PASS" =~ ^[0-9]+$ && "$GC_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        GC_PASS=0
+        GC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-install-guard-coexistence.sh" "$GC_STATUS"
+        strip_ansi "$GC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GC_STATUS" -ne 0 || "$GC_FAIL" -ne 0 ]]; then
+        [[ "$GC_FAIL" -eq 0 ]] && GC_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-install-guard-coexistence.sh" "$GC_PASS" "$GC_FAIL" "$GC_STATUS"
+        strip_ansi "$GC_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-install-guard-coexistence.sh" "$GC_PASS"
+    fi
+    PASS=$((PASS + GC_PASS))
+    FAIL=$((FAIL + GC_FAIL))
+    record_suite "test-install-guard-coexistence.sh" "$GC_PASS" "$GC_FAIL" "guard-hook coexistence"
 fi
 
 # The Codex-side skill surface `.agents/skills/repo/` (repo#285): format

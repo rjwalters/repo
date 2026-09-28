@@ -272,6 +272,59 @@ assert_contains "an unfiltered install records filtered:false" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- a deferred guard install (guardHookInstalled:false) is NOT re-added (repo#490) --"
+GTGT="$SCRATCH/tgt-deferred-guard"
+new_target "$GTGT"
+mkdir -p "$GTGT/.claude"
+cat >"$GTGT/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh" }
+        ]
+      }
+    ]
+  }
+}
+EOF
+do_install "$SRC" "$GTGT"
+GMETA="$GTGT/.claude/skills/repo/install-metadata.json"
+assert_contains "a deferred install records guardHookInstalled:false" \
+    "$(cat "$GMETA")" '"guardHookInstalled": false'
+if [[ ! -e "$GTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "the deferred install never wrote guard-destructive.sh"
+else
+    no "the deferred install never wrote guard-destructive.sh"
+fi
+
+run_resync "$GTGT" --dry-run
+assert_eq "dry-run on a deferred-guard install is in sync" "0" "$RS_RC"
+assert_not_contains "dry-run does not propose adding guard-destructive.sh back" \
+    "$RS_OUT" "guard-destructive.sh"
+run_resync "$GTGT"
+if [[ ! -e "$GTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "apply resync still does not create guard-destructive.sh"
+else
+    no "apply resync still does not create guard-destructive.sh"
+fi
+assert_contains "resync's re-stamped metadata still records guardHookInstalled:false" \
+    "$(cat "$GMETA")" '"guardHookInstalled": false'
+
+# An unfiltered, non-deferred install (TGT, established above) must record
+# guardHookInstalled:true and keep refreshing a hand-deleted guard script — the
+# deferral is selective, not a blanket "resync never touches this file".
+assert_contains "a normal install records guardHookInstalled:true" \
+    "$(cat "$TGT/.claude/skills/repo/install-metadata.json")" '"guardHookInstalled": true'
+rm -f "$TGT/.claude/skills/repo/hooks/guard-destructive.sh"
+run_resync "$TGT"
+assert_file "resync restores a guard recorded as installed" \
+    "$TGT/.claude/skills/repo/hooks/guard-destructive.sh"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- version stamping keeps the C5/C6 split --"
 echo "99.9.9" >"$SRC/VERSION"
 run_resync "$TGT"

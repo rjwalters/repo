@@ -111,7 +111,8 @@ therefore **MUST NOT** contain an absolute path, a hostname, a username, or a
 timestamp — those go in the sidecar (C6).
 
 Additional fields are permitted as long as they preserve that property (Repo
-Skills also records `dev`, `filtered`, and the selected `commands`).
+Skills also records `dev`, `filtered`, `guardHookInstalled`, and the selected
+`commands`).
 
 > Spot-check: `jq -e '.version and .commit and .layout_version' <tool-root>/install-metadata.json`
 > and `jq -e 'has("source") or has("installed_at") | not' <tool-root>/install-metadata.json`
