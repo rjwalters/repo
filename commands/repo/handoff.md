@@ -41,120 +41,82 @@ ones having actually happened.
 
 ### 0. Preflight — confirm something will actually read the note
 
-Run this **before** followups and reset, and stop on failure. Everything below
-produces a note; this step establishes that the note has a reader. A handoff
-nobody reads is worse than no handoff, and the failure is silent at the worst
-possible moment — the operator quits the CLI on this command's own
-instructions and never learns the note was orphaned.
+Run before followups and reset, and stop on a blocking failure. Everything
+below produces a note; this step proves the note has a reader first. That
+reader is a `session-start-handoff.sh` **SessionStart hook** in two halves — a
+script, and its wiring in `.claude/settings.json` — which `install.sh` writes
+to paths with different git dispositions, so neither check substitutes for the
+other.
 
-The reader is a `session-start-handoff.sh` **SessionStart hook**, and it has
-two halves that `install.sh` writes to paths with *different git
-dispositions*. Check both — neither substitutes for the other.
-
-**Half 1 — a hook script exists and is executable.** Normally the installed
-copy:
-
-```bash
-test -x .claude/skills/repo/hooks/session-start-handoff.sh
-```
-
-**Half 2 — a hook is wired for BOTH sources Claude Code will fire.** Mirror
-`install.sh`'s `merge_settings_sessionstart_hook`, which has **two**
-predicates, not one. Check them in the same order the installer does:
+Why each rule is shaped the way it is lives in the header of
+`commands/repo/tests/test-handoff-preflight.sh` — **read it before changing
+anything here.** That file pins much of this section by mutation-verified
+regex, and a rewrite that drops a pin silently reopens the branch it guards.
 
 ```bash
 HOOK='${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/session-start-handoff.sh'
 
-# 2a. Our exact command, under every matcher we manage — install.sh's
-#     idempotency test (its "already wired, no change" branch), verbatim.
+# 1. Which of three states is settings.json in? They do NOT share a repair.
+test -f .claude/settings.json              # absent, or present?
+jq -e . .claude/settings.json >/dev/null   # malformed, or genuinely unwired?
+
+# 2a. Our exact command, under every matcher we manage.
 jq -e --arg c "$HOOK" '
       (.hooks.SessionStart // []) as $ss |
       (["startup","resume"] | all(. as $m | $ss | any(.[]?;
         (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c)))))
     ' .claude/settings.json
 
-# 2b. If 2a fails: a DIFFERENT session-start-handoff.sh may already be wired
-#     (a copy at another path). install.sh DEFERS to it rather than adding a
-#     duplicate, so this is a satisfied reader, not a missing one.
+# 2b. Only if 2a fails: is a DIFFERENT session-start-handoff.sh already wired?
 jq -e --arg c "$HOOK" '
       (.hooks.SessionStart // []) | any(.[]?;
         (.hooks // []) | any(.[]?;
           ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c)))
     ' .claude/settings.json
+
+# 3. Is the script that will actually run present and executable?
+test -x .claude/skills/repo/hooks/session-start-handoff.sh
+
+# 4. Is the note safe from being committed?
+git check-ignore -q .claude/handoff.md
 ```
 
-**2b is not optional, and omitting it produces a false block.** When a
-foreign-pathed hook is wired, `install.sh` returns early and will *never*
-wire the command 2a tests for — so a preflight that checks only 2a fails,
-sends the operator to `install.sh`, and `install.sh` defers again. The
-operator loops, while a reader was present the whole time. That branch has
-existed since the hook's first commit (#34); it is a supported terminal
-state, not a leftover. On 2b, report the foreign path as **information** and
-continue — and point half 1 at *that* script rather than the installed path,
-since it is the one that will run. If *that* script is missing or not
-executable, `./install.sh` is the wrong repair: it only ever copies to
-`.claude/skills/repo/hooks/`, and 2b makes it defer on the wiring, so a
-re-install leaves the dangling entry exactly as it was. Fix or delete the
-foreign entry in `.claude/settings.json` by hand first — then `install.sh`
-can wire ours.
+The rules that make those checks correct — each guards a branch, so keep its
+sentence here even when compressing:
 
-A **partial** wiring — one matcher but not the other, with no foreign hook —
-is a failure, exactly as the installer treats it as incomplete and finishes it.
+- **Run check 1 first.** 2a and 2b are both `jq -e`, so an absent
+  `.claude/settings.json` and a malformed `.claude/settings.json` both fail
+  them exactly the way a valid-but-unwired one does. Three states, three
+  repairs.
+- **Absent is fully repaired by `install.sh`** — never send it to a by-hand
+  fix. `merge_settings_sessionstart_hook` creates an empty `{}` settings file
+  *before* its invalid-JSON guard, so one re-install creates the file, wires
+  both matchers and copies the script. Reachable on a fresh clone, not
+  theoretical — the test header has the worked example.
+- **Malformed is not repairable by `install.sh`.** That same guard refuses to
+  touch invalid JSON and returns having wired nothing.
+- **Mirror both predicates.** `install.sh`'s `merge_settings_sessionstart_hook`
+  has **two** predicates, not one: 2a is its idempotency test and 2b its
+  coexistence branch. `test-handoff-preflight.sh` extracts both jq programs
+  from this file and from `install.sh` and asserts they are equal after
+  normalization, so keep them copy-paste identical.
+- **2b is not optional.** When a foreign-pathed hook is wired, `install.sh`
+  defers to it and will never wire the command 2a tests for, so a 2a-only
+  preflight produces a false block and an operator loop. A 2b match is a
+  satisfied reader — report the foreign path as information and continue.
+- **Check 3 follows the hook that will actually run**, which is the foreign
+  path when 2b matched, not the installed path. When *that* script is missing,
+  `./install.sh` is the wrong repair: it only ever copies to
+  `.claude/skills/repo/hooks/`, and 2b makes it defer on the wiring, so the
+  dangling entry survives. Fix or delete the foreign entry by hand first.
+- **Check 4 auto-fixes** rather than blocks — adding the entry is the
+  archetypal safe fix and step 4 would have done it anyway. Under `--dry-run`,
+  report it and add nothing.
 
-Both predicates are `jq -e`, so an **absent** `.claude/settings.json` and a
-malformed `.claude/settings.json` both fail them exactly the way a
-valid-but-unwired one does. Three states, and they do **not** share a repair.
-Separate them before reaching for the table below, in the order the installer
-resolves them:
+A **partial** wiring — one matcher but not the other, with no foreign hook — is
+a failure, exactly as the installer treats it as incomplete and finishes it.
 
-```bash
-test -f .claude/settings.json              # absent, or present?
-jq -e . .claude/settings.json >/dev/null   # malformed, or genuinely unwired?
-```
-
-**Absent is fully repaired by `install.sh`** — do not send it to a by-hand
-fix. `merge_settings_sessionstart_hook` creates an empty `{}` settings file
-*before* its invalid-JSON guard runs, so a missing file is created, both
-matchers are wired, and the script is copied, all in one re-install. This
-state is reachable, not theoretical: a repo that tracks `.claude/commands/`
-through a `!` negation while gitignoring the rest of `.claude/` has the
-`/repo:handoff` command and no settings file at all on every fresh clone or
-`git clean -xdf`.
-
-**Malformed is not repairable by `install.sh`.** That same guard refuses to
-touch invalid JSON and returns having wired nothing, so a re-install changes
-nothing and reports the same warning each time.
-
-`test-handoff-preflight.sh` extracts the jq programs from this file and from
-`install.sh` and asserts they are equal after normalization, so the two cannot
-drift silently. Keep them copy-paste identical; if the installer's predicates
-change, that test fails and this block must follow.
-
-**Half 1 is load-bearing, and inspecting `settings.json` cannot replace it.**
-Where a consumer tracks `.claude/settings.json` while gitignoring
-`.claude/skills/`, the wiring propagates through `git pull` to every clone and
-the script it points at travels with none of them. That repo looks correctly
-configured to anyone who reads its settings by eye, and Claude Code invokes a
-missing command on every launch. A fresh clone of such a consumer starts in
-that state before it has drifted at all. `rjwalters/loom` has exactly this
-shape — `.claude/settings.json` tracked, `.claude/skills` in `.gitignore` — so
-its wiring reaches every clone and the script it names reaches none of them.
-How common the split is across consumers is not established; it needs to occur
-only once to lose a handoff.
-
-While `.gitignore` is already open, check the third thing the note depends on:
-
-```bash
-git check-ignore -q .claude/handoff.md   # the note must never be committable
-```
-
-This one **auto-fixes** rather than blocks: adding a `.claude/handoff.md`
-entry is the archetypal safe fix, step 4 would have done it anyway, and doing
-it here just moves it off the critical path. Say that it was added. Under
-`--dry-run`, report that it is missing and add nothing — the flag's contract
-is that the run writes nothing at all.
-
-**On a blocking failure, stop and report which half failed** — they have
+**On a blocking failure, stop and report which check failed.** They have
 different repairs, and one merged "the hook is broken" sends the operator to
 the wrong one:
 
@@ -175,32 +137,26 @@ rewrite `jq` fails (a full disk, a `mktemp` failure), it warns `Failed to
 update .claude/settings.json — left unchanged` and wires nothing. So an
 `install.sh` row that leaves this preflight *still* failing, with that warning
 in the installer's output, is not the wrong row — it is that state. It is
-self-diagnosing but not self-repairing: clear the underlying cause and re-run,
-or wire the two matchers by hand. Re-running the preflight after every repair
-is what surfaces it.
+self-diagnosing but not self-repairing: clear the cause and re-run, or wire
+the two matchers by hand.
 
 Offer to run the repair, then re-run the preflight. `--force` proceeds anyway
 and must say plainly, in the step-5 restart block, that the note will **not**
 be announced on restart and has to be read by hand.
 
-Three advisory notes that never block:
+Three advisories that never block:
 
-- If `REPO_HANDOFF_SIBLING_ROOT` is unset, say so once. It is the opt-in
-  fallback that reports a pending note in a *sibling* checkout (path and age
-  only), and it is the only thing standing between "no note in this repo" and
-  "no note anywhere" — a distinction that has already cost a real handoff.
-- Step 0 **does not check** whether the installed script is *stale* relative
-  to the Repo Skills source. `test -x` cannot see staleness, and the source
+- If `REPO_HANDOFF_SIBLING_ROOT` is unset, say so once — it is the opt-in
+  fallback that reports a pending note in a *sibling* checkout, and the only
+  thing distinguishing "no note here" from "no note anywhere".
+- Step 0 **does not check** whether the installed script is *stale* against
+  the Repo Skills source: `test -x` cannot see staleness and the source
   checkout is not reachable from every consumer, so there is no probe here to
-  fail — this is why staleness is not a row in the table above. A wired,
-  executable hook that predates a fix in
-  `hooks/repo/session-start-handoff.sh` still runs and still announces the
-  note, so mention `/repo:update-tools` as a follow-up if the version matters
-  and move on.
+  fail — which is why staleness is not a row in the table. A wired, executable
+  hook that predates a fix still runs and still announces the note, so mention
+  `/repo:update-tools` as a follow-up if the version matters and move on.
 - Under `--dry-run`, run every check for real and report the verdict, but
-  apply no repair — not even the gitignore one. The checks are read-only, and
-  knowing the reader is missing is the single most useful thing a dry run can
-  tell you.
+  apply no repair, not even the gitignore one: that flag writes nothing.
 
 ### 1. File follow-ups first (see [[followups]])
 

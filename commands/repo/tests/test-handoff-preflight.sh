@@ -24,11 +24,17 @@
 #     stages; learning the note has no reader must happen BEFORE them, which
 #     is why it is step 0 and not step 3.5.
 #   - The script-existence check gets dropped as redundant with the wiring
-#     check. It is the opposite of redundant: consumers commonly TRACK
-#     .claude/settings.json while GITIGNORING .claude/skills/, so a clone can
-#     receive correct-looking wiring with no script behind it. That is the
-#     case a settings.json-only check cannot see, and the case observed in
-#     rjwalters/loom.
+#     check. It is the opposite of redundant. Where a consumer TRACKS
+#     .claude/settings.json while GITIGNORING .claude/skills/, the wiring
+#     propagates through git pull to every clone and the script it points at
+#     travels with none of them: the repo reads as correctly configured to
+#     anyone inspecting settings.json by eye, while Claude Code invokes a
+#     missing command on every launch. A fresh clone of such a consumer
+#     starts there before drifting at all. rjwalters/loom has exactly this
+#     shape. How common the split is across consumers is NOT established, and
+#     it needs to occur only once to lose a handoff -- do not restate it as a
+#     frequency claim; #494 softened exactly that wording in handoff.md and
+#     repo#499 caught this copy still carrying it.
 #   - The two checks get collapsed into one "hook is broken" message. They
 #     have different repairs; a merged message sends the operator to the
 #     wrong one.
@@ -49,6 +55,23 @@
 #     install.sh treats it as incomplete and completes it; so must this.
 #   - --force loses its obligation to tell the truth in the restart block,
 #     leaving an operator with a note they believe will be announced.
+#
+# WHERE THE RATIONALE LIVES (repo#499): step 0 had grown to 163 of
+# handoff.md's 339 lines -- 48% of a command that install.sh copies into
+# every consumer repo, so the prose was context paid on every /repo:handoff
+# everywhere. #499 compressed it to a checklist plus a repair table and moved
+# the justification HERE: this file is read when someone changes the step,
+# which is exactly when the reasoning is needed, and it is not installed into
+# consumers. handoff.md keeps the operative sentence of every rule -- the part
+# an executor acts on -- and points here for the rest.
+#
+# That split is load-bearing in one direction. The assertions below pin
+# handoff.md's behavioural sentences, because those guard the branches; they
+# also pin the moved rationale in THIS header (via SELF_HEADER), so a
+# compression that drops an explanation from both files still fails. What is
+# deliberately unpinned is only the surrounding exposition. Moving a rule's
+# behavioural sentence OUT of handoff.md silently unguards it -- keep each
+# rule's operative sentence in the command, and only the "why" here.
 #
 # The contract under test:
 #   1  handoff.md still exists, is user-invocable, and documents --force
@@ -263,18 +286,33 @@ assert_matches "the repair table scopes the no-wiring row to 2a AND 2b failing" 
     "$PRE_FLAT" '2a and 2b both fail'
 assert_matches "records the false-block / operator-loop consequence" "$PRE_SECTION" \
     '[Ff]alse block|loops?\b'
-assert_matches "half 1 follows the hook that will actually run" "$PRE_SECTION" \
-    'point half 1 at|that script rather than|the one that will run'
+# repo#499 renumbered the "halves" as checks 1-4. Retargeted, not relaxed:
+# the #501 review demonstrated that the old single alternation accepted a
+# REVERSED rule ("which is always the installed path, never the foreign path
+# when 2b matched") because the matched phrase survived the reversal. The
+# pair below demands the redirect AND which path it redirects to.
+assert_matches "check 3 follows the hook that will actually run" "$PRE_FLAT" \
+    '[Cc]heck 3 follows the hook that will actually run'
+assert_matches "check 3 names the foreign path as what it redirects to" "$PRE_FLAT" \
+    'foreign[[:space:]]*path when 2b matched, not the installed path'
 
 # ---------------------------------------------------------------------------
 # 6. The rationale that makes half 1 non-redundant
 # ---------------------------------------------------------------------------
 echo
 echo "-- 6. why settings.json alone is not enough --"
-assert_matches "records the tracked-settings / gitignored-skills split" "$PRE_SECTION" \
-    '[Tt]rack.*settings\.json|settings\.json.*track'
-assert_matches "records that the script is gitignored" "$PRE_SECTION" \
-    'gitignor'
+SELF_HEADER="$(sed -n '1,/^set -uo pipefail/p' "${BASH_SOURCE[0]}")"
+# NOT 'TRACKS[[:space:]]*$' -- that alternative matched any line merely ENDING
+# in the word, which a gutted header still does. Require the actual pairing.
+assert_matches "the tracked-settings / gitignored-skills split is recorded" "$SELF_HEADER" \
+    'GITIGNORING \.claude/skills'
+assert_matches "the split names the tracked side too" "$SELF_HEADER" \
+    'TRACKS[[:space:]]*#? *\.claude/settings\.json|\.claude/settings\.json while GITIGNORING'
+assert_matches "the split's consequence is recorded, not just the fact" "$SELF_HEADER" \
+    'reads as correctly configured|missing command on every launch'
+# The frequency claim #494 softened must not creep back (repo#499).
+assert_not_contains "no unsupported frequency claim about consumers" \
+    "$SELF_HEADER" "consumers commonly TRACK"
 
 # ---------------------------------------------------------------------------
 # 7. Distinct repairs per failing half
