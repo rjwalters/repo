@@ -91,10 +91,25 @@ operator loops, while a reader was present the whole time. That branch has
 existed since the hook's first commit (#34); it is a supported terminal
 state, not a leftover. On 2b, report the foreign path as **information** and
 continue — and point half 1 at *that* script rather than the installed path,
-since it is the one that will run.
+since it is the one that will run. If *that* script is missing or not
+executable, `./install.sh` is the wrong repair: it only ever copies to
+`.claude/skills/repo/hooks/`, and 2b makes it defer on the wiring, so a
+re-install leaves the dangling entry exactly as it was. Fix or delete the
+foreign entry in `.claude/settings.json` by hand first — then `install.sh`
+can wire ours.
 
 A **partial** wiring — one matcher but not the other, with no foreign hook —
 is a failure, exactly as the installer treats it as incomplete and finishes it.
+
+Both predicates are `jq -e`, so a malformed `.claude/settings.json` fails them
+exactly the way an unwired one does. `install.sh` has a guard ahead of both
+that refuses to touch invalid JSON and returns having wired nothing, so it
+cannot repair that case either. Separate it out before reaching for the table
+below:
+
+```bash
+jq -e . .claude/settings.json >/dev/null   # malformed, or genuinely unwired?
+```
 
 `test-handoff-preflight.sh` extracts the jq programs from this file and from
 `install.sh` and asserts they are equal after normalization, so the two cannot
@@ -107,10 +122,11 @@ Where a consumer tracks `.claude/settings.json` while gitignoring
 the script it points at travels with none of them. That repo looks correctly
 configured to anyone who reads its settings by eye, and Claude Code invokes a
 missing command on every launch. A fresh clone of such a consumer starts in
-that state before it has drifted at all. Observed in `rjwalters/loom`: current
-wiring, alongside an installed tree left at 0.6.1 — a version that shipped no
-hook at all. How common the tracked/gitignored split is across consumers is
-not established; it needs to occur only once to lose a handoff.
+that state before it has drifted at all. `rjwalters/loom` has exactly this
+shape — `.claude/settings.json` tracked, `.claude/skills` in `.gitignore` — so
+its wiring reaches every clone and the script it names reaches none of them.
+How common the split is across consumers is not established; it needs to occur
+only once to lose a handoff.
 
 While `.gitignore` is already open, check the third thing the note depends on:
 
@@ -130,10 +146,12 @@ the wrong one:
 
 | Failing check | Repair |
 |---|---|
-| No hook script, or not executable | `./install.sh <repo>` — re-copies it |
+| No script at the installed path (2a's target), or not executable | `./install.sh <repo>` — re-copies it |
+| 2b matched, but the *foreign* script is missing or not executable | By hand: fix or delete that entry in `.claude/settings.json`, then `./install.sh <repo>` |
 | No wiring at all (2a and 2b both fail) | `./install.sh <repo>` — merges it |
 | Partial wiring, no foreign hook | `./install.sh <repo>` — completes it |
 | Script present but stale vs. source | `/repo:update-tools` |
+| `.claude/settings.json` is not valid JSON | By hand — `install.sh` returns without wiring anything |
 
 Offer to run the repair, then re-run the preflight. `--force` proceeds anyway
 and must say plainly, in the step-5 restart block, that the note will **not**

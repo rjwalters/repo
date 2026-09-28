@@ -64,7 +64,9 @@
 #      satisfied reader, not a blocking failure
 #   6  it records WHY the script check cannot be replaced by the wiring check
 #      (tracked settings.json + gitignored skills dir)
-#   7  failures are reported per-half with distinct repairs
+#   7  failures are reported per-half with distinct repairs, and the two
+#      cases install.sh CANNOT repair (a missing foreign 2b script; a
+#      malformed settings.json) are not sent to it
 #   8  --force proceeds but must correct the step-5 restart block
 #   9  the gitignore check and the REPO_HANDOFF_SIBLING_ROOT advisory are
 #      present, and the advisory does not block
@@ -278,6 +280,22 @@ assert_matches "stops on failure" "$PRE_SECTION" '[Ss]top|STOP'
 assert_contains "repair: re-run install.sh" "$PRE_SECTION" "install.sh"
 assert_contains "repair: /repo:update-tools for a stale script" "$PRE_SECTION" \
     "/repo:update-tools"
+# install.sh copies ONLY to .claude/skills/repo/hooks/ and, on a 2b match,
+# defers on the wiring -- so "re-run install.sh" is the WRONG repair when the
+# foreign-pathed script 2b found is itself missing. Saying otherwise rebuilds
+# the same operator loop one branch deeper (repo#494 follow-up).
+assert_matches "a missing foreign (2b) script is not repaired by install.sh alone" \
+    "$PRE_FLAT" 'is the wrong repair|[Bb]y hand: fix or delete that entry'
+assert_matches "the table carries a row for a missing foreign script" "$PRE_FLAT" \
+    '2b matched, but the \*foreign\* script'
+# The third early return in merge_settings_sessionstart_hook: invalid JSON.
+# jq -e fails identically for "malformed" and "not wired", and install.sh
+# refuses to touch a malformed settings file -- so the table must not send the
+# operator there for it.
+assert_matches "malformed settings.json is separated from 'not wired'" "$PRE_FLAT" \
+    'malformed .?\.claude/settings\.json'
+assert_matches "install.sh is not offered as the repair for invalid JSON" "$PRE_FLAT" \
+    'not valid JSON \| By hand'
 
 # ---------------------------------------------------------------------------
 # 8. --force keeps the restart block honest
