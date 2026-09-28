@@ -40,8 +40,9 @@
 # commands/repo/tests/test-json-escape-parity.sh,
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
-# commands/repo/tests/test-assert-matches-sigpipe.sh, and
-# commands/repo/tests/test-deps-security-updates-paused.sh.
+# commands/repo/tests/test-assert-matches-sigpipe.sh,
+# commands/repo/tests/test-deps-security-updates-paused.sh, and
+# commands/repo/tests/test-handoff-preflight.sh.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1571,6 +1572,41 @@ else
     PASS=$((PASS + DP_PASS))
     FAIL=$((FAIL + DP_FAIL))
     record_suite "test-deps-security-updates-paused.sh" "$DP_PASS" "$DP_FAIL" "deps security-updates paused state"
+fi
+
+# /repo:handoff's step-0 reader preflight — the command writes .claude/handoff.md
+# but a SEPARATE artifact (session-start-handoff.sh + its settings.json wiring)
+# reads it, and handoff.md used to assert that reader existed rather than check
+# (repo#493). Same delegation shape as every suite above.
+echo
+echo "-- handoff step-0 reader preflight (delegated suite) --"
+HP_TEST="$TESTS_DIR/../../../commands/repo/tests/test-handoff-preflight.sh"
+if [[ ! -f "$HP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-handoff-preflight.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-handoff-preflight.sh" "$HP_TEST"
+else
+    HP_OUT="$(bash "$HP_TEST" 2>&1)"
+    HP_STATUS=$?
+    HP_PASS="$(suite_count Passed "$HP_OUT")"
+    HP_FAIL="$(suite_count Failed "$HP_OUT")"
+    if ! [[ "$HP_PASS" =~ ^[0-9]+$ && "$HP_FAIL" =~ ^[0-9]+$ ]]; then
+        HP_PASS=0
+        HP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-handoff-preflight.sh" "$HP_STATUS"
+        strip_ansi "$HP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$HP_STATUS" -ne 0 || "$HP_FAIL" -ne 0 ]]; then
+        [[ "$HP_FAIL" -eq 0 ]] && HP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "$HP_STATUS"
+        strip_ansi "$HP_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-handoff-preflight.sh" "$HP_PASS"
+    fi
+    PASS=$((PASS + HP_PASS))
+    FAIL=$((FAIL + HP_FAIL))
+    record_suite "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "handoff step-0 reader preflight"
 fi
 
 echo
