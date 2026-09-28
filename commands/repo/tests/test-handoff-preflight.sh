@@ -161,6 +161,11 @@ fi
 # Everything below is scoped to the step-0 section so a stray mention
 # elsewhere in the document cannot satisfy these assertions.
 PRE_SECTION="$(awk '/^### 0\. Preflight/{f=1} /^### 1\. File follow-ups/{f=0} f' "$HANDOFF")"
+# Flattened copy: several pins below match phrases that wrap across lines,
+# and grep is line-oriented. Defined here beside PRE_SECTION because `set -u`
+# aborts on a forward reference (caught when section 4b was added).
+PRE_FLAT="$(printf '%s' "$PRE_SECTION" | tr '\n' ' ' | tr -s ' ')"
+
 if [[ -n "$PRE_SECTION" ]]; then
     ok "step-0 section body is extractable"
 else
@@ -186,8 +191,31 @@ assert_contains "reads .claude/settings.json" "$PRE_SECTION" ".claude/settings.j
 assert_contains "checks hooks.SessionStart" "$PRE_SECTION" "SessionStart"
 assert_contains "covers the startup matcher" "$PRE_SECTION" '"startup"'
 assert_contains "covers the resume matcher" "$PRE_SECTION" '"resume"'
-assert_matches "a partial wiring is a failure, not a pass" "$PRE_SECTION" \
-    '[Pp]artial'
+# NOT a bare '[Pp]artial' word-match — the #501 review named that the weakest
+# pin in the file, and it is: the word survives any rewrite that inverts the
+# rule around it. Demand the verdict too.
+assert_matches "a partial wiring is a failure, not a pass" "$PRE_FLAT" \
+    '[Pp]artial\*{0,2} wiring[^.]*is[[:space:]]*\*{0,2}a failure'
+
+# ---------------------------------------------------------------------------
+# 4b. The keystone: handoff.md must keep POINTING here
+#
+# repo#499 moved this step's rationale out of handoff.md and into this header.
+# That split has exactly one load-bearing link -- the sentence in step 0 that
+# sends a reader here before changing anything. The #501 review found that
+# deleting it survived all 20 mutations: the only survivor new to that PR.
+# Sever it and this header becomes orphaned prose that the next compression
+# deletes as dead weight, taking the rationale with it and silently undoing
+# repo#499's premise. Cheap to pin; expensive to lose.
+# ---------------------------------------------------------------------------
+echo
+echo "-- 4b. the pointer that holds the doc/test split together --"
+assert_contains "step 0 names this test file" "$PRE_SECTION" \
+    "commands/repo/tests/test-handoff-preflight.sh"
+assert_matches "step 0 tells the reader to read it BEFORE changing anything" \
+    "$PRE_FLAT" 'read it before changing[[:space:]]*anything here'
+assert_matches "step 0 says why: the pins are load-bearing" "$PRE_FLAT" \
+    'pins[^.]*by mutation-verified[[:space:]]*regex|drops a pin[^.]*reopens the branch'
 
 # ---------------------------------------------------------------------------
 # 5. The predicates are not re-invented -- and that is ENFORCED, not asserted
@@ -265,7 +293,6 @@ assert_contains "the doc's coexistence regex is escaped exactly as install.sh's"
 # ---------------------------------------------------------------------------
 echo
 echo "-- 5b. the coexistence branch --"
-PRE_FLAT="$(printf '%s' "$PRE_SECTION" | tr '\n' ' ' | tr -s ' ')"
 assert_matches "step 0 knows install.sh has TWO predicates, not one" "$PRE_FLAT" \
     '\*{0,2}[Tt]wo\*{0,2} +predicates'
 # Structural, not vocabulary: a rewrite that reverts to blocking on
@@ -437,6 +464,12 @@ assert_matches "--dry-run still runs the preflight" "$PRE_SECTION" '\-\-dry-run'
 # The gitignore check auto-fixes (it is the archetypal safe fix, and step 4
 # would have done it anyway) -- but --dry-run's contract is that the run
 # writes nothing, so the auto-fix must be suppressed there (repo#494 review).
+# An auto-fix the operator is never TOLD about is indistinguishable from the
+# command quietly editing .gitignore behind their back. repo#499 dropped this
+# sentence and the #501 review caught the loss -- it was unpinned before and
+# after, so restoring it without a pin just loses it again.
+assert_matches "the gitignore auto-fix is reported, not silent" "$PRE_FLAT" \
+    'Say that it was[[:space:]]*added'
 assert_matches "the gitignore check auto-fixes rather than blocks" "$PRE_FLAT" \
     'auto-fixes\*{0,2} rather than blocks'
 assert_matches "--dry-run suppresses the gitignore auto-fix" "$PRE_FLAT" \
