@@ -181,6 +181,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/repo-scrub-forks.sh` — the `/repo:scrub --forks` fork-network sweep. Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/repo-optimize-ci.py` — the `/repo:optimize-ci` workflow audit (read-only GitHub calls). Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/repo-org-policy.py` — the `/repo:org-policy` plan/apply engine (writes only through an explicitly applied plan, to the organization's `.github` repo — never to the consumer repo). Same colocation, removed with the skill dir on uninstall
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
@@ -205,6 +206,9 @@ scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, ins
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
 scripts/repo/repo-optimize-ci.py  /repo:optimize-ci workflow audit, installed to the same place
+scripts/repo/repo-org-policy.py  /repo:org-policy plan/apply engine, installed to the same place
+policies/                    Canonical organization preferences (Renovate preset + validators) that
+                             /repo:org-policy reads from GitHub — consumer-visible, not installed
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
 hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inline smoke cases
