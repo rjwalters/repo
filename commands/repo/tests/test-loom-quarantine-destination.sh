@@ -60,6 +60,13 @@ warning_noun() {
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 for c in "${DESTINATION_COMMANDS[@]}"; do
     if [[ ! -f "$CMD_DIR/$c.md" ]]; then
         echo "FATAL: $c.md not found at $CMD_DIR/$c.md" >&2
@@ -182,7 +189,7 @@ echo "-- a committed fix survives the quarantine that takes an uncommitted one -
 # The whole point of the ladder, against the real mechanism: the same
 # `git stash push` a sweep's check-main-clean.sh --quarantine runs.
 REPO="$SCRATCH/primary"
-git init -q -b main "$REPO"
+git_fixture_init "$REPO" -b main
 git -C "$REPO" config user.email "test@example.invalid"
 git -C "$REPO" config user.name "Quarantine Destination Test"
 printf '# Project\n\nA stale sentence.\n' > "$REPO/README.md"

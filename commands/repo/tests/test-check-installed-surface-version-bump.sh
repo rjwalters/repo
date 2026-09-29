@@ -25,6 +25,13 @@ SCRIPT="$REPO_ROOT/scripts/check-installed-surface-version-bump.sh"
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 if [[ ! -x "$SCRIPT" ]]; then
     echo "FATAL: check-installed-surface-version-bump.sh missing or not executable at $SCRIPT" >&2
     exit 1
@@ -42,7 +49,7 @@ REPO="$WORKDIR/repo"
 # tagged "base". Callers add more commits on top and diff against "base".
 make_fixture() {
     rm -rf "$REPO"
-    git init --quiet "$REPO"
+    git_fixture_init "$REPO"
     git -C "$REPO" checkout -q -b main
     mkdir -p "$REPO/commands/repo"
     echo "hello" > "$REPO/commands/repo/foo.md"

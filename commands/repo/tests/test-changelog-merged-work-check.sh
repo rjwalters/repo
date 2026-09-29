@@ -59,6 +59,15 @@ RELEASE_MD="$REPO_ROOT/commands/repo/release.md"
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session exports
+# core.hooksPath via GIT_CONFIG_* env pairs pointing at loom-daemon's
+# provenance hooks, which the fixture repos below would otherwise inherit —
+# the commit-msg hook appends `Loom-Story: <repo>#<N>` trailers, injecting a #N
+# that case 5 (a commit citing NO number) asserts is absent. See
+# lib/git-fixture.sh for the full mechanism.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 if [[ ! -f "$RELEASE_MD" ]]; then
     echo "FATAL: release.md not found at $RELEASE_MD" >&2
     exit 1
@@ -75,7 +84,10 @@ REPO=""
 
 build_repo() {   # <name>
     local root="$SCRATCH/$1"
-    git init -q -b main "$root"
+    # git_fixture_init = `git init -q -b main <root>` + hook neutralization, so
+    # every `git -C "$REPO" commit …` call site below is hook-free without
+    # having to pass `-c core.hooksPath=…` to each of them (repo#518).
+    git_fixture_init "$root" -b main
     REPO="$root"
     git -C "$REPO" config user.email "test@example.invalid"
     git -C "$REPO" config user.name "Merged Work Coverage Test"
