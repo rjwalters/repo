@@ -80,6 +80,9 @@
 #   3  it checks the script's existence AND executability
 #   4  it checks the settings.json wiring for BOTH startup and resume, and
 #      names a partial wiring a failure
+#  4b  step 0 still points a reader at this file's header
+#  4c  ...and the header block it points at still exists and still states
+#      the split's contract (repo#503: the reverse direction of 4b)
 #   5  it cross-references install.sh's merge_settings_sessionstart_hook AND
 #      the jq programs in the two files are literally equal after
 #      normalization -- enforced, not asserted in prose
@@ -218,6 +221,35 @@ assert_matches "step 0 says why: the pins are load-bearing" "$PRE_FLAT" \
     'pins[^.]*by mutation-verified[[:space:]]*regex|drops a pin[^.]*reopens the branch'
 
 # ---------------------------------------------------------------------------
+# 4c. ...and the block it points AT must still be here (repo#503)
+#
+# 4b pins the pointer; nothing pinned its target. Keep the pointer and delete
+# this header's rationale block and every assertion stayed green, leaving
+# handoff.md sending readers to an empty room. Worse, that block carries the
+# split's own contract -- which half lives where, and what moving a sentence
+# costs -- so a compression that deletes it removes the rule that governs the
+# next compression. Pinned against the header ONLY (SELF_HEADER stops at
+# `set -uo pipefail`), so the literals below cannot satisfy themselves, and
+# flattened because every contract sentence wraps across comment lines.
+# ---------------------------------------------------------------------------
+echo
+echo "-- 4c. the rationale block the pointer names --"
+SELF_HEADER="$(sed -n '1,/^set -uo pipefail/p' "${BASH_SOURCE[0]}")"
+SELF_FLAT="$(printf '%s' "$SELF_HEADER" | sed 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
+# Anchored to a line start, so the contract list's mention of 4c cannot stand
+# in for the block's own heading.
+assert_matches "the header still opens a WHERE THE RATIONALE LIVES block" \
+    "$SELF_HEADER" '^# WHERE THE RATIONALE LIVES \(repo#499\):'
+assert_matches "the block says the justification moved HERE, not elsewhere" \
+    "$SELF_FLAT" 'moved the justification HERE'
+assert_matches "the block says handoff.md keeps every rule's operative sentence" \
+    "$SELF_FLAT" 'handoff\.md keeps the operative sentence of every rule'
+assert_matches "the block says moving a behavioural sentence out unguards it" \
+    "$SELF_FLAT" "behavioural sentence OUT of handoff\\.md silently unguards it"
+assert_matches "the block says operative sentences stay in the command" \
+    "$SELF_FLAT" "keep each rule's operative sentence in the command, and only the \"why\" here"
+
+# ---------------------------------------------------------------------------
 # 5. The predicates are not re-invented -- and that is ENFORCED, not asserted
 #
 # The first revision of this file pinned the function name, the install path
@@ -303,8 +335,11 @@ assert_contains "both predicates are labelled, so neither can quietly vanish" \
 assert_contains "the coexistence predicate is labelled 2b" "$PRE_SECTION" "2b."
 assert_matches "2b is declared mandatory, not an optional extra" "$PRE_FLAT" \
     '2b is not optional'
+# NOT a bare 'satisfied reader' (repo#503): the phrase survives "A 2b match is
+# NOT a satisfied reader", which is the false-block regression this section
+# exists to stop. Demand the subject and the verdict together.
 assert_matches "a foreign-pathed hook is a satisfied reader, not a failure" "$PRE_FLAT" \
-    'satisfied reader'
+    '2b match is a[[:space:]]*\*{0,2}satisfied reader'
 assert_matches "the preflight continues past 2b rather than stopping" "$PRE_FLAT" \
     'report the foreign path as \*{0,2}information\*{0,2} and[[:space:]]*continue'
 # The repair table is the other place a revert would show: a 2b pass must not
@@ -328,7 +363,7 @@ assert_matches "check 3 names the foreign path as what it redirects to" "$PRE_FL
 # ---------------------------------------------------------------------------
 echo
 echo "-- 6. why settings.json alone is not enough --"
-SELF_HEADER="$(sed -n '1,/^set -uo pipefail/p' "${BASH_SOURCE[0]}")"
+# SELF_HEADER is defined in 4c above (set -u forbids a forward reference).
 # NOT 'TRACKS[[:space:]]*$' -- that alternative matched any line merely ENDING
 # in the word, which a gutted header still does. Require the actual pairing.
 assert_matches "the tracked-settings / gitignored-skills split is recorded" "$SELF_HEADER" \
@@ -346,8 +381,19 @@ assert_not_contains "no unsupported frequency claim about consumers" \
 # ---------------------------------------------------------------------------
 echo
 echo "-- 7. failure reporting --"
-assert_matches "stops on failure" "$PRE_SECTION" '[Ss]top|STOP'
-assert_contains "repair: re-run install.sh" "$PRE_SECTION" "install.sh"
+# NOT '[Ss]top|STOP' or a bare "install.sh" (repo#503): the section says
+# "stop" and "install.sh" in a dozen places, so both pins survived rewriting
+# the rule around them -- "on a blocking failure, continue", or every repair
+# cell sent to "By hand". Demand the verdict: what happens on failure, and
+# which rows install.sh is the repair FOR.
+assert_matches "stops on failure" "$PRE_FLAT" \
+    '[Oo]n a blocking failure,[[:space:]]*stop and report which check failed'
+assert_matches "repair: re-run install.sh for a missing/non-executable script" "$PRE_FLAT" \
+    'not executable \| `install\.sh` re-copies it'
+assert_matches "repair: re-run install.sh when neither 2a nor 2b is wired" "$PRE_FLAT" \
+    '2a and 2b both fail\) \| `install\.sh` merges it'
+assert_matches "repair: 'install.sh' in the table means re-running the installer" "$PRE_FLAT" \
+    '`install\.sh` in that table means re-running'
 assert_contains "repair: /repo:update-tools for a stale script" "$PRE_SECTION" \
     "/repo:update-tools"
 # install.sh copies ONLY to .claude/skills/repo/hooks/ and, on a 2b match,
@@ -460,7 +506,11 @@ assert_contains "mentions REPO_HANDOFF_SIBLING_ROOT" "$PRE_SECTION" \
     "REPO_HANDOFF_SIBLING_ROOT"
 assert_matches "the advisories are explicitly non-blocking" "$PRE_SECTION" \
     'never block|advisory|non-blocking'
-assert_matches "--dry-run still runs the preflight" "$PRE_SECTION" '\-\-dry-run'
+# NOT a bare '\-\-dry-run' (repo#503): the flag is named in the section either
+# way, so the pin survived "Under --dry-run, skip every check". Demand the
+# verdict -- the checks still run, for real.
+assert_matches "--dry-run still runs the preflight" "$PRE_FLAT" \
+    'Under `--dry-run`, run every check for real'
 # The gitignore check auto-fixes (it is the archetypal safe fix, and step 4
 # would have done it anyway) -- but --dry-run's contract is that the run
 # writes nothing, so the auto-fix must be suppressed there (repo#494 review).
