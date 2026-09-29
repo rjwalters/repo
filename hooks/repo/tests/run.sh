@@ -41,8 +41,9 @@
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
 # commands/repo/tests/test-assert-matches-sigpipe.sh,
-# commands/repo/tests/test-deps-security-updates-paused.sh, and
-# commands/repo/tests/test-handoff-preflight.sh.
+# commands/repo/tests/test-deps-security-updates-paused.sh,
+# commands/repo/tests/test-handoff-preflight.sh, and
+# commands/repo/tests/test_optimize_ci.py.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1627,6 +1628,28 @@ fi
 PASS=$((PASS + OP_PASS)); FAIL=$((FAIL + OP_FAIL))
 record_suite "test_org_policy.py" "$OP_PASS" "$OP_FAIL" "canonical policy and GitHub publication"
 printf '  organization policy: %s passed, %s failed\n' "$OP_PASS" "$OP_FAIL"
+
+# /repo:optimize-ci's deterministic helper (scripts/repo/repo-optimize-ci.py,
+# #505): workflow YAML reader, required-check safety, cache/concurrency/
+# under-filter detection, and history-based ranking — fixture workflows plus an
+# in-memory GitHub double, so no network. Same fold-in shape as the policy suite.
+echo
+echo "-- CI optimization audit (delegated suite) --"
+OC_TEST="$TESTS_DIR/../../../commands/repo/tests/test_optimize_ci.py"
+OC_OUT="$(python3 "$OC_TEST" 2>&1)"
+OC_STATUS=$?
+OC_PASS="$(suite_count Passed "$OC_OUT")"
+OC_FAIL="$(suite_count Failed "$OC_OUT")"
+if ! [[ "$OC_PASS" =~ ^[0-9]+$ && "$OC_FAIL" =~ ^[0-9]+$ ]]; then
+    OC_PASS=0; OC_FAIL=1
+fi
+if [[ "$OC_STATUS" -ne 0 || "$OC_FAIL" -ne 0 ]]; then
+    [[ "$OC_FAIL" -eq 0 ]] && OC_FAIL=1
+    printf '%s\n' "$OC_OUT" | tail -40
+fi
+PASS=$((PASS + OC_PASS)); FAIL=$((FAIL + OC_FAIL))
+record_suite "test_optimize_ci.py" "$OC_PASS" "$OC_FAIL" "optimize-ci workflow audit"
+printf '  optimize-ci: %s passed, %s failed\n' "$OC_PASS" "$OC_FAIL"
 echo
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}

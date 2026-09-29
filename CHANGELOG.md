@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **New `/repo:optimize-ci`: audit GitHub Actions for wasted CI minutes (#505).** A report-first audit, shaped like `/repo:deps`, of the three ways CI burns runner time: no change-relevance filtering (and the opposite hazard — a `paths:` filter that omits a lockfile, the workflow file, or a local action, letting a breaking change merge green), weak caching (no toolchain cache, keys containing `github.sha`/`github.run_id` that never hit, keys with no lockfile hash that never invalidate, missing `restore-keys`, matrix jobs sharing one key), and superseded runs (missing `concurrency`/`cancel-in-progress`, duplicate `push` + `pull_request` triggers). It reads required status checks from classic protection **and** rulesets and never recommends a workflow-level `paths:` filter on a workflow containing a required check — a skipped workflow reports no status and blocks the PR forever — recommending a job-level `dorny/paths-filter` + always-running gate instead, and it never recommends cancelling default-branch runs. Findings are ranked by minutes saved measured from recent Actions history (docs-only PR runs, superseded PR runs, duplicate push runs), degrading to "not measured" when history is unreadable. Default and `--check` never write; `--apply` confirms the diff, works on a branch, and opens a PR; `--all-repos` is a read-only org survey ranked by wasted minutes. The deterministic half is `scripts/repo/repo-optimize-ci.py` (stdlib only, with a built-in workflow-YAML reader verified identical to PyYAML across 414 real workflow files), installed to `.claude/skills/repo/scripts/` and covered by `commands/repo/tests/test_optimize_ci.py`.
+
 ## 0.12.2 (2026-09-22)
 
 - Add `/repo:org-policy`: preview canonical preferences from `rjwalters/repo/policies/`

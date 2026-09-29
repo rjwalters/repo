@@ -23,6 +23,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:host-optimize` | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | `/repo:deps` | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
+| `/repo:optimize-ci` | Audit GitHub Actions for wasted CI minutes — change-relevance path filtering (required-check safe), cache keys, superseded runs; ranked by measured savings, report-only unless `--apply` |
 | `/repo:org-policy` | Preview or deploy canonical rjwalters/repo preferences to the client's GitHub owner/.github repository through a policy PR |
 | `/repo:decide` | Put operator decisions to the operator as ranked options — best to worst, each with why — so they can answer with a number |
 | `/repo:followups` | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
@@ -179,6 +180,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/repo-scrub-forks.sh` — the `/repo:scrub --forks` fork-network sweep. Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/repo-optimize-ci.py` — the `/repo:optimize-ci` workflow audit (read-only GitHub calls). Same colocation, removed with the skill dir on uninstall
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
@@ -202,6 +204,7 @@ commands/repo/*.md           Command files installed to .claude/commands/repo/ a
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
+scripts/repo/repo-optimize-ci.py  /repo:optimize-ci workflow audit, installed to the same place
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
 hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inline smoke cases
