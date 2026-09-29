@@ -536,16 +536,21 @@ def finding(fid, severity, category, wf, message, recommendation, job=None, meas
             "measure": measure, "estMinutesSaved": None}
 
 
-def analyze(workflows, root_files, required, default_branch="main"):
-    """Static findings. `required` is a list of contexts, or None for unknown."""
+def analyze(workflows, root_files, required, default_branch="main", partial=False):
+    """Static findings. `required` is a list of contexts, or None for unknown.
+
+    `partial` means `required` came from only some sources (another was
+    unreadable): a workflow matching none of them may still be required.
+    """
     findings = []
-    required_known = required is not None
+    required_known = required is not None and not partial
     for wf in workflows:
         if wf.error:
             findings.append(finding("unparseable-workflow", "low", "meta", wf,
                                     f"could not parse ({wf.error}); not audited",
-                                    "Validate the YAML (GitHub rejects an invalid workflow file "
-                                    "outright, so it may not be running at all), then audit by hand."))
+                                    "The built-in reader could not parse it (YAML anchors/aliases "
+                                    "are unsupported). Check that GitHub accepts the file (an "
+                                    "invalid workflow never runs), then audit it by hand."))
             continue
         findings += _path_findings(wf, root_files, required, required_known)
         findings += _cache_findings(wf)
@@ -585,12 +590,21 @@ def _path_findings(wf, root_files, required, required_known):
             "are REQUIRED status checks — a PR that touches none of the paths never gets that "
             "status and is blocked forever",
             "Remove the workflow-level `paths:`/`paths-ignore:`. " + JOB_LEVEL_FILTER))
+    elif wf_filtered and not required_known:
+        out.append(finding(
+            "unverified-required-check-paths", "medium", "required-check", wf,
+            f"workflow-level `{wf_filtered[0]}` path filter, but required checks could not be "
+            "(fully) read — if any job here is a required check, a PR that touches none of the "
+            "paths never gets that status and is blocked forever",
+            "Verify in the branch protection / ruleset settings that no job in this workflow is a "
+            "required check. If one is, remove the workflow-level `paths:`/`paths-ignore:`. "
+            + JOB_LEVEL_FILTER))
 
     # Change relevance: PR-triggered, no filter at any level.
     if wf.pr_events and not wf_filtered and not wf.uses_job_level_filter() and wf.jobs:
         if req_jobs or not required_known:
             why = ("contains required check(s) " + ", ".join(f"`{j}`" for j in req_jobs)
-                   if req_jobs else "required checks could not be read, so assume it may be required")
+                   if req_jobs else "required checks could not be (fully) read, so assume it may be required")
             rec = f"Workflow {why}: do NOT add workflow-level `paths:`. " + JOB_LEVEL_FILTER
         else:
             rec = ("No job here is a required check, so a workflow-level filter is safe. Add "
@@ -824,25 +838,53 @@ def origin_repo():
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
+def _check_contexts(data):
+    found = list(data.get("contexts") or []) + [c.get("context") for c in data.get("checks") or []]
+    return [c for c in found if c]
+
+
+def _classic_required(gh, repo, branch):
+    """Classic branch-protection required contexts as (source_state, contexts).
+
+    `repos/O/R/branches/<b>` exposes `protected` and
+    `protection.required_status_checks` to anyone with read access, so it is the
+    primary source. The dedicated protection endpoint answers 404 to every
+    non-admin token even when checks ARE required, so its 404 means "none" only
+    when the branch itself reports `protected: false`; otherwise it is unknown.
+    """
+    protected = None
+    try:
+        info = gh.api(f"repos/{repo}/branches/{branch}") or {}
+        protected = info.get("protected")
+        if protected is False:
+            return "none", []
+        rsc = (info.get("protection") or {}).get("required_status_checks")
+        if isinstance(rsc, dict) and ("contexts" in rsc or "checks" in rsc):
+            found = _check_contexts(rsc)
+            return ("read" if found else "none"), found
+    except ApiError:
+        pass
+    try:
+        found = _check_contexts(gh.api(f"repos/{repo}/branches/{branch}/protection/required_status_checks") or {})
+        return "read", found
+    except ApiError as exc:
+        why = ("branch is protected but its checks are unreadable" if protected
+               else "branch protection status unreadable")
+        return f"unknown ({exc.status or 'error'}: {why})", []
+
+
 def required_checks(gh, repo, branch):
     """Union of classic-protection and ruleset required contexts.
 
-    Returns {"state": known|unknown, "contexts": [...], "sources": {...}}.
-    A 404 means "none configured" for that source; anything else is unknown —
-    an unreadable source must never be reported as "no required checks".
+    Returns {"state": known|unknown, "partial": bool, "contexts": [...], "sources": {...}}.
+    An unreadable source is never reported as "no required checks": with no
+    contexts from any source the state is unknown; with contexts from one source
+    but another unreadable, `partial` is set and callers must treat any workflow
+    matching none of the known contexts as possibly required.
     """
-    contexts, sources, unknown = [], {}, False
-    try:
-        data = gh.api(f"repos/{repo}/branches/{branch}/protection/required_status_checks") or {}
-        found = list(data.get("contexts") or []) + [c.get("context") for c in data.get("checks") or []]
-        contexts += [c for c in found if c]
-        sources["classic"] = "read"
-    except ApiError as exc:
-        if exc.status == 404:
-            sources["classic"] = "none"
-        else:
-            sources["classic"] = f"unknown ({exc.status or 'error'})"
-            unknown = True
+    sources = {}
+    sources["classic"], contexts = _classic_required(gh, repo, branch)
+    unknown = sources["classic"].startswith("unknown")
     try:
         for rule in gh.api(f"repos/{repo}/rules/branches/{branch}") or []:
             if rule.get("type") == "required_status_checks":
@@ -1053,7 +1095,8 @@ def render_text(report):
                      + ") — treating every PR workflow as possibly required")
     elif rc["contexts"]:
         lines.append("Required checks: " + ", ".join(f"`{c}`" for c in rc["contexts"])
-                     + (" (partial — a source was unreadable)" if rc.get("partial") else ""))
+                     + (" (partial — a source was unreadable; workflows matching none of these are "
+                        "treated as possibly required)" if rc.get("partial") else ""))
     else:
         lines.append("Required checks: none configured")
     h = report["history"]
@@ -1115,7 +1158,7 @@ def run_report(args, gh=None):
         workflows, root_files = load_local(args.root), local_root_files(args.root)
     req = required_checks(gh, repo, branch)
     required = None if req["state"] == "unknown" else req["contexts"]
-    findings = analyze(workflows, root_files, required, branch)
+    findings = analyze(workflows, root_files, required, branch, partial=bool(req.get("partial")))
     history_info = {"state": "not measured", "reason": "--no-history"}
     if not args.no_history and workflows:
         try:

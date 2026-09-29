@@ -72,11 +72,20 @@ python3 .claude/skills/repo/scripts/repo-optimize-ci.py report --json
 `report` reads the local checkout's workflows, then (read-only):
 
 - **Required status checks** for the default branch — the union of classic
-  branch protection (`repos/O/R/branches/<default>/protection/required_status_checks`)
-  and every ruleset that applies to the branch (`repos/O/R/rules/branches/<default>`,
-  which includes org-level rulesets). A 404 from a source means "none
-  configured"; a 403 or any other failure makes `requiredChecks.state`
-  `unknown` — never report an unreadable source as "no required checks".
+  branch protection and every ruleset that applies to the branch
+  (`repos/O/R/rules/branches/<default>`, which includes org-level rulesets).
+  Classic checks come from `repos/O/R/branches/<default>`, whose `protected`
+  flag and `protection.required_status_checks` are visible with read access.
+  The dedicated `.../protection/required_status_checks` endpoint is only a
+  fallback: it answers **404 to every non-admin token even when checks are
+  required**, so its 404 means "none" only when the branch reports
+  `protected: false`; on a protected (or unreadable) branch it is `unknown`.
+  With no readable source, `requiredChecks.state` is `unknown` — never report an
+  unreadable source as "no required checks". When one source returned checks
+  but another was unreadable, `requiredChecks.partial` is `true`: any workflow
+  matching none of the known checks is still treated as possibly required
+  (job-level filter only), and an existing workflow-level PR `paths:` filter
+  gets an `unverified-required-check-paths` warning to verify by hand.
 - **Run history** over the last 30 days (`--days`, `--runs` to widen): runner
   minutes per workflow and per job (sampled from the jobs API), which PR runs
   changed only documentation files (from each PR's file list), which PR runs
@@ -123,7 +132,7 @@ of its jobs is a required status check, every PR that touches none of those
 paths is blocked forever waiting for a status that will never arrive.
 
 So: **never recommend workflow-level `paths:` on a workflow that contains a
-required check — or when required checks could not be read.** Recommend the
+required check — or when required checks could not be (fully) read.** Recommend the
 job-level pattern instead:
 
 ```yaml

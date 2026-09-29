@@ -198,7 +198,7 @@ class RequiredCheckSafetyTests(unittest.TestCase):
     def test_unknown_required_checks_are_treated_as_possibly_required(self):
         report = scan({"ci.yml": node_workflow()}, required_unknown=True)
         f = only(report, "unfiltered-pr-workflow")
-        self.assertIn("could not be read", f["recommendation"])
+        self.assertIn("could not be (fully) read", f["recommendation"])
         self.assert_no_workflow_level_paths_recommended(report)
 
     def test_no_required_checks_allows_workflow_level_ignore(self):
@@ -445,12 +445,76 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(info["state"], "known")
         self.assertEqual(info["contexts"], ["a", "b", "c"])
 
-    def test_unreadable_protection_is_unknown_not_none(self):
+    def test_protected_branch_with_protection_404_is_unknown_not_none(self):
+        # GitHub answers 404 on the protection endpoint to every non-admin token,
+        # even when checks are required (cli/cli, microsoft/vscode, rust-lang/rust).
         info = oc.required_checks(FakeGitHub({
-            "repos/o/r/branches/main/protection": 403, "repos/o/r/rules/branches/main": []}), "o/r", "main")
+            "repos/o/r/branches/main": {"protected": True},
+            "repos/o/r/branches/main/protection": 404,
+            "repos/o/r/rules/branches/main": []}), "o/r", "main")
         self.assertEqual(info["state"], "unknown")
+        self.assertTrue(info["sources"]["classic"].startswith("unknown (404"))
+        # Branch endpoint unreadable too: a protection 404 still proves nothing.
         info = oc.required_checks(FakeGitHub({"repos/o/r/rules/branches/main": []}), "o/r", "main")
+        self.assertEqual(info["state"], "unknown")
+        # Only an explicitly unprotected branch makes the 404 mean "none".
+        info = oc.required_checks(FakeGitHub({
+            "repos/o/r/branches/main": {"protected": False},
+            "repos/o/r/branches/main/protection": 404,
+            "repos/o/r/rules/branches/main": []}), "o/r", "main")
         self.assertEqual((info["state"], info["contexts"]), ("known", []))
+        info = oc.required_checks(FakeGitHub({
+            "repos/o/r/branches/main": 403, "repos/o/r/rules/branches/main": []}), "o/r", "main")
+        self.assertEqual(info["state"], "unknown")
+
+    def test_required_checks_read_from_branch_endpoint_without_admin(self):
+        gh = FakeGitHub({
+            "repos/o/r/branches/main": {"protected": True, "protection": {
+                "enabled": True, "required_status_checks": {
+                    "enforcement_level": "non_admins",
+                    "contexts": ["build (ubuntu-latest)"],
+                    "checks": [{"context": "build (macos-latest)", "app_id": None}]}}},
+            "repos/o/r/branches/main/protection": 404,
+            "repos/o/r/rules/branches/main": []})
+        info = oc.required_checks(gh, "o/r", "main")
+        self.assertEqual(info["state"], "known")
+        self.assertFalse(info["partial"])
+        self.assertEqual(info["contexts"], ["build (macos-latest)", "build (ubuntu-latest)"])
+        self.assertEqual(info["sources"]["classic"], "read")
+        self.assertNotIn("repos/o/r/branches/main/protection/required_status_checks", gh.calls)
+        # Protected, but classic protection requires no checks: none, not unknown.
+        info = oc.required_checks(FakeGitHub({
+            "repos/o/r/branches/main": {"protected": True, "protection": {
+                "enabled": True, "required_status_checks": {
+                    "enforcement_level": "off", "contexts": [], "checks": []}}},
+            "repos/o/r/rules/branches/main": []}), "o/r", "main")
+        self.assertEqual((info["state"], info["sources"]["classic"]), ("known", "none"))
+        # End to end, a required matrix job keeps the job-level recommendation.
+        wf = node_workflow().replace("name: unit tests", "name: build")
+        report, _ = self.report({
+            "repos/o/r/branches/main": {"protected": True, "protection": {
+                "required_status_checks": {"contexts": ["build (ubuntu-latest)"]}}},
+            "repos/o/r/rules": [], "repos/o/r/actions": 403}, {"ci.yml": wf})
+        f = only(report, "unfiltered-pr-workflow")
+        self.assertIn("contains required check(s) `test`", f["recommendation"])
+        self.assertNotIn("a workflow-level filter is safe", f["recommendation"])
+        self.assertNotIn("none configured", oc.render_text(report))
+
+    def test_partial_read_gives_unmatched_workflows_the_job_level_recommendation(self):
+        routes = {"repos/o/r/branches/main": {"protected": True, "protection": {
+                      "required_status_checks": {"contexts": ["lint"]}}},
+                  "repos/o/r/rules": 403, "repos/o/r/actions": 403}
+        report, _ = self.report(routes, {"ci.yml": node_workflow()})
+        rc = report["requiredChecks"]
+        self.assertEqual((rc["state"], rc["partial"], rc["contexts"]), ("known", True, ["lint"]))
+        f = only(report, "unfiltered-pr-workflow")
+        self.assertIn("could not be (fully) read", f["recommendation"])
+        self.assertIn("dorny/paths-filter", f["recommendation"])
+        self.assertNotIn("a workflow-level filter is safe", f["recommendation"])
+        # An existing workflow-level filter gets a verify warning on a partial read.
+        report, _ = self.report(routes, {"ci.yml": node_workflow(
+            ["src/**", "package-lock.json", "package.json", ".github/workflows/ci.yml"])})
+        self.assertEqual(only(report, "unverified-required-check-paths")["severity"], "medium")
 
     def test_history_unavailable_degrades_to_not_measured(self):
         report, gh = self.report({"repos/o/r/actions": 403, "repos/o/r/rules": []},
