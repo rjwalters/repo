@@ -34,6 +34,13 @@ REMOTE_MD="$REPO_ROOT/commands/repo/remote.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+ . 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed â see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 if [[ ! -f "$RR" ]]; then
     echo "FATAL: repo-remote.sh not found at $RR" >&2
@@ -62,7 +69,7 @@ XDG="$FIX/xdg"
 REPO="$FIX/myrepo"
 SHARED="$XDG/repo/remote.env"
 mkdir -p "$XDG/repo" "$REPO"
-git -C "$REPO" init -q
+git_fixture_init "$REPO"
 
 write_shared() { mkdir -p "$XDG/repo"; printf '%s\n' "$@" >"$SHARED"; }
 write_repo_env() { printf '%s\n' "$@" >"$REPO/.env"; }

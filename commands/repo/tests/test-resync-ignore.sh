@@ -50,6 +50,13 @@ IGNORE_REL=".claude/skills/repo/resync-ignore"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+ . 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed â see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 for f in "$RESYNC_SRC" "$IGNORE_LIB" "$REPO_ROOT/install.sh"; do
     if [[ ! -f "$f" ]]; then
@@ -79,13 +86,13 @@ new_source() {  # <dir> — build a Repo Skills source clone at <dir>
     cp "$REPO_ROOT"/hooks/repo/*.sh "$dir/hooks/repo/"
     cp "$REPO_ROOT"/scripts/repo/*.sh "$REPO_ROOT"/scripts/repo/*.py "$dir/scripts/repo/"
     chmod +x "$dir/install.sh" "$dir/uninstall.sh" "$dir"/scripts/repo/*.sh "$dir"/scripts/repo/*.py
-    git -C "$dir" init -q
+    git_fixture_init "$dir"
     git -C "$dir" add -A >/dev/null 2>&1
     git -C "$dir" -c user.email=t@example.com -c user.name=Test \
         commit -qm "fixture" >/dev/null 2>&1
 }
 
-new_target() { mkdir -p "$1"; git -C "$1" init -q; }
+new_target() { mkdir -p "$1"; git_fixture_init "$1"; }
 
 IN_OUT=""; IN_RC=0
 do_install() {  # <source> <target> [extra install.sh args...]

@@ -223,15 +223,28 @@ echo "-- adoption drift: no suite under commands/repo/tests/ builds a raw fixtur
 # Two files are exempt: lib/git-fixture.sh (it IS the wrapper) and this file
 # (its CONTROL cases must build un-hardened fixtures on purpose, to prove the
 # simulated leak still leaks).
+#
+# The regex must cover BOTH spellings of a raw init, because both are in
+# everyday use in this directory and they leak identically:
+#
+#     git init -q "$dir"          # token-adjacent
+#     git -C "$dir" init -q       # -C <path> before the subcommand
+#
+# The original guard matched only the first, so ten already-present suites
+# using the second spelling were neither adopted nor flagged — the guard
+# passed while its own assertion label was false (repo#518 review). Matching
+# only `git … init` (one optional `-C <path>` pair) keeps it targeted: the
+# point is to catch a fixture BUILDER, and every raw builder here is one of
+# those two shapes.
 RAW_INIT="$(
-    grep -rn -E '(^|[;&|(]|[[:space:]])git init([[:space:]]|$)' "$TESTS_DIR" \
+    grep -rn -E '(^|[;&|(]|[[:space:]])git[[:space:]]+(-C[[:space:]]+[^[:space:]]+[[:space:]]+)?init([[:space:]]|$)' "$TESTS_DIR" \
         --include='*.sh' 2>/dev/null \
         | grep -v '/lib/git-fixture\.sh:' \
         | grep -v '/test-git-fixture-hermeticity\.sh:' \
         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
         || true
 )"
-assert_eq "every fixture-building suite here goes through git_fixture_init" "" "$RAW_INIT"
+assert_eq "every fixture-building suite here goes through git_fixture_init (both \`git init\` and \`git -C <path> init\` spellings)" "" "$RAW_INIT"
 
 # ---------------------------------------------------------------------------
 echo ""

@@ -155,6 +155,13 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # ---------------------------------------------------------------------------
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+ . 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed â see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 assert_guard_defines() {  # <label> <ere>  -- grep the guard source file directly
     # Greps the FILE, not a `printf "$GUARD_SRC" | grep -q` pipeline: under
@@ -463,7 +470,7 @@ fi
 # the rm guard still fails closed. If these two ever agree, the note is wrong.
 NOWT_REPO="$SCRATCH/no-worktrees"
 mkdir -p "$NOWT_REPO"
-git -C "$NOWT_REPO" init -q
+git_fixture_init "$NOWT_REPO"
 
 assert_decision "zero managed worktrees: sudo cp \"\$TMP\" \"\$DROPIN\" runs (write fails open)" \
     "allow" "$NOWT_REPO" 'sudo cp "$TMP" "$DROPIN"'
@@ -479,7 +486,7 @@ assert_decision "zero managed worktrees: rm -f \"\$TMP\" STILL denied (config-on
 # "keyed to whether any managed worktree exists" are both untested.
 WT_REPO="$SCRATCH/with-worktree"
 mkdir -p "$WT_REPO/.loom/worktrees/issue-1"
-git -C "$WT_REPO" init -q
+git_fixture_init "$WT_REPO"
 : > "$WT_REPO/.loom/worktrees/issue-1/.loom-managed"
 
 assert_decision "managed worktree present: sudo cp \"\$TMP\" \"\$DROPIN\" denied (write fails closed)" \
@@ -492,7 +499,7 @@ assert_decision "managed worktree present: { ... } > \"\$TMP\" denied (write fai
 # escape hatch is theirs to pull, so it has to keep working.
 OFF_REPO="$SCRATCH/rmscope-off"
 mkdir -p "$OFF_REPO/.claude/skills/repo"
-git -C "$OFF_REPO" init -q
+git_fixture_init "$OFF_REPO"
 printf '{"guards":{"rmScope":"off"}}\n' > "$OFF_REPO/.claude/skills/repo/config.json"
 
 assert_decision "guards.rmScope=off (config): sudo rm -f \"\$DROPIN\" allowed" \

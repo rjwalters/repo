@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Shared git-fixture hermeticity helpers for the repo test suites.
 #
-# WHY THIS FILE EXISTS (repo#518): several suites under commands/repo/tests/
-# and hooks/repo/tests/ build throwaway git repos (`mktemp -d` + `git init`)
-# and then assert on what those fixture commits look like. Those fixtures are
+# WHY THIS FILE EXISTS (repo#518): many suites build throwaway git repos
+# (`mktemp -d` + `git init`) and then assert on what those fixture commits
+# look like. Those fixtures are
 # only hermetic if the *outer* environment cannot reach into them — and under a
 # Loom-dispatched agent session it can:
 #
@@ -46,7 +46,13 @@
 #   git_fixture_scrub_env                 # once, near the top of the suite
 #   git_fixture_init "$SCRATCH/case1" -b main
 #
-# Usage (from hooks/repo/tests/):
+# ADOPTION STATUS — do not read this file as a claim of repo-wide coverage.
+# Every fixture-building suite under commands/repo/tests/ is adopted, and
+# test-git-fixture-hermeticity.sh's drift case mechanically enforces that it
+# stays that way (it greps for both raw spellings, `git init …` and
+# `git -C <path> init …`). Suites under hooks/repo/tests/ are NOT adopted and
+# are NOT covered by that drift case — tracked separately as repo#524. They
+# can source the helper the same way when that lands:
 #   source "$(dirname "${BASH_SOURCE[0]}")/../../../commands/repo/tests/lib/git-fixture.sh"
 #
 # This file defines functions only — it does not mutate the environment when

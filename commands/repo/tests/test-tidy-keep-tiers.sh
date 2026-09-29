@@ -52,6 +52,13 @@ TIDY_MD="$CMD_DIR/tidy.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+ . 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed â see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 if [[ ! -f "$TIDY_MD" ]]; then
     echo "FATAL: tidy.md not found at $TIDY_MD" >&2
@@ -182,7 +189,7 @@ mkrepo() {  # <name> <path>...
     local name="$1"; shift
     local r="$SCRATCH/$name"
     mkdir -p "$r"
-    git -C "$r" init -q
+    git_fixture_init "$r"
     git -C "$r" config user.email t@example.com
     git -C "$r" config user.name Test
     local p
