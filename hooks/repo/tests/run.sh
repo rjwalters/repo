@@ -36,6 +36,7 @@
 # commands/repo/tests/test-changelog-merged-work-check.sh,
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
 # commands/repo/tests/test-followups-scrub-step.sh,
+# commands/repo/tests/test-followups-dedup-step.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
@@ -1358,6 +1359,43 @@ else
     PASS=$((PASS + FS_PASS))
     FAIL=$((FAIL + FS_FAIL))
     record_suite "test-followups-scrub-step.sh" "$FS_PASS" "$FS_FAIL" "followups pre-filing scrub step"
+fi
+
+# /repo:followups' dedup match-type contract (repo#515): step 3's search returns
+# pull requests as well as issues on purpose (repo#102/#121), so the match TYPE
+# has to be visible in the output — a hand-rolled `#number title` query dropped
+# it, a PR was reported as a duplicate issue, and `gh issue close` silently
+# closed an approved PR. Prose contract, same delegation shape as every suite
+# above.
+echo
+echo "-- followups dedup match-type contract (delegated suite) --"
+FD_TEST="$TESTS_DIR/../../../commands/repo/tests/test-followups-dedup-step.sh"
+if [[ ! -f "$FD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-followups-dedup-step.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-followups-dedup-step.sh" "$FD_TEST"
+else
+    FD_OUT="$(bash "$FD_TEST" 2>&1)"
+    FD_STATUS=$?
+    FD_PASS="$(suite_count Passed "$FD_OUT")"
+    FD_FAIL="$(suite_count Failed "$FD_OUT")"
+    if ! [[ "$FD_PASS" =~ ^[0-9]+$ && "$FD_FAIL" =~ ^[0-9]+$ ]]; then
+        FD_PASS=0
+        FD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-followups-dedup-step.sh" "$FD_STATUS"
+        strip_ansi "$FD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$FD_STATUS" -ne 0 || "$FD_FAIL" -ne 0 ]]; then
+        [[ "$FD_FAIL" -eq 0 ]] && FD_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-followups-dedup-step.sh" "$FD_PASS" "$FD_FAIL" "$FD_STATUS"
+        strip_ansi "$FD_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-followups-dedup-step.sh" "$FD_PASS"
+    fi
+    PASS=$((PASS + FD_PASS))
+    FAIL=$((FAIL + FD_FAIL))
+    record_suite "test-followups-dedup-step.sh" "$FD_PASS" "$FD_FAIL" "followups dedup match-type contract"
 fi
 
 # /repo:all's ownership of Audit-surfaced orphaned files (repo#301): a tracked,
