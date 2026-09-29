@@ -200,8 +200,8 @@ git -C <source> show origin/HEAD:VERSION 2>/dev/null
 git -C <source> log --oneline <installed-commit>..origin/HEAD | wc -l
 ```
 
-**Record two numbers per non-dev tool, not one — version drift AND commit
-drift — plus, for a tool that records per-component versions, its
+**Record three numbers per non-dev tool, not one — version drift, commit
+drift, and (for a tool that records per-component versions) its
 frozen-component count (step 1).** Version equality alone systematically
 under-reports staleness: upstream routinely merges a day of work without
 bumping VERSION, so a tool
@@ -209,8 +209,8 @@ whose stamped version equals the VERSION at `origin/HEAD` can still be dozens
 of commits behind the code that will eventually ship under that same version
 number. In a real run that reported two tools `current`, one was 24 and the
 other 7 commits behind, and the misleading `current` stood for a whole working
-day until upstream happened to cut a release (repo#291). So carry both into
-step 3:
+day until upstream happened to cut a release (repo#291). So carry all three
+into step 3:
 
 1. **Version drift** — the metadata's installed `version` vs the VERSION at
    `origin/HEAD` (the comparison already shown above).
