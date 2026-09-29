@@ -155,10 +155,9 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # ---------------------------------------------------------------------------
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
- . 
 # Fixture hermeticity (repo#518): a Loom-dispatched session overrides
 # core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
-# hooks), which fixture repos inherit unless the override is scrubbed â see
+# hooks), which fixture repos inherit unless the override is scrubbed — see
 # lib/git-fixture.sh.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
 git_fixture_scrub_env
