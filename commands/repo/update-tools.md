@@ -304,7 +304,6 @@ TOOL PACKAGES
 | Tool        | Installed        | Latest  | Status      |
 |-------------|------------------|---------|-------------|
 | loom        | 0.9.1 (Jun 4)    | 0.10.6  | STALE       |
-| anvil       | 0.9.0 (Jul 1)    | 0.9.0   | current     |
 | anvil       | 0.11.6 (Jul 1)   | 0.11.6  | current, but 14 skill(s) frozen behind (memo 0.10.1, deck 0.10.1, …) |
 | other-tool  | 1.2.0 (commit abc1234) | 1.2.0 | current, but 24 commits behind source HEAD |
 | repo-skills | 0.8.0 (Aug 9)    | —       | dev (symlinked to /Users/you/GitHub/repo) |
@@ -319,7 +318,8 @@ recorded, in this precedence order:
 | Version vs `origin/HEAD` | Frozen components (step 2.3) | Installed commit vs `origin/HEAD` | Status |
 |--------------------------|------------------------------|-----------------------------------|--------|
 | behind | not consulted | not consulted — version drift already decides it | `STALE` |
-| equal | N > 0 | not consulted | `current, but N skill(s) frozen behind (<name> <ver>, …)` |
+| equal | N > 0 | M > 0 commits behind (still computed) | `current, but N skill(s) frozen behind (<name> <ver>, …); also M commits behind source HEAD` |
+| equal | N > 0 | 0 or not computable | `current, but N skill(s) frozen behind (<name> <ver>, …)` |
 | equal | 0 | 0 commits behind | `current` |
 | equal | 0 | N > 0 commits behind | `current, but N commits behind source HEAD` |
 | equal | 0 | not computable (step 2) | `current (commit drift unknown — <why>)` |
@@ -425,13 +425,13 @@ report the trade-off instead of quietly escalating.** A skill lands in
 `skipped_overrides` precisely because the consumer edited it; the installer's
 default is to preserve that edit, and re-running the installer without
 `--force` skips it again and reports the identical status next pass. Only
-`install-anvil.sh --force <this-repo>` overwrites it — and `--force` is
+`<source>/scripts/install-anvil.sh --force <this-repo>` overwrites it — and `--force` is
 **global, not per-skill**: it overwrites *every* consumer-modified skill body
 plus the lib override assets, with no undo. So for a tool reported
 `current, but N skill(s) frozen behind`:
 
-- Offer the plain (non-`--force`) re-run as usual if it also has version or
-  commit drift — that still upgrades the unmodified components, and leaves the
+- Offer the plain (non-`--force`) re-run only if the status line also
+  reports commit drift (`; also M commits behind source HEAD`) — that still upgrades the unmodified components, and leaves the
   frozen ones exactly where they were.
 - Never add `--force` on your own initiative, and never treat a frozen count as
   license to escalate. Surface the choice explicitly, with the per-skill frozen
