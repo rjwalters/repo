@@ -3,6 +3,7 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-09-29
+- **Issue #524** (closed): test: hooks/repo/tests fixtures are not hermetic against inherited core.hooksPath (git-fixture.sh header claims they are)
 - **PR #525**: test: remove stray `.` line and mojibake left by the #518 adoption commit
 - **Issue #518** (closed): test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits
 - **PR #523**: test: make git fixtures hermetic against inherited core.hooksPath
