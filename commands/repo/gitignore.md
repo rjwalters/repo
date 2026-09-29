@@ -85,6 +85,35 @@ symlink at that path, because `X/` alone won't re-cover it. This caused a live
 regression: `.lake` + `.lake/` were deduped to `.lake/`, unignoring a `.lake`
 symlink (rjwalters/lean-genius#43683).
 
+**Do not flag a subdirectory rule as redundant with an ancestor's on matching
+pattern text.** A pattern containing a `/` anywhere other than a single trailing
+slash is **anchored** to the directory of the `.gitignore` that declares it
+(`man gitignore`: "If there is a separator at the beginning or middle (or both)
+of the pattern, then the pattern is relative to the directory level of the
+particular `.gitignore` file itself"). Identical text in two `.gitignore` files
+at different depths can therefore cover entirely **disjoint** path sets:
+
+| Pattern in a `.gitignore`       | Anchored to that directory? | Reaches `sub/<name>`? |
+|---------------------------------|:---------------------------:|:---------------------:|
+| `name`, `*.log`, `name/`        | no — matches at every depth | yes                   |
+| `/name`, `dir/name`, `dir/*`    | **yes**                     | **no**                |
+| `**/name`, `dir/**/name`        | no — `**` crosses levels    | yes                   |
+
+So `proofs/.gitignore: .vscode/` is **not** redundant with a root
+`.gitignore: .vscode/*` — the root rule is anchored and never reaches
+`proofs/.vscode/`, so dropping the subdirectory rule un-ignores that whole
+subtree. This command made exactly that recommendation on a live repo (#531);
+only the `git check-ignore` gate below caught it before the commit.
+
+A rule is redundant only when a rule in the **same or an ancestor** `.gitignore`
+matches the same paths *from where that rule sits*. Anchoring is not the only
+way identical text stays load-bearing, either: `.gitignore` precedence resolves
+deepest-file-last, so a subdirectory rule can be re-establishing an ignore that a
+**negation** in an ancestor cancelled — root `*.log` + `!important.log` with
+`sub/.gitignore: *.log` keeps `sub/important.log` ignored, and removing the
+subdirectory copy un-ignores it. Treat the textual redundancy model as a
+*candidate filter only*; the verification below is what decides.
+
 ### 4. Large Untracked Files
 Find untracked files >1 MB that might need a decision:
 - Should they be tracked? (data files, docs)
@@ -98,12 +127,91 @@ For each `.gitignore` file, show:
 - Current rules and what they match
 - Suggested additions or removals
 - Files affected by changes
+- **The ignore-status verification result for every removal or narrowing** — one
+  line per rule, `verified` with the path count or `REFUSED` with the paths that
+  changed, per "Verify a removal changes nothing" below. A removal reported
+  without a verification result is indistinguishable from an unverified guess,
+  so the line is never omitted — including when these fixes come from [[all]]'s
+  Audit stage, whose report inherits this format.
 
 By default, apply the clear-cut rule changes (adding an obvious build-artifact
 ignore, removing a rule that hides real content) and report each edit — gitignore
 changes are fully git-reversible. Leave anything ambiguous, or that would change
 whether a **tracked** file stays tracked, as a reported recommendation. Under
 `--ask`, confirm every edit before writing.
+
+### Verify a removal changes nothing
+
+Removing or narrowing a rule on the strength of the redundancy model alone is not
+allowed — the model reasons about pattern text, and the subtleties above
+(anchoring, trailing-slash semantics, negation precedence) all live in how git
+*resolves* that text. Ask git instead, before and after, and let the answer
+decide whether the edit is applied at all.
+
+Run this from the repository root, with the scratch files **outside** the repo so
+they cannot perturb the very listing being compared:
+
+```bash
+S=$(mktemp -d)
+
+# The population that matters: paths ignored today. Tracked files are unaffected
+# by a .gitignore edit, so the ignored-untracked set is the whole exposure.
+# Scope the pathspec to the subtree the edited .gitignore governs — `-- .` for a
+# root-level rule. Add --directory when a huge ignored tree (node_modules/)
+# makes the full listing unwieldy: it collapses a wholly-ignored directory to one
+# entry, and a directory that stops being wholly ignored still differs, either by
+# vanishing or by expanding into its members.
+ipaths() {
+  git ls-files --others --ignored --exclude-standard -z -- "$1" \
+    | tr '\0' '\n' | sed '/^$/d' | sort
+}
+# Which rule covers each path, in `<file>:<line>:<pattern>\t<path>` form.
+attrib() { ipaths "$1" | git -c core.excludesFile=/dev/null check-ignore -v --stdin; }
+
+ipaths proofs/ > "$S/paths.before"
+attrib proofs/ > "$S/attrib.before"
+
+# ... apply the removal ...
+
+ipaths proofs/ > "$S/paths.after"
+attrib proofs/ > "$S/attrib.after"
+
+diff -u "$S/paths.before" "$S/paths.after"     # MUST be empty
+diff -u "$S/attrib.before" "$S/attrib.after"   # informational — see below
+```
+
+`-c core.excludesFile=/dev/null` keeps a user's global excludes from masking a
+difference the repo's own rules would show, so the result is a property of the
+repo rather than of this machine.
+
+**The path-set diff is the gate.** If it is non-empty — a path un-ignored, or a
+path newly ignored by an over-broad rewrite — **revert the edit and do not count
+it as applied**. Report it as a finding instead, naming the paths that changed and
+the rule that was actually covering them, and leave the rule in place:
+
+```
+proofs/.gitignore: .vscode/ — removal REFUSED: 3 paths would un-ignore
+  (root .vscode/* is anchored to the root and does not reach proofs/.vscode/)
+```
+
+**The attribution diff is not a gate** — it is expected to change on a genuine
+dedupe, because the surviving ancestor rule takes over coverage. Report it so the
+new owner is visible:
+
+```
+sub/.gitignore: *.log — removed, verified: 12 paths unchanged
+  (coverage moved to .gitignore:1:*.log)
+```
+
+This check is necessary, not sufficient: it can only speak for paths that exist
+on disk right now, so a rule covering build output that is not currently present
+passes it trivially. The anchoring and precedence reasoning above still has to
+hold on its own; the gate exists to catch the cases where that reasoning was
+wrong, which is how #531 was caught.
+
+Run the gate per rule, not once per file — a batched `.gitignore` rewrite that
+nets out to an unchanged path set can still have one wrong removal masked by
+another change. Same gate when these fixes are offered from [[all]]'s Audit stage.
 
 ### Verify after write
 
