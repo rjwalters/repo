@@ -27,7 +27,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#518**: test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits
+_None._
 
 ## PRs Awaiting Review
 
@@ -50,7 +50,6 @@ Issues carrying `loom:curated`.
 - **#439**: Worktree-write-confinement: a quoted single-command $( ) substitution writes into the main checkout in both guards *(curated)*
 - **#447**: Upstream the repo#443 single-quoted-span inertness fix to Loom's vendored guard *(curated)*
 - **#454**: Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount *(curated)*
-- **#518**: test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -67,10 +66,10 @@ _None._
 | Operator merge-risk holds | 3 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 3 |
-| Curated | 4 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
