@@ -912,7 +912,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.172   verdict-contradiction guard (#8112, landed in #8124)
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard — the last refuses only the post-merge worktree removal, never the merge) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -928,6 +928,7 @@ _check_loom_pr_label
 # _mp_daemon_roll_hint's `${sub} >= ` lookup resolving to the merge-gate version,
 # which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
+# requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -1576,18 +1577,28 @@ _strip_one_closed_issue_building_label() {
 _strip_closed_issue_building_labels() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
 
-  local close_targets
+  local close_targets issue_num
   close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
   [[ -n "$close_targets" ]] || return 0
 
-  local issue_num
+  # Loop status is 0: each body command (continue / the helper) returns 0.
   while IFS= read -r issue_num; do
     [[ -n "$issue_num" ]] || continue
     _strip_one_closed_issue_building_label "$issue_num"
   done <<< "$close_targets"
-
-  return 0
 }
+
+# ---------------------------------------------------------------------------
+# Close-triggered `loom:blocked` re-check (#9102; item 2 of #8927's deferred
+# fix list). `loom-daemon check-stale-blocked` (#8927) finds a stale block at
+# the next sweep pre-wave; this finds it the moment the blocker closes: every
+# open `loom:blocked` issue/PR citing this merged PR, or an issue it closed, as
+# a blocker gets a comment now (never a label edit). Resolving the closed set,
+# the decision and the comment all live in `loom-daemon notify-cleared-blockers`
+# (reusing the advisory's enumeration and the `dep_recheck` parsers — no second
+# parser, .loom/docs/shell-language-policy.md); it always exits 0. Best-effort
+# and GitHub-only, like every step in this section.
+_notify_cleared_blockers() { [[ "$FORGE_TYPE" == "github" ]] || return 0; "${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --pr "$PR_NUMBER" --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --quiet || warning "Close-triggered loom:blocked re-check (#9102) did not run; the next sweep's check-stale-blocked pass still covers it."; }
 
 # ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
@@ -2427,6 +2438,11 @@ _reset_partial_increment_labels || true
 # header comment above) and at the same confirmed-merge choke point.
 # Best-effort — never fails the merge.
 _strip_closed_issue_building_labels || true
+
+# Close-triggered loom:blocked re-check (#9102). Runs right after the
+# loom:building cleanup above, at the same confirmed-merge choke point.
+# Best-effort — never fails the merge. See the function's own header above.
+_notify_cleared_blockers || true
 
 # Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
 # same confirmed-merge choke point, and BEFORE branch deletion below so the
