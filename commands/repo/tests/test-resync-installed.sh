@@ -147,6 +147,16 @@ RESYNC_SRC_BODY="$(cat "$RESYNC_SRC")"
 assert_contains "resync-installed.sh's plan includes repo-scrub-forks.sh" \
     "$RESYNC_SRC_BODY" 'plan "scripts/repo/repo-scrub-forks.sh"'
 
+# repo#505: optimize-ci.md invokes repo-optimize-ci.py from the installed
+# scripts dir, so it must ship there and stay in the resync plan — same shape.
+OC_INSTALLED="$TGT/.claude/skills/repo/scripts/repo-optimize-ci.py"
+assert_file "install.sh installs repo-optimize-ci.py into the skill scripts dir" "$OC_INSTALLED"
+if [[ -x "$OC_INSTALLED" ]]; then ok "the installed repo-optimize-ci.py copy is executable"; else no "the installed repo-optimize-ci.py copy is executable"; fi
+assert_contains "install.sh --dry-run lists repo-optimize-ci.py as a planned write" \
+    "$DRY_INSTALL" "scripts/repo-optimize-ci.py"
+assert_contains "resync-installed.sh's plan includes repo-optimize-ci.py" \
+    "$RESYNC_SRC_BODY" 'plan "scripts/repo/repo-optimize-ci.py"'
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- a fresh install is already in sync --"
