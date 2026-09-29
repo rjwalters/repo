@@ -338,6 +338,72 @@ assert_contains "write confinement resolves a physical spelling" "$GUARD_TXT" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "11. Repo-local check extension point (repo#511)"
+# ---------------------------------------------------------------------------
+# WHY THIS SECTION EXISTS: before this hook existed, the only place a consumer
+# could say "also run my own check" was an edit to the vendored scrub.md, and a
+# reinstall deleted it. One consumer re-added the same wiring FOUR times
+# (2am#463 -> #593 -> #594 -> v0.11.12 -> #775/#776 -> v0.12.2/v0.14.0 ->
+# #1596). The hop only works while this file actually documents it, so every
+# load-bearing clause is pinned here: if a future edit reworders one away, the
+# consumer's wiring silently disconnects again with nothing to catch it — which
+# is exactly how the first four regressions happened.
+
+assert_contains "scrub.md names the repo-local check file" "$SCRUB" \
+    '`.repo/scrub-local-checks.md`'
+assert_contains "the file is READ and its checks RUN" "$SCRUB" \
+    "read it and run the checks it lists"
+assert_contains "findings fold in under the class each check names" "$SCRUB" \
+    "under the class each one names"
+# The load-bearing safety clause: a broken check must never read as a pass.
+assert_contains "a check that cannot run is 'check incomplete'" "$SCRUB" \
+    "check incomplete"
+assert_contains "'check incomplete' is never reported as clean" "$SCRUB" \
+    "never as clean"
+assert_contains "an incomplete check forces the inconclusive exit code" "$SCRUB" \
+    'inconclusive), never `0`'
+assert_matches "exit 2 covers a repo-local check that could not run" "$SCRUB" \
+    'repo-local check that could not run'
+# The machine-readable form, and the fields a runner needs to act on it.
+assert_contains "the [[local_check]] table is the machine-readable form" "$SCRUB" \
+    "[[local_check]]"
+for field in "name" "command" "class" "findings_exit"; do
+    assert_contains "[[local_check]] documents the '$field' field" "$SCRUB" "$field"
+done
+assert_contains "the table wins when both forms are present" "$SCRUB" \
+    "preferred when both are present"
+# A local check inherits the report-only posture; a check that edits is a bug in
+# the check, not a licensed exception to this command's whole safety story.
+assert_contains "local checks are report-only too" "$SCRUB" \
+    "report-only, like everything else here"
+# The rationale has to survive too: without it, the next editor "simplifies"
+# the hook back into "just edit scrub.md" and the four-time regression returns.
+assert_contains "the rationale names the vendored-copy failure mode" "$SCRUB" \
+    "deleted by the next reinstall"
+assert_contains "the rationale cites the four-time incident" "$SCRUB" \
+    "four times over a few months"
+assert_contains "the pin list is named as the fallback, not the first choice" "$SCRUB" \
+    ".claude/skills/repo/resync-ignore"
+assert_contains "the report groups local findings under the declared class" "$SCRUB" \
+    "Repo-local check findings are grouped by the class each"
+assert_contains "the sample report shows a check-incomplete line" "$SCRUB" \
+    "check incomplete: [local:"
+assert_contains "the principles section names the local-check config" "$SCRUB" \
+    '`.repo/scrub-local-checks.md`, never'
+
+# The pin list referenced above must actually be implemented — a doc pointing at
+# a mechanism that does not exist is worse than no pointer (the consumer follows
+# it, the pin does nothing, and the next resync clobbers the file anyway).
+RESYNC_IGNORE_LIB="$REPO_ROOT/lib/resync-ignore.sh"
+if [[ -f "$RESYNC_IGNORE_LIB" ]]; then
+    ok "the pin mechanism scrub.md points at is implemented (lib/resync-ignore.sh)"
+else
+    no "the pin mechanism scrub.md points at is implemented (lib/resync-ignore.sh)" \
+       "missing $RESYNC_IGNORE_LIB — scrub.md tells consumers to pin a path in .claude/skills/repo/resync-ignore, so that list must be honored by install.sh and resync-installed.sh"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

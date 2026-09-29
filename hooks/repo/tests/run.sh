@@ -26,6 +26,7 @@
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
 # commands/repo/tests/test-resync-installed.sh,
+# commands/repo/tests/test-resync-ignore.sh,
 # commands/repo/tests/test-installer-contract.sh,
 # commands/repo/tests/test-repo-scrub-forks.sh,
 # commands/repo/tests/test-readme-layout-block.sh,
@@ -852,12 +853,50 @@ else
     record_suite "test-resync-installed.sh" "$RI_PASS" "$RI_FAIL" "C7 consumer resync"
 fi
 
-# INSTALLER-CONTRACT.md C1–C8 conformance. This suite re-derives the contract's
+# Repo-owned pins — `.claude/skills/repo/resync-ignore`, requirement C10
+# (repo#511). Before this list existed, the only edit to a vendored file that
+# survived a reinstall was no edit at all, and one consumer lost the same
+# /repo:scrub customization FOUR times to reinstalls with no test in this repo to
+# catch any of them. The suite's own positive controls assert the same edit is
+# still clobbered WITHOUT a pin, so "the pin works" can never pass because the
+# writers stopped writing. Same delegation shape as every suite above.
+echo
+echo "-- repo-owned pins / resync-ignore, C10 (delegated suite) --"
+RG_TEST="$TESTS_DIR/../../../commands/repo/tests/test-resync-ignore.sh"
+if [[ ! -f "$RG_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-resync-ignore.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-resync-ignore.sh" "$RG_TEST"
+else
+    RG_OUT="$(bash "$RG_TEST" 2>&1)"
+    RG_STATUS=$?
+    RG_PASS="$(suite_count Passed "$RG_OUT")"
+    RG_FAIL="$(suite_count Failed "$RG_OUT")"
+    if ! [[ "$RG_PASS" =~ ^[0-9]+$ && "$RG_FAIL" =~ ^[0-9]+$ ]]; then
+        RG_PASS=0
+        RG_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-resync-ignore.sh" "$RG_STATUS"
+        strip_ansi "$RG_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RG_STATUS" -ne 0 || "$RG_FAIL" -ne 0 ]]; then
+        [[ "$RG_FAIL" -eq 0 ]] && RG_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-resync-ignore.sh" "$RG_PASS" "$RG_FAIL" "$RG_STATUS"
+        strip_ansi "$RG_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-resync-ignore.sh" "$RG_PASS"
+    fi
+    PASS=$((PASS + RG_PASS))
+    FAIL=$((FAIL + RG_FAIL))
+    record_suite "test-resync-ignore.sh" "$RG_PASS" "$RG_FAIL" "C10 repo-owned pins"
+fi
+
+# INSTALLER-CONTRACT.md C1–C10 conformance. This suite re-derives the contract's
 # `repo` column from the working tree and asserts it matches the published table,
 # so the conformance table cannot go stale silently (repo#156). Same delegation
 # shape as every suite above.
 echo
-echo "-- installer-contract C1-C8 conformance (delegated suite) --"
+echo "-- installer-contract C1-C10 conformance (delegated suite) --"
 IC_TEST="$TESTS_DIR/../../../commands/repo/tests/test-installer-contract.sh"
 if [[ ! -f "$IC_TEST" ]]; then
     FAIL=$((FAIL + 1))

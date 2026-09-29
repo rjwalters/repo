@@ -315,3 +315,33 @@ belong to `install.sh`, not to a refresh — re-run the installer if those need
 updating. This split is requirement **C7** of the normative
 [tool-package installer contract](https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md),
 which [[update-tools]] follows for every tool in the family.
+
+### Repo-owned files (`.claude/skills/repo/resync-ignore`)
+
+Because everything above is a copy, **an edit to one of these files reverts on
+the next install or refresh.** To keep a local customization, declare the path
+repo-owned by listing it — one target-relative path per line — in
+`.claude/skills/repo/resync-ignore`. Commit that file; both `install.sh` and
+`resync-installed.sh` read it and leave every listed path alone.
+
+```
+# keep our allowlist-drift wiring in /repo:scrub
+.claude/commands/repo/scrub.md
+.agents/skills/repo/references/scrub.md
+# a whole subtree of local helper forks (trailing slash)
+.claude/skills/repo/scripts/
+```
+
+Blank lines and `#` comments are ignored; a leading `./` is tolerated. Each
+honored pin is reported on every run, and an entry that matches nothing is
+reported as a dead pin rather than silently doing nothing. Install bookkeeping
+(`install-metadata.json`, `.install-local.json`) is deliberately not pinnable —
+freezing the version stamp would make this repo lie about what it has installed.
+
+**A pin is a fork: a pinned file stops receiving upstream fixes.** Reach for the
+per-repo extension points first — `/repo:scrub` reads `.repo/scrub.toml` and
+`.repo/scrub-local-checks.md`, `/repo:release` reads its own `.repo/` policy
+file — and pin only when there is no hook to use. This is requirement **C10** of
+the same contract; it exists because one consumer lost the same `/repo:scrub`
+customization four times to reinstalls before there was any way to say "this
+file is ours".
