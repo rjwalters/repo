@@ -43,6 +43,7 @@
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
 # commands/repo/tests/test-assert-matches-sigpipe.sh,
+# commands/repo/tests/test-git-fixture-hermeticity.sh,
 # commands/repo/tests/test-deps-security-updates-paused.sh,
 # commands/repo/tests/test-handoff-preflight.sh, and
 # commands/repo/tests/test_optimize_ci.py.
@@ -1685,6 +1686,46 @@ else
     PASS=$((PASS + HP_PASS))
     FAIL=$((FAIL + HP_FAIL))
     record_suite "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "handoff step-0 reader preflight"
+fi
+
+# git-fixture hermeticity (repo#518): pins that lib/git-fixture.sh keeps the
+# throwaway git fixtures the suites above build isolated from the OUTER
+# environment's hook configuration — a Loom-dispatched session overrides
+# core.hooksPath via GIT_CONFIG_* env pairs (loom-daemon's provenance hooks),
+# whose commit-msg hook appended `Loom-Story: <repo>#<N>` trailers to fixture
+# commits and broke test-changelog-merged-work-check.sh under dispatch only.
+# Every case there is paired with a control that asserts the simulated leak
+# still leaks, so this suite is meaningful from a clean shell and in CI too.
+# Same delegation shape as every suite above.
+echo
+echo "-- git-fixture hermeticity (delegated suite) --"
+GF_TEST="$TESTS_DIR/../../../commands/repo/tests/test-git-fixture-hermeticity.sh"
+if [[ ! -f "$GF_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-git-fixture-hermeticity.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-git-fixture-hermeticity.sh" "$GF_TEST"
+else
+    GF_OUT="$(bash "$GF_TEST" 2>&1)"
+    GF_STATUS=$?
+    GF_PASS="$(suite_count Passed "$GF_OUT")"
+    GF_FAIL="$(suite_count Failed "$GF_OUT")"
+    if ! [[ "$GF_PASS" =~ ^[0-9]+$ && "$GF_FAIL" =~ ^[0-9]+$ ]]; then
+        GF_PASS=0
+        GF_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-git-fixture-hermeticity.sh" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GF_STATUS" -ne 0 || "$GF_FAIL" -ne 0 ]]; then
+        [[ "$GF_FAIL" -eq 0 ]] && GF_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-git-fixture-hermeticity.sh" "$GF_PASS" "$GF_FAIL" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-git-fixture-hermeticity.sh" "$GF_PASS"
+    fi
+    PASS=$((PASS + GF_PASS))
+    FAIL=$((FAIL + GF_FAIL))
+    record_suite "test-git-fixture-hermeticity.sh" "$GF_PASS" "$GF_FAIL" "git-fixture hermeticity (repo#518)"
 fi
 
 echo

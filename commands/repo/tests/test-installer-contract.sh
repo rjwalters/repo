@@ -30,6 +30,13 @@ CONTRACT="$REPO_ROOT/INSTALLER-CONTRACT.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+ . 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed â see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 if [[ ! -f "$CONTRACT" ]]; then
     echo "FATAL: INSTALLER-CONTRACT.md not found at $CONTRACT" >&2
@@ -68,7 +75,7 @@ tree_fingerprint() {
       done )
 }
 
-new_target() { mkdir -p "$1"; git -C "$1" init -q; }
+new_target() { mkdir -p "$1"; git_fixture_init "$1"; }
 
 echo "INSTALLER-CONTRACT.md conformance suite"
 echo "======================================="
