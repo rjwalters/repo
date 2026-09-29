@@ -3,6 +3,9 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-09-29
+- **PR #525**: test: remove stray `.` line and mojibake left by the #518 adoption commit
+- **Issue #518** (closed): test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits
+- **PR #523**: test: make git fixtures hermetic against inherited core.hooksPath
 - **Issue #515** (closed): /repo:followups: a PR dedup match can be proposed and executed as a duplicate close (match type is never enforced)
 - **PR #521**: fix(followups): enforce dedup match type so a PR is never closed as a duplicate
 - **Issue #511** (closed): /repo:scrub has no repo-local extension point, and Repo Skills has no resync-ignore — a consumer's wiring was deleted by reinstall four times

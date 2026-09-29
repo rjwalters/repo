@@ -185,7 +185,11 @@ comments and blank lines ignored, a trailing `/` pinning a whole subtree:
 
 `install.sh` and `resync-installed.sh` read the same list through
 [`lib/resync-ignore.sh`](lib/resync-ignore.sh), so a pin cannot be honored by
-one writer and undone by the other. Every honored pin is reported; an entry that
+one writer and undone by the other. `uninstall.sh` reads it too, but for a
+different purpose: a pin protects a file from a refresh, not from a deliberate
+uninstall, so it still removes pinned paths — it just names them in the
+pre-removal preview first, so the operator can copy anything they want to keep.
+Every honored pin is reported; an entry that
 matches nothing is reported as a dead pin rather than silently doing nothing.
 Install bookkeeping (`install-metadata.json`, `.install-local.json`) is
 deliberately not pinnable — freezing the version stamp would make the consumer
@@ -269,7 +273,9 @@ lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): pat
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 lib/gitignore-check.sh       C9 post-install sweep: warns (never fails) when a written payload file is gitignored in the consumer repo
 lib/resync-ignore.sh         C10 repo-owned pins: the one reader of .claude/skills/repo/resync-ignore, shared by
-                             install.sh and resync-installed.sh so a pin cannot be honored by one writer and undone by the other
+                             install.sh and resync-installed.sh so a pin cannot be honored by one writer and undone
+                             by the other; also read by uninstall.sh, which still removes pinned paths but names
+                             them in the pre-removal preview first
 scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`), used by /repo:release and CI
 scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```
