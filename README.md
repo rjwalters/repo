@@ -170,6 +170,34 @@ This is requirement C7 of [`INSTALLER-CONTRACT.md`](INSTALLER-CONTRACT.md), the
 normative installer contract this repo owns for the whole tool-package family
 (Loom, Anvil, Repo Skills, squad).
 
+### Keeping a local customization (`resync-ignore`)
+
+Because the installed surfaces are copies, **an edit to one of them reverts on
+the next install or resync.** A consumer declares a path its own by listing it
+in `.claude/skills/repo/resync-ignore` — one target-relative path per line, `#`
+comments and blank lines ignored, a trailing `/` pinning a whole subtree:
+
+```
+# keep our allowlist-drift wiring in /repo:scrub
+.claude/commands/repo/scrub.md
+.agents/skills/repo/references/scrub.md
+```
+
+`install.sh` and `resync-installed.sh` read the same list through
+[`lib/resync-ignore.sh`](lib/resync-ignore.sh), so a pin cannot be honored by
+one writer and undone by the other. Every honored pin is reported; an entry that
+matches nothing is reported as a dead pin rather than silently doing nothing.
+Install bookkeeping (`install-metadata.json`, `.install-local.json`) is
+deliberately not pinnable — freezing the version stamp would make the consumer
+repo lie about what it has installed.
+
+**A pin is a fork**, so a pinned file stops receiving upstream fixes. Prefer a
+command's per-repo extension point where one exists (`/repo:scrub` reads
+`.repo/scrub.toml` and `.repo/scrub-local-checks.md`) and pin only when there is
+no hook to use. This is requirement C10 of the same contract; it exists because
+one consumer lost the same `/repo:scrub` customization four times to reinstalls
+before there was any way to say "this file is ours".
+
 ### Write footprint
 
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
@@ -218,7 +246,8 @@ hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLA
                              claude + codex shell wrappers, Claude/Codex skill parity
 commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
                              provisioning, verify-after-write, early sync-and-switch, tidy
-                             KEEP tiers, C7 resync, installer contract, fork-network sweep,
+                             KEEP tiers, C7 resync, C10 repo-owned pins, installer contract,
+                             fork-network sweep,
                              scrub/all/prune contract, links precision, guard equivalence
                              (its case table lives in guard-equivalence-cases.txt),
                              README layout block vs disk, SKILL.md Commands
@@ -228,7 +257,7 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              ownership, CHANGELOG merged-work and version-citation
                              checks, label-description lint, json_escape parity,
                              version.sh, and the installed-surface VERSION-bump gate
-INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C9), owned by this repo
+INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C10), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
@@ -239,6 +268,8 @@ lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): pat
                              records how the target format was confirmed against Codex's own docs
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 lib/gitignore-check.sh       C9 post-install sweep: warns (never fails) when a written payload file is gitignored in the consumer repo
+lib/resync-ignore.sh         C10 repo-owned pins: the one reader of .claude/skills/repo/resync-ignore, shared by
+                             install.sh and resync-installed.sh so a pin cannot be honored by one writer and undone by the other
 scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`), used by /repo:release and CI
 scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```

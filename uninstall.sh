@@ -38,6 +38,16 @@ source "$SOURCE_ROOT/lib/shell-wrapper.sh"
 # shellcheck source=lib/codex-skill.sh
 source "$SOURCE_ROOT/lib/codex-skill.sh"
 
+# The C10 repo-owned pin list (repo#511). Uninstall DOES remove a pinned path —
+# unlike install.sh and the resync, it is a deliberate "take this tool out"
+# instruction, and a pinned file is still a fork of a tool file. But a pin is the
+# consumer saying "this content is mine", so removing it silently inside a
+# directory-wide `rm -rf` would destroy exactly the customization the pin list
+# exists to protect. It is named in the pre-removal preview instead, above the
+# confirmation, so the operator can copy it out first.
+# shellcheck source=lib/resync-ignore.sh
+source "$SOURCE_ROOT/lib/resync-ignore.sh"
+
 # Candidate shell rc files that might carry our claude wrapper block, checked
 # regardless of the CURRENT $SHELL: the shell active at uninstall time may
 # differ from whichever was active when --shell-wrapper was installed, and
@@ -152,6 +162,17 @@ if sw_any_present; then
     shell_wrapper_block_present "$f" && echo "  $f REPO-SKILLS CLAUDE WRAPPER block"
     shell_wrapper_codex_block_present "$f" && echo "  $f REPO-SKILLS CODEX WRAPPER block"
   done
+fi
+
+resync_ignore_load "$TARGET"
+if resync_ignore_active; then
+  echo ""
+  warning "This repo declares paths repo-owned in $RESYNC_IGNORE_REL. Uninstall removes"
+  warning "them along with everything else — a pin protects a file from a REFRESH, not from a"
+  warning "deliberate uninstall. Copy anything you still want out first:"
+  while IFS= read -r _pin; do
+    [[ -n "$_pin" ]] && warning "  $_pin"
+  done < <(printf '%s\n' ${RESYNC_IGNORE_ENTRIES[@]+"${RESYNC_IGNORE_ENTRIES[@]}"})
 fi
 
 if [[ "$YES" != true ]]; then

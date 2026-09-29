@@ -144,6 +144,13 @@ source "$SOURCE_ROOT/lib/codex-skill.sh"
 # shellcheck source=lib/gitignore-check.sh
 source "$SOURCE_ROOT/lib/gitignore-check.sh"
 
+# The repo-owned pin list — requirement C10 of INSTALLER-CONTRACT.md. Shared
+# with the resync for the strongest version of the same reason: a pin honored by
+# only ONE of the two writers is not a pin at all, since the other one silently
+# undoes it on its next run. See lib/resync-ignore.sh (repo#511).
+# shellcheck source=lib/resync-ignore.sh
+source "$SOURCE_ROOT/lib/resync-ignore.sh"
+
 INSTALL_DATE="$(date -u +%Y-%m-%d)"
 REPO_OWNER="OWNER"
 REPO_NAME="REPO"
@@ -205,6 +212,10 @@ fi
 # Derive the consumer repo's identity for template substitution (best-effort:
 # parse owner/name from the origin remote, else fall back to the directory name).
 render_repo_identity "$TARGET"
+
+# Read the target's repo-owned pin list (C10) before anything is enumerated or
+# written, so --dry-run and the real run report the same set of skips.
+resync_ignore_load "$TARGET"
 
 # Resolve command selection
 ALL_COMMANDS="$(list_commands)"
@@ -311,6 +322,12 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry)"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
   fi
+  if resync_ignore_active; then
+    echo "Pinned as repo-owned in $RESYNC_IGNORE_REL — NOT written (C10):"
+    while IFS= read -r _dry_run_pin; do
+      [[ -n "$_dry_run_pin" ]] && echo "  $_dry_run_pin"
+    done < <(printf '%s\n' ${RESYNC_IGNORE_ENTRIES[@]+"${RESYNC_IGNORE_ENTRIES[@]}"})
+  fi
   if [[ "$SHELL_WRAPPER" == true ]]; then
     _dry_run_sw_shell="$(shell_wrapper_detect_shell)" || _dry_run_sw_shell="unsupported"
     if [[ "$_dry_run_sw_shell" == zsh || "$_dry_run_sw_shell" == bash ]]; then
@@ -330,13 +347,41 @@ confirm "Proceed? [Y/n] " Y || { info "Installation cancelled"; exit 0; }
 # otherwise we render template variables and copy. We symlink per-file rather
 # than whole directories so install-metadata.json and any target-only files
 # stay real and never leak back into the source tree.
+#
+# The CONTENT of a destination listed in the target's pin list (C10,
+# lib/resync-ignore.sh) is never written — including left ABSENT if it was never
+# installed here. The consumer has declared that path theirs; writing "just this
+# once, because it is the first install" would make the pin mean something
+# different on install than it means on resync, and a pin whose meaning depends
+# on which writer ran is the bug this list exists to fix (repo#511).
+INSTALL_FILE_SKIPPED=false
 install_file() {  # <source-abs> <dest-abs> <label>
+  local rel="${2#"$TARGET"/}"
+  INSTALL_FILE_SKIPPED=false
+  if resync_ignore_is_pinned "$rel"; then
+    INSTALL_FILE_SKIPPED=true
+    if [[ -e "$2" || -L "$2" ]]; then
+      info "Pinned (repo-owned, left alone): $rel"
+    else
+      warning "Pinned (repo-owned) but absent: $rel — nothing provides this file now;"
+      warning "remove the entry from $RESYNC_IGNORE_REL if you want the shipped copy back."
+    fi
+    return 0
+  fi
   if [[ "$DEV" == true ]]; then
     ln -sf "$1" "$2"
   else
     render <"$1" >"$2"
     assert_no_placeholders "$2" "$3"
   fi
+}
+
+# Report one payload file as installed — UNLESS the install_file() call
+# immediately above it skipped the write as repo-owned. A pinned path reported
+# as "Installed" is exactly the kind of overclaim that makes the rest of the
+# output untrustworthy, so the success line is gated on what actually happened.
+success_installed() {  # <dest-rel>
+  [[ "$INSTALL_FILE_SKIPPED" == true ]] || success "Installed $1"
 }
 
 # existing_guard_wired <settings-file> <our-cmd>
@@ -496,14 +541,24 @@ fi
 # 1. Skill file
 mkdir -p "$TARGET/.claude/skills/repo"
 install_file "$SOURCE_ROOT/skills/repo/SKILL.md" "$TARGET/.claude/skills/repo/SKILL.md" ".claude/skills/repo/SKILL.md"
-success "Installed .claude/skills/repo/SKILL.md"
+success_installed ".claude/skills/repo/SKILL.md"
 
 # 2. Command files
+# The count reported below is what was actually WRITTEN, not what was selected:
+# a command pinned as repo-owned (C10) is deliberately left alone, and rolling
+# it into the total would report a file as installed that this run never touched.
 mkdir -p "$TARGET/.claude/commands/repo"
+CMD_WRITTEN=0
+CMD_PINNED=0
 while IFS= read -r cmd; do
   install_file "$SOURCE_ROOT/commands/repo/$cmd.md" "$TARGET/.claude/commands/repo/$cmd.md" "commands/repo/$cmd.md"
+  if [[ "$INSTALL_FILE_SKIPPED" == true ]]; then
+    CMD_PINNED=$((CMD_PINNED + 1))
+  else
+    CMD_WRITTEN=$((CMD_WRITTEN + 1))
+  fi
 done <<<"$COMMANDS"
-success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') commands into .claude/commands/repo/"
+success "Installed $CMD_WRITTEN commands into .claude/commands/repo/$([[ "$CMD_PINNED" -gt 0 ]] && echo " ($CMD_PINNED pinned as repo-owned, left alone)")"
 
 # 3. Install metadata
 # Tracked file: only fields that are identical for any machine installing the
@@ -606,7 +661,7 @@ if [[ "$GUARD_HOOK_INSTALLED" == true ]]; then
   install_file "$SOURCE_ROOT/hooks/repo/guard-destructive.sh" \
     "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" "hooks/repo/guard-destructive.sh"
   chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
-  success "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+  success_installed ".claude/skills/repo/hooks/guard-destructive.sh"
 else
   info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it)"
 fi
@@ -620,7 +675,7 @@ merge_settings_hook
 install_file "$SOURCE_ROOT/hooks/repo/session-start-handoff.sh" \
   "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" "hooks/repo/session-start-handoff.sh"
 chmod +x "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" 2>/dev/null || true
-success "Installed .claude/skills/repo/hooks/session-start-handoff.sh"
+success_installed ".claude/skills/repo/hooks/session-start-handoff.sh"
 merge_settings_sessionstart_hook
 
 # 3d. Headless provisioning script for /repo:remote. Same colocation + chmod
@@ -634,7 +689,7 @@ mkdir -p "$TARGET/.claude/skills/repo/scripts"
 install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
   "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" "scripts/repo/repo-remote.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
-success "Installed .claude/skills/repo/scripts/repo-remote.sh"
+success_installed ".claude/skills/repo/scripts/repo-remote.sh"
 
 # 3d-2. Fork-network sweep script for /repo:scrub --forks. Same colocation +
 # chmod rationale as repo-remote.sh above: SKILL.md, README.md, and
@@ -643,13 +698,13 @@ success "Installed .claude/skills/repo/scripts/repo-remote.sh"
 install_file "$SOURCE_ROOT/scripts/repo/repo-scrub-forks.sh" \
   "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" "scripts/repo/repo-scrub-forks.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh" 2>/dev/null || true
-success "Installed .claude/skills/repo/scripts/repo-scrub-forks.sh"
+success_installed ".claude/skills/repo/scripts/repo-scrub-forks.sh"
 
 # Organization-policy deployment runs from a client without a source checkout.
 install_file "$SOURCE_ROOT/scripts/repo/repo-org-policy.py" \
   "$TARGET/.claude/skills/repo/scripts/repo-org-policy.py" "scripts/repo/repo-org-policy.py"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-org-policy.py" 2>/dev/null || true
-success "Installed .claude/skills/repo/scripts/repo-org-policy.py"
+success_installed ".claude/skills/repo/scripts/repo-org-policy.py"
 
 # /repo:optimize-ci's deterministic half (workflow parsing, required-check
 # lookup, run-history evidence). Same colocation + chmod rationale as the
@@ -657,7 +712,7 @@ success "Installed .claude/skills/repo/scripts/repo-org-policy.py"
 install_file "$SOURCE_ROOT/scripts/repo/repo-optimize-ci.py" \
   "$TARGET/.claude/skills/repo/scripts/repo-optimize-ci.py" "scripts/repo/repo-optimize-ci.py"
 chmod +x "$TARGET/.claude/skills/repo/scripts/repo-optimize-ci.py" 2>/dev/null || true
-success "Installed .claude/skills/repo/scripts/repo-optimize-ci.py"
+success_installed ".claude/skills/repo/scripts/repo-optimize-ci.py"
 
 # 3e. Consumer-side resync script — requirement C7 of INSTALLER-CONTRACT.md.
 # Same colocation + chmod rationale as the scripts above. This is what lets a
@@ -668,7 +723,7 @@ success "Installed .claude/skills/repo/scripts/repo-optimize-ci.py"
 install_file "$SOURCE_ROOT/scripts/repo/resync-installed.sh" \
   "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" "scripts/repo/resync-installed.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" 2>/dev/null || true
-success "Installed .claude/skills/repo/scripts/resync-installed.sh"
+success_installed ".claude/skills/repo/scripts/resync-installed.sh"
 
 # 3f. Codex-side skill surface (.agents/skills/repo/). Codex CLI discovers
 # skills by scanning `.agents/skills` from the cwd up to the repo root, in the
@@ -696,21 +751,35 @@ elif codex_target_is_foreign; then
   warning "skill and re-run to install the Codex surface too, or pass --no-codex to silence this."
 else
   mkdir -p "$TARGET/$CODEX_REFERENCES_REL"
-  CODEX_SKILL_TMP="$(mktemp)"
-  if codex_skill_render "$SOURCE_ROOT/skills/repo/SKILL.md" "$COMMANDS" >"$CODEX_SKILL_TMP"; then
-    assert_no_placeholders "$CODEX_SKILL_TMP" "$CODEX_SKILL_REL/SKILL.md"
-    mv "$CODEX_SKILL_TMP" "$CODEX_SKILL_MD"
-    success "Installed $CODEX_SKILL_REL/SKILL.md"
+  # Not an install_file() call (it is generated, never symlinked), so the C10 pin
+  # has to be consulted explicitly here — a pin honored on the Claude surface but
+  # not the Codex one would be a pin only half the time.
+  if resync_ignore_is_pinned "$CODEX_SKILL_REL/SKILL.md"; then
+    info "Pinned (repo-owned, left alone): $CODEX_SKILL_REL/SKILL.md"
   else
-    rm -f "$CODEX_SKILL_TMP"
-    error "Could not render $CODEX_SKILL_REL/SKILL.md: skills/repo/SKILL.md has no 'description' in its frontmatter, which the Agent Skills format requires."
+    CODEX_SKILL_TMP="$(mktemp)"
+    if codex_skill_render "$SOURCE_ROOT/skills/repo/SKILL.md" "$COMMANDS" >"$CODEX_SKILL_TMP"; then
+      assert_no_placeholders "$CODEX_SKILL_TMP" "$CODEX_SKILL_REL/SKILL.md"
+      mv "$CODEX_SKILL_TMP" "$CODEX_SKILL_MD"
+      success "Installed $CODEX_SKILL_REL/SKILL.md"
+    else
+      rm -f "$CODEX_SKILL_TMP"
+      error "Could not render $CODEX_SKILL_REL/SKILL.md: skills/repo/SKILL.md has no 'description' in its frontmatter, which the Agent Skills format requires."
+    fi
   fi
 
+  CODEX_REF_WRITTEN=0
+  CODEX_REF_PINNED=0
   while IFS= read -r cmd; do
     install_file "$SOURCE_ROOT/commands/repo/$cmd.md" \
       "$TARGET/$CODEX_REFERENCES_REL/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md"
+    if [[ "$INSTALL_FILE_SKIPPED" == true ]]; then
+      CODEX_REF_PINNED=$((CODEX_REF_PINNED + 1))
+    else
+      CODEX_REF_WRITTEN=$((CODEX_REF_WRITTEN + 1))
+    fi
   done <<<"$COMMANDS"
-  success "Installed $(echo "$COMMANDS" | wc -l | tr -d ' ') command procedures into $CODEX_REFERENCES_REL/"
+  success "Installed $CODEX_REF_WRITTEN command procedures into $CODEX_REFERENCES_REL/$([[ "$CODEX_REF_PINNED" -gt 0 ]] && echo " ($CODEX_REF_PINNED pinned as repo-owned, left alone)")"
   CODEX_INSTALLED=true
 
   # Same tracked-metadata emitter and same C5 guarantees as the Claude surface,
@@ -726,6 +795,14 @@ else
   success "Wrote $CODEX_SKILL_REL/install-metadata.json"
   CODEX_HINT=" In Codex CLI the same workflows are the \`$CODEX_SKILL_SLUG\` skill (\`/skills\`, or type \`\$$CODEX_SKILL_SLUG\`)."
 fi
+
+# Every payload destination has now been offered to the C10 pin list, so any
+# entry that still matched nothing is dead: a typo, or a path this tool no
+# longer ships. Named loudly here rather than left silent — a pin that LOOKS
+# installed and does nothing is exactly how the customization behind repo#511
+# got clobbered four times. Placed before all three exit paths below (dev mode,
+# gitignored destination, normal end) so the warning fires on every one.
+resync_ignore_warn_dead_pins
 
 # 3g. Optional shell `claude` wrapper — surfaces a pending /repo:handoff note
 # to the HUMAN before Claude starts (the SessionStart hook above is the half
