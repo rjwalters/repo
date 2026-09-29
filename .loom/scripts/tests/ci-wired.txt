@@ -212,7 +212,6 @@ test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
-test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
 test-worktree-stale-merged-branch.sh
 
@@ -244,6 +243,7 @@ tests/hooks/test-post-worktree-target-dir.sh
 defaults/hooks/tests/test-guard-background-subagents.sh
 defaults/hooks/tests/test-guard-installed-file-writes.sh
 defaults/hooks/tests/test-guard-loom-workspace.sh
+defaults/hooks/tests/test-guard-secret-scan.sh
 defaults/hooks/tests/test-guard-worktree-paths.sh
 defaults/hooks/tests/test-hook-wiring.sh
 defaults/hooks/tests/test-methodology-inject.sh
