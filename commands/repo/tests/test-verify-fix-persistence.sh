@@ -50,6 +50,13 @@ ALL_MD="$CMD_DIR/all.md"
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 for c in "${APPLYING_COMMANDS[@]}"; do
     if [[ ! -f "$CMD_DIR/$c.md" ]]; then
         echo "FATAL: $c.md not found at $CMD_DIR/$c.md" >&2
@@ -126,7 +133,7 @@ stage_report() {  # <stage> <applied-list> <reverted-list>
 build_fixture() {
     local root="$SCRATCH/fixture"
     mkdir -p "$root"
-    git init -q -b main "$root/repo"
+    git_fixture_init "$root/repo" -b main
     REPO="$root/repo"
     git -C "$REPO" config user.email "test@example.invalid"
     git -C "$REPO" config user.name "Verify Persistence Test"

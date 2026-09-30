@@ -9,7 +9,9 @@ This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered de
 every consumer repo, and every "am I current?" check a consumer runs
 (`install-metadata.json`, `/repo:update-tools`, downstream compute-drift
 tooling) compares against `VERSION`. That signal is only honest if `VERSION`
-moves whenever this surface does.
+moves whenever this surface does. The canonical `policies/` directory also
+counts as a consumer-visible surface: `/repo:org-policy` reads it from GitHub
+when deploying organization preferences.
 
 **Before opening a PR, ask: does this change touch the installed surface
 above?**

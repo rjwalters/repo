@@ -1825,6 +1825,26 @@ assert_shell_rejects() {
     fi
 }
 
+# The inverse of the helper above: pin that bash really DOES parse a command, so
+# a deny assertion next to it is protecting a shape that genuinely executes
+# (used by the #450 block, whose whole point is that its payload is parseable —
+# it is NOT a member of the unparseable #130 family).
+assert_shell_accepts() {
+    local description="$1"
+    local cmd="$2"
+    TOTAL=$((TOTAL + 1))
+    if bash -n <<<"$cmd" 2>/dev/null; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: bash parses it (the deny below guards a real, executable shape)"
+        echo -e "       Got: bash REJECTED it (syntax error)"
+    fi
+}
+
 _Q113_STRAY='"'           # a STRAY unmatched double quote after the span
 _Q113_STRAYBS='\\\\"'     # an escaped-backslash run, then a stray quote
 _Q113_TRAILQ='"trailing"' # the later quote pair the stray one reaches first
@@ -1901,9 +1921,20 @@ assert_allow "#130 KNOWN LIMIT: inner quote paired past the span close swallows 
     "echo $_Q130_SPANSQ ; $_Q113_HALT $_Q130_PARTSQ"
 
 # Quote kinds mirrored: a double quote inside a single-quoted lookalike span.
+#
+# NARROWED BY #443 (allow -> deny): this member of the family is gone. It only
+# ever reached the inert branch because the OUTER single-quoted lookalike span
+# `'$( " )'` was (wrongly) marked ACTIVE, so the walk stepped INTO it and the
+# inner `"` opened a phantom span that paired past the close. Single-quoted spans
+# are now unconditionally inert, so the outer span is consumed verbatim, the `;`
+# after it stays a REAL separator, and the rm tail is segmented and denied again.
+# The shape is still unparseable (the assertion below is unchanged) — the limit
+# simply no longer applies to it, which is the narrowing direction. The two
+# SQ-inside-DQ routes above are untouched: their outer span is DOUBLE-quoted, so
+# the #113/#3679 separator-active floor still governs them.
 assert_shell_rejects "#130 KNOWN LIMIT: mirrored inner-quote shape is unparseable" \
     "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
-assert_allow "#130 KNOWN LIMIT: inner double quote in a single-quoted span swallows the rm tail" \
+assert_deny "#130/#443: inner double quote in a now-inert single-quoted span no longer swallows the rm tail" \
     "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
 
 # qsplit()/command_has_shell_segment() exposure: here the inner quote's partner
@@ -1928,6 +1959,295 @@ assert_deny "#130 control: inner quote paired INSIDE the span still denies (pars
     "echo \"\$( ' ' )\" ; $_Q113_RM"
 assert_deny "#130 control: balanced inner quotes with a balanced trailing pair still deny" \
     "echo \"\$( '' )\" ; $_Q113_RM ''"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #443: a SINGLE-quoted span is inert even when it holds \$( ) ---${NC}"
+# =========================================================================
+#
+# ml_segment()'s quoted-span branch marks a span ACTIVE (separators stay live,
+# the walk continues character-by-character INTO it) whenever the span's inner
+# text merely CONTAINS the characters `$(` or a backtick. That rule is the
+# #3679/#3755 safety floor and is correct for a DOUBLE-quoted or UNQUOTED span,
+# where the substitution really does execute and a `; <destructive>` smuggled
+# inside it really does run.
+#
+# It was applied identically to a SINGLE-quoted span, which is wrong: bash never
+# expands or substitutes ANYTHING between `'...'`, so `'$(mktemp -d)'` is literal
+# text and nothing inside it is live code. Keeping separators active there let a
+# LITERAL `;` inside the quoted text leak out as a phantom top-level separator,
+# so the text after it was re-segmented and classified as its own command — and
+# an rm-shaped tail inside quoted DATA false-denied as a real local rm:
+#
+#   ssh <host> 'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'
+#       -> "rm target ... is an unexpanded shell variable"
+#   ssh <host> 'X=$(true); rm -rf /dev/shm/<dir>'
+#       -> "rm target outside repo scope" (with a stray quote leaking into the
+#          extracted target — a second symptom of the same mis-parse)
+#
+# The same shape WITHOUT a `$( )` in the quoted string was already allowed (see
+# the "Remote ssh/scp payloads" cases above), so this is a quote-classification
+# defect, not a missing remote-exec concept: nothing about `ssh` is load-bearing
+# here, and the identical false positive reproduces with a plain `echo`.
+#
+# Single-quoted spans are therefore ALWAYS inert now, regardless of `$(`/backtick
+# content. Double-quoted and unquoted spans are untouched — the control cases in
+# this block pin that the #113 smuggling protection still denies there.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113).
+_Q443_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q443_RMVAR="rm -r""f \"\$TMPDIR\""               # unexpandable-variable target
+_Q443_HALT="ha""lt"
+_Q443_SUB='$(mktemp -d)'
+_Q443_BT='`mktemp -d`'
+
+# 1. The exact shapes from the issue body: an `rm` inside the SINGLE-quoted
+#    remote command argument of `ssh`, alongside a command substitution.
+assert_allow "#443: ssh with a single-quoted mktemp+rm remote payload is allowed" \
+    "ssh myhost 'TMPDIR=$_Q443_SUB; $_Q443_RMVAR'"
+assert_allow "#443: ssh with a single-quoted \$( ) then a literal-path rm is allowed" \
+    "ssh myhost 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: ssh with a single-quoted backtick then a literal-path rm is allowed" \
+    "ssh myhost 'X=$_Q443_BT; $_Q443_RM'"
+
+# 2. Nothing about `ssh` is load-bearing — the same single-quoted DATA passed to
+#    any command must be inert too (the general, non-remote form of the bug).
+assert_allow "#443: single-quoted \$( ) then an rm inside a plain echo argument is allowed" \
+    "echo 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then an rm inside a printf argument is allowed" \
+    "printf '%s\\n' 'X=\$(true); $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then an &&-separated rm is allowed" \
+    "echo 'X=\$(true) && $_Q443_RM'"
+assert_allow "#443: single-quoted \$( ) then a |-separated lifecycle word is allowed" \
+    "echo 'X=\$(true) | $_Q443_HALT'"
+# `grep` is not a data-sink command, so the lifecycle tier really does read this
+# segment's command word (an `echo`/`printf` argument is stripped by
+# strip_datasink_literals() long before it gets there, which is why the pair
+# above cannot discriminate on its own).
+assert_allow "#443: single-quoted \$( ) then a ;-separated lifecycle word in a grep pattern is allowed" \
+    "grep -E 'X=\$(true); $_Q443_HALT ' file"
+
+# 3. CONTROLS — the DOUBLE-quoted and UNQUOTED forms are real substitutions, so
+#    the #113/#3679 separator-active floor must still catch the smuggled tail.
+#    These are the regression pins for "do not weaken DQ/unquoted behaviour".
+assert_deny "#443 control: DOUBLE-quoted \$( ) then a ;-separated rm still denies" \
+    "echo \"X=\$(true); $_Q443_RM\""
+assert_deny "#443 control: DOUBLE-quoted backtick then a ;-separated rm still denies" \
+    "echo \"X=$_Q443_BT; $_Q443_RM\""
+assert_deny "#443 control: DOUBLE-quoted \$( ) then a ;-separated lifecycle word still denies" \
+    "grep -E \"X=\$(true); $_Q443_HALT \" file"
+assert_deny "#443 control: UNQUOTED \$( ) then a ;-separated rm still denies" \
+    "echo X=\$(true); $_Q443_RM"
+
+# 4. CONTROLS — a real, unquoted rm outside the single-quoted span still denies,
+#    so the fix only makes the QUOTED text inert, never the text around it.
+assert_deny "#443 control: single-quoted \$( ) span then a REAL ;-separated rm denies" \
+    "echo 'X=\$(true)' ; $_Q443_RM"
+assert_deny "#443 control: single-quoted \$( ) span then a REAL ;-separated lifecycle word denies" \
+    "echo 'X=\$(true)' ; $_Q443_HALT"
+
+# 5. CONTROL — the catastrophic raw scan never reads through ml_segment(), so a
+#    root-obliterating payload inside a single-quoted span still denies.
+assert_deny "#443 control: catastrophic rm inside a single-quoted \$( ) span still denies" \
+    "echo 'X=\$(true); rm -r""f /'"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #450: #443 inertness applies only at the TOP LEVEL of the walk ---${NC}"
+# =========================================================================
+#
+# #443 made a single-quoted span inert in ml_segment(). Bash really does never
+# substitute inside `'...'`, so that is correct — but ONLY for a quote that is a
+# real opener, i.e. one reached at the TOP LEVEL of the walk (no ACTIVE span
+# open). As first merged, the test was `qc == SQ || <no substitution inside>`,
+# evaluated regardless of `acn`, so it also fired on an apostrophe encountered
+# while a LIVE double-quoted span was still open.
+#
+# Inside a double-quoted span an apostrophe is ordinary literal text to bash. Its
+# forward-scan "partner" is therefore some unrelated later apostrophe, with
+# genuinely LIVE, executing code between them. Treating that stretch as inert
+# made the lexer copy it verbatim and skip over a real `$( )` that bash actually
+# runs — turning a pre-#443 deny into an allow:
+#
+#   echo "don<apostrophe>t $(true; <recursive-force rm of an out-of-repo path>) won<apostrophe>t"
+#
+# The condition is now scoped with `acn == 0`, so an apostrophe reached while an
+# ACTIVE span is open stays on the legacy active-walk path (separators stay live,
+# the smuggled payload is segmented and classified). Every #443 shape is a
+# TOP-LEVEL single-quoted span, so all of them remain inert and allowed — the
+# block above pins that and must stay green alongside this one.
+#
+# CRITICAL — do not "simplify" the `acn == 0` term back out of that condition.
+# These cases exist precisely so that widening cannot land silently again.
+#
+# Unlike the #130 KNOWN LIMIT family, these shapes are NOT unparseable: the
+# apostrophes are balanced, bash parses the command and the substitution really
+# executes. `assert_shell_accepts` pins that mechanically, so the deny below is
+# protecting a shape that genuinely runs rather than one the shell would reject.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113/#443).
+_Q450_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q450_RM_ETC="rm -r""f /etc/orphaned-build-dir"   # outside-repo absolute path
+_Q450_HALT="ha""lt"
+
+# 1. The exact repro shapes from the issue body. Apostrophes sit INSIDE a live
+#    double-quoted span, on both sides of a real, executing `$( )`.
+_Q450_A="echo \"don't \$(true; $_Q450_RM) won't\""
+_Q450_B="echo \"it's \$(id; $_Q450_RM_ETC) fine's\""
+
+assert_shell_accepts "#450: apostrophe-in-live-DQ-span shape A is parseable (so the deny matters)" \
+    "$_Q450_A"
+assert_deny "#450: rm smuggled between apostrophes inside a live double-quoted \$( ) denies" \
+    "$_Q450_A"
+
+assert_shell_accepts "#450: apostrophe-in-live-DQ-span shape B is parseable (so the deny matters)" \
+    "$_Q450_B"
+assert_deny "#450: /etc rm smuggled between apostrophes inside a live double-quoted \$( ) denies" \
+    "$_Q450_B"
+
+# 2. Same shape via a BACKTICK substitution — the other half of the liveness
+#    probe — and on the lifecycle tier, so this is not pinned only on rm-scope.
+_Q450_BT_CMD="echo \"don't \`true; $_Q450_RM\` won't\""
+assert_shell_accepts "#450: backtick variant is parseable" \
+    "$_Q450_BT_CMD"
+assert_deny "#450: rm smuggled between apostrophes inside a live double-quoted backtick denies" \
+    "$_Q450_BT_CMD"
+
+# `grep` is not a data-sink command, so the lifecycle tier really does read this
+# segment's command word (an `echo` argument is stripped by
+# strip_datasink_literals() long before it gets there).
+_Q450_LIFECYCLE="grep -E \"don't \$(true; $_Q450_HALT ) fine's\" file"
+assert_shell_accepts "#450: lifecycle-tier variant is parseable" \
+    "$_Q450_LIFECYCLE"
+assert_deny "#450: lifecycle word smuggled between apostrophes inside a live \$( ) denies" \
+    "$_Q450_LIFECYCLE"
+
+# 3. CONTROLS — the narrowing is scoped to an OPEN active span, nothing more.
+#    A top-level single-quoted span is still inert even when an ACTIVE
+#    double-quoted span was opened and CLOSED earlier in the same command: `acn`
+#    is back to 0 by then, so #443 still governs. (An `acn`-blind "any DQ span
+#    seen" reading of the fix would break this and re-open #443.)
+assert_allow "#450 control: single-quoted \$( ) span after a CLOSED active DQ span is still inert" \
+    "echo \"\$(id)\" 'X=\$(true); $_Q450_RM'"
+assert_allow "#450 control: ssh single-quoted payload after a CLOSED active DQ span is still inert" \
+    "echo \"\$(id)\" && ssh myhost 'X=\$(true); $_Q450_RM'"
+
+# 4. CONTROL — an apostrophe inside a double-quoted span with NO substitution
+#    changes nothing: that span is inert on the second half of the condition,
+#    which this fix does not touch.
+assert_allow "#450 control: apostrophes inside a substitution-free double-quoted span still allow" \
+    "echo \"don't worry; it's only documentation about $_Q450_RM\""
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #453: a nested \$( ) quote must not PHANTOM-CLOSE the active span ---${NC}"
+# =========================================================================
+#
+# #450 (above) scoped the #443 inert-span branch with `acn == 0`. That term is
+# NECESSARY but it is not SUFFICIENT, because `acn` itself was derived from a
+# close index that could be WRONG.
+#
+# ml_segment() records where an active span really ends via trusted_close(),
+# which (pre-#453) resolved the close by scanning forward for the next
+# unescaped quote of the same kind. Inside a DOUBLE-quoted span that scan can
+# land on a `"` that belongs to a NESTED `$( )`/backtick substitution — a
+# string opened and parsed by the INNER shell, not by the shell that opened
+# this span. Accepting it is a PHANTOM close: `acn` drops to 0 while the walk
+# is still inside live, executing code, `acn == 0` then wrongly reports "top
+# level", and the very next apostrophe re-enters the #443 inert branch — which
+# copies the stretch verbatim straight over a real, running `$( )`. That is the
+# #450 hole reached by a different route.
+#
+# Measured on the pre-#453 lexer (instrumented ml_segment(), shape 1 below):
+#
+#   open span at i=6 qc=["] naive-ci=16 trusted_close=16 -> acn=1
+#   close-consumed at i=16 -> acn 1->0        <-- i=16 is the INNER "), depth 1
+#   INERT branch fires at i=18 qc=['] acn=0 inner=[z $(true; <destructive>) w]
+#
+# The fix is in trusted_close(): for a double-quoted span it now also SKIPS a
+# same-kind quote sitting at a deeper `$( )`/backtick nesting depth than the
+# span's own opener (depths precomputed by subst_depth(), moved into the shared
+# _ESCAPE_AWK source string so both lexers get it). `acn == 0` is unchanged and
+# still load-bearing — the depth check is what makes `acn` accurate enough for
+# it to mean what it says.
+#
+# CRITICAL — do not "simplify" either half away. The `acn == 0` term without
+# the depth check is this block; the depth check without `acn == 0` is #450.
+#
+# As with #450 (and unlike the #130 KNOWN LIMIT family) these shapes are NOT
+# unparseable: quotes are balanced, bash parses them and the substitution
+# really executes. `assert_shell_accepts` pins that mechanically.
+#
+# Danger phrases assembled at runtime so this test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag
+# (mirrors #60/#71/#84/#113/#443/#450).
+_Q453_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q453_RM_ETC="rm -r""f /etc/orphaned-build-dir"   # outside-repo absolute path
+_Q453_HALT="ha""lt"
+
+# 1. The three repro shapes from the issue body. Each has a nested double-quoted
+#    string inside a `$( )` that the pre-#453 forward scan mistook for the OUTER
+#    span's close.
+_Q453_A="echo \"x \$(echo \"y'z \$(true; $_Q453_RM) w'v\") q\""
+_Q453_B="echo \"\$(echo \"a'b \$(true; $_Q453_RM) c'd\")\""
+_Q453_C="echo \"\$(cat \"f'g \$(true; $_Q453_RM_ETC) h'i\")\""
+
+assert_shell_accepts "#453: nested-\$( ) shape A is parseable (so the deny matters)" \
+    "$_Q453_A"
+assert_deny "#453: rm smuggled past a phantom close (leading text before the nested \$( )) denies" \
+    "$_Q453_A"
+
+assert_shell_accepts "#453: nested-\$( ) shape B is parseable (so the deny matters)" \
+    "$_Q453_B"
+assert_deny "#453: rm smuggled past a phantom close (substitution opens the span) denies" \
+    "$_Q453_B"
+
+assert_shell_accepts "#453: nested-\$( ) shape C is parseable (so the deny matters)" \
+    "$_Q453_C"
+assert_deny "#453: /etc rm smuggled past a phantom close (cat inner command) denies" \
+    "$_Q453_C"
+
+# 2. The same defect reached through a BACKTICK outer substitution, and on the
+#    lifecycle tier, so this is not pinned only on rm-scope. (`grep` is not a
+#    data-sink command, so the lifecycle tier really does read the smuggled
+#    segment's command word.)
+_Q453_BT="echo \"x \$(echo \"y'z \`true; $_Q453_RM\` w'v\") q\""
+assert_shell_accepts "#453: nested backtick variant is parseable" \
+    "$_Q453_BT"
+assert_deny "#453: rm smuggled past a phantom close via a nested backtick denies" \
+    "$_Q453_BT"
+
+_Q453_LIFECYCLE="grep -E \"x \$(echo \"y'z \$(true; $_Q453_HALT ) w'v\") q\" file"
+assert_shell_accepts "#453: lifecycle-tier nested variant is parseable" \
+    "$_Q453_LIFECYCLE"
+assert_deny "#453: lifecycle word smuggled past a phantom close denies" \
+    "$_Q453_LIFECYCLE"
+
+# 3. CONTROLS — the depth check narrows ONLY the double-quote case, and only
+#    when the candidate close is genuinely deeper. A single-quoted span's close
+#    is always the very next single-quote byte (single quotes do not nest and
+#    admit no expansion), so depth-filtering must NOT apply to it — otherwise
+#    every #443 shape whose payload contains a `$(` would lose its close and
+#    stop being inert.
+assert_allow "#453 control: top-level single-quoted payload containing \$( ) is still inert" \
+    "echo 'X=\$(true); $_Q453_RM'"
+assert_allow "#453 control: ssh single-quoted payload containing \$( ) is still inert" \
+    "ssh myhost 'X=\$(true); $_Q453_RM'"
+
+# 4. CONTROL — a double-quoted span whose close is at the SAME depth as its
+#    opener is unaffected: the naive scan and the depth-aware scan agree, so
+#    ordinary nested substitutions keep segmenting exactly as before.
+assert_deny "#453 control: same-depth nested \$( ) close still segments (payload denies)" \
+    "echo \"\$(echo \"inner\") \" ; $_Q453_RM"
+assert_allow "#453 control: benign nested double-quoted substitution still allows" \
+    "echo \"outer \$(echo \"inner \$(date)\") tail\""
 
 echo ""
 
@@ -5023,6 +5343,115 @@ assert_deny_env "#311: grep's own quoted DDL pattern still denies (ask copy unto
 
 assert_deny "#311: sed's own quoted DDL pattern still denies (ask copy untouched)" \
     "sed -n 's|DROP TABLE users|x|p' schema.sql"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- repo#482: the logs directory ignores its own contents ---${NC}"
+# =========================================================================
+#
+# The guard's two log files live in a directory NO installer ever creates —
+# ensure_log_dir() mkdir's it on the first write, at .claude/skills/repo/logs/
+# in a real install. Nothing in the installed payload ignored it, so every
+# consumer had to add the same .gitignore rule by hand, and one that never did
+# carried an untracked runtime log in `git status` forever (which stalls any
+# installed-surface resync gating on a clean `git status --porcelain`).
+# ensure_log_dir() now drops a `*`-only .gitignore in as it creates the
+# directory, so the directory ignores its own contents — that .gitignore
+# included — and no consumer rule is needed.
+
+gi_assert() {  # <description> <status: 0=pass> [detail-on-fail]
+    TOTAL=$((TOTAL + 1))
+    if [[ "$2" -eq 0 ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $1"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $1"
+        [[ -n "${3:-}" ]] && echo -e "       ${3}"
+    fi
+}
+
+GI_DIR="$(mktemp -d)"
+
+# (a) Creating the decision log creates a .gitignore beside it whose only rule
+# is `*` (the whole directory, this file included).
+_gi_logs="$GI_DIR/a/logs"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_logs/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$_gi_logs/guard-decisions.log" && -f "$_gi_logs/.gitignore" ]] && \
+   [[ "$(grep -v '^#' "$_gi_logs/.gitignore" | grep -v '^[[:space:]]*$')" == "*" ]]; then
+    gi_assert "a fresh log-dir creation leaves a '*'-only .gitignore beside the log" 0
+else
+    gi_assert "a fresh log-dir creation leaves a '*'-only .gitignore beside the log" 1 \
+        "dir: $(ls -a "$_gi_logs" 2>&1)"
+fi
+
+# (b) The end-to-end property the fix exists for: in a git repo carrying NO
+# .gitignore rule of its own, a guard run that writes a log leaves
+# `git status --porcelain` completely clean — log file and .gitignore both.
+_gi_repo="$GI_DIR/repo"
+mkdir -p "$_gi_repo/.claude/skills/repo/hooks"
+git -C "$_gi_repo" init -q
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 \
+        LOOM_GUARD_DECISION_LOG_FILE="$_gi_repo/.claude/skills/repo/logs/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+_gi_status="$(git -C "$_gi_repo" status --porcelain 2>&1)"
+if [[ -f "$_gi_repo/.claude/skills/repo/logs/guard-decisions.log" && -z "$_gi_status" ]]; then
+    gi_assert "a written guard log leaves 'git status --porcelain' clean with no consumer rule" 0
+else
+    gi_assert "a written guard log leaves 'git status --porcelain' clean with no consumer rule" 1 \
+        "status: ${_gi_status:-<empty>}"
+fi
+
+# (c) Self-healing: a logs directory that already exists WITHOUT a .gitignore
+# (an install that predates this fix) gets one on the next write.
+_gi_pre="$GI_DIR/pre/logs"
+mkdir -p "$_gi_pre"
+printf 'stale\n' >"$_gi_pre/guard-decisions.log"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_pre/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ -f "$_gi_pre/.gitignore" ]]; then
+    gi_assert "a pre-existing logs dir with no .gitignore is healed on the next write" 0
+else
+    gi_assert "a pre-existing logs dir with no .gitignore is healed on the next write" 1 \
+        "dir: $(ls -a "$_gi_pre" 2>&1)"
+fi
+
+# (d) A .gitignore already in the logs directory is NEVER overwritten — a
+# consumer who put their own rules there keeps them.
+_gi_own="$GI_DIR/own/logs"
+mkdir -p "$_gi_own"
+printf '# consumer-owned\n*.log\n' >"$_gi_own/.gitignore"
+make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$_gi_own/guard-decisions.log" \
+        "$GUARD" >/dev/null 2>&1 || true
+if [[ "$(cat "$_gi_own/.gitignore")" == "# consumer-owned"$'\n'"*.log" ]]; then
+    gi_assert "an existing .gitignore in the logs dir is left untouched" 0
+else
+    gi_assert "an existing .gitignore in the logs dir is left untouched" 1 \
+        "content: $(cat "$_gi_own/.gitignore" 2>&1)"
+fi
+
+# (e) Fail-open is preserved: an unwritable log directory still denies, exits 0,
+# and of course writes no .gitignore anywhere it could not write.
+_gi_rc=0
+_gi_out="$(make_input "rm -rf /" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="/nonexistent-dir-482/a/b/decisions.log" \
+        "$GUARD" 2>/dev/null)" || _gi_rc=$?
+if [[ "$_gi_rc" -eq 0 ]] && \
+   [[ "$(printf '%s' "$_gi_out" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" == "deny" ]] && \
+   [[ ! -e "/nonexistent-dir-482" ]]; then
+    gi_assert "fail-open: an unwritable log dir still denies, exits 0, writes nothing" 0
+else
+    gi_assert "fail-open: an unwritable log dir still denies, exits 0, writes nothing" 1 \
+        "rc=$_gi_rc out=$_gi_out"
+fi
+
+[[ -n "$GI_DIR" && "$GI_DIR" != "/" && -d "$GI_DIR" ]] && rm -rf "$GI_DIR"
 
 echo ""
 

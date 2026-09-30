@@ -95,6 +95,13 @@ GUIDE_MD="$REPO_ROOT/.loom/roles/guide.md"
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 if [[ ! -f "$WORK_LOG" ]]; then
     echo "FATAL: WORK_LOG.md not found at $WORK_LOG" >&2
     exit 1
@@ -406,8 +413,8 @@ else
 
         seed_origin() { # <origin-exclude-expr>
             rm -rf "$ORIGIN_BARE" "$SEED_DIR"
-            git init -q --bare "$ORIGIN_BARE"
-            git init -q "$SEED_DIR"
+            git_fixture_init "$ORIGIN_BARE" --bare
+            git_fixture_init "$SEED_DIR"
             mkdir -p "$SEED_DIR/.loom/roles"
             {
                 printf "GUIDE_DOCS_PR_EXCLUDE='%s'\n" "$1"
@@ -424,7 +431,7 @@ else
             # and no-ops if none exists, so the local fixture repo needs a
             # (content-irrelevant) .loom/roles/guide.md on disk.
             rm -rf "$LOCAL_DIR"
-            git init -q "$LOCAL_DIR"
+            git_fixture_init "$LOCAL_DIR"
             git -C "$LOCAL_DIR" remote add origin "$2"
             mkdir -p "$LOCAL_DIR/.loom/roles"
             : > "$LOCAL_DIR/.loom/roles/guide.md"

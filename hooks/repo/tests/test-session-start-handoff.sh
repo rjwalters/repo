@@ -727,6 +727,43 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- repo#482: the shared logs directory ignores its own contents --"
+# ---------------------------------------------------------------------------
+# This hook and guard-destructive.sh write hook-errors.log into the SAME
+# directory (.claude/skills/repo/logs/ in a real install), and whichever hook
+# runs first is the one that creates it — the installer never does. So the
+# self-ignoring .gitignore must be written by EITHER creator, not just by the
+# guard: the fix must not be order-dependent. Exercised here against a
+# real installed layout (the hook resolves the logs dir relative to its own
+# location) in a git repo carrying NO .gitignore rule of its own.
+LOGIG="$SCRATCH/logs-ignore"
+mkdir -p "$LOGIG/.claude/skills/repo/hooks"
+git init -q "$LOGIG" 2>/dev/null
+cp "$HOOK" "$LOGIG/.claude/skills/repo/hooks/session-start-handoff.sh"
+LOGIG_DIR="$LOGIG/.claude/skills/repo/logs"
+# A missing sibling root is this hook's cheapest log_hook_error trigger, and the
+# repo has no handoff note of its own, so the scan is reached.
+jq -nc --arg w "$LOGIG" '{cwd:$w, source:"startup"}' \
+    | LOOM_ROLE= REPO_HANDOFF_SIBLING_ROOT="$SCRATCH/no-such-root-482" \
+      bash "$LOGIG/.claude/skills/repo/hooks/session-start-handoff.sh" >/dev/null 2>&1
+if [[ -f "$LOGIG_DIR/hook-errors.log" ]]; then
+    ok "logs dir: the hook's error path creates the shared logs directory"
+else
+    no "logs dir: the hook's error path creates the shared logs directory" \
+        "$(ls -a "$LOGIG_DIR" 2>&1)"
+fi
+if [[ -f "$LOGIG_DIR/.gitignore" ]] && \
+   [[ "$(grep -v '^#' "$LOGIG_DIR/.gitignore" | grep -v '^[[:space:]]*$')" == "*" ]]; then
+    ok "logs dir: this hook (not just the guard) writes the '*'-only .gitignore"
+else
+    no "logs dir: this hook (not just the guard) writes the '*'-only .gitignore" \
+        "$(cat "$LOGIG_DIR/.gitignore" 2>&1)"
+fi
+LOGIG_STATUS="$(git -C "$LOGIG" status --porcelain 2>&1 | grep -F '.claude/skills/repo/logs' || true)"
+assert_eq "logs dir: leaves git status clean with no consumer .gitignore rule" "" "$LOGIG_STATUS"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

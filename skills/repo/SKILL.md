@@ -34,7 +34,10 @@ costs.
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH. Its provisioning contract is implemented once in `scripts/repo/repo-remote.sh` (installed to `.claude/skills/repo/scripts/`); the interactive flow delegates to that script, which also serves as a headless `repo-remote up --yes --json` entry point for non-interactive callers (e.g. loom's `fleet add-worker`) |
 | [[sudo]] | Opt-in passwordless-sudo setup for a dev machine — install a `visudo`-validated `/etc/sudoers.d` drop-in (blanket `ALL` or a scoped command list) so an agent over SSH isn't blocked on password prompts; always confirmed first, validated with rollback on failure |
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
-| [[deps]] | Third-party dependency currency — verify/scaffold Dependabot (config *and* the repo-level security flag as distinct items) and triage open Dependabot PRs, always confirmed first |
+| [[deps]] | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
+| [[optimize-ci]] | Audit GitHub Actions for wasted CI minutes — change-relevance path filtering (required-check safe), cache keys, superseded runs; ranked by measured savings, report-only unless `--apply`. Its deterministic half is `scripts/repo/repo-optimize-ci.py` (installed to `.claude/skills/repo/scripts/`) |
+| [[org-policy]] | Preview or deploy canonical rjwalters/repo preferences to the client's GitHub owner/.github repository through a policy PR |
+| [[decide]] | Put operator decisions to the operator as ranked options — best to worst, each with why — so they can answer with a number |
 | [[followups]] | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | [[branches]] | Branch & worktree hygiene — merged PRs, orphaned branches, stale worktrees |
 | [[gitignore]] | Gitignore hygiene — over-ignored files, under-ignored build artifacts |
@@ -53,7 +56,10 @@ costs.
 - Before turning a Mac into a heavy Loom/agent build host (`host-optimize`)
 - To unblock an agent driving a dev box over SSH from `sudo` password prompts (`sudo`)
 - Periodically, to keep installed tool packages current (`update-tools`) and
-  third-party dependencies current — Dependabot setup and bot-PR triage (`deps`)
+  third-party dependencies current — organization policy, updater setup, and bot-PR triage (`deps`)
+- When CI is slow or expensive — docs-only PRs running full suites, caches that
+  never hit, superseded PR runs still burning minutes (`optimize-ci`)
+- To preview or install organization preferences from a client repo (`org-policy`)
 - Periodically (monthly) as general hygiene (`audit`)
 - Before making a repo public, and periodically after — to check what the
   public surface actually exposes (`scrub`)
@@ -309,3 +315,33 @@ belong to `install.sh`, not to a refresh — re-run the installer if those need
 updating. This split is requirement **C7** of the normative
 [tool-package installer contract](https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md),
 which [[update-tools]] follows for every tool in the family.
+
+### Repo-owned files (`.claude/skills/repo/resync-ignore`)
+
+Because everything above is a copy, **an edit to one of these files reverts on
+the next install or refresh.** To keep a local customization, declare the path
+repo-owned by listing it — one target-relative path per line — in
+`.claude/skills/repo/resync-ignore`. Commit that file; both `install.sh` and
+`resync-installed.sh` read it and leave every listed path alone.
+
+```
+# keep our allowlist-drift wiring in /repo:scrub
+.claude/commands/repo/scrub.md
+.agents/skills/repo/references/scrub.md
+# a whole subtree of local helper forks (trailing slash)
+.claude/skills/repo/scripts/
+```
+
+Blank lines and `#` comments are ignored; a leading `./` is tolerated. Each
+honored pin is reported on every run, and an entry that matches nothing is
+reported as a dead pin rather than silently doing nothing. Install bookkeeping
+(`install-metadata.json`, `.install-local.json`) is deliberately not pinnable —
+freezing the version stamp would make this repo lie about what it has installed.
+
+**A pin is a fork: a pinned file stops receiving upstream fixes.** Reach for the
+per-repo extension points first — `/repo:scrub` reads `.repo/scrub.toml` and
+`.repo/scrub-local-checks.md`, `/repo:release` reads its own `.repo/` policy
+file — and pin only when there is no hook to use. This is requirement **C10** of
+the same contract; it exists because one consumer lost the same `/repo:scrub`
+customization four times to reinstalls before there was any way to say "this
+file is ours".

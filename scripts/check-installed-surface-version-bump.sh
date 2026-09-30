@@ -56,11 +56,12 @@ MARKER='<!-- loom:no-surface-change -->'
 # Consumer-visible surface this repo installs into other repos (see README.md
 # "Write footprint" / INSTALLER-CONTRACT.md). Keep in sync with what
 # install.sh actually copies. scripts/repo/ is watched (not all of scripts/)
-# because install.sh only copies scripts/repo/*.sh (repo-remote.sh,
-# repo-scrub-forks.sh, resync-installed.sh) into
+# because install.sh only copies the client helpers (including repo-org-policy.py) into
 # .claude/skills/repo/scripts/ — scripts/version.sh and this script itself
 # are dev-only tooling that never leaves this repo (#416).
-WATCHED_PATHS=(commands/ skills/ hooks/ lib/ install.sh uninstall.sh scripts/repo/)
+# policies/ is fetched from the canonical source by the organization installer;
+# changes there alter consumer behavior even though it isn't copied locally.
+WATCHED_PATHS=(commands/ skills/ hooks/ lib/ install.sh uninstall.sh scripts/repo/ policies/)
 
 BASE=""
 HEAD="HEAD"
@@ -140,6 +141,7 @@ echo "" >&2
 echo "commands/, skills/, hooks/, lib/, install.sh, uninstall.sh, and" >&2
 echo "scripts/repo/ are copied into every consumer repo at install time --" >&2
 echo "NOT refreshed by a git pull." >&2
+echo "Canonical policies/ also changes organization deployments and is versioned." >&2
 echo "VERSION is the only mechanical signal consumers have that those copies" >&2
 echo "are stale (install-metadata.json, /repo:update-tools, and downstream" >&2
 echo "compute-drift checks all key off it), so a change to this surface must" >&2

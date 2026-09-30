@@ -39,6 +39,7 @@ A fine-grained PAT scoped to the target repository needs these permissions:
 | Pull requests | Read & Write | Builder, Judge, Champion, Doctor | PR creation, reviews, merges |
 | Contents | Read & Write | Builder, Champion | Push branches, merge PRs, delete branches |
 | Checks | Read | Auditor, Judge | CI status verification |
+| Actions | Read (optional) | Auditor, Judge, CI telemetry | Read workflow runs and job logs. `merge-pr.sh` reads a job log to derive the base each required check actually tested (#8919); without it the freshness guard falls back to the #8248 timestamp rule and says so on stderr. It no longer *re-runs* anything: an in-place re-run replays the original test merge commit, so it does not keep a verdict valid (#8914, withdrawn by #8919) |
 | Metadata | Read | All roles | Implicit, always granted with any other permission |
 
 ## Creating a Fine-Grained PAT
@@ -53,6 +54,7 @@ A fine-grained PAT scoped to the target repository needs these permissions:
    - **Issues**: Read and write
    - **Pull requests**: Read and write
    - **Checks**: Read-only
+   - **Actions**: Read and write (recommended — see the table above)
 7. Click **Generate token** and copy the value immediately — it won't be shown again
 
 ## Using the Token
@@ -202,7 +204,12 @@ hard-failing.
 
 1. Create a GitHub App (under whichever account/org owns the target repos)
    with **Contents: Read & write**, **Issues: Read & write**, **Pull
-   requests: Read & write**, **Metadata: Read** permissions.
+   requests: Read & write**, **Metadata: Read** permissions, plus
+   **Actions: Read** (optional: lets the #8248/#8919 freshness guard read the
+   base each required check actually tested, instead of falling back to the
+   timestamp rule). GitHub has no API for changing an App's
+   permissions: add it in the App's settings, then accept the updated
+   permission request on each installation.
 2. Generate a private key for the app (downloads a `.pem` file) and copy it to
    each fleet host that should mint tokens for that account/org — e.g.
    `~/.config/loom/github-app-key.pem`, readable only by the daemon's user
@@ -327,22 +334,21 @@ Wired call sites: `create-pr.sh` (PR creation), `create-issue.sh` /
 (comments), `forge_gh_swap_label_rl_safe` (label edits), and the sweep's
 own Builder-recovery PR creation.
 
-**The merge itself is wired too (#6752).** `merge-pr.sh`'s primary merge path
-calls the *native* `loom-daemon forge auto-merge`, whose forge-write code lives
-in Rust entirely outside this bash ladder, and its synchronous path issued a
-bare `gh api … -X PUT`. Both hard-failed on the integration-403 until #6752 —
-observed on 2026-08-22 (`/loom:sweep 6746`, PR #6751), where comment/label
-writes recovered through the ladder but the merge died, and the operator had to
-`unset GH_CONFIG_DIR` by hand (rung 3, performed manually) to finish it. The
-ladder is now command-agnostic: `forge_cmd_perm_safe <cmd> …` runs the same
-three rungs around **any** command whose credential comes from the environment
+**The merge itself is wired too (#6752).** `merge-pr.sh`'s merge path then
+called the *native* `loom-daemon forge auto-merge` (Rust, outside this bash
+ladder), and its synchronous path issued a bare `gh api … -X PUT`. Both
+hard-failed on the integration-403 until #6752 — observed on 2026-08-22
+(`/loom:sweep 6746`, PR #6751), where comment/label writes recovered through
+the ladder but the merge died, and the operator had to `unset GH_CONFIG_DIR` by
+hand (rung 3, performed manually) to finish it. The ladder is now
+command-agnostic: `forge_cmd_perm_safe <cmd> …` runs the same three rungs
+around **any** command whose credential comes from the environment
 (`loom-daemon forge …` shells out to `gh`, so the same `GH_TOKEN` /
 `GH_CONFIG_DIR` swap reaches it), and `forge_gh_perm_safe` is now just its
 `gh`-prefixed spelling — one implementation, so the two cannot drift. The
-wrapped command's exit code is preserved verbatim, so `loom-daemon forge
-auto-merge`'s meaningful codes (3 = forge declined → shell fallback, 4 =
-head-SHA mismatch → re-queue) still reach `merge-pr.sh` unretried and
-unrewritten.
+wrapped command's exit code is preserved verbatim. Since #8410 `merge-pr.sh`
+merges only via the ladder-protected `forge_merge_pr`; `forge auto-merge` is
+an operator-only verb no Loom path calls (#8427 — see its `--help` caveat).
 
 **Builders never lose work to this window.** `create-pr.sh` adopts an
 already-open PR for the head branch instead of creating a second one, and the
@@ -516,6 +522,43 @@ issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`.
 Full recipe, the atomic create+label requirement, the scripted
 `forge_gh_create_issue_rl_safe` equivalent, and why `loom-daemon forge issue
 create` is NOT a fallback: [`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md).
+
+### The duplicate backstop, and what makes it refuse (exit 3)
+
+Before filing, `create-issue.sh` runs `check-duplicate.sh` against **open
+issues** and refuses (exit 3, nothing filed) when the new issue looks like work
+already in flight. The similarity is a true Jaccard percentage over keyword
+sets, scored by `loom-daemon duplicate-scan`. The shipped calibration:
+
+| Signal | Default | Meaning |
+|---|---|---|
+| block threshold | **18%** full-text similarity | at/above this, the filing is refused |
+| corroboration ceiling | **25%** full-text similarity | below this, a block needs a second signal |
+| title threshold | **18%** *title-only* similarity | the second signal a low block must clear |
+| warn band floor | **13%** full-text similarity | reported on stderr, filed anyway |
+
+18% comes from this repo's own history (#4409): the confirmed duplicate pair
+#3550/#3551 scored 19% on full bodies, while unrelated richly-worded issues
+scored 4–13%. But 18% on *full text* alone is cheap — two long issues in the
+same subsystem share enough jargon to reach it — so since #8591 a match between
+18% and 25% must **also** reach 18% similarity on **titles alone** before it
+blocks. Titles are short and specific, so they are the cheap second opinion:
+#3550/#3551 scores 26% on titles and still blocks, while #8561 (a Kimi CLI
+harness adapter) vs. #8505 (an OpenCode metered-runtime budget bug) scores 3%
+and no longer does. At or above 25% the body overlap stands on its own.
+
+An uncorroborated match is **demoted, not discarded**: it appears as a
+`NEAR #<n>: … (similarity: X%, title overlap only Y% — not corroborated, so not
+a block)` row, and the filing proceeds. So does anything in the 13–17% warn
+band. Nothing the check noticed is ever silently dropped.
+
+**When you still need `--force`.** Genuinely distinct work that trips the block
+anyway — re-run with `--force` (or `LOOM_SKIP_DUPLICATE_CHECK=1` for a whole
+filing burst). Reaching for it *reflexively* is the failure mode the
+calibration exists to prevent: a backstop everyone bypasses protects nothing.
+An intentional follow-up needs neither — a filing that already cross-references
+the match by number (`Part of #123`, `Parent: #123`, `split out of #123`) is
+exempt by construction.
 
 ## Troubleshooting
 

@@ -35,6 +35,12 @@ CONTRACT="$REPO_ROOT/INSTALLER-CONTRACT.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 # assert_file is specific to this suite (not part of the shared set).
 assert_file() { if [[ -f "$2" ]]; then ok "$1"; else no "$1" "no such file: $2"; fi; }
 
@@ -64,9 +70,9 @@ new_source() {  # <dir> — build a Repo Skills source clone at <dir>
     cp "$REPO_ROOT/skills/repo/SKILL.md" "$dir/skills/repo/"
     cp "$REPO_ROOT"/commands/repo/*.md "$dir/commands/repo/"
     cp "$REPO_ROOT"/hooks/repo/*.sh "$dir/hooks/repo/"
-    cp "$REPO_ROOT"/scripts/repo/*.sh "$dir/scripts/repo/"
-    chmod +x "$dir/install.sh" "$dir/uninstall.sh" "$dir"/scripts/repo/*.sh
-    git -C "$dir" init -q
+    cp "$REPO_ROOT"/scripts/repo/*.sh "$REPO_ROOT"/scripts/repo/*.py "$dir/scripts/repo/"
+    chmod +x "$dir/install.sh" "$dir/uninstall.sh" "$dir"/scripts/repo/*.sh "$dir"/scripts/repo/*.py
+    git_fixture_init "$dir"
     git -C "$dir" add -A >/dev/null 2>&1
     git -C "$dir" -c user.email=t@example.com -c user.name=Test \
         commit -qm "fixture" >/dev/null 2>&1
@@ -74,7 +80,7 @@ new_source() {  # <dir> — build a Repo Skills source clone at <dir>
 
 new_target() {  # <dir> — an empty git repo to install into
     mkdir -p "$1"
-    git -C "$1" init -q
+    git_fixture_init "$1"
 }
 
 do_install() {  # <source> <target> [extra install.sh args...]
@@ -146,6 +152,16 @@ assert_contains "install.sh --dry-run lists repo-scrub-forks.sh as a planned wri
 RESYNC_SRC_BODY="$(cat "$RESYNC_SRC")"
 assert_contains "resync-installed.sh's plan includes repo-scrub-forks.sh" \
     "$RESYNC_SRC_BODY" 'plan "scripts/repo/repo-scrub-forks.sh"'
+
+# repo#505: optimize-ci.md invokes repo-optimize-ci.py from the installed
+# scripts dir, so it must ship there and stay in the resync plan — same shape.
+OC_INSTALLED="$TGT/.claude/skills/repo/scripts/repo-optimize-ci.py"
+assert_file "install.sh installs repo-optimize-ci.py into the skill scripts dir" "$OC_INSTALLED"
+if [[ -x "$OC_INSTALLED" ]]; then ok "the installed repo-optimize-ci.py copy is executable"; else no "the installed repo-optimize-ci.py copy is executable"; fi
+assert_contains "install.sh --dry-run lists repo-optimize-ci.py as a planned write" \
+    "$DRY_INSTALL" "scripts/repo-optimize-ci.py"
+assert_contains "resync-installed.sh's plan includes repo-optimize-ci.py" \
+    "$RESYNC_SRC_BODY" 'plan "scripts/repo/repo-optimize-ci.py"'
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -269,6 +285,59 @@ fi
 assert_file "the filtered install keeps the commands it did install" "$FTGT/.claude/commands/repo/reset.md"
 assert_contains "an unfiltered install records filtered:false" \
     "$(cat "$TGT/.claude/skills/repo/install-metadata.json")" '"filtered": false'
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- a deferred guard install (guardHookInstalled:false) is NOT re-added (repo#490) --"
+GTGT="$SCRATCH/tgt-deferred-guard"
+new_target "$GTGT"
+mkdir -p "$GTGT/.claude"
+cat >"$GTGT/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh" }
+        ]
+      }
+    ]
+  }
+}
+EOF
+do_install "$SRC" "$GTGT"
+GMETA="$GTGT/.claude/skills/repo/install-metadata.json"
+assert_contains "a deferred install records guardHookInstalled:false" \
+    "$(cat "$GMETA")" '"guardHookInstalled": false'
+if [[ ! -e "$GTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "the deferred install never wrote guard-destructive.sh"
+else
+    no "the deferred install never wrote guard-destructive.sh"
+fi
+
+run_resync "$GTGT" --dry-run
+assert_eq "dry-run on a deferred-guard install is in sync" "0" "$RS_RC"
+assert_not_contains "dry-run does not propose adding guard-destructive.sh back" \
+    "$RS_OUT" "guard-destructive.sh"
+run_resync "$GTGT"
+if [[ ! -e "$GTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "apply resync still does not create guard-destructive.sh"
+else
+    no "apply resync still does not create guard-destructive.sh"
+fi
+assert_contains "resync's re-stamped metadata still records guardHookInstalled:false" \
+    "$(cat "$GMETA")" '"guardHookInstalled": false'
+
+# An unfiltered, non-deferred install (TGT, established above) must record
+# guardHookInstalled:true and keep refreshing a hand-deleted guard script — the
+# deferral is selective, not a blanket "resync never touches this file".
+assert_contains "a normal install records guardHookInstalled:true" \
+    "$(cat "$TGT/.claude/skills/repo/install-metadata.json")" '"guardHookInstalled": true'
+rm -f "$TGT/.claude/skills/repo/hooks/guard-destructive.sh"
+run_resync "$TGT"
+assert_file "resync restores a guard recorded as installed" \
+    "$TGT/.claude/skills/repo/hooks/guard-destructive.sh"
 
 # ---------------------------------------------------------------------------
 echo ""

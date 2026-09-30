@@ -22,7 +22,10 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:sudo` | Opt-in passwordless-sudo setup for a dev machine — install a `visudo`-validated `/etc/sudoers.d` drop-in (blanket `ALL` or a scoped command list) so an agent over SSH isn't blocked on password prompts; always confirmed, validated with rollback on failure |
 | `/repo:host-optimize` | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
-| `/repo:deps` | Third-party dependency currency — verify/scaffold Dependabot (config *and* the repo-level security flag) and triage open Dependabot PRs, always confirmed first |
+| `/repo:deps` | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
+| `/repo:optimize-ci` | Audit GitHub Actions for wasted CI minutes — change-relevance path filtering (required-check safe), cache keys, superseded runs; ranked by measured savings, report-only unless `--apply` |
+| `/repo:org-policy` | Preview or deploy canonical rjwalters/repo preferences to the client's GitHub owner/.github repository through a policy PR |
+| `/repo:decide` | Put operator decisions to the operator as ranked options — best to worst, each with why — so they can answer with a number |
 | `/repo:followups` | Capture follow-on work from this session and file it as issues — here or in upstream tool repos, always confirmed first |
 | `/repo:branches` | Branch & worktree hygiene — merged PRs, orphaned worktree branches, stale worktrees |
 | `/repo:gitignore` | Gitignore audit — over-ignored files, under-ignored build artifacts, stale rules |
@@ -30,6 +33,12 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:links` | Validate internal cross-references — markdown links, CLAUDE.md paths, skill graphs |
 | `/repo:orphans` | Find unreferenced files — dead scripts, stale data, outputs without sources |
 | `/repo:readme` | Check README accuracy against actual directory contents |
+
+Organization preferences are maintained in [`policies/`](policies/README.md) in
+rjwalters/repo. From any client, `/repo:org-policy --install` previews and opens
+a PR installing the resolved preferences into that owner's `.github` repository.
+`/repo:deps` then handles client adoption. The default is 14-day routine updates,
+one-day advisory-backed security updates, and a separate opt-in for automerge.
 
 Hygiene skills **apply their safe, reversible fixes by default** and report each change; add `--ask` to review findings and confirm first. Irreversible actions (deleting branches, worktrees, stashes, untracked files) are never automatic — they require an explicit opt-in and pass a permanent-loss check. Commands whose only action is consequential (`orphans`, `update-tools`, `deps`, `followups`, `release`, `remote`, `sudo`) always confirm first.
 
@@ -161,16 +170,50 @@ This is requirement C7 of [`INSTALLER-CONTRACT.md`](INSTALLER-CONTRACT.md), the
 normative installer contract this repo owns for the whole tool-package family
 (Loom, Anvil, Repo Skills, squad).
 
+### Keeping a local customization (`resync-ignore`)
+
+Because the installed surfaces are copies, **an edit to one of them reverts on
+the next install or resync.** A consumer declares a path its own by listing it
+in `.claude/skills/repo/resync-ignore` — one target-relative path per line, `#`
+comments and blank lines ignored, a trailing `/` pinning a whole subtree:
+
+```
+# keep our allowlist-drift wiring in /repo:scrub
+.claude/commands/repo/scrub.md
+.agents/skills/repo/references/scrub.md
+```
+
+`install.sh` and `resync-installed.sh` read the same list through
+[`lib/resync-ignore.sh`](lib/resync-ignore.sh), so a pin cannot be honored by
+one writer and undone by the other. `uninstall.sh` reads it too, but for a
+different purpose: a pin protects a file from a refresh, not from a deliberate
+uninstall, so it still removes pinned paths — it just names them in the
+pre-removal preview first, so the operator can copy anything they want to keep.
+Every honored pin is reported; an entry that
+matches nothing is reported as a dead pin rather than silently doing nothing.
+Install bookkeeping (`install-metadata.json`, `.install-local.json`) is
+deliberately not pinnable — freezing the version stamp would make the consumer
+repo lie about what it has installed.
+
+**A pin is a fork**, so a pinned file stops receiving upstream fixes. Prefer a
+command's per-repo extension point where one exists (`/repo:scrub` reads
+`.repo/scrub.toml` and `.repo/scrub-local-checks.md`) and pin only when there is
+no hook to use. This is requirement C10 of the same contract; it exists because
+one consumer lost the same `/repo:scrub` customization four times to reinstalls
+before there was any way to say "this file is ours".
+
 ### Write footprint
 
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
-- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall)
+- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall). **Conditional**: skipped entirely when another destructive-command guard is already wired in `.claude/settings.json` (e.g. an existing Loom install) — the same coexistence check the `.claude/settings.json` bullet below describes decides both whether to wire the hook *and* whether to even copy the script, so a deferred install never ships a copy of the ~6,700-line script nothing would run. The decision is recorded in `install-metadata.json`'s `guardHookInstalled` field so `resync-installed.sh` keeps respecting it on every later refresh
 - `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/repo-scrub-forks.sh` — the `/repo:scrub --forks` fork-network sweep. Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/repo-optimize-ci.py` — the `/repo:optimize-ci` workflow audit (read-only GitHub calls). Same colocation, removed with the skill dir on uninstall
+- `.claude/skills/repo/scripts/repo-org-policy.py` — the `/repo:org-policy` plan/apply engine (writes only through an explicitly applied plan, to the organization's `.github` repo — never to the consumer repo). Same colocation, removed with the skill dir on uninstall
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
@@ -194,6 +237,10 @@ commands/repo/*.md           Command files installed to .claude/commands/repo/ a
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
+scripts/repo/repo-optimize-ci.py  /repo:optimize-ci workflow audit, installed to the same place
+scripts/repo/repo-org-policy.py  /repo:org-policy plan/apply engine, installed to the same place
+policies/                    Canonical organization preferences (Renovate preset + validators) that
+                             /repo:org-policy reads from GitHub — consumer-visible, not installed
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
 hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inline smoke cases
@@ -203,7 +250,8 @@ hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLA
                              claude + codex shell wrappers, Claude/Codex skill parity
 commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
                              provisioning, verify-after-write, early sync-and-switch, tidy
-                             KEEP tiers, C7 resync, installer contract, fork-network sweep,
+                             KEEP tiers, C7 resync, C10 repo-owned pins, installer contract,
+                             fork-network sweep,
                              scrub/all/prune contract, links precision, guard equivalence
                              (its case table lives in guard-equivalence-cases.txt),
                              README layout block vs disk, SKILL.md Commands
@@ -213,7 +261,7 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              ownership, CHANGELOG merged-work and version-citation
                              checks, label-description lint, json_escape parity,
                              version.sh, and the installed-surface VERSION-bump gate
-INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C9), owned by this repo
+INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C10), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller
 lib/claude-md-block.sh       Marker-bounded CLAUDE.md surgery shared by install.sh/uninstall.sh
@@ -224,6 +272,10 @@ lib/codex-skill.sh           The Codex skill surface (.agents/skills/repo/): pat
                              records how the target format was confirmed against Codex's own docs
 lib/shell-wrapper.sh         Opt-in claude + codex shell wrappers (--shell-wrapper): detection, alias parsing, runtime posture-flag dedup, marker-bounded rc surgery
 lib/gitignore-check.sh       C9 post-install sweep: warns (never fails) when a written payload file is gitignored in the consumer repo
+lib/resync-ignore.sh         C10 repo-owned pins: the one reader of .claude/skills/repo/resync-ignore, shared by
+                             install.sh and resync-installed.sh so a pin cannot be honored by one writer and undone
+                             by the other; also read by uninstall.sh, which still removes pinned paths but names
+                             them in the pre-removal preview first
 scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`), used by /repo:release and CI
 scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```

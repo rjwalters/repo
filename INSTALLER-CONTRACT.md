@@ -111,7 +111,8 @@ therefore **MUST NOT** contain an absolute path, a hostname, a username, or a
 timestamp — those go in the sidecar (C6).
 
 Additional fields are permitted as long as they preserve that property (Repo
-Skills also records `dev`, `filtered`, and the selected `commands`).
+Skills also records `dev`, `filtered`, `guardHookInstalled`, and the selected
+`commands`).
 
 > Spot-check: `jq -e '.version and .commit and .layout_version' <tool-root>/install-metadata.json`
 > and `jq -e 'has("source") or has("installed_at") | not' <tool-root>/install-metadata.json`
@@ -269,6 +270,66 @@ existed to keep out (repo#425).
 > place a file under the installed surface's runtime `logs/` directory,
 > gitignore it, and confirm the sweep stays silent about it.
 
+### C10 — Repo-owned pins
+
+The consumer **MUST** be able to declare an installed path repo-owned, and
+**every writer of the installed surface MUST honor that declaration** — the
+installer, the C7 resync, and any clean sweep a *reinstall* performs. A pin
+honored by one writer and not another is not a pin: the other one undoes it on
+its next run, and the consumer cannot tell which writer did it.
+
+An explicit **uninstall** is the one exception, and a narrow one: it is a
+deliberate "take this tool out" instruction, and a pinned file is still a fork of
+a tool file, so it goes with the rest. But the uninstaller **MUST NOT** remove a
+pinned path silently — it **MUST** name every pin in its pre-removal preview,
+above the confirmation, so the operator can copy the content out first.
+
+The mechanism **MUST** be:
+
+- **declarative and in-repo** — a plain-text list of paths committed to the
+  consumer repo, not a flag passed at invocation time. The whole point is that
+  the declaration survives being forgotten: whoever reinstalls next may be a
+  different person, or an automated fleet driver, months later;
+- **read from exactly one implementation** shared by every writer, for the
+  reason C5/C6's single emitter exists — two readers of the same list eventually
+  disagree, and the disagreement is invisible until it reaches a consumer;
+- **reported, never silent** — each honored pin named in that run's per-file
+  output, and each entry that matched **nothing** named as a dead pin. A pin
+  that looks installed and does nothing is the failure mode, not a cosmetic
+  gap: the consumer believes their file is protected and it is not;
+- **non-fatal** — a typo in the list warns; it never aborts an install.
+
+Scope: the **rendered payload copies**. Install bookkeeping (the C5 metadata,
+the C6 sidecar) is deliberately NOT pinnable — freezing the version stamp every
+"am I current?" check reads makes the repo lie about what it has installed,
+which is the opposite of ownership. Files the installer only ever *merges into*
+(`settings.json`, `.gitignore`) and marker-bounded blocks in consumer-owned
+prose (`CLAUDE.md`) need no pin: everything outside the markers is already the
+consumer's.
+
+Why this is a requirement and not a nicety: without it, **the only edit to a
+vendored file that survives a reinstall is no edit at all.** One consumer
+(2AMLogic/2am, private) lost the same `/repo:scrub` customization four times
+across a few months — 2am#463 wrote it, #593 found it gone, #594 re-added it,
+the v0.10.0 → v0.11.12 upgrade removed it, #775/#776 re-added it with a
+regression test, the v0.12.2 / v0.14.0 reinstalls removed it again, and #1596
+finally moved the wiring out of the vendored file entirely because the vendored
+file could not hold it (repo#511). The tell is a fix being re-applied because a
+reinstall reverted it. A tool that offers no pin leaves its consumers with only
+two options: re-apply forever, or fork the whole file out of the tool's reach.
+
+A pin is a fork, so a tool **SHOULD** also offer extension points that make
+pinning unnecessary for the common cases (a `.repo/`-style per-repo config a
+command reads at runtime), and **SHOULD** say so where the pin is documented —
+a pinned file stops receiving upstream fixes.
+
+> Spot-check: in a scratch consumer repo, install, edit an installed payload
+> file, list its path in the tool's pin list, then run **both** the installer
+> again and the C7 resync. The file must be byte-identical afterwards, both runs
+> must name it as pinned, and an entry naming a nonexistent path must produce a
+> dead-pin warning without failing either run. Separately, run the uninstaller
+> and confirm the pinned path is named before the confirmation prompt.
+
 ## Conformance
 
 `repo` is the only column below this repo can verify mechanically, and it does:
@@ -279,8 +340,8 @@ The other three columns are point-in-time observations — each carries the
 tool's tracking issue, and each requirement above carries a spot-check command
 you can run against that tool's clone to re-derive its row in seconds.
 
-Other tools' columns observed 2026-08-06 (repo#156); `repo` column verified on
-every test run.
+Other tools' columns observed 2026-08-06 (repo#156), C10 observed 2026-09-29
+(repo#511); `repo` column verified on every test run.
 
 | # | loom | anvil | repo | squad |
 |---|---|---|---|---|
@@ -293,6 +354,7 @@ every test run.
 | C7 consumer resync | ✅ | ❌ | ✅ | ❌ |
 | C8 honest `VERSION` | ❌ empty | ❌ scraped from prose | ✅ | ❌ empty |
 | C9 gitignore sweep | ❌ not yet checked (repo#385) | ❌ not yet checked (repo#385) | ✅ | ❌ not yet checked (repo#385) |
+| C10 repo-owned pins | ✅ `.loom/resync-ignore` | ❌ | ✅ | ❌ |
 
 Conformance work is tracked per tool: Loom
 [rjwalters/loom#5517](https://github.com/rjwalters/loom/issues/5517), Anvil
@@ -321,6 +383,7 @@ Conformance work is tracked per tool: Loom
 | C7 | [`scripts/repo/resync-installed.sh`](scripts/repo/resync-installed.sh) → installed to `.claude/skills/repo/scripts/` |
 | C8 | [`VERSION`](VERSION) |
 | C9 | [`lib/gitignore-check.sh`](lib/gitignore-check.sh)'s `warn_gitignored_payload`, called by both `install.sh` (generalizing the older single-path `dest_is_gitignored()` check) and `scripts/repo/resync-installed.sh` |
+| C10 | `.claude/skills/repo/resync-ignore` in the consumer repo, read by [`lib/resync-ignore.sh`](lib/resync-ignore.sh) — the single implementation both `install.sh` (in `install_file()`, plus the Codex `SKILL.md` write) and `scripts/repo/resync-installed.sh` (in `sync_one()`) consult before writing a payload destination. The resync **refuses** to run when the target has pins but the source clone predates the lib, rather than degrading to overwriting them. Extension points that make a pin unnecessary: `/repo:scrub`'s `.repo/scrub.toml` + `.repo/scrub-local-checks.md`, `/repo:release`'s `.repo/` policy file |
 
 The C5/C6 split has exactly one emitter (`lib/metadata.sh`) and the rendering
 of copied surfaces exactly one implementation (`lib/render.sh`), shared by the
@@ -330,7 +393,10 @@ consumer.
 
 Behavioral coverage lives in
 [`commands/repo/tests/test-resync-installed.sh`](commands/repo/tests/test-resync-installed.sh)
-(C7's properties) and
+(C7's properties),
+[`commands/repo/tests/test-resync-ignore.sh`](commands/repo/tests/test-resync-ignore.sh)
+(C10's, including a positive control that the same edit is clobbered *without*
+a pin) and
 [`commands/repo/tests/test-installer-contract.sh`](commands/repo/tests/test-installer-contract.sh)
-(the C1–C9 spot-checks and the conformance-table cross-check). Both run under
-`pnpm test`.
+(the C1–C10 spot-checks and the conformance-table cross-check). All three run
+under `pnpm test`.

@@ -96,11 +96,54 @@ HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
 # see decision_log_enabled() below.
 DECISION_LOG="${REPO_GUARD_DECISION_LOG_FILE:-${LOOM_GUARD_DECISION_LOG_FILE:-${SCRIPT_DIR}/../logs/guard-decisions.log}}"
 
+# ensure_log_dir <log-file> — create the log file's directory and make that
+# directory ignore its own contents (repo#482).
+#
+# The logs directory is created by the HOOKS, never by install.sh: at runtime it
+# resolves to .claude/skills/repo/logs/ inside the consumer repo, and nothing in
+# the installed payload ignored it. That left "add a .gitignore rule for the
+# guard's runtime logs" as an unstated per-consumer obligation — and a consumer
+# who never learned of it carries an untracked hook-errors.log/guard-decisions.log
+# in `git status` forever. In a repo whose installed-surface resync gates on a
+# clean `git status --porcelain` (Loom's resync-installed.sh does), that one
+# untracked log silently stalls every scheduled resync with no obvious cause.
+#
+# Writing a `*`-only .gitignore into the directory as we create it makes the
+# directory ignore its own contents — the .gitignore file included — wherever
+# the hooks create it, so no consumer .gitignore rule is needed at all. Doing it
+# HERE rather than in install.sh is deliberate: this is the only code that ever
+# creates the directory, so it covers a pre-existing install too (the next log
+# write drops the file in), a bare hook copy made without running the installer,
+# and whichever hook happens to create the directory first.
+#
+# An existing .gitignore is never overwritten — a consumer who wrote their own
+# rules in that file keeps them.
+#
+# Best-effort like every other logging path in this file: a failed mkdir or
+# write NEVER changes a decision and NEVER produces a non-zero exit.
+ensure_log_dir() {  # <log-file-path>
+    local dir
+    dir="$(dirname "$1" 2>/dev/null)" || return 0
+    [[ -n "$dir" ]] || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    [[ -e "$dir/.gitignore" ]] && return 0
+    # Grouped so a FAILED redirection-open (unwritable dir) has its bash-level
+    # error caught by the group's stderr redirect too — same reason
+    # log_guard_decision's append below is grouped.
+    { printf '%s\n' \
+        "# Runtime output from the installed Repo Skills hooks (repo#482)." \
+        "# Machine-local: these logs routinely carry absolute filesystem paths," \
+        "# so they must never be committed. This file ignores the whole" \
+        "# directory, itself included, so no consumer .gitignore rule is needed." \
+        "*" >"$dir/.gitignore"; } 2>/dev/null || true
+    return 0
+}
+
 # Log a diagnostic error message (best-effort, never fails the script)
 log_hook_error() {
     local msg="$1"
-    # Ensure log directory exists
-    mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
+    # Ensure log directory exists (and ignores itself — see ensure_log_dir)
+    ensure_log_dir "$HOOK_ERROR_LOG"
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [guard-destructive] $msg" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
 }
 
@@ -192,7 +235,7 @@ log_guard_decision() {
             2>/dev/null) || return 0
     fi
     [[ -n "$line" ]] || return 0
-    mkdir -p "$(dirname "$DECISION_LOG")" 2>/dev/null || true
+    ensure_log_dir "$DECISION_LOG"
     # Group the append so a FAILED >> redirection (unwritable/nonexistent dir)
     # has its bash-level error caught by the group's stderr redirect too — a bare
     # `>> "$f" 2>/dev/null` does not suppress the redirection-open error itself.
@@ -1169,15 +1212,34 @@ resolve_default_branch() {
 #     inside `$( )`), and recording it would end the span at a position the
 #     legacy walk pairs differently — the one direction that can lose a segment
 #     boundary. Returning 0 reproduces the pre-#113 walk for that span exactly.
+#   - for a DOUBLE-quoted span (`qc == dqc`), also SKIPS a same-kind quote that
+#     sits at a DEEPER `$( )`/backtick substitution nesting depth than the
+#     opening quote itself (#453). A `"` nested one substitution level below the
+#     opener belongs to the INNER shell's own quoting, not to this span — it is
+#     unescaped, so the pre-#453 walk accepted it as this span's close anyway
+#     (a "phantom close"), which handed everything from there to the REAL close
+#     — genuinely live code the outer `$( )` is still running — to the inert
+#     verbatim-copy branch instead of to the active, separator-tracking one. See
+#     subst_depth() below for how the per-byte depth is computed, and the #453
+#     block in the ml_segment() copy of this guard for the worked repro. Scoped
+#     to DOUBLE quotes only: a single-quoted span's close is *always* the very
+#     next single-quote byte in real bash — single quotes cannot nest and admit
+#     no expansion of any kind, so a `$(` appearing between them is inert LITERAL
+#     text with no bearing on where the span ends, and depth-filtering it would
+#     wrongly skip the correct (and only) close.
 # Every use of THESE HELPERS is narrowing: treating something as
-# escaped/ambiguous only falls back to (or stays in) separator-ACTIVE
-# segmentation. That is a property of the helpers, not an unconditional property
-# of the lexers — see the KNOWN LIMIT note on the inert-span branch (#130) for
-# the one shape where correcting the active-span pairing lets a STRAY unmatched
-# quote pair differently than it did before #113.
+# escaped/ambiguous/depth-mismatched only falls back to (or stays in)
+# separator-ACTIVE segmentation. That is a property of the helpers, not an
+# unconditional property of the lexers — see the KNOWN LIMIT note on the
+# inert-span branch (#130) for the one shape where correcting the active-span
+# pairing lets a STRAY unmatched quote pair differently than it did before #113.
 #
 # Lives in its own awk source string, prepended to BOTH lexer sources, so
 # qsplit() and ml_segment() share ONE definition and cannot drift (#113).
+# subst_depth() (the `$( )`/backtick nesting-depth precompute trusted_close()
+# needs for the DOUBLE-quote check above) lives here too, for the same reason —
+# #453 needed it available to ml_segment(), which qsplit()-only placement
+# (its pre-#453 home) did not provide.
 # =============================================================================
 _ESCAPE_AWK='
 function bs_escaped(s, i,   bs, p) {
@@ -1185,11 +1247,78 @@ function bs_escaped(s, i,   bs, p) {
     for (p = i - 1; p >= 1 && substr(s, p, 1) == "\\"; p--) bs++
     return (bs % 2)
 }
-function trusted_close(s, n, ci, qc,   j) {
-    while (ci > 0 && bs_escaped(s, ci)) {
+# subst_depth(s, d) — fill d[i] with the number of `$( … )`/backtick command
+# substitutions enclosing byte i of s (#436).
+#
+# The opening `$(` / opening backtick bytes carry the INNER depth and the
+# closing `)` / closing backtick byte carries the OUTER depth, so a byte is
+# "inside a substitution" exactly when d[i] > 0 — boundary bytes included on the
+# side they belong to, which is what makes the inner-segment capture in
+# subst_inner() terminate on the close.
+#
+# A plain `(` only nests when a substitution is already open: a genuine TOP-LEVEL
+# subshell `( a ; b )` runs its own commands in the calling shell-s pipeline, so
+# its separators must stay live. `$((` arithmetic therefore reads as `$(` plus a
+# plain `(`, which nests and unnests symmetrically. A `)` never closes a backtick
+# span. Escaped openers/closers (`\$(`, `` \` ``) are literal text, matching the
+# escape convention the rest of this lexer uses (#113).
+#
+# Deliberately quote-BLIND, exactly like the `index(inner, "$(")` probe the
+# active-span branch already uses: a `$( … )` inside single quotes is not
+# expanded by the real shell, but both are treated as a substitution here so the
+# conservative direction (separators inside stay capturable as inner segments) is
+# the one taken. trusted_close() above compensates for this at its one call site
+# that matters (the DOUBLE-quote depth check): a single-quoted span never uses
+# this depth at all, so its quote-blindness there is moot.
+function subst_depth(s, d,   n, i, c, dep, kind, BQ) {
+    BQ = sprintf("%c", 96)   # backtick
+    n = length(s)
+    split("", d)
+    split("", kind)
+    dep = 0
+    i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (!bs_escaped(s, i)) {
+            if (c == "$" && i < n && substr(s, i + 1, 1) == "(") {
+                dep++
+                kind[dep] = "P"
+                d[i] = dep
+                d[i + 1] = dep
+                i += 2
+                continue
+            }
+            if (c == BQ) {
+                if (dep > 0 && kind[dep] == "B") { dep--; d[i] = dep }
+                else { dep++; kind[dep] = "B"; d[i] = dep }
+                i++
+                continue
+            }
+            if (c == "(" && dep > 0) {
+                dep++
+                kind[dep] = "p"
+                d[i] = dep
+                i++
+                continue
+            }
+            if (c == ")" && dep > 0 && kind[dep] != "B") {
+                dep--
+                d[i] = dep
+                i++
+                continue
+            }
+        }
+        d[i] = dep
+        i++
+    }
+}
+function trusted_close(s, n, ci, qc, dqc, d, dep0,   j) {
+    while (ci > 0 && (bs_escaped(s, ci) || (qc == dqc && d[ci] != dep0))) {
         j = ci + 1
         ci = 0
-        for (; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
+        for (; j <= n; j++) {
+            if (substr(s, j, 1) == qc && (qc != dqc || d[j] == dep0)) { ci = j; break }
+        }
     }
     if (ci > 1 && substr(s, ci - 1, 1) == "\\") return 0
     return ci
@@ -1278,69 +1407,11 @@ function trusted_close(s, n, ci, qc,   j) {
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK='
-# subst_depth(s, d) — fill d[i] with the number of `$( … )`/backtick command
-# substitutions enclosing byte i of s (#436).
+# subst_depth() (the `$( )`/backtick nesting-depth precompute used below and by
+# trusted_close()) now lives in the shared _ESCAPE_AWK source string above,
+# prepended ahead of this one at every call site (#453) — it moved there so
+# ml_segment() could use it too; see that block for the full doc comment.
 #
-# The opening `$(` / opening backtick bytes carry the INNER depth and the
-# closing `)` / closing backtick byte carries the OUTER depth, so a byte is
-# "inside a substitution" exactly when d[i] > 0 — boundary bytes included on the
-# side they belong to, which is what makes the inner-segment capture in
-# subst_inner() terminate on the close.
-#
-# A plain `(` only nests when a substitution is already open: a genuine TOP-LEVEL
-# subshell `( a ; b )` runs its own commands in the calling shell-s pipeline, so
-# its separators must stay live. `$((` arithmetic therefore reads as `$(` plus a
-# plain `(`, which nests and unnests symmetrically. A `)` never closes a backtick
-# span. Escaped openers/closers (`\$(`, `` \` ``) are literal text, matching the
-# escape convention the rest of this lexer uses (#113).
-#
-# Deliberately quote-BLIND, exactly like the `index(inner, "$(")` probe the
-# active-span branch already uses: a `$( … )` inside single quotes is not
-# expanded by the real shell, but both are treated as a substitution here so the
-# conservative direction (separators inside stay capturable as inner segments) is
-# the one taken.
-function subst_depth(s, d,   n, i, c, dep, kind, BQ) {
-    BQ = sprintf("%c", 96)   # backtick
-    n = length(s)
-    split("", d)
-    split("", kind)
-    dep = 0
-    i = 1
-    while (i <= n) {
-        c = substr(s, i, 1)
-        if (!bs_escaped(s, i)) {
-            if (c == "$" && i < n && substr(s, i + 1, 1) == "(") {
-                dep++
-                kind[dep] = "P"
-                d[i] = dep
-                d[i + 1] = dep
-                i += 2
-                continue
-            }
-            if (c == BQ) {
-                if (dep > 0 && kind[dep] == "B") { dep--; d[i] = dep }
-                else { dep++; kind[dep] = "B"; d[i] = dep }
-                i++
-                continue
-            }
-            if (c == "(" && dep > 0) {
-                dep++
-                kind[dep] = "p"
-                d[i] = dep
-                i++
-                continue
-            }
-            if (c == ")" && dep > 0 && kind[dep] != "B") {
-                dep--
-                d[i] = dep
-                i++
-                continue
-            }
-        }
-        d[i] = dep
-        i++
-    }
-}
 # subst_inner(s, d) — the inner commands that separators INSIDE a substitution
 # really do start, as "\n"-prefixed segments to append after the outer stream
 # (#436). d[] comes from subst_depth().
@@ -1555,12 +1626,13 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
             # REMEMBER where the span really ENDS (#113) so the char-walk does not
             # re-read that quote as a NEW opener — which used to swallow
             # everything after the span. `trusted_close()` resolves the real close
-            # (skipping backslash-escaped quotes, refusing an ambiguous one); see
-            # the ml_segment() copy of this guard for the full rationale — both
-            # lexers share the defect and therefore share the fix so they cannot
-            # drift.
+            # (skipping backslash-escaped quotes, refusing an ambiguous one, and —
+            # for a double-quoted span — refusing a same-kind quote nested at a
+            # DEEPER substitution depth, #453); see the ml_segment() copy of this
+            # guard for the full rationale — both lexers share the defect and
+            # therefore share the fix so they cannot drift.
             out = out c
-            tc = trusted_close(s, n, ci, qc)
+            tc = trusted_close(s, n, ci, qc, DQ, sdep, sdep[i])
             if (tc > 0) acs[++acn] = tc
             i++
             continue
@@ -1624,12 +1696,18 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
 #     command still yields a real later-line segment and still denies (safety
 #     floor preserved; matches the old per-record behaviour where each input line
 #     was its own record).
-#   - An INERT quoted span (no `$(` and no backtick) is copied VERBATIM, so its
-#     embedded newlines/separators stay literal and never manufacture a phantom
-#     segment out of quoted documentation prose (the false positive).
-#   - A quoted span carrying command substitution (`$(` or a backtick) keeps its
-#     separators ACTIVE (walked char-by-char, exactly like qsplit()), so a
-#     smuggled payload is never hidden behind an opening quote. Its
+#   - An INERT quoted span is copied VERBATIM, so its embedded
+#     newlines/separators stay literal and never manufacture a phantom segment
+#     out of quoted documentation prose (the false positive). A span is inert
+#     when it carries no `$(` and no backtick — and a TOP-LEVEL single-quoted
+#     span is inert regardless of its content (#443), because bash never expands
+#     or substitutes anything between `'...'`. "Top-level" is load-bearing
+#     (#450): an apostrophe met while an ACTIVE span is still open is literal
+#     text to the shell, not an opener, so its span may hold live code and is
+#     NOT treated as inert.
+#   - A DOUBLE-quoted span carrying command substitution (`$(` or a backtick)
+#     keeps its separators ACTIVE (walked char-by-char, exactly like qsplit()),
+#     so a smuggled payload is never hidden behind an opening quote. Its
 #     already-computed CLOSING quote index is remembered (#113) so the walk that
 #     reaches it recognises the span TERMINATOR instead of re-opening a phantom
 #     span there — the mis-read that used to swallow the whole rest of the
@@ -1756,7 +1834,7 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
 # BOTH this lexer and qsplit() so the two cannot drift (#113).
 function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
-                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn) {
+                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn, sdep) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     split("", segs)          # clear the caller-supplied out-array
@@ -1764,6 +1842,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
     acn = 0
     s = buf
     n = length(s)
+    subst_depth(s, sdep)     # byte -> enclosing `$( … )`/backtick depth (#436, #453)
     seg = ""
     segc = 0
     hdc = 0                  # heredoc openers pending a body on the next line
@@ -1853,7 +1932,73 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            # A TOP-LEVEL SINGLE-quoted span is inert, `$(`/backtick or not
+            # (#443, scoped to the top level of the walk by #450).
+            # (No apostrophes in this block: it lives inside a single-quoted awk
+            # source string, where one would terminate the string. S below stands
+            # for the single quote character.)
+            #
+            # Bash never expands or substitutes ANYTHING between S...S, so a
+            # $(mktemp -d) written there is literal text, not live code — the
+            # substitution probe below must therefore not apply to it. Marking an
+            # SQ span ACTIVE because its text merely CONTAINS the characters `$(`
+            # kept separators live inside quoted DATA, and a LITERAL `;` in that
+            # data then leaked out as a phantom top-level command boundary: the
+            # tail after it was re-segmented and classified as a real command, so
+            #   ssh <host> S TMPDIR=$(mktemp -d); rm -rf "$TMPDIR" S
+            # false-denied as a local rm with an unresolvable target, and
+            #   echo S X=$(true); rm -rf <some-path-outside-the-repo> S
+            # false-denied as a local out-of-repo rm. The SAME command WITHOUT a
+            # `$( )` in the quoted string was already allowed, so this was a
+            # quote-classification defect, not a missing remote-exec concept:
+            # nothing about `ssh` is load-bearing here and the identical false
+            # positive reproduced with a plain `echo`.
+            #
+            # The #3679/#3755 "keep separators ACTIVE inside a substitution-bearing
+            # span" floor is UNCHANGED for DOUBLE-quoted and unquoted spans, where
+            # `$( )` really does execute and a smuggled `; <destructive>` really
+            # does run — that is the #113 protection and it must not be weakened.
+            # There is no single-quoted equivalent to preserve: the shell cannot
+            # execute anything inside S...S, so nothing is being masked here.
+            # The catastrophic ALWAYS_BLOCK scan is unaffected either way — it
+            # reads the raw command string and never goes through this lexer, so a
+            # root-obliterating payload inside a single-quoted span still denies.
+            #
+            # The SQ branch is scoped to the TOP LEVEL of the walk (`acn == 0`)
+            # — #450, a regression the unscoped form shipped with. `acn == 0` is
+            # NECESSARY for an unescaped S to be a real OPENER whose span the
+            # shell genuinely treats as inert (the only shape #443 was ever
+            # about — every #443 payload is a top-level single-quoted argument)
+            # — but it is not SUFFICIENT on its own (#453): `acn` is decremented
+            # from the recorded active-span CLOSE index below, and that index
+            # can itself be a PHANTOM close when a quote of the same kind sits
+            # nested one `$( )`/backtick level deeper than the span-s real
+            # opener (see the #453 block right below trusted_close()-s call at
+            # the bottom of this branch). `acn == 0` still correctly rejects
+            # every non-top-level S; it is the trusted_close() depth check that
+            # keeps `acn` itself accurate. Do not read `acn == 0` in isolation
+            # as "guaranteed top level" — it is "top level, GIVEN an accurate
+            # acn" — the #453 fix is what makes that given hold.
+            #
+            # Reached while an ACTIVE span is still open, that S is a PHANTOM
+            # quote: inside a double-quoted span bash reads it as ordinary
+            # literal text, so the forward scan above pairs it with some
+            # unrelated LATER S, and the stretch between them can hold genuinely
+            # live, executing code. Copying that stretch verbatim made the lexer
+            # skip a real $( ) that bash actually runs:
+            #
+            #   echo "donSt $(true; <recursive-force rm of an out-of-repo path>) wonSt"
+            #
+            # That is parseable (the apostrophes are balanced), the substitution
+            # really executes, and the guard allowed it — a deny before #443
+            # became an allow after it. The earlier claim that every such shape
+            # needs an ODD quote count and so cannot parse was simply wrong; the
+            # #450 test block pins the parseability mechanically next to the deny.
+            # So: an S reached with `acn > 0` stays on the legacy active-walk path
+            # below, where separators remain live and the smuggled payload is
+            # still segmented and classified. Do NOT drop the `acn == 0` term as
+            # a simplification — it is the entire scoping of the #443 branch.
+            if ((qc == SQ && acn == 0) || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
                 seg = seg substr(s, i, ci - i + 1)   # inert span: verbatim (newlines stay literal)
                 # KNOWN LIMIT (#130): the only branch that can LOSE a boundary —
                 # it consumes whatever the forward scan paired with, which for a
@@ -1876,11 +2021,31 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
             # quote of the same kind" index is NOT usable here: a backslash-escaped
             # `\"` inside the span is literal text, so ending the span there would
             # leave the REAL close to open a bogus span (`echo "$(a \" b)" ;
-            # <destructive>` — a shape the pre-#113 walk denied). trusted_close()
-            # skips escaped candidates and returns 0 when the pairing is ambiguous,
-            # in which case NO close is recorded and this span is walked exactly
-            # the legacy way.
-            tc = trusted_close(s, n, ci, qc)
+            # <destructive>` — a shape the pre-#113 walk denied). It is ALSO not
+            # usable when the span is double-quoted and that naive index actually
+            # belongs to a NESTED `$( )`/backtick substitution one level deeper
+            # than this span-s own opener (#453): a double-quoted string opened
+            # INSIDE a command substitution is parsed by that inner subshell, not
+            # by the shell that opened THIS span, so an unescaped `"` there is not
+            # this span-s close — it just happens to be the same byte value. The
+            # pre-#453 walk accepted it anyway (a phantom close), which handed
+            # everything up to the REAL close — genuinely live code this span-s
+            # own `$( )` is still executing — to the inert verbatim-copy branch
+            # above instead of to this active, separator-tracking one (S stands
+            # for the single quote this single-quoted awk source string cannot
+            # contain):
+            #
+            #   echo "x $(echo "ySz $(true; <destructive>) wSv") q"
+            #
+            # trusted_close() now skips BOTH escaped candidates and (for a
+            # double-quoted span) same-kind quotes at the wrong substitution
+            # depth, continuing to scan forward for the real close; it returns 0
+            # when no such candidate exists, in which case NO close is recorded
+            # and this span is walked exactly the legacy way. Single-quoted spans
+            # pass their own depth check trivially (see trusted_close()-s doc
+            # comment in _ESCAPE_AWK) since a single quote-s close is always the
+            # very next single-quote byte, nesting depth notwithstanding.
+            tc = trusted_close(s, n, ci, qc, DQ, sdep, sdep[i])
             if (tc > 0) acs[++acn] = tc
             i++
             continue
