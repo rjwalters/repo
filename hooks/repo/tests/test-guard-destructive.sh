@@ -1950,10 +1950,24 @@ assert_deny "#130/#443: inner double quote in a now-inert single-quoted span no 
     "echo $_Q130_SPANDQ ; $_Q113_RM $_Q130_PARTDQ"
 
 # qsplit()/command_has_shell_segment() exposure: here the inner quote's partner
-# is the opener of a later quote PAIR, so the pipe-to-shell is never seen.
+# is the opener of a later quote PAIR, so the pipe-to-shell was never seen.
+#
+# NARROWED BY #539 (allow -> deny): this member of the family is gone on the
+# qsplit() side. subst_depth() is now quote-AWARE inside an open substitution,
+# so the `'` inside `"$( ' )"` opens an inner-shell span that the following `)`
+# no longer closes — the `$(` stays UNCLOSED, every later byte keeps depth > 0,
+# and subst_inner() therefore re-emits each separator's command as its own
+# segment (the fail-closed path the #436 header describes for unbalanced
+# input). `sh` resurfaces as a segment command word, command_has_shell_segment()
+# fires, the data-sink redaction is skipped and the raw payload denies again.
+# The shape is still unparseable (the assertion below is unchanged) — the limit
+# simply no longer applies to it, which is the narrowing direction, exactly as
+# for the #443 mirror case above. The three ml_segment()-side members of the
+# family (rm / lifecycle / force-push) are untouched: that lexer reaches the
+# inert branch by its own naive quote pairing, not through subst_depth().
 assert_shell_rejects "#130 KNOWN LIMIT: inner-quote piped-to-shell shape is unparseable" \
     "echo $_Q130_SPANSQ ; echo '$_Q113_DANGER' | sh ; echo $_Q130_TRAILSQ"
-assert_allow "#130 KNOWN LIMIT: inner quote swallows a piped-to-shell payload" \
+assert_deny "#130/#539: inner quote no longer swallows a piped-to-shell payload" \
     "echo $_Q130_SPANSQ ; echo '$_Q113_DANGER' | sh ; echo $_Q130_TRAILSQ"
 
 # parse_force_ops() is the third consumer and loses its ask tier the same way.
@@ -4820,8 +4834,10 @@ assert_deny_tag "#439: substitution nested one level deeper still denies" \
     "echo \"\$(echo \$(id > $WTC439_MAIN/e.sh))\"" "$WTC439_WT" \
     "worktree-write-confinement"
 # SINGLE-quoted spelling: the real shell would not expand it, but this lexer is
-# quote-BLIND about substitutions everywhere (subst_depth()'s documented rule),
-# so it denies here too — the conservative direction, matching qsplit().
+# quote-BLIND about a substitution OPENER at the top level (subst_depth()'s
+# documented rule — #539 made it quote-aware only INSIDE an already-open
+# substitution), so it denies here too — the conservative direction, matching
+# qsplit().
 assert_deny_tag "#439: single-quoted \$( ) into main denies (quote-blind, fail-closed)" \
     "echo '\$(id > $WTC439_MAIN/e.sh)'" "$WTC439_WT" "worktree-write-confinement"
 
@@ -4920,13 +4936,15 @@ assert_deny_tag "#439/#433: \\\\ before a backtick leaves it live and denies" \
     "echo \"\\\\\`id > $WTC439_MAIN/e.sh\`\"" "$WTC439_WT" \
     "worktree-write-confinement"
 
-# ---- (f) Over-redaction guard. subst_depth() is quote-blind, so a `)` inside
-# ---- the inner shell-s own quotes closes the `$( )` early. The depth-matched
-# ---- close then lands on a LATER `"`, misaligning every following span, and
-# ---- a REAL unquoted redirect was redacted as echo data — allowed, where main
-# ---- (naive pairing) denies. strip_datasink_literals() now redacts only when
-# ---- the naive and depth-matched closes agree; both shapes below deny, as on
-# ---- main. (Both really write into the main checkout in bash.)
+# ---- (f) Over-redaction guard. A `)` inside the inner shell-s own quotes used
+# ---- to close the `$( )` early (subst_depth() was quote-blind before #539).
+# ---- The depth-matched close then landed on a LATER `"`, misaligning every
+# ---- following span, and a REAL unquoted redirect was redacted as echo data —
+# ---- allowed, where main (naive pairing) denies. Two independent fixes now
+# ---- hold these: strip_datasink_literals() redacts only when the naive and
+# ---- depth-matched closes agree (#442), and subst_depth() no longer closes at
+# ---- an inner quoted `)` at all (#539, see the block below). Both shapes here
+# ---- deny, as on main. (Both really write into the main checkout in bash.)
 assert_deny_tag "#439: quoted \$(printf \")\") then a real > into main still denies" \
     "echo \"\$(printf \")\" )\" > $WTC439_MAIN/f; echo \"z\"" "$WTC439_WT" \
     "worktree-write-confinement"
@@ -4939,6 +4957,191 @@ assert_shell_accepts "#439: the quoted-paren-in-\$( ) shape is real bash" \
 git -C "$WTC439_MAIN" worktree remove --force "$WTC439_WT" >/dev/null 2>&1 || true
 if [[ -n "$WTC439_MAIN" && "$WTC439_MAIN" != "/" && -d "$WTC439_MAIN" ]]; then
     rm -rf "$WTC439_MAIN"
+fi
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #539: a quoted ')' inside \$( ) no longer hides a write ---${NC}"
+# =========================================================================
+#
+# subst_depth() tracked `$( … )`/backtick nesting depth quote-BLIND everywhere,
+# so a `)` sitting between the INNER shell's own quotes — `$(printf ")" )`,
+# `$(echo ')' > …)` — was counted as the substitution's close. The real shell
+# re-parses quoting inside `$( )` and does NOT close there, so the whole depth
+# array was misaligned from that byte on, and with it every consumer:
+# qsplit(), subst_inner(), subst_heads(), trusted_close() and
+# strip_datasink_literals(). Two distinct escapes followed, both ALLOWED from a
+# managed-worktree cwd while bash really performed the write:
+#
+#   1. the depth-matched close lands on a LATER `"`, so the text after the
+#      substitution (a real `&& cp … <main>/f`) is re-read as a NEW quoted span
+#      and copied verbatim as inert data — its separators and its write target
+#      never segmented (`echo "$(printf ")" )" && cp /tmp/a <main>/f; echo "z"`);
+#   2. the early close makes the REST OF THE SUBSTITUTION look like literal text
+#      inside the outer double quotes, so subst_heads() emits a truncated head
+#      and the write that really runs in the subshell is never seen
+#      (`echo "$(printf ")" ; id > <main>/x)"`, `echo "$(printf ")"  > <main>/y)"`).
+#
+# subst_depth() is now quote-AWARE inside an open substitution: the inner
+# shell's `"…"`/`'…'` are opaque to `)`, `(` and (for single quotes) to `$(`
+# and backticks too, while a `$( )`/backtick inside inner DOUBLE quotes still
+# opens a level. The TOP level stays deliberately quote-blind, so the
+# fail-closed `echo '$(id > <main>/e.sh)'` deny pinned in the #439 block above
+# is unchanged.
+read -r WTC539_MAIN WTC539_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- (a) The reported rows. Each of these five really creates its file in the
+# ---- main checkout when run under bash from the worktree cwd.
+assert_deny_tag "#539: \$( ) head that single-quotes a ) then redirects into main denies" \
+    "echo \"\$(echo ')' > $WTC539_MAIN/e.sh)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: quoted-) \$( ) then a ;-terminated cp into main denies" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a $WTC539_MAIN/f; echo \"z\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: quoted-) \$( ) then a cp into a QUOTED main target denies" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a \"$WTC539_MAIN/f\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: write INSIDE the \$( ) after a quoted ) and a ; denies" \
+    "echo \"\$(printf \")\" ; id > $WTC539_MAIN/x)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: redirect INSIDE the \$( ) right after a quoted ) denies" \
+    "echo \"\$(printf \")\"  > $WTC539_MAIN/y)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+# Every row is a shape bash really parses — the denies above guard executable
+# commands, not syntax errors (contrast the #130 KNOWN LIMIT family).
+assert_shell_accepts "#539: the single-quoted-) head shape is real bash" \
+    "echo \"\$(echo ')' > /dev/null)\""
+assert_shell_accepts "#539: the quoted-) then-\`&&\` shape is real bash" \
+    "echo \"\$(printf \")\" )\" && cp /dev/null /dev/null; echo \"z\""
+assert_shell_accepts "#539: the write-inside-the-substitution shape is real bash" \
+    "echo \"\$(printf \")\" ; id > /dev/null)\""
+
+# ---- (a2) The issue's remaining row, `… && cp /tmp/a <main>/f "y"`, is NOT a
+# ---- bypass and must NOT be forced to deny. With THREE arguments `cp a b c`
+# ---- copies a AND b INTO directory c, so `<main>/f` is a SOURCE the command
+# ---- READS, never a target it writes: run under bash from a worktree cwd the
+# ---- row leaves the main checkout empty (all five rows above do create their
+# ---- file there). Its correct verdict is the same ALLOW the identical command
+# ---- WITHOUT the substitution prefix already gets on main — the issue's own
+# ---- contrast standard — and the pair below pins that equivalence, so the
+# ---- quoted-) substitution demonstrably buys the caller nothing.
+assert_allow "#539: 3-arg cp reads main/f as a SOURCE, so the bare form allows" \
+    "cp /tmp/a $WTC539_MAIN/f \"y\"" "$WTC539_WT"
+assert_allow "#539: …and a quoted-) \$( ) in front of it adds nothing" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a $WTC539_MAIN/f \"y\"" "$WTC539_WT"
+# The SHAPE that row exercises — a later quoted token AFTER the write target,
+# which is what let the misaligned pairing swallow it — is pinned here with the
+# idioms that really do write the path they name.
+assert_deny_tag "#539: quoted-) \$( ) then tee into main with a trailing quoted arg denies" \
+    "echo \"\$(printf \")\" )\" && tee $WTC539_MAIN/f \"y\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: quoted-) \$( ) then a > into main with a trailing quoted arg denies" \
+    "echo \"\$(printf \")\" )\" && echo x > $WTC539_MAIN/f \"y\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: quoted-) \$( ) then sed -i on main with a trailing quoted arg denies" \
+    "echo \"\$(printf \")\" )\" && sed -i s/a/b/ $WTC539_MAIN/f \"y\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+
+# ---- (b) No widened deny: every reported shape aimed INSIDE the acting
+# ---- worktree, or at /tmp scratch, is still ALLOWED.
+assert_allow "#539: single-quoted-) head writing INSIDE the worktree is allowed" \
+    "echo \"\$(echo ')' > $WTC539_WT/ok.sh)\"" "$WTC539_WT"
+assert_allow "#539: quoted-) \$( ) then a cp INSIDE the worktree is allowed" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a $WTC539_WT/f; echo \"z\"" "$WTC539_WT"
+assert_allow "#539: quoted-) \$( ) then a QUOTED in-worktree cp target is allowed" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a \"$WTC539_WT/f\"" "$WTC539_WT"
+assert_allow "#539: in-substitution write into the worktree after a ; is allowed" \
+    "echo \"\$(printf \")\" ; id > $WTC539_WT/x)\"" "$WTC539_WT"
+assert_allow "#539: in-substitution redirect into the worktree is allowed" \
+    "echo \"\$(printf \")\"  > $WTC539_WT/y)\"" "$WTC539_WT"
+assert_allow "#539: single-quoted-) head writing to /tmp scratch is allowed" \
+    "echo \"\$(echo ')' > /tmp/loom-539-scratch.txt)\"" "$WTC539_WT"
+assert_allow "#539: quoted-) \$( ) then a cp to /tmp scratch is allowed" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a /tmp/loom-539-scratch.txt; echo \"z\"" "$WTC539_WT"
+assert_allow "#539: in-substitution write to /tmp scratch after a ; is allowed" \
+    "echo \"\$(printf \")\" ; id > /tmp/loom-539-scratch.txt)\"" "$WTC539_WT"
+assert_allow "#539: in-substitution redirect to /tmp scratch is allowed" \
+    "echo \"\$(printf \")\"  > /tmp/loom-539-scratch.txt)\"" "$WTC539_WT"
+assert_allow "#539: a quoted-) \$( ) with no write idiom at all is allowed" \
+    "echo \"\$(printf \")\" )\"" "$WTC539_WT"
+assert_allow "#539: an inner-quoted ) in a query command is untouched" \
+    "grep -c ')' README.md" "$WTC539_WT"
+assert_allow "#539: a sed program whose inner ) is single-quoted is allowed" \
+    "echo \"\$(sed 's/)/x/' f)\"" "$WTC539_WT"
+
+# ---- (c) Token integrity (#436) must survive the delayed close: a quoted /tmp
+# ---- redirect target carrying a quoted-) substitution is still resolved whole.
+assert_allow "#539: quoted /tmp target holding a quoted-) \$( ) is allowed" \
+    "echo hi > \"/tmp/out-\$(printf \")\" ).json\"" "$WTC539_WT"
+assert_deny_tag "#539: …and the same target under the main checkout still denies" \
+    "echo hi > \"$WTC539_MAIN/out-\$(printf \")\" ).json\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+
+# ---- (d) The quote-awareness rules themselves, each pinned on its own.
+# A `$( )` inside the inner shell's DOUBLE quotes still opens a level, so a
+# write smuggled into that nested substitution is still seen.
+assert_deny_tag "#539: nested \$( ) inside inner double quotes still opens a level" \
+    "echo \"\$(echo \"\$(id > $WTC539_MAIN/e.sh)\" )\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+# …and a backtick inside inner double quotes likewise.
+assert_deny_tag "#539: backtick inside inner double quotes still opens a level" \
+    "echo \"\$(echo \"\`id > $WTC539_MAIN/e.sh\`\" )\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+# A BACKTICK substitution gets the same inner-quote treatment as `$( )`.
+assert_deny_tag "#539: backtick span whose head single-quotes a ) denies" \
+    "echo \"\`echo ')' > $WTC539_MAIN/e.sh\`\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+# An inner SINGLE-quoted span admits no expansion at all, so a `$(` inside it
+# opens nothing — the enclosing substitution still closes at its own `)`, and
+# the write after that close is still segmented and still denied.
+assert_deny_tag "#539: a \$( inside an inner single-quoted span opens no level" \
+    "echo \"\$(echo '\$(x' )\" && cp /tmp/a $WTC539_MAIN/f; echo \"z\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_allow "#539: …and the same shape with no write at all is allowed" \
+    "echo \"\$(echo '\$(x' )\"; echo \"z\"" "$WTC539_WT"
+# A backslash-ESCAPED quote inside the substitution is literal text (bs_escaped()
+# parity, the convention the rest of this lexer uses) and must not open an inner
+# span, so a write sitting after it inside the same substitution is still seen.
+assert_deny_tag "#539: an escaped quote inside the \$( ) opens no inner span" \
+    "echo \"\$(printf \\\"x > $WTC539_MAIN/f)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: …and one before an in-substitution separator likewise" \
+    "echo \"\$(printf \\\"x ; id > $WTC539_MAIN/z)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+# BOUNDARY (not this issue's scope). An escaped `\"` in the OUTER double-quoted
+# span misaligns that span's own pairing, which swallows a trailing
+# `&& cp … <main>/f` — e.g. `echo "\"" && cp /tmp/a <main>/f; echo "z"`, which
+# carries no `$( )` at all and allows identically before and after this change.
+# That is a separate defect in the naive next-quote close scans (they do not
+# skip an escaped quote), not in subst_depth(); pinned here as an allow so the
+# boundary is explicit rather than silently absent.
+assert_allow "#539 boundary: an escaped quote in the OUTER span still swallows the tail (pre-existing)" \
+    "echo \"\\\"\" && cp /tmp/a $WTC539_MAIN/f; echo \"z\"" "$WTC539_WT"
+# `$(( ))` arithmetic still reads as `$(` plus a plain `(`, unaffected by the
+# quote state machine.
+assert_allow "#539: \$(( )) arithmetic is unaffected by inner-quote tracking" \
+    'echo "$((1 > 2))"' "$WTC539_WT"
+assert_allow "#539: \$(( )) arithmetic beside a quoted ) is unaffected" \
+    "echo \"\$((1 > 2))\" \"\$(printf \")\" )\"" "$WTC539_WT"
+
+# ---- (e) The #439/#453/#436 properties must not regress under the new depths.
+assert_deny_tag "#539: #439's plain single-command \$( ) write still denies" \
+    "echo \"\$(id > $WTC539_MAIN/e.sh)\"" "$WTC539_WT" "worktree-write-confinement"
+assert_deny_tag "#539: #453's nested-quote head shape still denies" \
+    "echo \"x \$(echo \"y'z\" > $WTC539_MAIN/e.sh) q\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#539: #436's post-separator in-substitution write still denies" \
+    "echo \"\$(id|tee $WTC539_MAIN/evil.sh)\"" "$WTC539_WT" \
+    "worktree-write-confinement"
+assert_allow "#539: #436's quoted /tmp target with a piping \$( ) is still allowed" \
+    'echo hi > "/tmp/out-$(echo x|tr -d x).json"' "$WTC539_WT"
+assert_allow "#539: #433's escaped backtick code span is still not a head" \
+    "gh pr comment 1 --body \"see \\\`id > $WTC539_MAIN/e.sh\\\` here\"" "$WTC539_WT"
+
+git -C "$WTC539_MAIN" worktree remove --force "$WTC539_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC539_MAIN" && "$WTC539_MAIN" != "/" && -d "$WTC539_MAIN" ]]; then
+    rm -rf "$WTC539_MAIN"
 fi
 
 echo ""

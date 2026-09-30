@@ -1272,40 +1272,136 @@ function bs_escaped(s, i,   bs, p) {
 # span. Escaped openers/closers (`\$(`, `` \` ``) are literal text, matching the
 # escape convention the rest of this lexer uses (#113).
 #
-# Deliberately quote-BLIND, exactly like the `index(inner, "$(")` probe the
-# active-span branch already uses: a `$( … )` inside single quotes is not
-# expanded by the real shell, but both are treated as a substitution here so the
-# conservative direction (separators inside stay capturable as inner segments) is
-# the one taken. trusted_close() above compensates for this at its one call site
-# that matters (the DOUBLE-quote depth check): a single-quoted span never uses
-# this depth at all, so its quote-blindness there is moot.
-function subst_depth(s, d,   n, i, c, dep, kind, BQ) {
+# QUOTE HANDLING — quote-BLIND at the TOP level, quote-AWARE inside an OPEN
+# substitution (issue #539).
+#
+# At depth 0 an OPENER is recognised whatever quoting surrounds it, exactly like
+# the `index(inner, "$(")` probe the active-span branch already uses: a
+# `$( … )` inside single quotes is not expanded by the real shell, but treating
+# it as a substitution here takes the conservative direction (separators inside
+# stay capturable as inner segments). trusted_close() above compensates for this
+# at its one call site that matters (the DOUBLE-quote depth check): a
+# single-quoted span never uses this depth at all, so the top-level
+# quote-blindness there is moot.
+#
+# Inside an OPEN substitution that same blindness was a WRITE-CONFINEMENT
+# BYPASS (issue #539). The inner shell re-parses quoting from scratch, so a `)`
+# between the inner shell-s OWN quotes is literal text and does not close the
+# substitution — but a quote-blind walk counted it as a close, ending the
+# substitution early and misaligning every later quote/paren pairing for EVERY
+# consumer of this depth (qsplit(), subst_inner(), subst_heads(),
+# trusted_close(), strip_datasink_literals()). From a worktree cwd,
+#   echo "$(echo S)S > <main>/e.sh)"          (S = single quote)
+#   echo "$(printf ")" )" && cp /tmp/a <main>/f; echo "z"
+#   echo "$(printf ")" ; id > <main>/x)"
+# and friends therefore ALLOWED a write into the main checkout that bash really
+# performs — the #4178 escape reachable purely by quoting a paren, the same
+# asymmetry repo#197/repo#439 closed for the other quoted spellings.
+#
+# qs[k] therefore tracks the inner shell-s open quote character at depth k:
+#   - a quote character at depth > 0 with no span open OPENS one; the matching
+#     character closes it;
+#   - inside a SINGLE-quoted inner span nothing expands at all, so `)`, `(`,
+#     `$(` and backticks are all literal;
+#   - inside a DOUBLE-quoted inner span `$( )` and backticks STILL expand, so an
+#     opener there still raises the depth — and the span it opens begins with a
+#     fresh, unquoted parse of its own (qs[dep] = "" on every open);
+#   - a BACKTICK span-s close is recognised regardless of qs[], because bash
+#     delimits `…` by scanning for the next unescaped backtick without honouring
+#     the quoting of the text between.
+# Escape parity is bs_escaped() for both quote kinds, matching the convention
+# qsplit()/ml_segment()/trusted_close() already use. That is exact for double
+# quotes and over-broad for single ones (bash treats a backslash inside S…S as
+# literal, so `\S` really does close the span) — over-broad in the fail-closed
+# direction: the span stays open longer, the depth stays > 0 longer, and the
+# consumers keep re-emitting inner segments rather than dropping them.
+#
+# SAFETY DIRECTION. Recognising an inner quoted `)` as literal only ever DELAYS
+# the close, so a byte-s depth can rise but never fall relative to the old
+# walk. Every consumer reads depth > 0 as "inside a substitution", whose
+# contents are re-emitted as their own segments (subst_inner()/subst_heads())
+# rather than masked — so a delayed close adds segment boundaries. Unbalanced
+# input stays fail-closed by the same mechanism the #436 header describes: an
+# inner quote with no partner leaves every later byte at depth > 0, where each
+# separator still starts an inner segment.
+function subst_depth(s, d,   n, i, c, dep, kind, qs, inq, SQ, DQ, BQ) {
     BQ = sprintf("%c", 96)   # backtick
+    SQ = sprintf("%c", 39)   # single quote
+    DQ = sprintf("%c", 34)   # double quote
     n = length(s)
     split("", d)
     split("", kind)
+    split("", qs)            # qs[k] — inner-shell open quote char at depth k
     dep = 0
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
         if (!bs_escaped(s, i)) {
+            inq = (dep > 0) ? qs[dep] : ""
+            # A backtick span ends at the next unescaped backtick whatever the
+            # inner text quotes, so its close is resolved BEFORE the quote-state
+            # branch below (and abandons any inner span still open at its level).
+            if (c == BQ && dep > 0 && kind[dep] == "B") {
+                qs[dep] = ""
+                dep--
+                d[i] = dep
+                i++
+                continue
+            }
+            if (inq != "") {
+                if (c == inq) { qs[dep] = ""; d[i] = dep; i++; continue }
+                if (inq == SQ) { d[i] = dep; i++; continue }
+                # inq == DQ: only `$(` and a backtick still act.
+                if (c == "$" && i < n && substr(s, i + 1, 1) == "(") {
+                    dep++
+                    kind[dep] = "P"
+                    qs[dep] = ""
+                    d[i] = dep
+                    d[i + 1] = dep
+                    i += 2
+                    continue
+                }
+                if (c == BQ) {
+                    dep++
+                    kind[dep] = "B"
+                    qs[dep] = ""
+                    d[i] = dep
+                    i++
+                    continue
+                }
+                d[i] = dep
+                i++
+                continue
+            }
+            # Unquoted at this depth. A quote character OPENS an inner span —
+            # only inside a substitution; at the top level this stays blind.
+            if (dep > 0 && (c == SQ || c == DQ)) {
+                qs[dep] = c
+                d[i] = dep
+                i++
+                continue
+            }
             if (c == "$" && i < n && substr(s, i + 1, 1) == "(") {
                 dep++
                 kind[dep] = "P"
+                qs[dep] = ""
                 d[i] = dep
                 d[i + 1] = dep
                 i += 2
                 continue
             }
             if (c == BQ) {
-                if (dep > 0 && kind[dep] == "B") { dep--; d[i] = dep }
-                else { dep++; kind[dep] = "B"; d[i] = dep }
+                dep++
+                kind[dep] = "B"
+                qs[dep] = ""
+                d[i] = dep
                 i++
                 continue
             }
             if (c == "(" && dep > 0) {
                 dep++
                 kind[dep] = "p"
+                qs[dep] = ""
                 d[i] = dep
                 i++
                 continue
@@ -1565,11 +1661,14 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
 # plain `(`, so `$((1>2))` emits `(1>2)` as one whitespace-bounded token, which
 # the token-anchored `>` scan cannot misread as a redirection operator.
 #
-# Quote-BLIND, exactly like subst_depth()/subst_inner() and the `index(inner,
-# "$(")` probe in qsplit(): a `$( … )` inside SINGLE quotes is not expanded by
-# the real shell, but treating it as a substitution here is the conservative
-# direction this lexer already takes everywhere else, and consistency with
-# subst_depth() matters more than recovering that one allow.
+# Blind to a TOP-LEVEL quoted opener, exactly like subst_depth()/subst_inner()
+# and the `index(inner, "$(")` probe in qsplit(): a `$( … )` inside SINGLE
+# quotes is not expanded by the real shell, but treating it as a substitution
+# here is the conservative direction this lexer already takes everywhere else,
+# and consistency with subst_depth() matters more than recovering that one
+# allow. INSIDE an open substitution the depth this walks is quote-AWARE
+# (#539), so a `)` between the inner shell-s own quotes no longer ends a head
+# early.
 #
 # `sep` (optional, default "\n") is the byte each head is PREFIXED with. The
 # one caller passes a byte that cannot be a real segment boundary so it can
@@ -2915,14 +3014,19 @@ strip_datasink_literals() {
                     if (substr(s, j, 1) == qc && (qc != DQ || sdep[j] == sdep[i])) { ci = j; break }
                 }
                 # Redact only when the depth-matched close AGREES with the
-                # naive next-quote close. subst_depth() is quote-blind, so a `)`
-                # inside the inner shell-s own quotes (`"$(printf ")" )"`) ends
-                # the substitution early and the depth-matched close lands on a
-                # LATER `"`: every following span is then misaligned and a real
-                # unquoted `> <main>/f` gets redacted as echo data — allowed,
-                # where the naive pairing denies. When the two closes disagree
-                # the pairing is ambiguous, so fall to the unterminated branch
-                # below (copy verbatim, never redact), the safe direction.
+                # naive next-quote close. This landed for the case subst_depth()
+                # got wrong while it was quote-blind: a `)` inside the inner
+                # shell-s own quotes (`"$(printf ")" )"`) ended the substitution
+                # early, the depth-matched close landed on a LATER `"`, every
+                # following span was misaligned, and a real unquoted
+                # `> <main>/f` got redacted as echo data — allowed, where the
+                # naive pairing denies. subst_depth() is quote-AWARE inside an
+                # open substitution since #539, so that specific misalignment is
+                # gone at the source; the agreement check is KEPT as the
+                # belt-and-braces floor, because "the two pairings disagree" is
+                # a general ambiguity signal (an escaped quote, an unbalanced
+                # one) and falling to the unterminated branch below — copy
+                # verbatim, never redact — is the safe direction in every case.
                 cn = 0
                 for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { cn = j; break }
                 if (cn != ci) ci = 0
