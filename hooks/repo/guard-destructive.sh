@@ -2905,6 +2905,18 @@ strip_datasink_literals() {
                 for (j = i + 1; j <= n; j++) {
                     if (substr(s, j, 1) == qc && (qc != DQ || sdep[j] == sdep[i])) { ci = j; break }
                 }
+                # Redact only when the depth-matched close AGREES with the
+                # naive next-quote close. subst_depth() is quote-blind, so a `)`
+                # inside the inner shell-s own quotes (`"$(printf ")" )"`) ends
+                # the substitution early and the depth-matched close lands on a
+                # LATER `"`: every following span is then misaligned and a real
+                # unquoted `> <main>/f` gets redacted as echo data — allowed,
+                # where the naive pairing denies. When the two closes disagree
+                # the pairing is ambiguous, so fall to the unterminated branch
+                # below (copy verbatim, never redact), the safe direction.
+                cn = 0
+                for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { cn = j; break }
+                if (cn != ci) ci = 0
                 if (ci == 0) {
                     # Unterminated quote: copy the rest verbatim, never redact.
                     out = out substr(s, i); i = n + 1; continue

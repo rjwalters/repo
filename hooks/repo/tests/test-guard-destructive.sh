@@ -4908,6 +4908,22 @@ assert_deny_tag "#439/#433: \\\\ before a backtick leaves it live and denies" \
     "echo \"\\\\\`id > $WTC439_MAIN/e.sh\`\"" "$WTC439_WT" \
     "worktree-write-confinement"
 
+# ---- (f) Over-redaction guard. subst_depth() is quote-blind, so a `)` inside
+# ---- the inner shell-s own quotes closes the `$( )` early. The depth-matched
+# ---- close then lands on a LATER `"`, misaligning every following span, and
+# ---- a REAL unquoted redirect was redacted as echo data — allowed, where main
+# ---- (naive pairing) denies. strip_datasink_literals() now redacts only when
+# ---- the naive and depth-matched closes agree; both shapes below deny, as on
+# ---- main. (Both really write into the main checkout in bash.)
+assert_deny_tag "#439: quoted \$(printf \")\") then a real > into main still denies" \
+    "echo \"\$(printf \")\" )\" > $WTC439_MAIN/f; echo \"z\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439: same shape between two quoted args still denies" \
+    "echo \"x\" \"\$(printf \")\" )\" > $WTC439_MAIN/f \"y\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_shell_accepts "#439: the quoted-paren-in-\$( ) shape is real bash" \
+    "echo \"\$(printf \")\" )\" > /dev/null; echo \"z\""
+
 git -C "$WTC439_MAIN" worktree remove --force "$WTC439_WT" >/dev/null 2>&1 || true
 if [[ -n "$WTC439_MAIN" && "$WTC439_MAIN" != "/" && -d "$WTC439_MAIN" ]]; then
     rm -rf "$WTC439_MAIN"
