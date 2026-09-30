@@ -14,7 +14,7 @@ each change; add `--ask` to review findings and confirm first. Anything
 irreversible — deleting a branch, worktree, stash, or untracked file — is never
 automatic: it takes an explicit opt-in and passes a permanent-loss check.
 Commands whose only action is consequential (`orphans`, `update-tools`, `deps`,
-`followups`, `release`, `remote`, `sudo`) always confirm first by nature. The environment commands (`remote`) stand up
+`followups`, `release`, `remote`, `browser`, `sudo`) always confirm first by nature. The environment commands (`remote`, `browser`) stand up
 infrastructure only after showing exactly what they will create and what it
 costs.
 
@@ -32,6 +32,7 @@ costs.
 | [[release]] | Cut a release — pre-flight, semver decision, CHANGELOG, version bump, tag, GitHub Release. Supports per-project release policy via named phase-boundary seams in `.repo/release-policy.md` |
 | [[host-optimize]] | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | [[remote]] | Launch a cloud dev session (GCP or AWS) with this repo ready to go, then open SSH. Its provisioning contract is implemented once in `scripts/repo/repo-remote.sh` (installed to `.claude/skills/repo/scripts/`); the interactive flow delegates to that script, which also serves as a headless `repo-remote up --yes --json` entry point for non-interactive callers (e.g. loom's `fleet add-worker`) |
+| [[browser]] | Check the environment's browser-automation stack — Browser Use CLI, official agent skill, auth, cloud credit/concurrency health — and offer confirm-gated installs; report-first, provisions only (never drives a browser) |
 | [[sudo]] | Opt-in passwordless-sudo setup for a dev machine — install a `visudo`-validated `/etc/sudoers.d` drop-in (blanket `ALL` or a scoped command list) so an agent over SSH isn't blocked on password prompts; always confirmed first, validated with rollback on failure |
 | [[update-tools]] | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
 | [[deps]] | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
