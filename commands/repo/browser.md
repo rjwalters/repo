@@ -16,8 +16,7 @@ and — when a key is present — the Browser Use Cloud account behind them.
 
 This command **provisions and reports; it never drives a browser**. Task
 execution, URL policy, and what may enter a browser session belong to the
-org's browser-automation policy (in 2AMLogic/2am,
-[`docs/browser-automation.md`](https://github.com/2AMLogic/2am/blob/main/docs/browser-automation.md)),
+adopting org's browser-automation policy (wherever that org keeps it),
 not to this command.
 
 Shaped like [[remote]] and [[sudo]]: the report is read-only and safe to run
@@ -85,9 +84,16 @@ If a key is configured **and already present in the environment**
 (`BROWSER_USE_API_KEY`), read the account the way the docs recommend:
 
 ```bash
-curl -sS -H "X-Browser-Use-API-Key: $BROWSER_USE_API_KEY" \
-  https://api.browser-use.com/api/v2/billing/account
+printf 'X-Browser-Use-API-Key: %s\n' "$BROWSER_USE_API_KEY" \
+  | curl -sS -H @- https://api.browser-use.com/api/v2/billing/account
 ```
+
+The header goes to `curl` on stdin (`-H @-`, curl 7.55+), never as an
+argument: `curl -H "X-Browser-Use-API-Key: $BROWSER_USE_API_KEY"` expands
+the key into curl's argv, where `ps` on a shared host shows it. `printf` is
+a shell builtin, so the key never lands in any process's argv. Do not run
+this with `set -x` / `bash -x` (or any other shell tracing) on — tracing
+prints the expanded `printf` line, key included.
 
 Report the fields that matter operationally: credit balance,
 `concurrentSessionLimit`, `activeSessionCount`, and the key's `projectId`.
@@ -135,7 +141,8 @@ transcript.
 3. **The API key is never printed, stored, or written by this command.** If
    a value must be referenced at all, it is masked to its last four
    characters. The REST call in step 3 uses only a key already exported in
-   the environment, and never echoes the header.
+   the environment, feeds the header to `curl` on stdin rather than argv,
+   runs with shell tracing off, and never echoes the header.
 4. **No browsing.** This command does not open pages, run tasks, or start
    sessions. The nearest it comes to the cloud is the read-only billing
    endpoint in step 3.
