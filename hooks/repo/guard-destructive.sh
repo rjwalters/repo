@@ -6572,9 +6572,15 @@ _mount_entry_for_path() {
 # stepped over (each may carry its own flags before the assignments resume) —
 # `export CARGO_TARGET_DIR=/dev/shm/x && cargo build` is the same hazard as the
 # same-command form and must not escape by wearing a different hat.
+#
+# _HASLIVESUBST_AWK is load-bearing: since #433 (d4d7df0) qsplit() calls
+# has_live_subst(), so every program that prepends _QSPLIT_AWK must prepend it
+# too. Without it awk dies with "calling undefined function has_live_subst",
+# this helper prints nothing, and every shape 1-3 deny silently turns into an
+# allow — the failure mode the merge of main into this branch first produced.
 # =============================================================================
 tmpfs_scratch_assignments() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
     function unq(v) {
         sub(/^["\047]/, "", v); sub(/["\047]$/, "", v)
         return v
