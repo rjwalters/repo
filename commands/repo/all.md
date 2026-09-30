@@ -297,8 +297,9 @@ issue worktree, a commit on a `chore/repo-hygiene-<date>` branch plus a PR when
 the default branch is PR-protected, a commit on an otherwise-clean current
 branch, or uncommitted plus an explicit quarantine warning. [[gitignore]] and
 [[links]] point at that same canonical ladder, so the one choice governs the
-rule fixes stage 1 applied and any link fixes made here. Carry that destination into this stage's line and into the
-final summary — a branch or worktree name when the fixes were committed,
+rule fixes stage 1 applied and any link fixes made here. Carry that destination
+into this stage's line and into the final summary — a branch or worktree name
+when the fixes were committed,
 `uncommitted, at risk` when they were not. In a repo that is not Loom-managed
 there is no destination to name and the line is exactly what it always was.
 
