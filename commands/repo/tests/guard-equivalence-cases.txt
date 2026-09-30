@@ -235,12 +235,18 @@ wt:cp /tmp/src.txt {{MAIN}}/evil.sh
 wt:sed -i s/a/b/ {{MAIN}}/evil.sh
 wt:echo x > $DIR/f.txt
 
-# The divergences. Each is a real worktree-isolation bypass the vendored copy
-# still allows and canonical denies, so each carries a DECLARED_DIVERGENCES
-# entry with its measured rationale. Two of the three only deny at all because
-# repo#437 stopped qsplit() splitting the outer stream at a separator inside
-# $( ) — the write idiom sits AFTER a separator, inside a substitution the
-# shell executes.
+# A separator INSIDE the substitution (and, in the first row, a substitution
+# inside the write TARGET). Each is a real worktree-isolation bypass, and each
+# only denies at all because repo#436/#437 stopped qsplit() splitting the outer
+# stream at a separator inside $( ) and re-emitted the inner commands via
+# subst_inner() — the write idiom sits AFTER a separator, inside a substitution
+# the shell executes.
+#
+# These were DECLARED_DIVERGENCES (canonical deny, vendored allow) until
+# repo#545 ported that pair into the vendored guard's qsplit() as an opt-in
+# depth-aware mode. They now read `deny == deny`, their declarations are gone,
+# and these rows are the regression net for the port: if a resync ever reverts
+# it they come back as UNDECLARED stricter divergences and name themselves.
 wt:echo hi > "{{MAIN}}/o-$(echo x|tr -d x).json"
 wt:echo "$(id|tee {{MAIN}}/evil.sh)"
 wt:echo "$(id && cp /tmp/s {{MAIN}}/e.sh)"
@@ -250,9 +256,10 @@ wt:echo "$(id && cp /tmp/s {{MAIN}}/e.sh)"
 # when there is no separator to emit for, so the whole span stayed one quoted
 # token and the `>` / the spaces in it were masked as inert data — while the
 # shell, which executes a substitution whatever quoting wraps it, really did
-# write into the main checkout. Canonical now re-emits the substitution's HEAD
-# as its own segment (subst_heads()) and denies; the vendored copy still
-# allows, so each row is a declared divergence like the three above.
+# write into the main checkout. Both guards now re-emit the substitution's HEAD
+# as its own segment (subst_heads()) and deny — canonical since repo#439, the
+# vendored copy since repo#441 — so these rows read `deny == deny` and, like
+# the three above, carry no declaration.
 wt:echo "$(id > {{MAIN}}/e.sh)"
 wt:echo "$(cp /tmp/s {{MAIN}}/e.sh)"
 wt:echo "`id > {{MAIN}}/e.sh`"

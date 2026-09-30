@@ -126,24 +126,27 @@ declare -a DECLARED_DIVERGENCES=(
     "rg --pre 'rm -rf /' . | head -3|repo#311: ripgrep's --pre names an external preprocessor program that rg EXECUTES, so an rg carrying it is vetoed out of query-sink treatment and its pattern stays visible to the catastrophic scan. The vendored copy has no query sinks at all and allows this shape outright."
     "grep 'rm -rf /' f.txt | sh|repo#311: the pattern is piped into a shell that WOULD execute it, so command_has_shell_segment() skips the redaction entirely and canonical denies. The vendored copy allows it; this is the safety floor that makes the query sinks safe, and it is measurably stricter here."
     "rg -m \"use --pre for preprocessing\" 'rm -rf /' . | head -3|repo#434: the --pre veto token sits inside a -m value that strip_literal_text() blanks, so the veto only fires because the data-sink pass now reads the RAW command. Canonical denies; the vendored copy has no query sinks at all and allows every rg shape outright (same posture as the plain rg --pre row above). The sed and awk rows of this trio match the vendored copy exactly and need no entry."
-    "wt:echo hi > \"{{MAIN}}/o-\$(echo x|tr -d x).json\"|repo#438: a write target carrying a command substitution, issued from a Loom-managed worktree into its own main checkout. Canonical resolves the target past the substitution and denies under worktree-write-confinement; the vendored copy still allows it — a live worktree-isolation bypass, and the first divergence in this capability the harness has ever been able to see (measured deny vs allow, 2026-09-19)."
-    "wt:echo \"\$(id|tee {{MAIN}}/evil.sh)\"|repo#438: a tee into the main checkout smuggled inside a command substitution, which the shell EXECUTES. repo#437 stopped qsplit() splitting the outer stream at a separator inside \$( ), so canonical now sees the inner segment and denies; the vendored copy still allows it. Measured deny vs allow, 2026-09-19."
-    "wt:echo \"\$(id && cp /tmp/s {{MAIN}}/e.sh)\"|repo#438: same shape as the tee row, with the write idiom after a && separator rather than a pipe, confirming the fix is separator-general and not pipe-specific. Canonical denies, vendored allows. Measured 2026-09-19."
-    # The three repo#439 rows that used to sit here (a quoted SINGLE-command
-    # `$( )` holding `>`, `cp`, or the backtick spelling) were REMOVED by
-    # repo#441: the vendored guard now carries subst_heads() too, so those
-    # corpus rows read `deny == deny` and a declaration for them would be the
-    # dead weight this list's own rule forbids. They are still in the corpus
-    # (guard-equivalence-cases.txt:256-258) and are now the regression net for
-    # that port — if a resync ever reverts it, they come back as UNDECLARED
-    # stricter divergences and name themselves. See `.loom/resync-ignore` for
-    # why the fix lives in the vendored copy and how to retire that pin.
+    # SIX rows for the vendored guard's command-substitution handling used to
+    # sit here, and all six are now GONE because the vendored copy caught up:
     #
-    # The three repo#438 rows ABOVE deliberately stay: they are the repo#436 /
-    # repo#437 family (a separator INSIDE the substitution, and a substitution
-    # inside a write TARGET), which needs subst_depth()-aware qsplit() +
-    # subst_inner() in the vendored copy — a separate, larger port, measured
-    # still divergent 2026-09-30.
+    #   * three repo#439 rows (a quoted SINGLE-command `$( )` holding `>`,
+    #     `cp`, or the backtick spelling), removed by repo#441 when the
+    #     vendored guard gained subst_heads();
+    #   * three repo#438 rows (the repo#436 / repo#437 family — a separator
+    #     INSIDE the substitution, and a substitution inside a write TARGET),
+    #     removed by repo#545 when the vendored guard's qsplit() gained a
+    #     subst_depth()-aware mode plus subst_inner():
+    #         wt:echo hi > "{{MAIN}}/o-$(echo x|tr -d x).json"
+    #         wt:echo "$(id|tee {{MAIN}}/evil.sh)"
+    #         wt:echo "$(id && cp /tmp/s {{MAIN}}/e.sh)"
+    #
+    # All six read `deny == deny` as of 2026-09-30, and a declaration that no
+    # longer diverges is exactly the dead weight this list's own rule forbids.
+    # Every one of them is still IN the corpus (guard-equivalence-cases.txt),
+    # which makes them the regression net for both ports: if a resync ever
+    # reverts either, they come back as UNDECLARED stricter divergences and
+    # name themselves. See `.loom/resync-ignore` for why both fixes live in
+    # the vendored copy and how to retire that pin.
 )
 
 # ---------------------------------------------------------------------------

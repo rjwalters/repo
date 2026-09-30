@@ -4,21 +4,43 @@
 # ignored; matching is exact (no globs). See `.loom/docs/repo-owned-files.md`.
 
 # ---------------------------------------------------------------------------
-# hooks/guard-destructive-generic.sh — repo#441 (ports repo#439)
+# hooks/guard-destructive-generic.sh
+#   — repo#441 (ports repo#439) + repo#545 (ports repo#436/#437)
 #
 # WHY THIS IS PINNED
 #
-# repo#439 fixed the CANONICAL guard (`hooks/repo/guard-destructive.sh`, PR
-# #442): a write into the main checkout wrapped in a quoted SINGLE-command
-# `$( … )` / backtick substitution now DENIES under
-# `worktree-write-confinement`. Loom's vendored copy of the generic guard
-# still allowed it — and the vendored copy is the one a Loom-managed repo
-# runs BEFORE the capability probe flips it to the canonical copy, so the
-# escape was live there:
+# TWO ports now live in this file, both closing the same class of escape: a
+# write into the main checkout that the shell really performs because a command
+# substitution is EXECUTED whatever quoting wraps it. Each was fixed in the
+# CANONICAL guard (`hooks/repo/guard-destructive.sh`) first and did not arrive
+# here, and the vendored copy is the one a Loom-managed repo runs BEFORE the
+# capability probe flips it to the canonical copy — so both escapes were live
+# here.
+#
+# (a) repo#439 / PR #442 — a quoted SINGLE-command substitution, ported by
+#     repo#441 (`bs_escaped()` / `subst_depth()` / `subst_heads()`, wired into
+#     `_extract_write_targets_scan()`):
 #
 #     echo "$(id > <main-checkout>/evil.sh)"     # shell really performs it
 #     echo "$(cp /tmp/s <main-checkout>/evil.sh)"
 #     echo "`id > <main-checkout>/evil.sh`"
+#
+# (b) repo#436/#437 — a SEPARATOR INSIDE the substitution, and a substitution
+#     inside the write TARGET, ported by repo#545 (`subst_inner()` plus an
+#     opt-in `subst_depth()`-aware mode of `qsplit()`, `qsplit(buf, 1)`, called
+#     from the same one place). subst_heads() could not reach these by
+#     construction — a head ends at the first separator at its own depth, so
+#     the write idiom after the `&&`/`|` is not in the head:
+#
+#     echo hi > "<main-checkout>/o-$(echo x|tr -d x).json"
+#     echo "$(id|tee <main-checkout>/evil.sh)"
+#     echo "$(id && cp /tmp/s <main-checkout>/e.sh)"
+#
+#     The mode is opt-in rather than qsplit()'s unconditional behaviour because
+#     this copy's `parse_force_ops()` carries a vendored-only recognizer (#9312,
+#     `NAME="$(cd <literal-path> && pwd)"`) that is BUILT ON the legacy split at
+#     that inner `&&` and has no canonical counterpart. See the `sdaware`
+#     paragraphs in the file's `_QSPLIT_AWK` header.
 #
 # `.loom/docs/repo-owned-files.md` gives exactly two durable dispositions for
 # a bug in an installed Loom file: **upstream it** to `rjwalters/loom`'s
@@ -35,7 +57,8 @@
 # `rjwalters/loom` nor open a cross-repo PR from a fork. That leaves the pin
 # as the only disposition an automated Builder can actually complete, and the
 # fix is a hard-deny write-confinement escape that should not wait on a human
-# forking round-trip.
+# forking round-trip. The same credential check was re-run for repo#545 with
+# the same result, so (b) took the same disposition rather than a new pin.
 #
 # COST OF THIS PIN, STATED PLAINLY
 #
@@ -45,16 +68,26 @@
 #
 # HOW TO RETIRE IT
 #
+# One upstream PR retires BOTH ports at once — do not split them; (b) builds on
+# (a)'s `subst_depth()` and is meaningless without it.
+#
 # 1. Open a PR against `rjwalters/loom`'s
-#    `defaults/hooks/guard-destructive-generic.sh` carrying the repo#441 port
-#    (`bs_escaped()` / `subst_depth()` / `subst_heads()` and the
-#    `_extract_write_targets_scan()` wiring — search that file for `repo#439`).
+#    `defaults/hooks/guard-destructive-generic.sh` carrying both ports:
+#      * (a) `bs_escaped()` / `subst_depth()` / `subst_heads()` and the
+#        `_extract_write_targets_scan()` wiring — search this file for
+#        `repo#439`;
+#      * (b) `subst_inner()`, qsplit()'s `sdaware` parameter and the three
+#        `sdaware`-gated branches inside it, and the `qsplit(buf, 1)` call —
+#        search this file for `repo#545`.
+#    Carry the `sdaware` rationale upstream too: `defaults/`' own copy is the
+#    one that will grow more `qsplit()` consumers, so the reason the mode is
+#    opt-in must travel with the code.
 # 2. Once it merges and a `chore: resync installed Loom surfaces` commit lands
-#    a vendored copy that already denies the three shapes above, DELETE this
+#    a vendored copy that already denies all six shapes above, DELETE this
 #    stanza and let the file resync normally again.
 # 3. `commands/repo/tests/test-guard-equivalence.sh` is the regression net for
-#    step 2: if a resync ever reverts the port, the three `wt:` corpus rows
-#    (`guard-equivalence-cases.txt:256-258`) come back as UNDECLARED stricter
-#    divergences and say so by name.
+#    step 2: if a resync ever reverts either port, the six `wt:` corpus rows
+#    (the repo#438 and repo#439 blocks of `guard-equivalence-cases.txt`) come
+#    back as UNDECLARED stricter divergences and say so by name.
 # ---------------------------------------------------------------------------
 hooks/guard-destructive-generic.sh
