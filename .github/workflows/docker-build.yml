@@ -31,9 +31,13 @@ on:
       - ".dockerignore"
       - ".github/workflows/docker-build.yml"
 
+# PR-only cancellation: superseded PR runs are cancelled, but `main` pushes
+# queue instead of cancelling each other, so a burst of merges cannot leave an
+# intermediate `main` commit with no completed run (issue #507 — same reasoning
+# as ci.yml's concurrency block).
 concurrency:
   group: docker-build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:

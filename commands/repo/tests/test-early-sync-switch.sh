@@ -56,6 +56,13 @@ RESET_MD="$CMD_DIR/reset.md"
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 for f in "$ALL_MD" "$RESET_MD"; do
     if [[ ! -f "$f" ]]; then
         echo "FATAL: $(basename "$f") not found at $f" >&2
@@ -165,8 +172,8 @@ SEED="$SCRATCH/seed"
 git_quiet() { git -C "$1" "${@:2}" >/dev/null 2>&1; }
 
 build_origin() {
-    git init -q --bare -b main "$ORIGIN"
-    git init -q -b main "$SEED"
+    git_fixture_init "$ORIGIN" --bare -b main
+    git_fixture_init "$SEED" -b main
     git -C "$SEED" config user.email "test@example.invalid"
     git -C "$SEED" config user.name "Early Sync Test"
     printf '# Project\n\nBase README.\n' > "$SEED/README.md"
@@ -459,7 +466,7 @@ assert_eq "still on the working branch after the degraded check" "feature/y" \
 
 # A repo with no remote at all is the same conclusion by a different route.
 NOREMOTE="$SCRATCH/no-remote"
-git init -q -b main "$NOREMOTE"
+git_fixture_init "$NOREMOTE" -b main
 git -C "$NOREMOTE" config user.email "test@example.invalid"
 git -C "$NOREMOTE" config user.name "Early Sync Test"
 printf 'solo\n' > "$NOREMOTE/README.md"

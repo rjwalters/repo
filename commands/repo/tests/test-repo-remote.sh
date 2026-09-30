@@ -34,6 +34,12 @@ REMOTE_MD="$REPO_ROOT/commands/repo/remote.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 if [[ ! -f "$RR" ]]; then
     echo "FATAL: repo-remote.sh not found at $RR" >&2
@@ -62,7 +68,7 @@ XDG="$FIX/xdg"
 REPO="$FIX/myrepo"
 SHARED="$XDG/repo/remote.env"
 mkdir -p "$XDG/repo" "$REPO"
-git -C "$REPO" init -q
+git_fixture_init "$REPO"
 
 write_shared() { mkdir -p "$XDG/repo"; printf '%s\n' "$@" >"$SHARED"; }
 write_repo_env() { printf '%s\n' "$@" >"$REPO/.env"; }
@@ -974,6 +980,81 @@ assert_not_contains "shared remote.env is NOT touched with an instance id" "$(ca
 run_rr MOCK_AWS_NEW_ID=i-0second MOCK_AWS_STATE=None -- up --yes --json
 assert_eq "write-back updates in place (one line only)" "1" "$(grep -c '^REPO_REMOTE_INSTANCE_ID=' "$REPO/.env")"
 assert_contains "write-back reflects the newest id" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0second"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- out-of-tree per-repo config: REPO_REMOTE_ENV_FILE + no auto-created .env (repo#492) --"
+# ---------------------------------------------------------------------------
+SHARED_BACKUP="$(cat "$SHARED")"
+# (a) No repo .env and no override: write-back must NOT create <git-root>/.env;
+#     it logs the id and a pin hint instead.
+rm -f "$REPO/.env"
+run_rr REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge MOCK_AWS_NEW_ID=i-0nodotenv MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "up without a repo .env still succeeds" "0" "$RR_RC"
+[[ ! -e "$REPO/.env" ]] && ok "write-back does NOT create <git-root>/.env" \
+                         || no "write-back created $REPO/.env: $(cat "$REPO/.env")"
+assert_contains "the unwritten id is logged" "$RR_ERR" "i-0nodotenv"
+assert_contains "the log suggests REPO_REMOTE_ENV_FILE" "$RR_ERR" "REPO_REMOTE_ENV_FILE"
+
+# (b) Override via the environment: config is READ from it and the id is
+#     WRITTEN to it (file and parent dir created); no in-tree .env appears.
+OOT="$SCRATCH/oot/loom-ui/remote.env"
+run_rr REPO_REMOTE_ENV_FILE="$OOT" REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge \
+       MOCK_AWS_NEW_ID=i-0oot MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "up with an env override succeeds" "0" "$RR_RC"
+assert_contains "id written to the override file (created)" "$(cat "$OOT" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0oot"
+[[ ! -e "$REPO/.env" ]] && ok "override: no <git-root>/.env created" || no "override: $REPO/.env was created"
+# An empty pin line: the next `up` creates, and the write-back must fill THIS line in.
+printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.4xlarge" "REPO_REMOTE_INSTANCE_ID=" >"$OOT"
+run_rr REPO_REMOTE_ENV_FILE="$OOT" -- up --json
+assert_eq "override file is loaded as the per-repo layer (instance type)" "m5.4xlarge" "$(json_field "$RR_OUT" instance_type)"
+run_rr REPO_REMOTE_ENV_FILE="$OOT" MOCK_AWS_NEW_ID=i-0oot2 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "override write-back updates in place (one line only)" "1" "$(grep -c '^REPO_REMOTE_INSTANCE_ID=' "$OOT")"
+assert_contains "override write-back filled in the new id" "$(cat "$OOT")" "REPO_REMOTE_INSTANCE_ID=i-0oot2"
+
+# (c) Override named in the shared remote.env (with ~/ expansion via HOME).
+FAKEHOME="$SCRATCH/fakehome"
+mkdir -p "$FAKEHOME"
+printf '%s\n' "$SHARED_BACKUP" "REPO_REMOTE_ENV_FILE=~/cfg/remote.env" >"$SHARED"
+run_rr HOME="$FAKEHOME" REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge MOCK_AWS_NEW_ID=i-0shared MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "shared-file override (~/ expanded) receives the id" \
+                "$(cat "$FAKEHOME/cfg/remote.env" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0shared"
+[[ ! -e "$REPO/.env" ]] && ok "shared override: no <git-root>/.env created" || no "shared override: $REPO/.env was created"
+# ...and an environment value beats the shared file's.
+printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=" >"$OOT"
+run_rr HOME="$FAKEHOME" REPO_REMOTE_ENV_FILE="$OOT" \
+       MOCK_AWS_NEW_ID=i-0envwins MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "env REPO_REMOTE_ENV_FILE wins over the shared file's" "$(cat "$OOT")" "REPO_REMOTE_INSTANCE_ID=i-0envwins"
+assert_not_contains "shared-named file untouched when env overrides" "$(cat "$FAKEHOME/cfg/remote.env")" "i-0envwins"
+printf '%s\n' "$SHARED_BACKUP" >"$SHARED"
+
+# (c2) A tilde that reaches the script UNEXPANDED, so expand_tilde() is what
+#      does the work (repo#496). Case (c) writes an *unquoted* assignment into
+#      the shared file, which bash expands itself while sourcing — the value is
+#      already absolute before expand_tilde() ever sees it. These two paths are
+#      not: `env FOO='~/x'` (no expansion of an assignment's value by `env`),
+#      and a *quoted* assignment in the shared file.
+run_rr HOME="$FAKEHOME" REPO_REMOTE_ENV_FILE='~/cfg/from-env.env' \
+       REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge MOCK_AWS_NEW_ID=i-0tildeenv MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "literal ~/ from the environment: up succeeds" "0" "$RR_RC"
+assert_contains "literal ~/ from the environment is expanded to \$HOME (expand_tilde)" \
+                "$(cat "$FAKEHOME/cfg/from-env.env" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0tildeenv"
+[[ ! -e "$REPO/~" ]] && ok "literal ~/: no literal '~' directory created in the repo" \
+                      || no "literal ~/: created a literal '~' directory in $REPO"
+# ...and the same for a quoted value in the shared file, which bash leaves alone.
+printf '%s\n' "$SHARED_BACKUP" 'REPO_REMOTE_ENV_FILE="~/cfg/from-shared.env"' >"$SHARED"
+run_rr HOME="$FAKEHOME" REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge \
+       MOCK_AWS_NEW_ID=i-0tildeshared MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "quoted ~/ in the shared file is expanded to \$HOME (expand_tilde)" \
+                "$(cat "$FAKEHOME/cfg/from-shared.env" 2>/dev/null)" "REPO_REMOTE_INSTANCE_ID=i-0tildeshared"
+printf '%s\n' "$SHARED_BACKUP" >"$SHARED"
+
+# (d) REPO_REMOTE_NO_WRITEBACK=1: an existing .env is left untouched.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr REPO_REMOTE_NO_WRITEBACK=1 MOCK_AWS_NEW_ID=i-0nowb MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "NO_WRITEBACK run succeeds" "0" "$RR_RC"
+assert_not_contains "NO_WRITEBACK leaves the repo .env untouched" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID"
+assert_contains "NO_WRITEBACK still logs the id" "$RR_ERR" "i-0nowb"
 
 # ---------------------------------------------------------------------------
 echo ""

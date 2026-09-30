@@ -16,15 +16,18 @@
 # diverge from the breakdown (repo#44). Currently delegated:
 # test-guard-destructive.sh (the full guard regression suite),
 # test-session-start-handoff.sh, test-install-claude-md-markers.sh,
-# test-install-sidecar-untracking.sh, test-install-codex-skill.sh,
+# test-install-sidecar-untracking.sh, test-install-guard-coexistence.sh,
+# test-install-codex-skill.sh,
 # test-skill-parity.sh, test-shell-wrapper.sh,
 # commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
+# commands/repo/tests/test-gitignore-anchoring.sh,
 # commands/repo/tests/test-loom-quarantine-destination.sh,
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
 # commands/repo/tests/test-resync-installed.sh,
+# commands/repo/tests/test-resync-ignore.sh,
 # commands/repo/tests/test-installer-contract.sh,
 # commands/repo/tests/test-repo-scrub-forks.sh,
 # commands/repo/tests/test-readme-layout-block.sh,
@@ -34,13 +37,17 @@
 # commands/repo/tests/test-changelog-merged-work-check.sh,
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
 # commands/repo/tests/test-followups-scrub-step.sh,
+# commands/repo/tests/test-followups-dedup-step.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
-# commands/repo/tests/test-assert-matches-sigpipe.sh, and
-# commands/repo/tests/test-deps-security-updates-paused.sh.
+# commands/repo/tests/test-assert-matches-sigpipe.sh,
+# commands/repo/tests/test-git-fixture-hermeticity.sh,
+# commands/repo/tests/test-deps-security-updates-paused.sh,
+# commands/repo/tests/test-handoff-preflight.sh, and
+# commands/repo/tests/test_optimize_ci.py.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -388,6 +395,45 @@ else
     record_suite "test-install-sidecar-untracking.sh" "$SC_PASS" "$SC_FAIL" "sidecar untracking"
 fi
 
+# install.sh's guard-hook coexistence branch (repo#490): skip copying
+# hooks/repo/guard-destructive.sh (and record the decision in
+# install-metadata.json) when another destructive-command guard is already
+# wired in the target's .claude/settings.json. Same delegation shape as the two
+# suites above — it drives install.sh and resync-installed.sh against scratch
+# git repos.
+echo
+echo "-- install.sh guard-hook coexistence (delegated suite) --"
+GC_TEST="$TESTS_DIR/test-install-guard-coexistence.sh"
+if [[ ! -f "$GC_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-install-guard-coexistence.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-install-guard-coexistence.sh" "$GC_TEST"
+else
+    GC_OUT="$(bash "$GC_TEST" 2>&1)"
+    GC_STATUS=$?
+    GC_PASS="$(suite_count Passed "$GC_OUT")"
+    GC_FAIL="$(suite_count Failed "$GC_OUT")"
+    if ! [[ "$GC_PASS" =~ ^[0-9]+$ && "$GC_FAIL" =~ ^[0-9]+$ ]]; then
+        # Summary block missing or unparseable (e.g. the suite died early under
+        # its own `set -e`). Never let that fold in as zero failures.
+        GC_PASS=0
+        GC_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-install-guard-coexistence.sh" "$GC_STATUS"
+        strip_ansi "$GC_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GC_STATUS" -ne 0 || "$GC_FAIL" -ne 0 ]]; then
+        [[ "$GC_FAIL" -eq 0 ]] && GC_FAIL=1  # non-zero exit with no counted failure
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-install-guard-coexistence.sh" "$GC_PASS" "$GC_FAIL" "$GC_STATUS"
+        strip_ansi "$GC_OUT" | grep -E '^ +FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-install-guard-coexistence.sh" "$GC_PASS"
+    fi
+    PASS=$((PASS + GC_PASS))
+    FAIL=$((FAIL + GC_FAIL))
+    record_suite "test-install-guard-coexistence.sh" "$GC_PASS" "$GC_FAIL" "guard-hook coexistence"
+fi
+
 # The Codex-side skill surface `.agents/skills/repo/` (repo#285): format
 # conformance, ownership of a shared namespace, the install/uninstall/resync
 # lifecycle. Same delegation shape as the two suites above — it drives the real
@@ -620,6 +666,45 @@ else
     record_suite "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_NOTE"
 fi
 
+# /repo:gitignore's redundancy model (gitignore anchoring, trailing-slash and
+# negation-precedence subtleties) and the `git check-ignore -v` before/after gate
+# that has to clear before a rule removal is applied (repo#531). Same delegation
+# shape as the suites above.
+echo
+echo "-- gitignore anchoring + ignore-status gate (delegated suite) --"
+GA_TEST="$TESTS_DIR/../../../commands/repo/tests/test-gitignore-anchoring.sh"
+if [[ ! -f "$GA_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-gitignore-anchoring.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-gitignore-anchoring.sh" "$GA_TEST"
+else
+    GA_OUT="$(bash "$GA_TEST" 2>&1)"
+    GA_STATUS=$?
+    GA_PASS="$(suite_count Passed "$GA_OUT")"
+    GA_FAIL="$(suite_count Failed "$GA_OUT")"
+    # Skips are neither pass nor fail — surfaced as a note only, same as above.
+    GA_SKIP="$(suite_count Skipped "$GA_OUT")"
+    GA_NOTE="gitignore anchoring + removal gate"
+    [[ "$GA_SKIP" =~ ^[0-9]+$ && "$GA_SKIP" -gt 0 ]] && GA_NOTE+=" — $GA_SKIP skipped"
+    if ! [[ "$GA_PASS" =~ ^[0-9]+$ && "$GA_FAIL" =~ ^[0-9]+$ ]]; then
+        GA_PASS=0
+        GA_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-gitignore-anchoring.sh" "$GA_STATUS"
+        strip_ansi "$GA_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GA_STATUS" -ne 0 || "$GA_FAIL" -ne 0 ]]; then
+        [[ "$GA_FAIL" -eq 0 ]] && GA_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-gitignore-anchoring.sh" "$GA_PASS" "$GA_FAIL" "$GA_STATUS"
+        strip_ansi "$GA_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-gitignore-anchoring.sh" "$GA_PASS"
+    fi
+    PASS=$((PASS + GA_PASS))
+    FAIL=$((FAIL + GA_FAIL))
+    record_suite "test-gitignore-anchoring.sh" "$GA_PASS" "$GA_FAIL" "$GA_NOTE"
+fi
+
 # The Loom-managed destination contract shared by docs.md / gitignore.md /
 # links.md, plus all.md's "Where the fixes live" summary block and its stage-2
 # dirty-tree note (repo#448) — the decision that keeps a reported fix from being
@@ -810,12 +895,50 @@ else
     record_suite "test-resync-installed.sh" "$RI_PASS" "$RI_FAIL" "C7 consumer resync"
 fi
 
-# INSTALLER-CONTRACT.md C1–C8 conformance. This suite re-derives the contract's
+# Repo-owned pins — `.claude/skills/repo/resync-ignore`, requirement C10
+# (repo#511). Before this list existed, the only edit to a vendored file that
+# survived a reinstall was no edit at all, and one consumer lost the same
+# /repo:scrub customization FOUR times to reinstalls with no test in this repo to
+# catch any of them. The suite's own positive controls assert the same edit is
+# still clobbered WITHOUT a pin, so "the pin works" can never pass because the
+# writers stopped writing. Same delegation shape as every suite above.
+echo
+echo "-- repo-owned pins / resync-ignore, C10 (delegated suite) --"
+RG_TEST="$TESTS_DIR/../../../commands/repo/tests/test-resync-ignore.sh"
+if [[ ! -f "$RG_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-resync-ignore.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-resync-ignore.sh" "$RG_TEST"
+else
+    RG_OUT="$(bash "$RG_TEST" 2>&1)"
+    RG_STATUS=$?
+    RG_PASS="$(suite_count Passed "$RG_OUT")"
+    RG_FAIL="$(suite_count Failed "$RG_OUT")"
+    if ! [[ "$RG_PASS" =~ ^[0-9]+$ && "$RG_FAIL" =~ ^[0-9]+$ ]]; then
+        RG_PASS=0
+        RG_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-resync-ignore.sh" "$RG_STATUS"
+        strip_ansi "$RG_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$RG_STATUS" -ne 0 || "$RG_FAIL" -ne 0 ]]; then
+        [[ "$RG_FAIL" -eq 0 ]] && RG_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-resync-ignore.sh" "$RG_PASS" "$RG_FAIL" "$RG_STATUS"
+        strip_ansi "$RG_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-resync-ignore.sh" "$RG_PASS"
+    fi
+    PASS=$((PASS + RG_PASS))
+    FAIL=$((FAIL + RG_FAIL))
+    record_suite "test-resync-ignore.sh" "$RG_PASS" "$RG_FAIL" "C10 repo-owned pins"
+fi
+
+# INSTALLER-CONTRACT.md C1–C10 conformance. This suite re-derives the contract's
 # `repo` column from the working tree and asserts it matches the published table,
 # so the conformance table cannot go stale silently (repo#156). Same delegation
 # shape as every suite above.
 echo
-echo "-- installer-contract C1-C8 conformance (delegated suite) --"
+echo "-- installer-contract C1-C10 conformance (delegated suite) --"
 IC_TEST="$TESTS_DIR/../../../commands/repo/tests/test-installer-contract.sh"
 if [[ ! -f "$IC_TEST" ]]; then
     FAIL=$((FAIL + 1))
@@ -1279,6 +1402,43 @@ else
     record_suite "test-followups-scrub-step.sh" "$FS_PASS" "$FS_FAIL" "followups pre-filing scrub step"
 fi
 
+# /repo:followups' dedup match-type contract (repo#515): step 3's search returns
+# pull requests as well as issues on purpose (repo#102/#121), so the match TYPE
+# has to be visible in the output — a hand-rolled `#number title` query dropped
+# it, a PR was reported as a duplicate issue, and `gh issue close` silently
+# closed an approved PR. Prose contract, same delegation shape as every suite
+# above.
+echo
+echo "-- followups dedup match-type contract (delegated suite) --"
+FD_TEST="$TESTS_DIR/../../../commands/repo/tests/test-followups-dedup-step.sh"
+if [[ ! -f "$FD_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-followups-dedup-step.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-followups-dedup-step.sh" "$FD_TEST"
+else
+    FD_OUT="$(bash "$FD_TEST" 2>&1)"
+    FD_STATUS=$?
+    FD_PASS="$(suite_count Passed "$FD_OUT")"
+    FD_FAIL="$(suite_count Failed "$FD_OUT")"
+    if ! [[ "$FD_PASS" =~ ^[0-9]+$ && "$FD_FAIL" =~ ^[0-9]+$ ]]; then
+        FD_PASS=0
+        FD_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-followups-dedup-step.sh" "$FD_STATUS"
+        strip_ansi "$FD_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$FD_STATUS" -ne 0 || "$FD_FAIL" -ne 0 ]]; then
+        [[ "$FD_FAIL" -eq 0 ]] && FD_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-followups-dedup-step.sh" "$FD_PASS" "$FD_FAIL" "$FD_STATUS"
+        strip_ansi "$FD_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-followups-dedup-step.sh" "$FD_PASS"
+    fi
+    PASS=$((PASS + FD_PASS))
+    FAIL=$((FAIL + FD_FAIL))
+    record_suite "test-followups-dedup-step.sh" "$FD_PASS" "$FD_FAIL" "followups dedup match-type contract"
+fi
+
 # /repo:all's ownership of Audit-surfaced orphaned files (repo#301): a tracked,
 # unreferenced file surfaced in stage 1 had no stage that acted on it and no
 # deferred line in the final summary, so a correct finding could leave the run
@@ -1533,6 +1693,81 @@ else
     record_suite "test-deps-security-updates-paused.sh" "$DP_PASS" "$DP_FAIL" "deps security-updates paused state"
 fi
 
+# /repo:handoff's step-0 reader preflight — the command writes .claude/handoff.md
+# but a SEPARATE artifact (session-start-handoff.sh + its settings.json wiring)
+# reads it, and handoff.md used to assert that reader existed rather than check
+# (repo#493). Same delegation shape as every suite above.
+echo
+echo "-- handoff step-0 reader preflight (delegated suite) --"
+HP_TEST="$TESTS_DIR/../../../commands/repo/tests/test-handoff-preflight.sh"
+if [[ ! -f "$HP_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-handoff-preflight.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-handoff-preflight.sh" "$HP_TEST"
+else
+    HP_OUT="$(bash "$HP_TEST" 2>&1)"
+    HP_STATUS=$?
+    HP_PASS="$(suite_count Passed "$HP_OUT")"
+    HP_FAIL="$(suite_count Failed "$HP_OUT")"
+    if ! [[ "$HP_PASS" =~ ^[0-9]+$ && "$HP_FAIL" =~ ^[0-9]+$ ]]; then
+        HP_PASS=0
+        HP_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-handoff-preflight.sh" "$HP_STATUS"
+        strip_ansi "$HP_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$HP_STATUS" -ne 0 || "$HP_FAIL" -ne 0 ]]; then
+        [[ "$HP_FAIL" -eq 0 ]] && HP_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "$HP_STATUS"
+        strip_ansi "$HP_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-handoff-preflight.sh" "$HP_PASS"
+    fi
+    PASS=$((PASS + HP_PASS))
+    FAIL=$((FAIL + HP_FAIL))
+    record_suite "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "handoff step-0 reader preflight"
+fi
+
+# git-fixture hermeticity (repo#518): pins that lib/git-fixture.sh keeps the
+# throwaway git fixtures the suites above build isolated from the OUTER
+# environment's hook configuration — a Loom-dispatched session overrides
+# core.hooksPath via GIT_CONFIG_* env pairs (loom-daemon's provenance hooks),
+# whose commit-msg hook appended `Loom-Story: <repo>#<N>` trailers to fixture
+# commits and broke test-changelog-merged-work-check.sh under dispatch only.
+# Every case there is paired with a control that asserts the simulated leak
+# still leaks, so this suite is meaningful from a clean shell and in CI too.
+# Same delegation shape as every suite above.
+echo
+echo "-- git-fixture hermeticity (delegated suite) --"
+GF_TEST="$TESTS_DIR/../../../commands/repo/tests/test-git-fixture-hermeticity.sh"
+if [[ ! -f "$GF_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-git-fixture-hermeticity.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-git-fixture-hermeticity.sh" "$GF_TEST"
+else
+    GF_OUT="$(bash "$GF_TEST" 2>&1)"
+    GF_STATUS=$?
+    GF_PASS="$(suite_count Passed "$GF_OUT")"
+    GF_FAIL="$(suite_count Failed "$GF_OUT")"
+    if ! [[ "$GF_PASS" =~ ^[0-9]+$ && "$GF_FAIL" =~ ^[0-9]+$ ]]; then
+        GF_PASS=0
+        GF_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-git-fixture-hermeticity.sh" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GF_STATUS" -ne 0 || "$GF_FAIL" -ne 0 ]]; then
+        [[ "$GF_FAIL" -eq 0 ]] && GF_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-git-fixture-hermeticity.sh" "$GF_PASS" "$GF_FAIL" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-git-fixture-hermeticity.sh" "$GF_PASS"
+    fi
+    PASS=$((PASS + GF_PASS))
+    FAIL=$((FAIL + GF_FAIL))
+    record_suite "test-git-fixture-hermeticity.sh" "$GF_PASS" "$GF_FAIL" "git-fixture hermeticity (repo#518)"
+fi
+
 echo
 echo "==============================="
 echo "-- Organization policy resolution and publication (delegated suite) --"
@@ -1551,6 +1786,28 @@ fi
 PASS=$((PASS + OP_PASS)); FAIL=$((FAIL + OP_FAIL))
 record_suite "test_org_policy.py" "$OP_PASS" "$OP_FAIL" "canonical policy and GitHub publication"
 printf '  organization policy: %s passed, %s failed\n' "$OP_PASS" "$OP_FAIL"
+
+# /repo:optimize-ci's deterministic helper (scripts/repo/repo-optimize-ci.py,
+# #505): workflow YAML reader, required-check safety, cache/concurrency/
+# under-filter detection, and history-based ranking — fixture workflows plus an
+# in-memory GitHub double, so no network. Same fold-in shape as the policy suite.
+echo
+echo "-- CI optimization audit (delegated suite) --"
+OC_TEST="$TESTS_DIR/../../../commands/repo/tests/test_optimize_ci.py"
+OC_OUT="$(python3 "$OC_TEST" 2>&1)"
+OC_STATUS=$?
+OC_PASS="$(suite_count Passed "$OC_OUT")"
+OC_FAIL="$(suite_count Failed "$OC_OUT")"
+if ! [[ "$OC_PASS" =~ ^[0-9]+$ && "$OC_FAIL" =~ ^[0-9]+$ ]]; then
+    OC_PASS=0; OC_FAIL=1
+fi
+if [[ "$OC_STATUS" -ne 0 || "$OC_FAIL" -ne 0 ]]; then
+    [[ "$OC_FAIL" -eq 0 ]] && OC_FAIL=1
+    printf '%s\n' "$OC_OUT" | tail -40
+fi
+PASS=$((PASS + OC_PASS)); FAIL=$((FAIL + OC_FAIL))
+record_suite "test_optimize_ci.py" "$OC_PASS" "$OC_FAIL" "optimize-ci workflow audit"
+printf '  optimize-ci: %s passed, %s failed\n' "$OC_PASS" "$OC_FAIL"
 echo
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
