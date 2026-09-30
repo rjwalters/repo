@@ -63,7 +63,9 @@ Run each of the following checks and compile results into a single report:
 - …and **not** a subdirectory rule matching an ancestor's pattern text, unless
   the ancestor's pattern is unanchored. A pattern with a `/` other than a
   trailing one is anchored to its own `.gitignore`'s directory, so root
-  `.vscode/*` never covers `proofs/.gitignore: .vscode/` (#531); see
+  `.vscode/*` never covers `proofs/.gitignore: .vscode/` (#531). Only a
+  *leading* `**/` un-anchors — a mid-pattern `**` does not, so `dir/**/name` is
+  anchored just like `dir/name`. See
   [[gitignore]] for the anchoring table and the `git check-ignore -v`
   before/after gate that has to clear before any such removal is applied. This
   audit is read-only, so report the rule as *candidate* redundancy and name the

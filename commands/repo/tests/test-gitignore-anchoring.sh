@@ -22,8 +22,11 @@
 # The contract under test:
 #   1  a rule is redundant only if a rule in the SAME OR AN ANCESTOR .gitignore
 #      matches the same paths from where that rule sits — anchored ancestor
-#      patterns (`/x`, `dir/x`, `dir/*`) never cover a subdirectory; unanchored
-#      ones (`x`, `*.log`, `**/x`) do
+#      patterns (`/x`, `dir/x`, `dir/*`, and `dir/**/x`: only a LEADING `**/`
+#      un-anchors) never cover a subdirectory; unanchored ones (`x`, `*.log`,
+#      `**/x`) do
+#   1b the gate's own snapshot function carries `core.excludesFile=/dev/null`, so
+#      a host-global exclude cannot mask a real difference (repo#535)
 #   2  before applying a removal or narrowing, the ignored-path set is captured
 #      before and after; any difference REFUSES the edit (report as a finding,
 #      do not count as applied)
@@ -70,8 +73,18 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # ipaths <repo> <pathspec>: the paths ignored today under <pathspec>. Tracked
 # files are unaffected by a .gitignore edit, so ignored-untracked is the whole
 # exposure.
+#
+# `-c core.excludesFile=/dev/null` is on THIS function, not only on attrib()
+# below, because this is the one whose diff decides SAFE vs REFUSED (repo#535).
+# `ls-files --exclude-standard` reads the user's global excludes, so without the
+# override a host-global `*.log` keeps a path listed after the repo's own rule is
+# removed, the before/after diff comes back empty, and the gate reports SAFE for a
+# removal that really did un-ignore the path. The `-- gate: a global excludesFile
+# cannot mask a difference --` case below is the negative control for exactly
+# this: drop the override here and it fails.
 ipaths() {
-    git -C "$1" ls-files --others --ignored --exclude-standard -z -- "$2" \
+    git -C "$1" -c core.excludesFile=/dev/null \
+        ls-files --others --ignored --exclude-standard -z -- "$2" \
         | tr '\0' '\n' | sed '/^$/d' | sort
 }
 
@@ -79,6 +92,17 @@ ipaths() {
 attrib() {
     ipaths "$1" "$2" \
         | git -C "$1" -c core.excludesFile=/dev/null check-ignore -v --stdin
+}
+
+# ign <repo> <path> -> "0" ignored / "1" not ignored. Carries the same
+# `core.excludesFile=/dev/null` override every other view here does, so a host
+# global exclude covering `.vscode` or `*.log` cannot flip an assertion
+# (repo#535). `git_fixture_init` also pins it repo-locally; this is belt and
+# braces, and it keeps the masking control below honest — that case deliberately
+# re-points `core.excludesFile`, and only an explicit `-c` on the command line
+# beats repo-local config.
+ign() {  # <repo> <path>
+    git -C "$1" -c core.excludesFile=/dev/null check-ignore -q "$2"; echo $?
 }
 
 # gate <repo> <pathspec> <mutation-command...>
@@ -134,10 +158,10 @@ assert_eq "the root's anchored .vscode/* is NOT what covers it" "0" \
 # with the subdirectory .gitignore absent, nothing ignores the path at all.
 mv "$R1/proofs/.gitignore" "$SCRATCH/parked-gitignore"
 assert_eq "with the subdirectory rule gone, proofs/.vscode/settings.json is unignored" \
-    "1" "$(git -C "$R1" check-ignore -q proofs/.vscode/settings.json; echo $?)"
+    "1" "$(ign "$R1" proofs/.vscode/settings.json)"
 mv "$SCRATCH/parked-gitignore" "$R1/proofs/.gitignore"
 assert_eq "restoring the subdirectory rule re-ignores it" \
-    "0" "$(git -C "$R1" check-ignore -q proofs/.vscode/settings.json; echo $?)"
+    "0" "$(ign "$R1" proofs/.vscode/settings.json)"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -148,7 +172,7 @@ assert_eq "removing proofs/.gitignore's rule is refused by the gate" "REFUSED" "
 assert_contains "the gate names the path that would un-ignore" \
     "$GATE_PATHS_DIFF" "proofs/.vscode/settings.json"
 assert_eq "a refused edit is reverted, so the rule is still on disk" \
-    "0" "$(git -C "$R1" check-ignore -q proofs/.vscode/settings.json; echo $?)"
+    "0" "$(ign "$R1" proofs/.vscode/settings.json)"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -173,11 +197,11 @@ assert_eq "the removal actually happened (not reverted)" \
 assert_matches "coverage moved to the ancestor rule (attribution diff is non-empty)" \
     "$GATE_ATTRIB_DIFF" '\+\.gitignore:1:\*\.log'
 assert_eq "sub/b.log is still ignored, now by the root rule" \
-    "0" "$(git -C "$R2" check-ignore -q sub/b.log; echo $?)"
+    "0" "$(ign "$R2" sub/b.log)"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- anchoring: \`**\` crosses directory levels, so it is not anchored --"
+echo "-- anchoring: a LEADING \`**/\` is unanchored, so it does reach every depth --"
 # ---------------------------------------------------------------------------
 R3="$SCRATCH/globstar"
 git_fixture_init "$R3" -b main
@@ -186,9 +210,61 @@ printf '**/build/\n' >"$R3/.gitignore"
 printf 'build/\n' >"$R3/a/b/.gitignore"
 touch "$R3/a/b/build/x" "$R3/README.md"
 assert_eq "a root \`**/build/\` reaches a/b/build/x despite containing a slash" \
-    "0" "$(git -C "$R3" check-ignore -q a/b/build/x; echo $?)"
+    "0" "$(ign "$R3" a/b/build/x)"
 gate "$R3" "a/" rm -f "$R3/a/b/.gitignore"
 assert_eq "so the nested \`build/\` duplicate is SAFE to remove" "SAFE" "$GATE_RESULT"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- anchoring: a NON-LEADING \`**\` does NOT un-anchor (\`dir/**/name\`) --"
+# ---------------------------------------------------------------------------
+# repo#535: the first version of the anchoring table grouped `dir/**/name` with
+# the leading-`**/name` form above and called both unanchored. It is not — `**`
+# crosses the levels *below* the `dir/` prefix, but the prefix itself is still a
+# mid-pattern separator, so the whole pattern is relative to the declaring
+# .gitignore's directory. A root `dir/**/name` therefore does NOT cover
+# `sub/dir/name`, and a `sub/.gitignore: name` beneath it is load-bearing. The
+# mis-classification made this exact shape a removal candidate — the #531 failure
+# class, reintroduced by the table added to prevent it.
+R3B="$SCRATCH/globstar-mid"
+git_fixture_init "$R3B" -b main
+mkdir -p "$R3B/dir/x" "$R3B/sub/dir"
+printf 'dir/**/name\n' >"$R3B/.gitignore"
+printf 'name\n' >"$R3B/sub/.gitignore"
+touch "$R3B/dir/name" "$R3B/dir/x/name" "$R3B/sub/dir/name" "$R3B/README.md"
+
+# `**` crosses intermediate levels BELOW the anchored prefix...
+assert_eq "root \`dir/**/name\` ignores dir/name (zero intermediate levels)" \
+    "0" "$(ign "$R3B" dir/name)"
+assert_eq "root \`dir/**/name\` ignores dir/x/name (one intermediate level)" \
+    "0" "$(ign "$R3B" dir/x/name)"
+
+# ...but does NOT cross the prefix itself. This is the whole point, and it has to
+# be measured with the subdirectory rule parked — otherwise `sub/.gitignore: name`
+# (unanchored, so it matches at every depth under sub/) answers for the path and
+# the ancestor's reach is never actually tested.
+mv "$R3B/sub/.gitignore" "$SCRATCH/parked-mid-globstar"
+assert_eq "with the subdirectory rule parked, root \`dir/**/name\` does NOT reach sub/dir/name" \
+    "1" "$(ign "$R3B" sub/dir/name)"
+# Control: the LEADING form, same tree, same parked state, IS unanchored and does
+# reach it — so the row above is a real distinction, not an artifact of the fixture.
+printf '**/name\n' >"$R3B/.gitignore"
+assert_eq "CONTROL: a leading \`**/name\` in the same tree DOES reach sub/dir/name" \
+    "0" "$(ign "$R3B" sub/dir/name)"
+printf 'dir/**/name\n' >"$R3B/.gitignore"
+mv "$SCRATCH/parked-mid-globstar" "$R3B/sub/.gitignore"
+assert_eq "restoring the subdirectory rule re-ignores sub/dir/name" \
+    "0" "$(ign "$R3B" sub/dir/name)"
+
+# The gate must refuse removing the subdirectory rule: the ancestor cannot reach
+# it, so sub/dir/name would un-ignore.
+gate "$R3B" "sub/" rm -f "$R3B/sub/.gitignore"
+assert_eq "removing \`sub/.gitignore: name\` under a root \`dir/**/name\` is REFUSED" \
+    "REFUSED" "$GATE_RESULT"
+assert_contains "the gate names the path the mid-\`**\` ancestor cannot cover" \
+    "$GATE_PATHS_DIFF" "sub/dir/name"
+assert_eq "the refused removal is reverted, so sub/dir/name is still ignored" \
+    "0" "$(ign "$R3B" sub/dir/name)"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -220,7 +296,7 @@ printf '*.log\n!important.log\n' >"$R5/.gitignore"
 printf '*.log\n' >"$R5/sub/.gitignore"
 touch "$R5/important.log" "$R5/sub/important.log" "$R5/sub/other.log" "$R5/README.md"
 assert_eq "sub/important.log is ignored only via the subdirectory rule" \
-    "0" "$(git -C "$R5" check-ignore -q sub/important.log; echo $?)"
+    "0" "$(ign "$R5" sub/important.log)"
 gate "$R5" "sub/" rm -f "$R5/sub/.gitignore"
 assert_eq "the textually-identical subdirectory rule is REFUSED for removal" \
     "REFUSED" "$GATE_RESULT"
@@ -251,15 +327,53 @@ echo "-- gate: a global excludesFile cannot mask a difference --"
 # `-c core.excludesFile=/dev/null` makes the result a property of the repo rather
 # than of the machine: without it, a user's global ignore of `*.log` keeps
 # sub/b.log ignored after the repo's own rule is gone, and the gate says SAFE.
+#
+# repo#535: this section used to assert only on `check-ignore -v` attribution,
+# which the doc explicitly says is NOT the gate — so its title claimed a guarantee
+# about the gate that it never exercised, and the omission of the override from
+# `ipaths()` went unnoticed. It now drives the real `gate()`. Remove the
+# `-c core.excludesFile=/dev/null` from `ipaths()` above and the REFUSED assertion
+# below fails (the path-set diff comes back empty and the gate reports SAFE).
 R7="$SCRATCH/globalexclude"
 git_fixture_init "$R7" -b main
 mkdir -p "$R7/sub"
 printf '*.log\n' >"$R7/sub/.gitignore"
-touch "$R7/sub/b.log"
+touch "$R7/sub/b.log" "$R7/sub/keep.txt"
 printf '*.log\n' >"$SCRATCH/global-excludes"
+# A host whose GLOBAL excludes overlap the rule under test. Set after
+# git_fixture_init (which pins /dev/null) — repo-local config, last write wins —
+# so only an explicit `-c` on the command line can still beat it.
 git -C "$R7" config core.excludesFile "$SCRATCH/global-excludes"
+
+# CONTROL: the masking is real. Without the override, removing the repo's own rule
+# leaves the path-set unchanged, because the global `*.log` silently takes over.
+masked_ipaths() {  # the pre-#535 ipaths(), verbatim: no override
+    git -C "$1" ls-files --others --ignored --exclude-standard -z -- "$2" \
+        | tr '\0' '\n' | sed '/^$/d' | sort
+}
+R7_MASKED_BEFORE="$(masked_ipaths "$R7" "sub/")"
+R7_UNMASKED_BEFORE="$(ipaths "$R7" "sub/")"
 R7_ATTRIB_MASKED="$(git -C "$R7" check-ignore -v sub/b.log 2>/dev/null)"
+
+# The gate, with the override in place, must REFUSE: sub/b.log really does stop
+# being ignored *by the repo* when sub/.gitignore goes away.
+gate "$R7" "sub/" rm -f "$R7/sub/.gitignore"
+assert_eq "the real gate REFUSES the removal despite the global excludesFile" \
+    "REFUSED" "$GATE_RESULT"
+assert_contains "the gate names the path the global exclude was masking" \
+    "$GATE_PATHS_DIFF" "sub/b.log"
+assert_eq "the refused removal is reverted, so the repo's own rule is back" \
+    "*.log" "$(cat "$R7/sub/.gitignore")"
+
+# CONTROL, continued: an un-overridden ipaths() sees no difference at all — which
+# is exactly why the override has to live on the gate's own snapshot function.
 rm -f "$R7/sub/.gitignore"
+assert_eq "CONTROL: without the override the path-set diff is empty (gate would say SAFE)" \
+    "$R7_MASKED_BEFORE" "$(masked_ipaths "$R7" "sub/")"
+assert_matches "CONTROL: the masked listing does include sub/b.log both times" \
+    "$R7_MASKED_BEFORE" 'sub/b\.log'
+assert_eq "with the override, the path-set really did change" "0" \
+    "$([[ "$R7_UNMASKED_BEFORE" != "$(ipaths "$R7" "sub/")" ]]; echo $?)"
 assert_contains "without the override, the global excludesFile answers for the path" \
     "$(git -C "$R7" check-ignore -v sub/b.log 2>/dev/null)" "global-excludes"
 assert_contains "with the override, nothing in the repo ignores it any more" \
@@ -267,6 +381,7 @@ assert_contains "with the override, nothing in the repo ignores it any more" \
     "rc=1"
 assert_contains "the repo's own rule was the real owner before the removal" \
     "$R7_ATTRIB_MASKED" "sub/.gitignore"
+printf '*.log\n' >"$R7/sub/.gitignore"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -286,8 +401,19 @@ assert_contains "it gives the unanchored row (bare name / glob / trailing slash)
     "$GI" '| `name`, `*.log`, `name/`'
 assert_contains "it gives the anchored row (leading and mid-pattern slash)" \
     "$GI" '| `/name`, `dir/name`, `dir/*`'
-assert_contains "it exempts \`**\`, which crosses directory levels" \
+# repo#535: these two rows must stay SPLIT. The original table grouped
+# `**/name` and `dir/**/name` as one unanchored row, which is wrong — only a
+# LEADING `**/` un-anchors — and this assertion pinned that wrong text green.
+assert_contains "it gives the unanchored leading-\`**/\` row" \
+    "$GI" '| `**/name` (leading `**/`)'
+assert_contains "it classifies a non-leading \`**\` as ANCHORED, in its own row" \
+    "$GI" '| `dir/**/name` (non-leading `**`) | **yes**'
+assert_not_contains "it does NOT group \`dir/**/name\` with the unanchored forms" \
     "$GI" '| `**/name`, `dir/**/name`'
+assert_matches "it states that only a leading \`**/\` un-anchors" \
+    "$GI" 'Only a \*\*leading\*\* `\*\*/` un-anchors'
+assert_matches "it gives the concrete \`dir/\*\*/name\` behavior (sub/dir/name not ignored)" \
+    "$GI" '`dir/\*\*/name`.*`dir/name`.*`dir/x/name`.*`sub/dir/name` is \*\*not\*\*'
 assert_contains "it states the redundancy condition in terms of same-or-ancestor scope" \
     "$GI" "matches the same paths *from where that rule sits*"
 assert_contains "it carries the concrete .vscode regression" "$GI" "proofs/.vscode/"
@@ -305,6 +431,19 @@ assert_contains "there is a dedicated gate section" "$GI" "### Verify a removal 
 assert_contains "the gate runs git check-ignore -v" "$GI" "check-ignore -v --stdin"
 assert_contains "it neutralizes the user's global excludes" \
     "$GI" "core.excludesFile=/dev/null"
+# repo#535: the override has to be on `ipaths` — the function whose diff IS the
+# gate — and not only on the attribution view the doc calls explicitly not a gate.
+# The documented `ipaths` body is extracted from the fenced recipe so this cannot
+# be satisfied by the override appearing somewhere else in the file.
+IPATHS_BODY="$(awk '/^ipaths\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$GITIGNORE_MD" | tr '\n' ' ' | tr -s ' ')"
+assert_contains "the documented ipaths() (THE GATE) carries the override" \
+    "$IPATHS_BODY" "core.excludesFile=/dev/null"
+assert_contains "the documented ipaths() still lists ignored-untracked paths" \
+    "$IPATHS_BODY" "ls-files --others --ignored --exclude-standard"
+assert_matches "the prose says the override belongs on BOTH functions" \
+    "$GI" 'core.excludesFile=/dev/null` on \*\*both\*\* functions'
+assert_matches "the guarantee is scoped honestly: .git/info/exclude is NOT neutralized" \
+    "$GI" '`\.git/info/exclude`.*\*\*not\*\* neutralized here'
 assert_contains "it snapshots the ignored-path set before and after" "$GI" "paths.before"
 assert_contains "and compares them" "$GI" "paths.after"
 assert_matches "the path-set diff is the gate and must be empty" \
@@ -360,6 +499,13 @@ assert_contains "audit.md now also carries the anchoring caveat" \
 assert_matches "it states the anchoring rule in one line" \
     "$AU" 'anchored to its own `.gitignore`'"'"'s directory'
 assert_contains "it names the concrete example" "$AU" '`.vscode/*` never covers'
+# repo#535: audit.md's one-line form must not contradict gitignore.md's table —
+# "a `/` other than a trailing one anchors" has exactly one exception, a LEADING
+# `**/`, and a mid-pattern `**` is not it.
+assert_matches "it names the only exception (a *leading* \`**/\`) explicitly" \
+    "$AU" 'Only a \*leading\* `\*\*/` un-anchors'
+assert_matches "it says a mid-pattern \`**\` stays anchored" \
+    "$AU" '`dir/\*\*/name` is anchored just like `dir/name`'
 assert_contains "it points at gitignore.md's gate" "$AU" "before/after gate"
 assert_contains "it keeps audit.md read-only (candidate redundancy only)" \
     "$AU" "candidate* redundancy"

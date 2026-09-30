@@ -83,15 +83,22 @@ git_fixture_scrub_env() {
     unset LOOM_PROVENANCE_HOOKS_DIR
 }
 
-# git_fixture_harden <dir>: neutralize inherited hooks for an ALREADY-created
-# fixture repo (works for bare repos too). Points the repo's own
-# `core.hooksPath` at an empty directory inside its git dir, which beats any
-# `core.hooksPath` in the outer global/system config.
+# git_fixture_harden <dir>: neutralize inherited hooks and inherited global
+# excludes for an ALREADY-created fixture repo (works for bare repos too).
+# Points the repo's own `core.hooksPath` at an empty directory inside its git
+# dir, which beats any `core.hooksPath` in the outer global/system config, and
+# pins `core.excludesFile` to `/dev/null` for the same reason (repo#535): a host
+# global excludes file covering, say, `.vscode` or `*.log` silently changes what
+# `git check-ignore` / `git ls-files --exclude-standard` answer inside a fixture,
+# flipping any ignore-status assertion the suite makes. A case that deliberately
+# wants a global exclude (test-gitignore-anchoring.sh's masking control) just
+# sets `core.excludesFile` again after init — repo-local config, last write wins.
 git_fixture_harden() {  # <dir>
     local dir="${1:?git_fixture_harden: <dir> required}" gitdir
     gitdir="$(git -C "$dir" rev-parse --absolute-git-dir)" || return 1
     mkdir -p "$gitdir/loom-test-no-hooks"
     git -C "$dir" config core.hooksPath "$gitdir/loom-test-no-hooks"
+    git -C "$dir" config core.excludesFile /dev/null
 }
 
 # git_fixture_init <dir> [extra git-init flags...]: create a hermetic fixture

@@ -93,11 +93,20 @@ of the pattern, then the pattern is relative to the directory level of the
 particular `.gitignore` file itself"). Identical text in two `.gitignore` files
 at different depths can therefore cover entirely **disjoint** path sets:
 
-| Pattern in a `.gitignore`       | Anchored to that directory? | Reaches `sub/<name>`? |
-|---------------------------------|:---------------------------:|:---------------------:|
-| `name`, `*.log`, `name/`        | no — matches at every depth | yes                   |
-| `/name`, `dir/name`, `dir/*`    | **yes**                     | **no**                |
-| `**/name`, `dir/**/name`        | no — `**` crosses levels    | yes                   |
+| Pattern in a `.gitignore`        | Anchored to that directory? | Reaches `sub/<name>`? |
+|----------------------------------|:---------------------------:|:---------------------:|
+| `name`, `*.log`, `name/`         | no — matches at every depth | yes                   |
+| `**/name` (leading `**/`)        | no — matches at every depth | yes                   |
+| `/name`, `dir/name`, `dir/*`     | **yes**                     | **no**                |
+| `dir/**/name` (non-leading `**`) | **yes** — `dir/` anchors it | **no**                |
+
+Only a **leading** `**/` un-anchors a pattern. A `**` in the *middle* crosses
+intermediate directory levels *below* the anchored prefix; it does not cross the
+prefix itself. With a root `.gitignore: dir/**/name`, both `dir/name` and
+`dir/x/name` are ignored but `sub/dir/name` is **not** — so for redundancy
+purposes `dir/**/name` is anchored exactly like `dir/name`, and a
+`sub/.gitignore: name` beneath it is **not** redundant with it. Only the leading
+form (`**/name`) reaches every depth.
 
 So `proofs/.gitignore: .vscode/` is **not** redundant with a root
 `.gitignore: .vscode/*` — the root rule is anchored and never reaches
@@ -161,8 +170,14 @@ S=$(mktemp -d)
 # makes the full listing unwieldy: it collapses a wholly-ignored directory to one
 # entry, and a directory that stops being wholly ignored still differs, either by
 # vanishing or by expanding into its members.
+# `-c core.excludesFile=/dev/null` belongs HERE, on the gate itself — not only on
+# the attribution view below. `ls-files --exclude-standard` reads the user's
+# global excludes too, so without it a host-global `*.log` keeps a path listed
+# after the repo's own rule is gone and the diff comes back empty (SAFE) for a
+# removal that really did un-ignore it.
 ipaths() {
-  git ls-files --others --ignored --exclude-standard -z -- "$1" \
+  git -c core.excludesFile=/dev/null \
+    ls-files --others --ignored --exclude-standard -z -- "$1" \
     | tr '\0' '\n' | sed '/^$/d' | sort
 }
 # Which rule covers each path, in `<file>:<line>:<pattern>\t<path>` form.
@@ -180,9 +195,21 @@ diff -u "$S/paths.before" "$S/paths.after"     # MUST be empty
 diff -u "$S/attrib.before" "$S/attrib.after"   # informational — see below
 ```
 
-`-c core.excludesFile=/dev/null` keeps a user's global excludes from masking a
-difference the repo's own rules would show, so the result is a property of the
-repo rather than of this machine.
+`-c core.excludesFile=/dev/null` on **both** functions keeps a user's global
+excludes from masking a difference the repo's own rules would show. Putting it
+only on `attrib` is not enough — that diff is explicitly not the gate (below), so
+the override would sit on the one view whose answer does not decide anything
+while `ipaths`, which does, stayed machine-dependent.
+
+**Scope that guarantee honestly:** `--exclude-standard` reads three sources — the
+repo's `.gitignore` files, the global excludes file, and `.git/info/exclude`.
+`core.excludesFile=/dev/null` neutralizes the second only. `.git/info/exclude` is
+equally clone-local and is **not** neutralized here (there is no config knob to
+redirect it, and moving the file aside would mutate the user's clone, which this
+read-only check must not do). So the result is a property of the repo *plus this
+clone's `.git/info/exclude`* — not of the machine's global config. If a rule under
+test overlaps a pattern in `.git/info/exclude`, say so in the finding rather than
+reporting a bare `verified`.
 
 **The path-set diff is the gate.** If it is non-empty — a path un-ignored, or a
 path newly ignored by an over-broad rewrite — **revert the edit and do not count
