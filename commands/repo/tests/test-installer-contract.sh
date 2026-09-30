@@ -30,6 +30,12 @@ CONTRACT="$REPO_ROOT/INSTALLER-CONTRACT.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 if [[ ! -f "$CONTRACT" ]]; then
     echo "FATAL: INSTALLER-CONTRACT.md not found at $CONTRACT" >&2
@@ -46,7 +52,7 @@ mkdir -p "$FAKE_HOME"
 # table. Columns are: | # | loom | anvil | repo | squad |, so awk field 5 is
 # `repo` (field 1 is the empty string before the leading pipe).
 # ---------------------------------------------------------------------------
-documented_repo_cell() {  # <C1..C8> -> "yes" | "no" | "" (row not found)
+documented_repo_cell() {  # <C1..C10> -> "yes" | "no" | "" (row not found)
     local id="$1" cell
     cell="$(awk -F'|' -v id="$id" '
         $2 ~ ("^ " id " ") { gsub(/^[ \t]+|[ \t]+$/, "", $5); print $5; exit }
@@ -68,13 +74,13 @@ tree_fingerprint() {
       done )
 }
 
-new_target() { mkdir -p "$1"; git -C "$1" init -q; }
+new_target() { mkdir -p "$1"; git_fixture_init "$1"; }
 
 echo "INSTALLER-CONTRACT.md conformance suite"
 echo "======================================="
 
 # Derived results, filled in below and cross-checked against the document last.
-C1=no; C2=no; C3=no; C4=no; C5=no; C6=no; C7=no; C8=no; C9=no
+C1=no; C2=no; C3=no; C4=no; C5=no; C6=no; C7=no; C8=no; C9=no; C10=no
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -199,6 +205,12 @@ if [[ -x "$ORG_POLICY_HELPER" ]] && python3 "$ORG_POLICY_HELPER" --help >/dev/nu
     ok "organization policy helper runs from a client install"
 else
     no "organization policy helper runs from a client install"
+fi
+OPTIMIZE_CI_HELPER="$TOOL_ROOT/scripts/repo-optimize-ci.py"
+if [[ -x "$OPTIMIZE_CI_HELPER" ]] && python3 "$OPTIMIZE_CI_HELPER" scan --root "$C3_T" --json >/dev/null 2>&1; then
+    ok "optimize-ci helper runs from a client install"
+else
+    no "optimize-ci helper runs from a client install"
 fi
 if [[ -f "$C3_T/.agents/skills/repo/references/org-policy.md" ]]; then
     ok "organization policy command is discoverable in the Codex install"
@@ -344,6 +356,16 @@ fi
 # left behind by the installed guard hooks running between installs, and a
 # consumer deliberately ignoring it (it carries absolute filesystem paths) is
 # the CORRECT state, not a defect the warning should flag.
+#
+# DELIBERATELY REAFFIRMED under repo#482 (which asked whether this case should
+# survive the fix, rather than leaving the answer implicit): the hooks now ship
+# their OWN self-ignoring `.gitignore` into that directory, so a consumer no
+# longer has to write the rule seeded below by hand. This case stays because
+# the consumer-authored rule is still a legal, supported arrangement — every
+# repo that added one before repo#482 still has it, and the C9 sweep must keep
+# staying silent about it whether the ignore comes from the consumer's root
+# .gitignore (here) or from the hooks' own file (the C9_SELFIG case after it).
+# The fix is purely additive: it never requires removing an existing rule.
 C9_RUNTIME="$SCRATCH/c9-runtime"; new_target "$C9_RUNTIME"
 cat >"$C9_RUNTIME/.gitignore" <<'EOF'
 # guard-hook decision logs (machine-local)
@@ -369,12 +391,149 @@ else
     C9_OK=false
 fi
 
+# repo#482 — the same runtime-log path, in a consumer that has NO .gitignore
+# rule of its own (the ordinary case: nothing in the installed payload ever told
+# them to add one). Before the fix the guard's first log write left an untracked
+# file under the tool root forever, which is enough on its own to stall an
+# installed-surface resync that gates on a clean `git status --porcelain`. The
+# hooks now drop a `*`-only .gitignore into the logs directory as they create
+# it, so the directory ignores its own contents wherever it appears.
+#
+# This runs the REAL installed guard hook (not a simulated log write) so the
+# assertion covers the shipped behaviour end to end.
+C9_SELFIG="$SCRATCH/c9-selfignore"; new_target "$C9_SELFIG"
+HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_SELFIG" >/dev/null 2>&1 </dev/null
+if [[ -f "$C9_SELFIG/.gitignore" ]] && grep -qE 'logs|\.log' "$C9_SELFIG/.gitignore"; then
+    no "the fresh target carries no logs rule of its own (fixture precondition)" \
+        "$(cat "$C9_SELFIG/.gitignore")"
+    C9_OK=false
+else
+    ok "the fresh target carries no logs rule of its own (fixture precondition)"
+fi
+C9_SELFIG_LOGS="$C9_SELFIG/.claude/skills/repo/logs"
+jq -nc --arg w "$C9_SELFIG" '{tool_name:"Bash", tool_input:{command:"rm -rf /"}, cwd:$w}' \
+    | env REPO_GUARD_DECISION_LOG=1 \
+      bash "$C9_SELFIG/.claude/skills/repo/hooks/guard-destructive.sh" >/dev/null 2>&1
+if [[ -f "$C9_SELFIG_LOGS/guard-decisions.log" ]]; then
+    ok "the installed guard hook writes its decision log under the tool root"
+else
+    no "the installed guard hook writes its decision log under the tool root" \
+        "$(ls -a "$C9_SELFIG_LOGS" 2>&1)"
+    C9_OK=false
+fi
+C9_SELFIG_STATUS="$( git -C "$C9_SELFIG" status --porcelain 2>&1 | grep -F 'skills/repo/logs' || true )"
+if [[ -z "$C9_SELFIG_STATUS" ]]; then
+    ok "a guard-hook run leaves no untracked runtime log behind (self-ignoring logs/)"
+else
+    no "a guard-hook run leaves no untracked runtime log behind (self-ignoring logs/)" \
+        "$C9_SELFIG_STATUS"
+    C9_OK=false
+fi
+C9_SELFIG_RULE="$( git -C "$C9_SELFIG" check-ignore -v .claude/skills/repo/logs/guard-decisions.log 2>/dev/null || true )"
+if [[ "$C9_SELFIG_RULE" == *".claude/skills/repo/logs/.gitignore:"* ]]; then
+    ok "the matching rule is the hooks' own shipped logs/.gitignore, not a consumer rule"
+else
+    no "the matching rule is the hooks' own shipped logs/.gitignore, not a consumer rule" \
+        "${C9_SELFIG_RULE:-<no match>}"
+    C9_OK=false
+fi
+# ...and C9 itself is unchanged by any of that: still silent about runtime logs.
+C9_SELFIG_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y "$C9_SELFIG" 2>&1 </dev/null )"
+if [[ "$C9_SELFIG_OUT" != *"INSTALLER-CONTRACT.md C9"* && "$C9_SELFIG_OUT" != *"guard-decisions.log"* ]]; then
+    ok "a self-ignored runtime log does not trigger the C9 warning either"
+else
+    no "a self-ignored runtime log does not trigger the C9 warning either" "$C9_SELFIG_OUT"
+    C9_OK=false
+fi
+
 [[ "$C9_OK" == true ]] && C9=yes
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- C10: repo-owned pins, honored by every writer --"
+# This is C10's published spot-check, run verbatim: install, edit an installed
+# payload file, pin it, then run BOTH writers again and require the file to be
+# byte-identical. The deeper behavioural coverage (positive controls, format,
+# subtree pins, the too-old-clone refusal) lives in test-resync-ignore.sh; this
+# is the cell derivation, so it stays the contract's own check and nothing more.
+C10_OK=true
+C10_T="$SCRATCH/c10"; new_target "$C10_T"
+HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y --no-codex "$C10_T" >/dev/null 2>&1 </dev/null
+C10_FILE="$C10_T/.claude/commands/repo/scrub.md"
+C10_PINS="$C10_T/.claude/skills/repo/resync-ignore"
+if [[ -f "$C10_FILE" ]]; then
+    printf '\n<!-- C10-SPOTCHECK-LOCAL-EDIT -->\n' >>"$C10_FILE"
+    {
+        echo "# repo-owned: our local wiring lives in this file"
+        echo ".claude/commands/repo/scrub.md"
+        echo ".claude/commands/repo/does-not-exist.md"
+    } >"$C10_PINS"
+    C10_SUM="$(cksum <"$C10_FILE")"
+
+    C10_RESYNC_OUT="$( cd "$C10_T" && HOME="$FAKE_HOME" bash "$C10_T/.claude/skills/repo/scripts/resync-installed.sh" 2>&1 )"
+    C10_RESYNC_RC=$?
+    if [[ "$(cksum <"$C10_FILE")" == "$C10_SUM" ]]; then
+        ok "a pinned payload file survives the C7 resync byte-for-byte"
+    else
+        no "a pinned payload file survives the C7 resync byte-for-byte" "$C10_RESYNC_OUT"
+        C10_OK=false
+    fi
+    if [[ "$C10_RESYNC_RC" -eq 0 ]]; then ok "the resync still exits 0 with pins present"; else no "the resync still exits 0 with pins present" "exit $C10_RESYNC_RC"; C10_OK=false; fi
+    if [[ "$C10_RESYNC_OUT" == *"pinned"* ]]; then
+        ok "the resync names the pin rather than skipping it silently"
+    else
+        no "the resync names the pin rather than skipping it silently" "$C10_RESYNC_OUT"
+        C10_OK=false
+    fi
+    if [[ "$C10_RESYNC_OUT" == *"pin had no effect: '.claude/commands/repo/does-not-exist.md'"* ]]; then
+        ok "the resync warns about a dead pin"
+    else
+        no "the resync warns about a dead pin" "$C10_RESYNC_OUT"
+        C10_OK=false
+    fi
+
+    C10_INSTALL_OUT="$( HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" -y --no-codex "$C10_T" 2>&1 </dev/null )"
+    C10_INSTALL_RC=$?
+    if [[ "$(cksum <"$C10_FILE")" == "$C10_SUM" ]]; then
+        ok "a pinned payload file survives a reinstall byte-for-byte"
+    else
+        no "a pinned payload file survives a reinstall byte-for-byte" "$C10_INSTALL_OUT"
+        C10_OK=false
+    fi
+    if [[ "$C10_INSTALL_RC" -eq 0 ]]; then ok "the installer still exits 0 with pins present"; else no "the installer still exits 0 with pins present" "exit $C10_INSTALL_RC"; C10_OK=false; fi
+    if [[ "$C10_INSTALL_OUT" == *"Pinned (repo-owned, left alone)"* ]]; then
+        ok "the installer names the pin it honored"
+    else
+        no "the installer names the pin it honored" "$C10_INSTALL_OUT"
+        C10_OK=false
+    fi
+    if [[ "$C10_INSTALL_OUT" == *"pin had no effect: '.claude/commands/repo/does-not-exist.md'"* ]]; then
+        ok "the installer warns about the same dead pin"
+    else
+        no "the installer warns about the same dead pin" "$C10_INSTALL_OUT"
+        C10_OK=false
+    fi
+
+    # The uninstall half of C10: a pinned path IS removed (uninstall is a
+    # deliberate removal, not a refresh) but must be named before the
+    # confirmation so the operator can copy it out.
+    C10_UNINSTALL_OUT="$( cd "$C10_T" && HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" -y "$C10_T" 2>&1 )"
+    if [[ "$C10_UNINSTALL_OUT" == *".claude/commands/repo/scrub.md"* && "$C10_UNINSTALL_OUT" == *"resync-ignore"* ]]; then
+        ok "the uninstaller names pinned paths before removing them"
+    else
+        no "the uninstaller names pinned paths before removing them" "$C10_UNINSTALL_OUT"
+        C10_OK=false
+    fi
+else
+    no "a pinned payload file survives the C7 resync byte-for-byte" "no install at $C10_FILE"
+    C10_OK=false
+fi
+[[ "$C10_OK" == true ]] && C10=yes
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- the conformance table matches what was just derived --"
-for id in C1 C2 C3 C4 C5 C6 C7 C8 C9; do
+for id in C1 C2 C3 C4 C5 C6 C7 C8 C9 C10; do
     documented="$(documented_repo_cell "$id")"
     derived="$(eval "echo \"\$$id\"")"
     if [[ -z "$documented" ]]; then
@@ -390,7 +549,7 @@ echo "-- the contract is normative and self-describing --"
 CT="$(cat "$CONTRACT")"
 assert_contains "the contract states its normative status" "$CT" "normative"
 assert_contains "the contract cites RFC 2119 key words" "$CT" "RFC 2119"
-for id in C1 C2 C3 C4 C5 C6 C7 C8 C9; do
+for id in C1 C2 C3 C4 C5 C6 C7 C8 C9 C10; do
     assert_contains "the contract has a section for $id" "$CT" "### $id"
 done
 assert_contains "every requirement publishes a spot-check" "$CT" "Spot-check:"

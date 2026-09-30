@@ -56,6 +56,12 @@ TIDY_MD="$CMD_DIR/tidy.md"
 # assert_matches) plus the PASS/FAIL/SKIP/TOTAL counters and color vars are
 # shared across the repo test suites — see lib/assert.sh (repo#307).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 for f in "$ALL_MD" "$AUDIT_MD" "$ORPHANS_MD" "$TIDY_MD"; do
     if [[ ! -f "$f" ]]; then
@@ -96,7 +102,7 @@ if ! command -v git >/dev/null 2>&1; then
 else
     FIX="$FIXTURE_ROOT/repo"
     mkdir -p "$FIX"
-    git -C "$FIX" init --quiet
+    git_fixture_init "$FIX"
     git -C "$FIX" config user.email "test@example.invalid"
     git -C "$FIX" config user.name "Orphan Stage Test"
 

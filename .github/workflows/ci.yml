@@ -34,10 +34,15 @@ on:
     branches:
       - main
 
-# Cancel superseded runs on the same ref to save runner minutes.
+# Cancel superseded runs on the same ref to save runner minutes — but ONLY for
+# pull requests. An unconditional `cancel-in-progress: true` also applies to the
+# `push: main` trigger above, so during a sweep wave each merge cancels the
+# previous `main` run in this group and intermediate merged commits end up with
+# no completed CI run at all. A regression introduced by a middle merge then
+# surfaces later, attributed to the wrong commit (issue #507).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   organization-policy:

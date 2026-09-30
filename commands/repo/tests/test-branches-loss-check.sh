@@ -52,6 +52,13 @@ RESET_MD="$REPO_ROOT/commands/repo/reset.md"
 # reports the skip count as a breakdown annotation.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 if [[ ! -f "$BRANCHES_MD" ]]; then
     echo "FATAL: branches.md not found at $BRANCHES_MD" >&2
     exit 1
@@ -203,8 +210,8 @@ safe_to_delete_set() {
 build_fixtures() {
     local root="$SCRATCH/fixture"
     mkdir -p "$root"
-    git init -q --bare "$root/origin.git"
-    git init -q -b main "$root/repo"
+    git_fixture_init "$root/origin.git" --bare
+    git_fixture_init "$root/repo" -b main
     REPO="$root/repo"
     git -C "$REPO" config user.email "test@example.invalid"
     git -C "$REPO" config user.name "Loss Check Test"

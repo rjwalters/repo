@@ -78,6 +78,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
+# Fixture hermeticity (repo#518): a Loom-dispatched session overrides
+# core.hooksPath through GIT_CONFIG_* env pairs (loom-daemon's provenance
+# hooks), which fixture repos inherit unless the override is scrubbed — see
+# lib/git-fixture.sh. (This suite has its own counters and does not source
+# lib/assert.sh, so the helper is sourced here rather than next to it.)
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
+
 CANONICAL="$REPO_ROOT/hooks/repo/guard-destructive.sh"
 VENDORED="$REPO_ROOT/.loom/hooks/guard-destructive-generic.sh"
 CASES="$SCRIPT_DIR/guard-equivalence-cases.txt"
@@ -238,7 +246,7 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
-git -C "$WORK" init -q 2>/dev/null
+git_fixture_init "$WORK" 2>/dev/null
 git -C "$WORK" -c user.email=t@example.com -c user.name=t \
     commit -q --allow-empty -m init 2>/dev/null
 
@@ -259,7 +267,7 @@ git -C "$WORK" -c user.email=t@example.com -c user.name=t \
 WTC_READY=0
 WTC_WT=""
 WTC_MAIN="$(mktemp -d)"
-if git -C "$WTC_MAIN" init -q 2>/dev/null &&
+if git_fixture_init "$WTC_MAIN" 2>/dev/null &&
     git -C "$WTC_MAIN" -c user.email=t@example.com -c user.name=t \
         commit -q --allow-empty -m init 2>/dev/null &&
     mkdir -p "$WTC_MAIN/.loom/worktrees" 2>/dev/null; then

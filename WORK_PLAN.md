@@ -7,11 +7,13 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-_None._
+- **#433**: fix(guard): a backslash-escaped backtick no longer vetoes span masking
+- **#442**: fix(guard): reach into a quoted single-command $( ) for write-target extraction
+- **#461**: feat(guard): deny a build/scratch dir that resolves onto a tmpfs mount
 
-## Urgent
+## Operator Priority
 
-Issues flagged as highest priority (`loom:urgent`).
+Issues the operator starred (`loom:operator-priority`); land these first.
 
 _None._
 
@@ -37,21 +39,21 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#433**: fix(guard): a backslash-escaped backtick no longer vetoes span masking
+- **#442**: fix(guard): reach into a quoted single-command $( ) for write-target extraction
+- **#461**: feat(guard): deny a build/scratch dir that resolves onto a tmpfs mount
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#282**: Add dual-runtime Claude and Codex packaging for Repo Skills *(curated)*
-- **#257**: Handoff note in another repo is invisible from the repo you start in *(curated)*
+- **#439**: Worktree-write-confinement: a quoted single-command $( ) substitution writes into the main checkout in both guards *(curated)*
+- **#447**: Upstream the repo#443 single-quoted-span inertness fix to Loom's vendored guard *(curated)*
+- **#454**: Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount *(curated)*
 
 ## Proposed (Architect / Hermit)
 
-- **#381**: Remove validate-toolchain.sh: dead entry point, zero in-repo callers *(hermit)*
-- **#379**: Fix random-file.sh: broken gitignore/exclusion filtering leaks .git internals and worktree scratch files *(hermit)*
-- **#375**: Consolidate find_repo_root(): worktree-unaware copies break signal.sh across worktrees *(hermit)*
-- **#346**: Remove clean-labels.sh: dead deprecated stub with zero callers *(hermit)*
+_None._
 
 ## Epics
 
@@ -61,13 +63,13 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
-| Urgent | 0 |
+| Operator merge-risk holds | 3 |
+| Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 0 |
-| Curated | 2 |
-| Architect / Hermit proposals | 4 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 3 |
+| Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

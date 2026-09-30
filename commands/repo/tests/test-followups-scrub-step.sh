@@ -57,6 +57,28 @@
 #   9  a source-confidentiality sub-step (3c) exists, sits after 3b and
 #      before 4, is advisory-only, fails closed on ambiguity (not on a
 #      missing file), and step 4's warning is additive to 3b's `Vis` column
+#
+# repo#464 adds a second, stricter opt-in on top of #272's advisory warning:
+# a `.repo/scrub.toml` `source_confidential = "block"` STRING (distinct from
+# the existing boolean `source_confidential = true`) makes step 4 default
+# every `public`/`unknown` row to `HOLD — source firewall` and require an
+# explicit per-run operator override to file it, instead of the ordinary
+# confirmation. This is additive, not a replacement: the default (no key)
+# and boolean-`true` cases must still be advisory-only, exactly as #272 left
+# them, and the CLAUDE.md keyword scan alone must never trigger block mode.
+# One more way this can rot, on top of the ones above:
+#
+#   - Block mode gets wired to the same boolean/keyword signal as the
+#     advisory warning, so a prose-only CLAUDE.md match silently starts
+#     blocking filing — undoing #272's deliberate advisory-only design
+#     instead of coexisting with it as a separate, structured opt-in.
+#
+#  10  `.repo/scrub.toml` documents `source_confidential = "block"` as a
+#      string distinct from the boolean; when set, step 4 defaults
+#      `public`/`unknown` rows to `HOLD — source firewall` and requires an
+#      explicit override to file, separate from the ordinary confirmation;
+#      the keyword scan alone never selects block mode; and the default /
+#      boolean-`true` cases remain advisory-only as before
 
 set -uo pipefail
 
@@ -303,16 +325,20 @@ assert_contains "step 3c fails closed on ambiguous matches (warn when in doubt)"
 assert_contains "a missing CLAUDE.md is the one case that does NOT warn" "$FOLLOWUPS" \
     "missing** \`CLAUDE.md\`"
 
-# The warning must be additive to Vis, not a replacement — and advisory-only,
-# matching the rest of the command's confirm-first posture.
+# The warning must be additive to Vis, not a replacement — and advisory-only
+# IN THE DEFAULT/BOOLEAN CASE, matching the rest of the command's
+# confirm-first posture. (repo#464 adds a separate, structured "block" opt-in
+# that is NOT advisory — see section 10 below — so these assertions describe
+# the default/boolean case specifically, not an unconditional property of
+# step 3c/4.)
 assert_contains "the step-4 warning is additive to the Vis column, not a replacement" \
     "$FOLLOWUPS" "additive to the \`Vis\` column, not"
 assert_contains "the warning text appears above the confirmation table" "$FOLLOWUPS" \
     "SOURCE REPO LOOKS CONFIDENTIAL"
-assert_contains "the warning is explicitly advisory-only" "$FOLLOWUPS" \
-    "**purely advisory**"
-assert_contains "the warning never blocks filing" "$FOLLOWUPS" \
-    "it never blocks filing and never auto-redacts"
+assert_contains "the warning is explicitly advisory-only in the default/boolean case" \
+    "$FOLLOWUPS" "**purely advisory** in the default case"
+assert_contains "the default/boolean warning never blocks filing" "$FOLLOWUPS" \
+    "it never blocks filing and never"
 
 # It must cross-reference 3b's Vis resolution rather than re-deriving target
 # visibility from scratch — same anti-duplication property as step 3b's own
@@ -322,6 +348,50 @@ assert_contains "step 3c/4 reuses 3b's resolved Vis rather than re-deriving it" 
 
 assert_contains "safety rule 7 covers the source-confidentiality warning" "$FOLLOWUPS" \
     "7. **Warn, never block, on a confidential source filing to a public target**"
+assert_contains "safety rule 7 is now scoped to the default/boolean case" "$FOLLOWUPS" \
+    "advisory only in the"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "10. Source firewall BLOCK mode (repo#464) — a separate, structured opt-in"
+# ---------------------------------------------------------------------------
+
+# The new value must be documented as a STRING, distinct from the existing
+# boolean, and reachable only through .repo/scrub.toml — never the keyword
+# scan alone.
+assert_contains "block mode is documented as the string value" "$FOLLOWUPS" \
+    'source_confidential = "block"'
+assert_contains "block mode is called out as distinct from the boolean" "$FOLLOWUPS" \
+    "distinct from the boolean \`true\`"
+assert_contains "the keyword scan alone never selects block mode" "$FOLLOWUPS" \
+    "keyword scan above never sets block mode on its own"
+assert_contains "only .repo/scrub.toml can select block mode" "$FOLLOWUPS" \
+    "opt-in can select block mode"
+
+# Step 4 must default held rows to HOLD, not merely warn, and must require an
+# override that is separate from the ordinary set-level confirmation.
+assert_contains "block mode defaults public/unknown rows to a HOLD" "$FOLLOWUPS" \
+    "HOLD — source firewall"
+assert_contains "the HOLD mirrors 3b's HOLD — needs redaction convention" "$FOLLOWUPS" \
+    "already uses for \`HOLD — needs redaction\`"
+assert_contains "a held row is not filed by the ordinary confirmation" "$FOLLOWUPS" \
+    "row is **not** filed by"
+assert_contains "filing a held row requires an explicit per-run override" "$FOLLOWUPS" \
+    "separate, explicit per-run override"
+assert_contains "a bare table-level yes is explicitly not an override" "$FOLLOWUPS" \
+    "is not an override"
+
+# Private-visibility rows and rows targeting this repo must never be held —
+# same fail-closed *set* (public/unknown) as the advisory warning, not a
+# broader one.
+assert_contains "private-visibility rows are never held by block mode" "$FOLLOWUPS" \
+    "is never held"
+
+# Safety rule 8 records block mode as a distinct rule from rule 7.
+assert_contains "a new safety rule 8 covers block mode" "$FOLLOWUPS" \
+    "8. **Hold, don't warn, when the source repo opts into block mode**"
+assert_contains "safety rule 8 requires an explicit per-run override" "$FOLLOWUPS" \
+    "requires an explicit per-run operator override naming that row"
 
 # ---------------------------------------------------------------------------
 echo ""

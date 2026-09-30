@@ -1193,11 +1193,14 @@ fi
 # 8b. --help survives a concurrent same-path rewrite of the script file
 #     itself, repeated many times (regression test for #7201's flake).
 #
-# Builds an ISOLATED fixture copy of loom-daemon-update.sh (+ its two
-# sourced lib deps) so this scenario can safely race a background writer
-# against it without ever touching the real UPDATE_SCRIPT -- corrupting the
-# repo's own checked-in script, even transiently, would be far worse than
-# the flake this regression test exists to catch.
+# Builds an ISOLATED fixture copy of loom-daemon-update.sh (+ EVERY lib it
+# sources -- three as of #8770's bounded-run.sh; each is a hard dependency
+# that exits 1 when absent, so a lib missing from the cp below shows up here
+# as a 20/20 race failure, not as a missing-file error) so this scenario can
+# safely race a background writer against it without ever touching the real
+# UPDATE_SCRIPT -- corrupting the repo's own checked-in script, even
+# transiently, would be far worse than the flake this regression test exists
+# to catch.
 #
 # The race: launch a background `cat orig > fixture` (a same-path
 # truncate+rewrite, byte-identical content) in its own backgrounded
@@ -1222,7 +1225,15 @@ fi
 W8B="$BASE_WORKDIR/w8b"
 mkdir -p "$W8B/cli" "$W8B/lib"
 cp "$UPDATE_SCRIPT" "$W8B/cli/loom-daemon-update.sh"
-cp "$CLI_DIR/../lib/daemon-env-harvest.sh" "$CLI_DIR/../lib/locate-daemon-bin.sh" "$W8B/lib/"
+# HARNESS ONLY (#8088). This used to name daemon-env-harvest.sh and
+# locate-daemon-bin.sh — the two libs the pre-port script sourced. The stub
+# sources ../lib/script-helper.sh instead, so the hand-written list left the
+# fixture unable to load at all and this scenario failed 20/20 for a reason
+# that had nothing to do with the race it measures. Copy the whole lib/
+# directory, exactly as install_update_script_into() above already does, so a
+# future change to what the entry point sources cannot silently re-break it.
+# No expectation below moves.
+cp "$CLI_DIR/../lib/"*.sh "$W8B/lib/"
 FIXTURE8B="$W8B/cli/loom-daemon-update.sh"
 ORIG8B="$W8B/cli/.orig.sh"
 cp "$FIXTURE8B" "$ORIG8B"

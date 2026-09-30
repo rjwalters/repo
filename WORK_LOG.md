@@ -2,6 +2,177 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-09-29
+- **Issue #524** (closed): test: hooks/repo/tests fixtures are not hermetic against inherited core.hooksPath (git-fixture.sh header claims they are)
+- **PR #525**: test: remove stray `.` line and mojibake left by the #518 adoption commit
+- **Issue #518** (closed): test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits
+- **PR #523**: test: make git fixtures hermetic against inherited core.hooksPath
+- **Issue #515** (closed): /repo:followups: a PR dedup match can be proposed and executed as a duplicate close (match type is never enforced)
+- **PR #521**: fix(followups): enforce dedup match type so a PR is never closed as a duplicate
+- **Issue #511** (closed): /repo:scrub has no repo-local extension point, and Repo Skills has no resync-ignore — a consumer's wiring was deleted by reinstall four times
+- **PR #519**: feat(installer): add repo-owned pins (C10) and a /repo:scrub local-check hook
+- **Issue #520** (closed): test-changelog-merged-work-check.sh case 5 fails under Loom sweep dispatch (provenance trailers leak into its fixture commits)
+- **Issue #507** (closed): ci: scope cancel-in-progress to PRs so main pushes are never cancelled
+- **PR #517**: ci: scope cancel-in-progress to pull requests in both workflows
+- **Issue #510** (closed): update-tools: frozen-component row suppresses a number step 4 still needs (follow-up to #509)
+- **PR #516**: fix(update-tools): step 3/4 consistency, example table, installer path
+- **PR #514**: chore: resync installed Loom surfaces (0.19.487 → 0.19.498)
+- **PR #513**: chore(hygiene): ignore .squad/; document repo-org-policy.py and policies/
+- **PR #512**: docs(changelog): 0.16.1 release notes
+- **Issue #504** (closed): update-tools: per-component staleness — a tool's top-level version can be a partial claim (anvil skipped_overrides/skill_versions)
+- **PR #509**: update-tools: frozen-component drift as a third staleness dimension (#504)
+- **Issue #505** (closed): feat: /repo:optimize-ci — audit CI for change-relevance filtering, caching, and wasted runs
+- **PR #506**: feat: /repo:optimize-ci — audit CI for path filtering, caching, and wasted runs (#505)
+- **Issue #503** (closed): test-handoff-preflight: pin the rationale block itself, and strengthen four token-shaped pins
+- **PR #508**: test(handoff): pin the rationale block itself, strengthen four token pins
+
+### 2026-09-28
+- **PR #502**: test(handoff): pin the doc/test split's keystone, plus two weak spots
+- **Issue #499** (closed): Compress /repo:handoff step 0 — 45% of an installed command file is preflight rationale
+- **PR #501**: refactor(handoff): compress step 0 to a checklist, move the why to the tests
+- **Issue #498** (closed): handoff step 0: absent settings.json is misrouted to the by-hand repair row
+- **PR #500**: fix(handoff): stop misrouting an absent settings.json to a by-hand repair
+- **Issue #493** (closed): /repo:handoff never verifies the SessionStart hook that reads the note it writes
+- **PR #494**: feat(handoff): verify the note has a reader before writing it
+- **Issue #496** (closed): repo-remote: remote.md config-loading snippet inverts REPO_REMOTE_ENV_FILE precedence; tilde test does not exercise expand_tilde
+- **PR #497**: fix(remote): env REPO_REMOTE_ENV_FILE beats the shared file in the doc snippet; test expand_tilde for real
+- **Issue #492** (closed): repo-remote.sh: per-repo config (and instance-id write-back) is hardwired to <git-root>/.env; allow an out-of-tree location
+- **PR #495**: repo-remote: REPO_REMOTE_ENV_FILE override; never auto-create <git-root>/.env
+- **Issue #490** (closed): install.sh copies the unused guard-destructive.sh even when it defers to an existing guard
+- **PR #491**: install.sh skips copying guard-destructive.sh when a guard already exists
+
+### 2026-09-26
+- **Issue #463** (closed): test-repo-remote.sh: SSH-readiness retry assertion flakes under CI load (1s margin)
+- **PR #489**: test-repo-remote.sh: widen SSH-readiness timeout margin (repo#463)
+- **PR #486**: Add /repo:decide: operator decisions as ranked options, best to worst, each with why
+- **Issue #487** (closed): repo-remote (AWS): fail closed on SSH CIDR — no silent 0.0.0.0/0 fallback, validate REPO_REMOTE_SSH_CIDR, revoke stale /32s
+- **PR #488**: fix(repo-remote): fail closed on SSH ingress — no silent 0.0.0.0/0 fallback, validated override, revoke stale /32s
+- **Issue #481** (closed): /repo:deps has no guidance for sibling supersession or lockfile conflicts between bot PRs
+- **PR #484**: docs(deps): classify sibling supersession and serialize lockfile-bearing merges
+
+### 2026-09-25
+- **Issue #482** (closed): Guard-hook logs land in a non-ignored path under the tool root, so every consumer must add the same .gitignore rule — ship a self-ignoring logs/ instead
+- **PR #485**: fix(hooks): ship a self-ignoring logs/ so consumers need no .gitignore rule for hook runtime logs
+- **Issue #479** (closed): /repo:deps blames missing admin for an absent security_and_analysis — but it is absent on private org repos with full admin
+- **PR #483**: feat(deps): report security updates as enabled/paused/disabled
+- **Issue #480** (closed): /repo:deps stale-check compares npm PRs against the manifest range, so a caret range marks every real upgrade stale
+- **Issue #469** (closed): repo-org-policy.py: ambiguous absent/inaccessible error, unconstrained preset visibility, no handoff to deps
+- **PR #477**: feat(org-policy): disambiguate an absent target, constrain preset visibility, hand off to deps
+- **Issue #470** (closed): deps: label refusal silently disables Loom bot-PR review routing on Loom-managed repos
+- **PR #476**: docs(deps): report when label refusal leaves bot PRs unrouted on Loom-managed repos
+- **Issue #471** (closed): deps: file a follow-up issue for the deferred Dependabot shutdown instead of only reporting it
+- **PR #475**: feat: offer a durable follow-up issue for the deferred Dependabot shutdown
+- **Issue #467** (closed): org-policy/deps can report success while Renovate is not installed, leaving the org inert
+- **PR #474**: feat: verify Renovate App installation in org-policy and deps reports
+- **Issue #466** (closed): assert_matches() in commands/repo/tests/lib/assert.sh: intermittent false FAIL from SIGPIPE under set -o pipefail
+- **PR #473**: fix: replace printf|grep pipe with here-string in assert_matches() to avoid SIGPIPE races
+- **Issue #468** (closed): deps: no org-wide mode for migrating repos from Dependabot to Renovate
+- **PR #472**: feat(deps): add --all-repos org-wide migration survey mode
+- **Issue #464** (closed): /repo:followups: step 3c only warns even when the source repo's CLAUDE.md forbids outward writes
+- **PR #465**: feat(followups): support source_confidential = "block" firewall mode
+
+### 2026-09-22
+- **PR #445**: feat: install canonical organization dependency policy from clients
+- **Issue #458** (closed): repo-remote: stale SSH alias + auto-assigned public IPs silently re-point a project at a stranger's instance
+- **PR #460**: feat(repo-remote): verify the host identity behind the SSH alias
+- **Issue #451** (closed): repo-remote: idle guard stops instances mid-build with no held SSH session; stop/start churns public IP, alias + SG ingress go stale
+- **PR #457**: fix(repo-remote): refresh SSH ingress on every reuse path and poll for the public IP
+- **Issue #453** (closed): Guard: acn==0 is not a sound 'top level' proxy — a nested $( ) with a quote phantom-closes the active span, re-opening the #450 apostrophe hole
+- **PR #459**: fix(guard): a nested $( ) quote must not phantom-close the active span (#453)
+- **Issue #448** (closed): /repo:all doc fixes applied in a Loom primary checkout are quarantined by the next sweep; land them on a branch or warn
+- **PR #456**: fix(repo): land /repo:* doc fixes where a sweep cannot quarantine them
+- **Issue #449** (closed): repo-remote: wait for fresh-instance SSH readiness before declaring provisioning failure
+- **PR #455**: fix(repo-remote): wait for fresh-instance SSH readiness before declaring provisioning failure
+- **Issue #450** (closed): Guard regression from #446: an apostrophe inside a LIVE double-quoted span makes a real executing $( ) inert, allowing a destructive command
+- **PR #452**: fix: scope single-quoted-span inertness to the top level of ml_segment()
+- **Issue #443** (closed): rmScope guard denies rm inside a remote command string (ssh host '…') — classify remote deletions separately and default them to ask
+- **PR #446**: fix(guard): treat single-quoted spans as inert in ml_segment() (#443)
+
+### 2026-09-19
+- **Issue #438** (closed): test-guard-equivalence.sh cannot see worktree-write-confinement divergences: every case runs from a cwd with no sibling worktree
+- **PR #440**: test: run guard-equivalence cases from a real Loom worktree cwd
+
+### 2026-09-18
+- **Issue #436** (closed): guard-destructive.sh: qsplit() mis-splits a quoted redirect target's $(...) at an embedded pipe, causing false worktree-write-confinement DENY
+- **PR #437**: fix(guard): stop qsplit() splitting the outer stream at a separator inside $( )
+- **Issue #434** (closed): guard: query-sink vetoes read the masked command copy, so an earlier masking pass can hide a veto token (residual from #428)
+- **PR #435**: fix(guard): run the data-sink pass before literal-text redaction so a masked span cannot hide a query-sink veto
+- **Issue #311** (closed): Auditor: guard-destructive fires on dangerous substrings inside test/data strings, not just executed commands
+- **PR #428**: fix(guard): treat jq/grep/sed/awk query text as data, not a command (#311)
+
+### 2026-09-15
+- **Issue #432** (closed): merge-pr.sh: _check_champion_hold_state_staleness aborts the whole script on a PR with no champion:hold-state marker
+- **Issue #429** (closed): guard: command_has_shell_segment() misses a shell reached through xargs/parallel
+- **PR #431**: fix(guard): recognize xargs/parallel as a shell-spawning segment
+- **Issue #430** (closed): merge-pr.sh: _check_champion_hold_state_staleness crashes under set -euo pipefail when no champion:hold-state marker exists
+- **Issue #257** (closed): Handoff note in another repo is invisible from the repo you start in
+- **PR #427**: feat(hooks): opt-in sibling-repo handoff-note visibility (#257)
+- **Issue #282** (closed): Add dual-runtime Claude and Codex packaging for Repo Skills
+
+### 2026-09-05
+- **Issue #349** (closed): test: run.sh inline guard smoke cases pollute guard-decisions.log (missing ambient-env neutralization from #134)
+
+### 2026-08-25
+- **PR #412**: remote: refer to the fleet-host incident generically (no private tracker number, no hostname)
+
+### 2026-08-24
+- **Issue #425** (closed): C9 gitignore warning fires on runtime guard-hook logs and advises committing machine paths
+- **PR #426**: fix: C9 gitignore sweep no longer flags runtime guard-hook logs
+
+### 2026-08-23
+- **Issue #422** (closed): scrub.md: the \b section's exit-code clause says 0; git grep exits 1 (and 1 is indistinguishable from a real no-match)
+- **PR #423**: docs: clarify git grep exit-code clause in scrub.md \b section
+
+### 2026-08-21
+- **Issue #411** (closed): /repo:branches loss check misses work that merged via a differently-named head — add a commits/<sha>/pulls arm
+- **PR #421**: feat(branches): rescue review branches via commit-containment forge lookup
+- **Issue #410** (closed): /repo:tidy classifies dist/ as CACHE even when a registered MCP server loads from it — demote to ASK
+- **PR #420**: fix(tidy): demote CACHE dirs referenced by a registered MCP server to ASK
+- **Issue #409** (closed): update-tools: a layout_version bump needs the installer re-run, not resync — document it as the (non-destructive) upgrade path
+- **PR #419**: docs(update-tools): document layout_version bump needs installer re-run
+- **Issue #416** (closed): check-installed-surface-version-bump.sh's WATCHED_PATHS omits scripts/ (part of the installed surface)
+- **PR #418**: fix(ci): watch scripts/repo/ in installed-surface VERSION-bump gate
+- **Issue #408** (closed): deps: document `directories:` for multi-manifest ecosystems, and re-polling mergeability between sequential merges
+- **PR #417**: docs(deps): document `directories:` for multi-manifest ecosystems and mergeability re-polling between merges
+- **Issue #407** (closed): update-tools: resync-installed.sh path leaves the CLAUDE.md "Repo Skills vX.Y.Z" line stale
+- **PR #415**: fix(resync): restamp CLAUDE.md's REPO-SKILLS block version token
+- **Issue #405** (closed): update-tools: flag repo-local modifications a resync would overwrite before applying (guide.md patch dropped 3×)
+- **PR #414**: docs(update-tools): flag repo-local modifications a resync would overwrite
+- **Issue #404** (closed): update-tools: GitHub fallback should read VERSION on the default branch, not the latest tag (Loom tags lag by 100+ patches)
+- **PR #413**: docs(update-tools): read VERSION on default branch before tags in GitHub fallback
+- **Issue #403** (closed): update-tools: name Loom's `.loom/loom-source-path` sidecar inline in step 1 (C6 exception, like kicad-tools)
+- **PR #406**: docs(update-tools): name Loom's .loom/loom-source-path sidecar inline (C6 exception)
+- **Issue #400** (closed): test-guard-destructive.sh: #315 context-field assertions fail on macOS (mktemp logical path vs guard-recorded physical path)
+- **PR #402**: fix: compare guard-recorded wtMainRoot against physical fixture path
+- **Issue #399** (closed): /repo:release Phase 6 notes extraction uses GNU-only sed `\?` — publishes an empty GitHub Release body on macOS
+- **PR #401**: fix(release): replace GNU-only sed \? with portable awk in notes extraction
+- **PR #398**: chore: resync installed Loom surfaces (0.18.96 -> 0.18.121) + docs drift
+
+### 2026-08-19
+- **Issue #394** (closed): sweep-lease-fence.sh treats a stood-down dispatcher's stale lease comment as freshest, blocking the legitimate winner
+- **PR #397**: fix(scripts): exclude yielded leases from sweep-lease-fence freshest read
+- **Issue #375** (closed): Consolidate find_repo_root(): worktree-unaware copies break signal.sh across worktrees
+- **PR #396**: fix(scripts): consolidate find_repo_root() onto one worktree-aware implementation
+- **Issue #379** (closed): Fix random-file.sh: broken gitignore/exclusion filtering leaks .git internals and worktree scratch files
+- **PR #395**: fix: correctly exclude .git/.loom/worktrees and respect nested gitignore in random-file.sh find fallback
+- **Issue #381** (closed): Remove validate-toolchain.sh: dead entry point, zero in-repo callers
+- **PR #393**: chore: remove unused validate-toolchain.sh (dead entry point, zero in-repo callers)
+- **Issue #346** (closed): Remove clean-labels.sh: dead deprecated stub with zero callers
+- **PR #392**: chore: remove dead clean-labels.sh deprecated stub
+- **Issue #391** (closed): main branch CI red: resync 5ce28b6 stripped preflight_refresh_docs_pr_exclude() from guide.md, breaking test-work-log-docs-pr-self-loop.sh
+- **Issue #389** (closed): session-start-handoff: Loom role sessions consume and delete operator handoff notes
+- **PR #390**: fix(hooks): gate session-start-handoff deletion directive on operator audience
+
+### 2026-08-18
+- **Issue #387** (closed): Adopt loom's VERSION-on-main model: CI gate that makes any change to the installed surface bump VERSION (or carry the no-surface-change marker)
+- **PR #388**: feat: add CI gate requiring a VERSION bump for installed-surface changes
+
+### 2026-08-17
+- **Issue #385** (closed): INSTALLER-CONTRACT: installers should detect installed files hidden by the consumer repo's gitignore
+- **PR #386**: INSTALLER-CONTRACT: add C9 post-install gitignore sweep
+- **Issue #383** (closed): followups reports its own repo as UNKNOWN, with the slug in its own SKILL.md
+- **PR #384**: docs(followups): add self-target short-circuit for Repo Skills
+
 ### 2026-08-16
 
 - **Issue #373** (closed): Consolidate stash_scope_guard_enabled and worktree_isolation_guard_enabled into guard_toggle_enabled
