@@ -103,7 +103,8 @@ run_rr() {
     # real 120s readiness window (repo#449); the assignments below come BEFORE
     # "${envs[@]}", and `env` applies assignments left-to-right, so any test
     # that passes its own value still wins.
-    RR_OUT="$(cd "$REPO" && env \
+    # RR_CWD (repo#538) runs from another checkout, e.g. a linked worktree.
+    RR_OUT="$(cd "${RR_CWD:-$REPO}" && env \
         PATH="$MOCK_BIN:$PATH" \
         XDG_CONFIG_HOME="$XDG" \
         REPO_REMOTE_SSH_CONFIG="$SCRATCH/ssh_config" \
@@ -1055,6 +1056,53 @@ run_rr REPO_REMOTE_NO_WRITEBACK=1 MOCK_AWS_NEW_ID=i-0nowb MOCK_AWS_STATE=None --
 assert_eq "NO_WRITEBACK run succeeds" "0" "$RR_RC"
 assert_not_contains "NO_WRITEBACK leaves the repo .env untouched" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID"
 assert_contains "NO_WRITEBACK still logs the id" "$RR_ERR" "i-0nowb"
+
+# (e) Linked git worktree (repo#538): a pre-existing in-tree .env is still read
+#     and written, but with a loud warning naming the file and recommending
+#     REPO_REMOTE_ENV_FILE. The primary checkout never warns; neither does a
+#     linked worktree once REPO_REMOTE_ENV_FILE is set.
+git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "fixture base" >/dev/null 2>&1 || true
+WT="$SCRATCH/myrepo-wt"
+git -C "$REPO" worktree add -q --detach "$WT" >/dev/null 2>&1
+if [[ -d "$WT" ]]; then
+    WT="$(cd "$WT" && pwd -P)"
+    printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.3xlarge" "REPO_REMOTE_INSTANCE_ID=" >"$WT/.env"
+    # (e.a) read side: a plan-only up loads the worktree .env and warns once.
+    RR_CWD="$WT" run_rr -- up --json
+    assert_eq "linked worktree: up still succeeds" "0" "$RR_RC"
+    assert_eq "linked worktree: the in-tree .env is still loaded" "m5.3xlarge" "$(json_field "$RR_OUT" instance_type)"
+    assert_contains "linked worktree read: warning names the file" "$RR_ERR" "loading per-repo config from $WT/.env"
+    assert_contains "linked worktree read: warning says linked git worktree" "$RR_ERR" "linked git worktree"
+    assert_contains "linked worktree read: warning recommends REPO_REMOTE_ENV_FILE" "$RR_ERR" "set REPO_REMOTE_ENV_FILE"
+    assert_eq "linked worktree read: warned exactly once (not per key)" "1" \
+              "$(printf '%s\n' "$RR_ERR" | grep -c 'WARNING: loading per-repo config from')"
+    # (e.a) write side: the id is still written back, after a warning.
+    RR_CWD="$WT" run_rr MOCK_AWS_NEW_ID=i-0wtwrite MOCK_AWS_STATE=None -- up --yes --json
+    assert_eq "linked worktree write-back: up succeeds" "0" "$RR_RC"
+    assert_contains "linked worktree write-back: warning names the file" "$RR_ERR" "writing the instance id into $WT/.env"
+    assert_contains "linked worktree write-back: id still written (warn-then-proceed)" \
+                    "$(cat "$WT/.env")" "REPO_REMOTE_INSTANCE_ID=i-0wtwrite"
+    # (e.b) primary checkout with a pre-existing .env: no warning at all.
+    write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+    run_rr MOCK_AWS_NEW_ID=i-0primary MOCK_AWS_STATE=None -- up --yes --json
+    assert_eq "primary checkout: up succeeds" "0" "$RR_RC"
+    assert_contains "primary checkout: id written to its .env" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0primary"
+    assert_not_contains "primary checkout: no linked-worktree warning" "$RR_ERR" "linked git worktree"
+    # (e.c) REPO_REMOTE_ENV_FILE set from the linked worktree: no warning, and
+    #       the in-tree .env is neither read for the id nor written.
+    printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=" >"$OOT"
+    WT_ENV_BEFORE="$(cat "$WT/.env")"
+    RR_CWD="$WT" run_rr REPO_REMOTE_ENV_FILE="$OOT" MOCK_AWS_NEW_ID=i-0wtoot MOCK_AWS_STATE=None -- up --yes --json
+    assert_eq "linked worktree + override: up succeeds" "0" "$RR_RC"
+    assert_not_contains "linked worktree + override: no linked-worktree warning" "$RR_ERR" "linked git worktree"
+    assert_contains "linked worktree + override: id written to the override file" \
+                    "$(cat "$OOT")" "REPO_REMOTE_INSTANCE_ID=i-0wtoot"
+    assert_eq "linked worktree + override: in-tree .env untouched" "$WT_ENV_BEFORE" "$(cat "$WT/.env")"
+    git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
+else
+    no "linked worktree fixture: git worktree add failed"
+fi
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
