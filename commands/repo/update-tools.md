@@ -802,45 +802,76 @@ Land each tool's bump as its own commit:
    cannot be pushed straight to `$DEFAULT`, and the only way out by hand is to
    cherry-pick it onto a fresh branch off `origin/$DEFAULT`, open a PR, and
    reset local `$DEFAULT` afterwards (repo#530). Detect this **before**
-   deciding which of the two landing shapes below to use, with the same
-   fail-closed pattern `.loom/scripts/land-resync-commit.sh`'s
-   `default_branch_requires_pr()` already uses for the analogous
-   resync-landing problem (lines 598–625 as of commit `082176e`) — reuse the
-   *pattern* here; this command does not source that script:
+   deciding which of the two landing shapes below to use, mirroring
+   `.loom/scripts/land-resync-commit.sh`'s `default_branch_requires_pr()`
+   exactly — same fail-closed-on-error / fail-open-when-undetectable split,
+   same `PROTECTION_SOURCE` side effect (lines 598–625 as of commit
+   `082176e`). Reuse the *pattern* here; this command does not source that
+   script:
 
    ```bash
    DEFAULT=$(git -C <this-repo> symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^origin/##')
    DEFAULT=${DEFAULT:-main}
    CUR=$(git -C <this-repo> symbolic-ref --short HEAD)
 
-   # Fail-closed: try the rulesets API, fall back to legacy branch protection,
-   # and treat ANY API failure or unparseable answer as protected — never
-   # assume unprotected on ambiguity. {owner}/{repo} here is gh's own
-   # placeholder for *this* repo's `origin` remote (the consumer being
-   # updated) — resolved from cwd, exactly like step 1's tool discovery. Do
-   # NOT substitute the tool-source-repo slug step 2's version check reads;
-   # that is a different repo answering a different question.
+   # Try the rulesets API, fall back to legacy branch protection, and treat
+   # ANY API failure or unparseable answer as protected — never assume
+   # unprotected on ambiguity. {owner}/{repo} here is gh's own placeholder for
+   # *this* repo's `origin` remote (the consumer being updated) — resolved
+   # from cwd, exactly like step 1's tool discovery. Do NOT substitute the
+   # tool-source-repo slug step 2's version check reads; that is a different
+   # repo answering a different question.
+   #
+   # Records WHY in PROTECTION_SOURCE at each protected return, so item 4's
+   # report can name the reason instead of just "protected" (same side effect,
+   # same strings as the mirrored function).
+   PROTECTION_SOURCE=""
    default_branch_requires_pr() {
-     [ "$FORCE_BRANCH" = "1" ] && return 0        # --branch: skip detection, always protected-path
-     command -v gh >/dev/null 2>&1 || return 0    # no gh — can't tell; fail closed
+     if [ "$FORCE_BRANCH" = "1" ]; then
+       PROTECTION_SOURCE="--branch forced the branch + PR path (detection skipped)"
+       return 0
+     fi
+     # Fail OPEN in the two cases where detection cannot run *at all*, exactly
+     # as the mirrored function does — a Gitea forge, or no `gh` on PATH.
+     # This is deliberate, not an oversight: these are the scenarios `--branch`
+     # exists for, and failing closed here would both diverge silently from
+     # land-resync-commit.sh and make the flag redundant (every non-GitHub repo
+     # would take the branch + PR path whether or not it needed one).
+     case "$(printf '%s' "${LOOM_FORGE_TYPE:-}" | tr '[:upper:]' '[:lower:]')" in
+       gitea) return 1 ;;                         # fail open — pass --branch if it does need a PR
+     esac
+     command -v gh >/dev/null 2>&1 || return 1    # fail open — same reason
+     # From here on the forge *was* asked, so an unhelpful answer fails CLOSED.
      local rule_types
      if ! rule_types="$(cd <this-repo> && gh api "repos/{owner}/{repo}/rules/branches/$DEFAULT" --jq '.[].type' 2>/dev/null)"; then
-       return 0   # rules API call failed — assumed protected (fail closed)
+       PROTECTION_SOURCE="rules API call failed — assumed protected (fail closed)"
+       return 0
      fi
-     grep -qvE '^[A-Za-z0-9_]*$' <<< "$rule_types" && return 0   # unparseable — assumed protected
-     grep -qxE 'pull_request|required_status_checks' <<< "$rule_types" && return 0
+     if grep -qvE '^[A-Za-z0-9_]*$' <<< "$rule_types"; then
+       PROTECTION_SOURCE="rules API answer unparseable — assumed protected (fail closed)"
+       return 0
+     fi
+     if grep -qxE 'pull_request|required_status_checks' <<< "$rule_types"; then
+       PROTECTION_SOURCE="ruleset rule(s): $(grep -xE 'pull_request|required_status_checks' <<< "$rule_types" | tr '\n' ' ' | sed 's/ $//')"
+       return 0
+     fi
      local legacy
      legacy="$(cd <this-repo> && gh api "repos/{owner}/{repo}/branches/$DEFAULT/protection" \
        --jq '[.required_pull_request_reviews, .required_status_checks] | map(select(. != null)) | length' 2>/dev/null || true)"
-     [[ "$legacy" =~ ^[0-9]+$ && "$legacy" -gt 0 ]]
+     if [[ "$legacy" =~ ^[0-9]+$ && "$legacy" -gt 0 ]]; then
+       PROTECTION_SOURCE="legacy branch protection (PR reviews / status checks required)"
+       return 0
+     fi
+     return 1   # the forge definitively answered "no rules"
    }
    ```
 
-   `FORCE_BRANCH=1` is what `--branch` sets — the escape hatch for a remote
-   where the detection above cannot run at all (a non-GitHub remote with no
-   `gh api` to answer it, or a Gitea forge), forcing the branch + PR path
-   unconditionally instead of silently falling back to the old fast-forward
-   merge on a repo this check cannot actually evaluate.
+   `FORCE_BRANCH=1` is what `--branch` sets — the escape hatch for exactly the
+   two fail-open cases above, where the detection cannot run at all (a
+   non-GitHub remote with no `gh api` to answer it, or a Gitea forge). On
+   those remotes the detector reports "unprotected" because it has no evidence
+   either way, so `--branch` is how the operator supplies that evidence by
+   hand and forces the branch + PR path.
 
    ```bash
    MSG="chore(tooling): update <tool> <old>→<new>"
@@ -885,7 +916,7 @@ Land each tool's bump as its own commit:
 
    ```bash
    if [ "$CUR" = "$DEFAULT" ] && default_branch_requires_pr; then
-     BRANCH="tooling/update-<tool>-<new>"
+     WANT_BRANCH="tooling/update-<tool>-<new>"   # requested name; may be rewritten below
      git -C <this-repo> fetch origin "$DEFAULT" --quiet
      if [ -x <this-repo>/.loom/scripts/worktree.sh ] && [ -n "${ISSUE_NUMBER:-}" ]; then
        # A Loom-managed repo, and this run is already attached to a real issue
@@ -893,18 +924,33 @@ Land each tool's bump as its own commit:
        # `git worktree add` — it is what writes the `.loom-managed` sentinel
        # that authorizes later cleanup. Do not invent an issue number to
        # unlock this arm; the ordinary ad hoc invocation has none.
-       <this-repo>/.loom/scripts/worktree.sh "$ISSUE_NUMBER" "$BRANCH"
+       #
+       # NOTE: worktree.sh ALWAYS rewrites a custom branch argument to
+       # `feature/<arg>` (BRANCH_NAME="feature/$CUSTOM_BRANCH", and it prints
+       # "Custom branch '…' resolved to '…' (feature/ prefix applied)"), so the
+       # branch this creates is `feature/tooling/update-<tool>-<new>`, NOT the
+       # name passed in. The worktree directory is always
+       # `issue-$ISSUE_NUMBER` regardless of the branch name.
+       <this-repo>/.loom/scripts/worktree.sh "$ISSUE_NUMBER" "$WANT_BRANCH"
        WT="<this-repo>/.loom/worktrees/issue-$ISSUE_NUMBER"
      else
        # No issue number in scope (the normal case for an ad hoc
        # /repo:update-tools run): a plain worktree following the same
        # conventions the helper would use — off origin/$DEFAULT, not off
        # local $DEFAULT, under .loom/worktrees/ when this is a Loom-managed
-       # repo, otherwise a sibling scratch directory.
+       # repo, otherwise a sibling scratch directory. `git worktree add -b`
+       # takes the name literally — no prefix is applied on this path.
        WT_ROOT="<this-repo>/.loom/worktrees"; [ -d "<this-repo>/.loom" ] || WT_ROOT="/tmp"
        WT="$WT_ROOT/tooling-update-<tool>-<new>"
-       git -C <this-repo> worktree add -b "$BRANCH" "$WT" "origin/$DEFAULT"
+       git -C <this-repo> worktree add -b "$WANT_BRANCH" "$WT" "origin/$DEFAULT"
      fi
+     # The two paths above therefore end up with differently-shaped branch
+     # names (`feature/tooling/update-…` vs. `tooling/update-…`). Never reuse
+     # $WANT_BRANCH for the push or the PR — ask the worktree what it is
+     # actually on, which also covers worktree.sh's "directory already exists"
+     # fast path (it reuses that worktree's current branch, typically
+     # `feature/issue-$ISSUE_NUMBER`, and creates nothing new):
+     BRANCH="$(git -C "$WT" symbolic-ref --short HEAD)"
      # Re-run step 4's installer/updater inside $WT (its target resolution is
      # cwd-based — see step 4's note — so cd into $WT first), then repeat
      # item 1's isolate-the-footprint recipe and item 2's cross-check there
@@ -924,6 +970,11 @@ Land each tool's bump as its own commit:
    explicit operator confirmation — never automatically:**
 
    ```bash
+   # $BRANCH here is the name re-derived from $WT above — the actual local
+   # branch — so this pushes the right refspec on both worktree paths. Using
+   # the requested `tooling/update-…` name on the worktree.sh path would fail
+   # with `src refspec … does not match any`, since the branch there is
+   # `feature/tooling/update-…`.
    git -C "$WT" push -u origin "$BRANCH"
    gh pr create --head "$BRANCH" --base "$DEFAULT" --title "$MSG" \
      --body "Automated tool bump via /repo:update-tools (Safety Rule 5 carve-out)."
@@ -937,9 +988,10 @@ Land each tool's bump as its own commit:
 4. **Report** the resulting commit (`git -C <this-repo> log --oneline -1` or,
    on the protected path, `git -C "$WT" log --oneline -1`), the flagged-set
    outcome from item 2, which of the three landing shapes above was taken and
-   why (unprotected default / feature branch / protected default — name the
-   `PROTECTION_SOURCE`-equivalent reason, e.g. "ruleset rule: pull_request",
-   when the protected path was taken), and — for the two branches that stop at
+   why (unprotected default / feature branch / protected default — on the
+   protected path, quote `$PROTECTION_SOURCE` as the detector set it, e.g.
+   "ruleset rule(s): pull_request", and name the branch actually created,
+   which the `worktree.sh` path `feature/`-prefixes), and — for the two branches that stop at
    a local commit — a reminder that it has **not** been pushed (run `git push`
    explicitly to share it). The protected path's PR, once opened, is already
    shared; report its URL instead of a push reminder.
@@ -981,7 +1033,9 @@ Land each tool's bump as its own commit:
    "also outward-facing" — it is actively unpushable, because the operator
    would still have to push it and the ruleset would reject that push exactly
    as it would reject this command doing so. In that case, and only that case,
-   step 5 commits on a `tooling/update-<tool>-<new>` branch instead and may
+   step 5 commits on a `tooling/update-<tool>-<new>` branch instead
+   (`feature/tooling/update-<tool>-<new>` when `worktree.sh` created it — it
+   prefixes custom branch names) and may
    push *that branch* (never `$DEFAULT`) to open a PR, still gated on explicit
    operator confirmation each time. Every other rule above, and this rule's
    prohibition on pushing `$DEFAULT` itself, are unchanged.
