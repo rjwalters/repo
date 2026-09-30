@@ -43,6 +43,7 @@
 # commands/repo/tests/test-json-escape-parity.sh,
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
+# commands/repo/tests/test-tidy-scan-batching.sh,
 # commands/repo/tests/test-assert-matches-sigpipe.sh,
 # commands/repo/tests/test-git-fixture-hermeticity.sh,
 # commands/repo/tests/test-deps-security-updates-paused.sh,
@@ -860,6 +861,45 @@ else
     PASS=$((PASS + MD_PASS))
     FAIL=$((FAIL + MD_FAIL))
     record_suite "test-tidy-mcp-dist-demotion.sh" "$MD_PASS" "$MD_FAIL" "$MD_NOTE"
+fi
+
+# /repo:tidy's batched reference scans, the CACHE-tree exclusion from the
+# ignored-file inventory, and the --fast/--deep cost dial — the per-candidate
+# scan shape blew a two-minute budget on six empty directories on top of an
+# inventory that had already blown five (repo#533). Same delegation shape as the
+# suites above.
+echo
+echo "-- tidy batched reference scans + --fast/--deep (delegated suite) --"
+TB_TEST="$TESTS_DIR/../../../commands/repo/tests/test-tidy-scan-batching.sh"
+if [[ ! -f "$TB_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-tidy-scan-batching.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-tidy-scan-batching.sh" "$TB_TEST"
+else
+    TB_OUT="$(bash "$TB_TEST" 2>&1)"
+    TB_STATUS=$?
+    TB_PASS="$(suite_count Passed "$TB_OUT")"
+    TB_FAIL="$(suite_count Failed "$TB_OUT")"
+    TB_SKIP="$(suite_count Skipped "$TB_OUT")"
+    TB_NOTE="tidy batched reference scans"
+    [[ "$TB_SKIP" =~ ^[0-9]+$ && "$TB_SKIP" -gt 0 ]] && TB_NOTE+=" — $TB_SKIP skipped"
+    if ! [[ "$TB_PASS" =~ ^[0-9]+$ && "$TB_FAIL" =~ ^[0-9]+$ ]]; then
+        TB_PASS=0
+        TB_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-tidy-scan-batching.sh" "$TB_STATUS"
+        strip_ansi "$TB_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$TB_STATUS" -ne 0 || "$TB_FAIL" -ne 0 ]]; then
+        [[ "$TB_FAIL" -eq 0 ]] && TB_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-tidy-scan-batching.sh" "$TB_PASS" "$TB_FAIL" "$TB_STATUS"
+        strip_ansi "$TB_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-tidy-scan-batching.sh" "$TB_PASS"
+    fi
+    PASS=$((PASS + TB_PASS))
+    FAIL=$((FAIL + TB_FAIL))
+    record_suite "test-tidy-scan-batching.sh" "$TB_PASS" "$TB_FAIL" "$TB_NOTE"
 fi
 
 # scripts/repo/resync-installed.sh — the consumer-side resync required by
