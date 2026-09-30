@@ -1,0 +1,60 @@
+# .loom/resync-ignore — paths Loom must not overwrite or delete.
+#
+# Format: one `.loom/`-relative path per line. Blank lines and `#` comments are
+# ignored; matching is exact (no globs). See `.loom/docs/repo-owned-files.md`.
+
+# ---------------------------------------------------------------------------
+# hooks/guard-destructive-generic.sh — repo#441 (ports repo#439)
+#
+# WHY THIS IS PINNED
+#
+# repo#439 fixed the CANONICAL guard (`hooks/repo/guard-destructive.sh`, PR
+# #442): a write into the main checkout wrapped in a quoted SINGLE-command
+# `$( … )` / backtick substitution now DENIES under
+# `worktree-write-confinement`. Loom's vendored copy of the generic guard
+# still allowed it — and the vendored copy is the one a Loom-managed repo
+# runs BEFORE the capability probe flips it to the canonical copy, so the
+# escape was live there:
+#
+#     echo "$(id > <main-checkout>/evil.sh)"     # shell really performs it
+#     echo "$(cp /tmp/s <main-checkout>/evil.sh)"
+#     echo "`id > <main-checkout>/evil.sh`"
+#
+# `.loom/docs/repo-owned-files.md` gives exactly two durable dispositions for
+# a bug in an installed Loom file: **upstream it** to `rjwalters/loom`'s
+# `defaults/` tree, or **pin it** here. Upstreaming was attempted first and is
+# not reachable from this repo's automation:
+#
+#     gh repo view rjwalters/loom --json viewerPermission  ->  ""  (no access)
+#     gh api user                                          ->  403 Resource not
+#                                                              accessible by
+#                                                              integration
+#
+# This repo's `gh` credential is a GitHub App INSTALLATION token (`ghs_…`)
+# scoped to this repository. It has no user context, so it can neither fork
+# `rjwalters/loom` nor open a cross-repo PR from a fork. That leaves the pin
+# as the only disposition an automated Builder can actually complete, and the
+# fix is a hard-deny write-confinement escape that should not wait on a human
+# forking round-trip.
+#
+# COST OF THIS PIN, STATED PLAINLY
+#
+# The file is now repo-owned: `resync-installed.sh` and the installer's clean
+# sweep will never refresh it from upstream again, so upstream fixes to the
+# generic guard stop arriving here automatically.
+#
+# HOW TO RETIRE IT
+#
+# 1. Open a PR against `rjwalters/loom`'s
+#    `defaults/hooks/guard-destructive-generic.sh` carrying the repo#441 port
+#    (`bs_escaped()` / `subst_depth()` / `subst_heads()` and the
+#    `_extract_write_targets_scan()` wiring — search that file for `repo#439`).
+# 2. Once it merges and a `chore: resync installed Loom surfaces` commit lands
+#    a vendored copy that already denies the three shapes above, DELETE this
+#    stanza and let the file resync normally again.
+# 3. `commands/repo/tests/test-guard-equivalence.sh` is the regression net for
+#    step 2: if a resync ever reverts the port, the three `wt:` corpus rows
+#    (`guard-equivalence-cases.txt:256-258`) come back as UNDECLARED stricter
+#    divergences and say so by name.
+# ---------------------------------------------------------------------------
+hooks/guard-destructive-generic.sh

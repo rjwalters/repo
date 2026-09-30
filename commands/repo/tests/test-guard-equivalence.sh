@@ -129,9 +129,21 @@ declare -a DECLARED_DIVERGENCES=(
     "wt:echo hi > \"{{MAIN}}/o-\$(echo x|tr -d x).json\"|repo#438: a write target carrying a command substitution, issued from a Loom-managed worktree into its own main checkout. Canonical resolves the target past the substitution and denies under worktree-write-confinement; the vendored copy still allows it — a live worktree-isolation bypass, and the first divergence in this capability the harness has ever been able to see (measured deny vs allow, 2026-09-19)."
     "wt:echo \"\$(id|tee {{MAIN}}/evil.sh)\"|repo#438: a tee into the main checkout smuggled inside a command substitution, which the shell EXECUTES. repo#437 stopped qsplit() splitting the outer stream at a separator inside \$( ), so canonical now sees the inner segment and denies; the vendored copy still allows it. Measured deny vs allow, 2026-09-19."
     "wt:echo \"\$(id && cp /tmp/s {{MAIN}}/e.sh)\"|repo#438: same shape as the tee row, with the write idiom after a && separator rather than a pipe, confirming the fix is separator-general and not pipe-specific. Canonical denies, vendored allows. Measured 2026-09-19."
-    "wt:echo \"\$(id > {{MAIN}}/e.sh)\"|repo#439: a SINGLE simple command inside a quoted substitution — no separator, so repo#437's subst_inner() had nothing to re-emit and the span stayed one quoted token whose \`>\` mask_gt() masked as data. Both guards allowed it while the shell really performed the write. Canonical now re-emits every substitution's HEAD as its own segment (subst_heads()) and denies under worktree-write-confinement; the vendored copy still allows. Measured deny vs allow, 2026-09-19."
-    "wt:echo \"\$(cp /tmp/s {{MAIN}}/e.sh)\"|repo#439: the cp spelling of the row above — no redirection operator involved at all, so it proves the head is re-emitted as a real command segment rather than the \`>\` scan merely being unmasked. Canonical denies, vendored allows. Measured 2026-09-19."
-    "wt:echo \"\`id > {{MAIN}}/e.sh\`\"|repo#439: the legacy backtick spelling of the first row, confirming subst_heads() recognises a backtick substitution and not just \$( ). Canonical denies, vendored allows. Measured 2026-09-19."
+    # The three repo#439 rows that used to sit here (a quoted SINGLE-command
+    # `$( )` holding `>`, `cp`, or the backtick spelling) were REMOVED by
+    # repo#441: the vendored guard now carries subst_heads() too, so those
+    # corpus rows read `deny == deny` and a declaration for them would be the
+    # dead weight this list's own rule forbids. They are still in the corpus
+    # (guard-equivalence-cases.txt:256-258) and are now the regression net for
+    # that port — if a resync ever reverts it, they come back as UNDECLARED
+    # stricter divergences and name themselves. See `.loom/resync-ignore` for
+    # why the fix lives in the vendored copy and how to retire that pin.
+    #
+    # The three repo#438 rows ABOVE deliberately stay: they are the repo#436 /
+    # repo#437 family (a separator INSIDE the substitution, and a substitution
+    # inside a write TARGET), which needs subst_depth()-aware qsplit() +
+    # subst_inner() in the vendored copy — a separate, larger port, measured
+    # still divergent 2026-09-30.
 )
 
 # ---------------------------------------------------------------------------
