@@ -63,6 +63,40 @@ build_repo() {
     VS="$root/scripts/version.sh"
 }
 
+# seed_conflict <repo>: leave <repo> with two divergent commits that conflict on
+# conflict.txt — `main` at "main change", branch `side` at "side change". Driving
+# a real conflicted merge / rebase / cherry-pick off this pair is what actually
+# puts MERGE_HEAD / rebase-merge / CHERRY_PICK_HEAD on disk, which is the state
+# version.sh's skip-commit detection reads (#536). Hand-creating those files
+# would test the assertion instead of the condition.
+seed_conflict() {  # <repo>
+    local repo="$1"
+    git -C "$repo" checkout -q -b side
+    printf 'side\n' > "$repo/conflict.txt"
+    git -C "$repo" add conflict.txt
+    git -C "$repo" commit -q -m "side change"
+    git -C "$repo" checkout -q main
+    printf 'main\n' > "$repo/conflict.txt"
+    git -C "$repo" add conflict.txt
+    git -C "$repo" commit -q -m "main change"
+}
+
+head_subject() { git -C "$1" log -1 --format=%s; }
+commit_count() { git -C "$1" rev-list --count HEAD; }
+staged_files() { git -C "$1" diff --cached --name-only; }
+
+# run_vs <repo> <args...>: run the fixture's version.sh, capturing stdout in
+# RUN_OUT, stderr in RUN_ERR and the exit status in RUN_RC. Both streams are
+# needed together throughout the skip-commit cases: the new behavior announces
+# itself on stderr while the version still goes to stdout.
+run_vs() {  # <repo> <args...>
+    local repo="$1"; shift
+    local errfile="$SCRATCH/last-stderr.txt"
+    RUN_RC=0
+    RUN_OUT="$(cd "$repo" && "$repo/scripts/version.sh" "$@" 2>"$errfile")" || RUN_RC=$?
+    RUN_ERR="$(cat "$errfile")"
+}
+
 echo "version.sh test suite"
 echo "======================"
 echo ""
@@ -181,6 +215,220 @@ build_repo "case6" "1.2.3"
 RC=0
 (cd "$REPO" && "$VS" bogus-command >/dev/null 2>&1) || RC=$?
 assert_eq "an unknown subcommand exits 2" "2" "$RC"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 7: clean tree with no flag still auto-commits (regression guard) --"
+# ---------------------------------------------------------------------------
+# The whole point of #536's change is that it is conditional. These two cases
+# pin the unchanged path: outside a merge/rebase/cherry-pick and without
+# --no-commit, bump and set each still create exactly one commit and leave
+# nothing staged behind.
+for sub in bump set; do
+    build_repo "case7-$sub" "1.2.3"
+    BEFORE_COUNT="$(commit_count "$REPO")"
+    if [[ "$sub" == "bump" ]]; then
+        run_vs "$REPO" bump patch
+        EXPECT_SUBJECT="chore: bump version to 1.2.4"
+        EXPECT_VERSION="1.2.4"
+    else
+        run_vs "$REPO" set 5.0.0
+        EXPECT_SUBJECT="chore: set version to 5.0.0"
+        EXPECT_VERSION="5.0.0"
+    fi
+    assert_eq "$sub on a clean tree exits 0" "0" "$RUN_RC"
+    assert_eq "$sub on a clean tree prints the new version" "$EXPECT_VERSION" "$RUN_OUT"
+    assert_eq "$sub on a clean tree adds exactly one commit" \
+        "$((BEFORE_COUNT + 1))" "$(commit_count "$REPO")"
+    assert_eq "$sub on a clean tree commits with the expected subject" \
+        "$EXPECT_SUBJECT" "$(head_subject "$REPO")"
+    assert_eq "$sub on a clean tree leaves nothing staged" "" "$(staged_files "$REPO")"
+    assert_not_contains "$sub on a clean tree prints no skip notice" "$RUN_ERR" "not committed"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 8: --no-commit stages without committing --"
+# ---------------------------------------------------------------------------
+build_repo "case8-bump" "1.2.3"
+BEFORE_SUBJECT="$(head_subject "$REPO")"
+BEFORE_COUNT="$(commit_count "$REPO")"
+run_vs "$REPO" bump patch --no-commit
+assert_eq "bump --no-commit exits 0" "0" "$RUN_RC"
+assert_eq "bump --no-commit still prints the new version" "1.2.4" "$RUN_OUT"
+assert_eq "bump --no-commit writes VERSION" "1.2.4" "$(cat "$REPO/VERSION")"
+assert_contains "bump --no-commit syncs package.json" "$(cat "$REPO/package.json")" '"version": "1.2.4"'
+assert_contains "bump --no-commit stages VERSION" "$(staged_files "$REPO")" "VERSION"
+assert_contains "bump --no-commit stages package.json" "$(staged_files "$REPO")" "package.json"
+assert_eq "bump --no-commit creates no commit" "$BEFORE_COUNT" "$(commit_count "$REPO")"
+assert_eq "bump --no-commit leaves HEAD where it was" "$BEFORE_SUBJECT" "$(head_subject "$REPO")"
+assert_contains "bump --no-commit says why on stderr" "$RUN_ERR" "--no-commit requested"
+assert_contains "bump --no-commit says the files are staged, not committed" "$RUN_ERR" "not committed"
+
+build_repo "case8-set" "1.2.3"
+BEFORE_COUNT="$(commit_count "$REPO")"
+run_vs "$REPO" set 5.0.0 --no-commit
+assert_eq "set --no-commit exits 0" "0" "$RUN_RC"
+assert_eq "set --no-commit writes VERSION" "5.0.0" "$(cat "$REPO/VERSION")"
+assert_contains "set --no-commit stages VERSION" "$(staged_files "$REPO")" "VERSION"
+assert_eq "set --no-commit creates no commit" "$BEFORE_COUNT" "$(commit_count "$REPO")"
+assert_contains "set --no-commit says why on stderr" "$RUN_ERR" "--no-commit requested"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 9: an in-progress merge skips the commit --"
+# ---------------------------------------------------------------------------
+# The reported incident: an agent resolving a VERSION conflict mid-merge ran
+# `set`, and version.sh's own commit consumed the merge the agent was about to
+# write, dropping its provenance trailers.
+for sub in bump set; do
+    build_repo "case9-$sub" "1.2.3"
+    seed_conflict "$REPO"
+    git -C "$REPO" merge side >/dev/null 2>&1 || true
+    MERGE_HEAD_PRESENT=no
+    git -C "$REPO" rev-parse --quiet --verify MERGE_HEAD >/dev/null 2>&1 && MERGE_HEAD_PRESENT=yes
+    assert_eq "$sub fixture: the merge really is in progress" "yes" "$MERGE_HEAD_PRESENT"
+    BEFORE_COUNT="$(commit_count "$REPO")"
+    if [[ "$sub" == "bump" ]]; then
+        run_vs "$REPO" bump patch
+        EXPECT_VERSION="1.2.4"
+    else
+        run_vs "$REPO" set 5.0.0
+        EXPECT_VERSION="5.0.0"
+    fi
+    assert_eq "$sub mid-merge exits 0" "0" "$RUN_RC"
+    assert_eq "$sub mid-merge still writes VERSION" "$EXPECT_VERSION" "$(cat "$REPO/VERSION")"
+    assert_contains "$sub mid-merge stages VERSION" "$(staged_files "$REPO")" "VERSION"
+    assert_eq "$sub mid-merge creates no commit" "$BEFORE_COUNT" "$(commit_count "$REPO")"
+    assert_eq "$sub mid-merge leaves HEAD at the pre-merge tip" "main change" "$(head_subject "$REPO")"
+    MERGE_HEAD_STILL=no
+    git -C "$REPO" rev-parse --quiet --verify MERGE_HEAD >/dev/null 2>&1 && MERGE_HEAD_STILL=yes
+    assert_eq "$sub mid-merge leaves the merge still in progress" "yes" "$MERGE_HEAD_STILL"
+    assert_contains "$sub mid-merge names the merge on stderr" "$RUN_ERR" "merge in progress"
+    assert_contains "$sub mid-merge says the files are staged, not committed" "$RUN_ERR" "not committed"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 10: an in-progress rebase skips the commit --"
+# ---------------------------------------------------------------------------
+for sub in bump set; do
+    build_repo "case10-$sub" "1.2.3"
+    seed_conflict "$REPO"
+    git -C "$REPO" checkout -q side
+    git -C "$REPO" rebase main >/dev/null 2>&1 || true
+    GITDIR="$(git -C "$REPO" rev-parse --absolute-git-dir)"
+    REBASE_PRESENT=no
+    { [[ -d "$GITDIR/rebase-merge" ]] || [[ -d "$GITDIR/rebase-apply" ]]; } && REBASE_PRESENT=yes
+    assert_eq "$sub fixture: the rebase really is in progress" "yes" "$REBASE_PRESENT"
+    BEFORE_COUNT="$(commit_count "$REPO")"
+    if [[ "$sub" == "bump" ]]; then
+        run_vs "$REPO" bump patch
+        EXPECT_VERSION="1.2.4"
+    else
+        run_vs "$REPO" set 5.0.0
+        EXPECT_VERSION="5.0.0"
+    fi
+    assert_eq "$sub mid-rebase exits 0" "0" "$RUN_RC"
+    assert_eq "$sub mid-rebase still writes VERSION" "$EXPECT_VERSION" "$(cat "$REPO/VERSION")"
+    assert_contains "$sub mid-rebase stages VERSION" "$(staged_files "$REPO")" "VERSION"
+    assert_eq "$sub mid-rebase creates no commit" "$BEFORE_COUNT" "$(commit_count "$REPO")"
+    REBASE_STILL=no
+    { [[ -d "$GITDIR/rebase-merge" ]] || [[ -d "$GITDIR/rebase-apply" ]]; } && REBASE_STILL=yes
+    assert_eq "$sub mid-rebase leaves the rebase still in progress" "yes" "$REBASE_STILL"
+    assert_contains "$sub mid-rebase names the rebase on stderr" "$RUN_ERR" "rebase in progress"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 11: an in-progress cherry-pick skips the commit --"
+# ---------------------------------------------------------------------------
+for sub in bump set; do
+    build_repo "case11-$sub" "1.2.3"
+    seed_conflict "$REPO"
+    git -C "$REPO" cherry-pick side >/dev/null 2>&1 || true
+    CP_PRESENT=no
+    git -C "$REPO" rev-parse --quiet --verify CHERRY_PICK_HEAD >/dev/null 2>&1 && CP_PRESENT=yes
+    assert_eq "$sub fixture: the cherry-pick really is in progress" "yes" "$CP_PRESENT"
+    BEFORE_COUNT="$(commit_count "$REPO")"
+    if [[ "$sub" == "bump" ]]; then
+        run_vs "$REPO" bump patch
+        EXPECT_VERSION="1.2.4"
+    else
+        run_vs "$REPO" set 5.0.0
+        EXPECT_VERSION="5.0.0"
+    fi
+    assert_eq "$sub mid-cherry-pick exits 0" "0" "$RUN_RC"
+    assert_eq "$sub mid-cherry-pick still writes VERSION" "$EXPECT_VERSION" "$(cat "$REPO/VERSION")"
+    assert_contains "$sub mid-cherry-pick stages VERSION" "$(staged_files "$REPO")" "VERSION"
+    assert_eq "$sub mid-cherry-pick creates no commit" "$BEFORE_COUNT" "$(commit_count "$REPO")"
+    CP_STILL=no
+    git -C "$REPO" rev-parse --quiet --verify CHERRY_PICK_HEAD >/dev/null 2>&1 && CP_STILL=yes
+    assert_eq "$sub mid-cherry-pick leaves the cherry-pick still in progress" "yes" "$CP_STILL"
+    assert_contains "$sub mid-cherry-pick names the cherry-pick on stderr" "$RUN_ERR" "cherry-pick in progress"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 12: --tag is refused when there is no commit to tag --"
+# ---------------------------------------------------------------------------
+# Tagging an uncommitted bump would put v<new> on the PREVIOUS commit, naming a
+# version that commit does not contain. The refusal happens before anything is
+# written, so the tree is left exactly as it was.
+build_repo "case12-no-commit" "1.2.3"
+run_vs "$REPO" bump patch --tag --no-commit
+assert_eq "bump --tag --no-commit exits 2" "2" "$RUN_RC"
+assert_contains "bump --tag --no-commit explains the refusal" "$RUN_ERR" "refusing --tag"
+assert_eq "a refused --tag leaves VERSION unchanged" "1.2.3" "$(cat "$REPO/VERSION")"
+assert_eq "a refused --tag stages nothing" "" "$(staged_files "$REPO")"
+assert_eq "a refused --tag creates no tag" "" "$(git -C "$REPO" tag -l)"
+
+build_repo "case12-set-no-commit" "1.2.3"
+run_vs "$REPO" set 5.0.0 --tag --no-commit
+assert_eq "set --tag --no-commit exits 2" "2" "$RUN_RC"
+assert_eq "a refused set --tag leaves VERSION unchanged" "1.2.3" "$(cat "$REPO/VERSION")"
+
+build_repo "case12-merge" "1.2.3"
+seed_conflict "$REPO"
+git -C "$REPO" merge side >/dev/null 2>&1 || true
+run_vs "$REPO" set 5.0.0 --tag
+assert_eq "set --tag mid-merge exits 2" "2" "$RUN_RC"
+assert_contains "set --tag mid-merge names the merge as the reason" "$RUN_ERR" "merge in progress"
+assert_eq "set --tag mid-merge leaves VERSION unchanged" "1.2.3" "$(cat "$REPO/VERSION")"
+assert_eq "set --tag mid-merge creates no tag" "" "$(git -C "$REPO" tag -l)"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 13: flag order and unknown flags --"
+# ---------------------------------------------------------------------------
+build_repo "case13-order" "1.2.3"
+run_vs "$REPO" bump patch --no-commit
+assert_eq "bump accepts --no-commit after the level" "0" "$RUN_RC"
+
+build_repo "case13-tag-then-nothing" "1.2.3"
+run_vs "$REPO" bump patch --tag
+assert_eq "bump --tag on a clean tree still tags" "0" "$RUN_RC"
+assert_contains "bump --tag on a clean tree creates the tag" "$(git -C "$REPO" tag -l)" "v1.2.4"
+
+build_repo "case13-unknown" "1.2.3"
+run_vs "$REPO" bump patch --bogus
+assert_eq "bump with an unknown flag exits 2" "2" "$RUN_RC"
+assert_eq "an unknown flag leaves VERSION unchanged" "1.2.3" "$(cat "$REPO/VERSION")"
+run_vs "$REPO" set 5.0.0 --bogus
+assert_eq "set with an unknown flag exits 2" "2" "$RUN_RC"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- case 14: the usage header documents the new behavior --"
+# ---------------------------------------------------------------------------
+# The header comment is the only usage text a reader of the script sees; a
+# behavior this surprising has to be written down next to the flag that drives
+# it (#536).
+HEADER="$(sed -n '1,40p' "$SOURCE_SCRIPT")"
+assert_contains "usage documents --no-commit for bump" "$HEADER" "bump <level> [--tag] [--no-commit]"
+assert_contains "usage documents --no-commit for set" "$HEADER" "set <version> [--tag] [--no-commit]"
+assert_contains "usage documents the auto-detected skip" "$HEADER" "merge, rebase or cherry-pick is in progress"
+assert_contains "usage documents the --tag refusal" "$HEADER" "REJECTED"
 
 # ---------------------------------------------------------------------------
 echo ""

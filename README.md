@@ -277,7 +277,9 @@ lib/resync-ignore.sh         C10 repo-owned pins: the one reader of .claude/skil
                              install.sh and resync-installed.sh so a pin cannot be honored by one writer and undone
                              by the other; also read by uninstall.sh, which still removes pinned paths but names
                              them in the pre-removal preview first
-scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`), used by /repo:release and CI
+scripts/version.sh           Single source of truth for VERSION (`print|check|bump <level>|set <x.y.z>`, both accepting
+                             `--tag`/`--no-commit`; bump/set stage without committing mid merge/rebase/cherry-pick),
+                             used by /repo:release and CI
 scripts/check-installed-surface-version-bump.sh  CI gate: installed-surface changes need a VERSION bump or the no-surface-change marker
 ```
 
