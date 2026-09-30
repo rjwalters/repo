@@ -67,6 +67,16 @@ for _guard_env_var in \
 done
 unset _guard_env_var
 
+# Same hermeticity argument, different class of variable (repo#462): since the
+# tmpfs-scratch guard resolves the AMBIENT effective cargo target dir, the
+# guard's own inherited CARGO_TARGET_DIR is now a real input to its verdict. A
+# developer who happens to export one (very common on a machine with a shared
+# target dir) would otherwise flip every bare-`cargo` case in this file. Cases
+# that need one set it explicitly and locally via `env CARGO_TARGET_DIR=…`.
+# CARGO_HOME is NOT unset here — it is neutralized per-case in
+# run_guard_tmpfs() instead, so a case can still point it at a fixture.
+unset CARGO_TARGET_DIR
+
 PASS=0
 FAIL=0
 TOTAL=0
@@ -5630,6 +5640,15 @@ EOF
 # table, exactly as it is against a real /proc/mounts.
 TMPFS_CWD="/home/u/repo"
 
+# An EMPTY $CARGO_HOME. Since repo#462 the guard falls back to
+# `$CARGO_HOME/config.toml` when resolving the ambient target dir, so a real
+# one on the machine running this suite (or in CI) would leak into every bare
+# `cargo` case. Pointing CARGO_HOME at an empty directory by default makes the
+# fallback deterministically find nothing; a case that WANTS to exercise the
+# $CARGO_HOME arm passes its own CARGO_HOME=… after the cwd (env applies
+# assignments left to right, so the later one wins).
+TMPFS_EMPTY_CARGO_HOME="$(mktemp -d)"
+
 # Run the guard with the fixture mount table plus any extra `VAR=value`
 # assignments the case needs. run_guard_env() above takes only ONE env
 # assignment, and every case here needs at least the fixture path.
@@ -5637,7 +5656,10 @@ run_guard_tmpfs() {
     local cmd="$1"; local cwd="${2:-$TMPFS_CWD}"
     shift                                   # drop cmd
     [[ $# -gt 0 ]] && shift                 # drop cwd, when one was passed
-    make_input "$cmd" "$cwd" | env REPO_GUARD_MOUNTS_FILE="$TMPFS_FIXTURE_MOUNTS" "$@" "$GUARD" 2>&1 || true
+    make_input "$cmd" "$cwd" \
+        | env REPO_GUARD_MOUNTS_FILE="$TMPFS_FIXTURE_MOUNTS" \
+              CARGO_HOME="$TMPFS_EMPTY_CARGO_HOME" \
+              "$@" "$GUARD" 2>&1 || true
 }
 
 # assert_tmpfs_deny <description> <command> [cwd] [extra env...]
@@ -5858,6 +5880,170 @@ assert_tmpfs_deny "#454: REPO_GUARD_TMPFS_SCRATCH=1 wins over the legacy name" \
     "CARGO_TARGET_DIR=/dev/shm/x cargo build" \
     "$TMPFS_CWD" LOOM_GUARD_TMPFS_SCRATCH=0 REPO_GUARD_TMPFS_SCRATCH=1
 
+# =========================================================================
+# repo#462 — the AMBIENT effective target dir
+#
+# Families 1-4 above all key on an EXPLICIT assignment carried by the command.
+# These cases cover the persistent form, where the command is a bare `cargo
+# build` and the RAM-backed target dir was configured EARLIER:
+#
+#   - Family 5: an exported CARGO_TARGET_DIR the guard inherits;
+#   - Family 6: a pre-existing `[build] target-dir` in .cargo/config.toml —
+#     repo-local, walked up to an ancestor, and $CARGO_HOME;
+#   - Family 7: the gate — a command with no cargo invocation must stay silent
+#     however the ambient value is set, and the unmeasurable/opt-out contracts
+#     must be unchanged for the ambient shapes too.
+#
+# Family 6 needs REAL directories (the resolution stats config files on disk),
+# unlike the purely lexical mount classification above.
+# =========================================================================
+
+echo -e "\n${YELLOW}repo#462: ambient (exported / pre-existing-config) target dir${NC}"
+
+# --- Family 5: an exported CARGO_TARGET_DIR ---
+
+assert_tmpfs_deny "#462: an ambient exported CARGO_TARGET_DIR on a bare cargo build denies" \
+    "cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/inherited
+
+assert_tmpfs_deny "#462: the ambient export is classified by mount TYPE too (tmpfs /tmp)" \
+    "cargo build --release" "$TMPFS_CWD" CARGO_TARGET_DIR=/tmp/cargo-target
+
+assert_tmpfs_deny "#462: a ramfs ambient export denies, and cross counts as a cargo command word" \
+    "cross test" "$TMPFS_CWD" CARGO_TARGET_DIR=/mnt/ram/build
+
+assert_tmpfs_allow "#462: an on-disk ambient export is silent" \
+    "cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/home/u/repo/target
+
+# cargo's own precedence: anything explicit on the command SHADOWS the ambient
+# value, so the guard must classify what the build will actually write to.
+assert_tmpfs_allow "#462: an explicit on-disk assignment shadows a tmpfs ambient export" \
+    "CARGO_TARGET_DIR=/home/u/repo/target cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_allow "#462: an explicit on-disk --target-dir shadows a tmpfs ambient export" \
+    "cargo build --target-dir /home/u/repo/target" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+# The deny has to name the thing that actually has to change. "Drop the
+# assignment" is unfollowable advice when the command carries no assignment.
+TOTAL=$((TOTAL + 1))
+_tmpfs_amb_msg=$(run_guard_tmpfs "cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x \
+    | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null || echo "")
+if [[ "$_tmpfs_amb_msg" == *"unset CARGO_TARGET_DIR"* ]] && \
+   [[ "$_tmpfs_amb_msg" == *"not by this command"* ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #462: the ambient deny says WHERE the value came from and what to change"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #462: the ambient deny says WHERE the value came from and what to change"
+    echo -e "       Got: $_tmpfs_amb_msg"
+fi
+
+# --- Family 6: a pre-existing .cargo/config.toml build.target-dir ---
+
+# Real on-disk fixtures. Layout:
+#   $TMPFS_CFG/repo/.cargo/config.toml      -> repo-local
+#   $TMPFS_CFG/anc/.cargo/config.toml       -> found by walking up from anc/a/b
+#   $TMPFS_CFG/home/config.toml             -> the $CARGO_HOME fallback
+#   $TMPFS_CFG/plain/                       -> no config anywhere (control)
+TMPFS_CFG="$(mktemp -d)"
+mkdir -p "$TMPFS_CFG/repo/.cargo" "$TMPFS_CFG/anc/.cargo" "$TMPFS_CFG/anc/a/b" \
+         "$TMPFS_CFG/home" "$TMPFS_CFG/plain" "$TMPFS_CFG/ondisk/.cargo"
+printf '[build]\ntarget-dir = "/dev/shm/from-repo-config"\n' > "$TMPFS_CFG/repo/.cargo/config.toml"
+printf '[build]\ntarget-dir = "/dev/shm/from-ancestor"\n'    > "$TMPFS_CFG/anc/.cargo/config.toml"
+printf '[build]\ntarget-dir = "/dev/shm/from-cargo-home"\n'  > "$TMPFS_CFG/home/config.toml"
+printf '[build]\ntarget-dir = "/home/u/repo/target"\n'       > "$TMPFS_CFG/ondisk/.cargo/config.toml"
+
+assert_tmpfs_deny "#462: a pre-existing repo-local .cargo/config.toml target-dir denies" \
+    "cargo build" "$TMPFS_CFG/repo"
+
+assert_tmpfs_deny "#462: the config is found by walking UP to an ancestor, as cargo does" \
+    "cargo build" "$TMPFS_CFG/anc/a/b"
+
+assert_tmpfs_deny "#462: the \$CARGO_HOME config is the lowest-precedence fallback" \
+    "cargo build" "$TMPFS_CFG/plain" CARGO_HOME="$TMPFS_CFG/home"
+
+assert_tmpfs_allow "#462: an on-disk pre-existing config target-dir is silent" \
+    "cargo build" "$TMPFS_CFG/ondisk"
+
+assert_tmpfs_allow "#462: no config anywhere means cargo's on-disk default — silent" \
+    "cargo build" "$TMPFS_CFG/plain"
+
+# Precedence again, this time config vs. command.
+assert_tmpfs_allow "#462: an explicit on-disk --target-dir shadows a tmpfs config target-dir" \
+    "cargo build --target-dir /home/u/repo/target" "$TMPFS_CFG/repo"
+
+# The deny must name the config FILE, since that is what has to be edited.
+TOTAL=$((TOTAL + 1))
+_tmpfs_cfg_msg=$(run_guard_tmpfs "cargo build" "$TMPFS_CFG/repo" \
+    | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null || echo "")
+if [[ "$_tmpfs_cfg_msg" == *"$TMPFS_CFG/repo/.cargo/config.toml"* ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #462: the ambient-config deny names the config file to edit"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #462: the ambient-config deny names the config file to edit"
+    echo -e "       Got: $_tmpfs_cfg_msg"
+fi
+
+# A `target-dir` under a table that is NOT [build] must not be read as one —
+# the minimal TOML reader tracks top-level table headers on purpose.
+mkdir -p "$TMPFS_CFG/wrongtable/.cargo"
+printf '[alias]\ntarget-dir = "/dev/shm/nope"\n' > "$TMPFS_CFG/wrongtable/.cargo/config.toml"
+assert_tmpfs_allow "#462: a target-dir outside the [build] table is not a target-dir" \
+    "cargo build" "$TMPFS_CFG/wrongtable"
+
+# --- Family 7: the ambient path's gate and the inherited contracts ---
+
+# The whole point of the command-word anchor: an ambient value only matters to
+# a command that actually invokes cargo. None of these do.
+assert_tmpfs_allow "#462: a non-cargo command does not consult the ambient target dir" \
+    "make -j8" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_allow "#462: prose merely containing the word cargo is not a cargo invocation" \
+    'git commit -am "note: cargo build now warns on a tmpfs target dir"' \
+    "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_allow "#462: echo cargo build is not a cargo invocation" \
+    "echo cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_allow "#462: a non-cargo command in a repo with a tmpfs config target-dir is silent" \
+    "ls -la" "$TMPFS_CFG/repo"
+
+# …and the anchor must not weaken the positives: the prefixes tmpfs_scratch_
+# assignments() steps over are stepped over here too.
+assert_tmpfs_deny "#462: an env-prefixed bare cargo build still resolves the ambient value" \
+    "env cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_deny "#462: the cargo invocation is found in a later shell segment too" \
+    "cd /home/u/repo && cargo build" "$TMPFS_CWD" CARGO_TARGET_DIR=/dev/shm/x
+
+# Unmeasurable must not deny — unchanged for the ambient shapes.
+TOTAL=$((TOTAL + 1))
+_tmpfs_out=$(make_input "cargo build" "$TMPFS_CWD" \
+    | env REPO_GUARD_MOUNTS_FILE="$TMPFS_FIXTURE_MOUNTS.missing" \
+          CARGO_HOME="$TMPFS_EMPTY_CARGO_HOME" CARGO_TARGET_DIR=/dev/shm/x "$GUARD" 2>&1 || true)
+if ! echo "$_tmpfs_out" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #462: an absent mount table is silent for the ambient shape too"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #462: an absent mount table is silent for the ambient shape too"
+    echo -e "       Got: $_tmpfs_out"
+fi
+
+# The opt-out toggle covers the ambient shapes too.
+assert_tmpfs_allow "#462: REPO_GUARD_TMPFS_SCRATCH=0 opts out of the ambient shape" \
+    "cargo build" "$TMPFS_CWD" REPO_GUARD_TMPFS_SCRATCH=0 CARGO_TARGET_DIR=/dev/shm/x
+
+assert_tmpfs_allow "#462: REPO_GUARD_TMPFS_SCRATCH=0 opts out of the ambient-config shape" \
+    "cargo build" "$TMPFS_CFG/repo" REPO_GUARD_TMPFS_SCRATCH=0
+
+# The already-in-RAM exemption applies to the ambient shapes too: cwd on the
+# SAME RAM mount as the resolved target dir means nothing is being redirected
+# into RAM that wasn't already there.
+assert_tmpfs_allow "#462: an ambient export under the cwd's own RAM mount is exempt" \
+    "cargo build" "/dev/shm/scratch-repo" CARGO_TARGET_DIR=/dev/shm/scratch-repo/target
+
+rm -rf "$TMPFS_CFG" "$TMPFS_EMPTY_CARGO_HOME"
 rm -f "$TMPFS_FIXTURE_MOUNTS"
 
 echo ""

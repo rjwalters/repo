@@ -102,8 +102,10 @@ guard** (rjwalters/repo#30). It runs before every agent `Bash` command and:
   prose never trips), SQL DDL/DML (`DROP TABLE`, `TRUNCATE TABLE`,
   `DELETE FROM …` without a `WHERE`), and a build/scratch dir pointed at a
   RAM-backed filesystem (`CARGO_TARGET_DIR=`/`TMPDIR=`/`--target-dir`/a
-  `build.target-dir` config write that resolves onto a `tmpfs`/`ramfs` mount —
-  see `tmpfsScratch` below).
+  `build.target-dir` config write that resolves onto a `tmpfs`/`ramfs` mount,
+  plus the *ambient* form — an exported `CARGO_TARGET_DIR` or a pre-existing
+  `.cargo/config.toml` `build.target-dir` on a bare `cargo build` — see
+  `tmpfsScratch` below).
 - **Asks** for confirmation on risky-but-legitimate ones: force ops
   (`git push --force` / `git reset --hard`, branch-aware via `forceScope`),
   `git clean -fd`, un-isolated `git read-tree`, mutating cloud verbs
@@ -225,6 +227,40 @@ wasn't already there and the on-disk alternative the message would name does
 not exist, so that case is exempt too. (This is why `/repo:host-optimize`'s
 confirm-first `build.target-dir` redirect is unaffected: it writes an on-disk
 path.)
+
+**It covers the AMBIENT form too, not just a per-command assignment (#462).**
+The four shapes above are all *explicit*: the command itself carries
+`CARGO_TARGET_DIR=`, `TMPDIR=`, `--target-dir`, or a `target-dir = …` write
+into a cargo config. The *persistent* form of the same hazard carries nothing
+at all — someone set it up earlier and every build after that inherits it
+invisibly. So on a command whose actual **command word** is `cargo` or `cross`,
+the guard also resolves the ambient effective target dir and classifies it the
+same way:
+
+- an exported `CARGO_TARGET_DIR` inherited from the agent's own environment
+  (a parent shell, a profile, a daemon env), and
+- a **pre-existing** `[build] target-dir` in `.cargo/config.toml` — repo-local,
+  any walked-up ancestor (closest wins), or `$CARGO_HOME/config.toml` —
+  following cargo's own resolution order.
+
+Anything explicit on the command **shadows** the ambient value (cargo's own
+precedence: `--target-dir` > `CARGO_TARGET_DIR` > config), so the guard
+classifies what the build will actually write to, not both. The deny message
+names *where* the value came from and what has to change (unset the export /
+edit that config file), because "drop the assignment" is unfollowable advice
+for a command that carries none.
+
+Both silences above apply unchanged, and the ambient resolution is gated so it
+never reaches the hot path: a command that contains neither `cargo` nor `cross`
+as a substring does no extra work at all, and one that contains the substring
+without a matching command word (`git commit -m "…cargo…"`, `echo cargo build`)
+is rejected on the command-word anchor before any config read. One deliberate
+departure from the equivalent chain in Loom's vendored guard: there is no
+`cargo config get build.target-dir` probe here, because this site sees every
+cargo invocation rather than only a bare `cargo clean` — spawning cargo per
+command is a real latency cost, and `cargo config get` needs
+`-Z unstable-options` on stable cargo anyway, so it would fall through to the
+same manual walk-up in practice.
 
 **`rmScope`'s unresolved-shell-variable policy (#239).** `extract_rm_targets()`
 is a tokenizer, not a shell evaluator: an `rm` target of `"$p"` reaches the
