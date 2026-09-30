@@ -1913,9 +1913,57 @@ function has_live_subst(str,    i, c, bs) {
 # guard-s (hooks/repo/guard-destructive.sh) implementation. They are DEFINED
 # here, alongside qsplit(), so every consumer of this shared source string
 # parses one copy — but they are CALLED from exactly one place,
-# _extract_write_targets_scan(), mirroring the canonical scoping. qsplit()
-# itself is untouched: its other consumers answer different questions and
-# handing them new segments would widen denies nobody measured.
+# _extract_write_targets_scan(), mirroring the canonical scoping.
+#
+# SEPARATORS INSIDE A SUBSTITUTION (repo#436/#437, ported by repo#545)
+# --------------------------------------------------------------------
+# subst_heads() closed the SINGLE-command case. It cannot reach the separator
+# case by construction: a head ends at the first unescaped separator at its own
+# depth, so the write idiom AFTER a `&&`/`|` inside the substitution is by
+# definition not part of the head. Three shapes therefore stayed live
+# worktree-isolation bypasses in this copy after repo#441 (measured allow here,
+# deny in canonical — the three repo#438 rows of
+# commands/repo/tests/guard-equivalence-cases.txt):
+#
+#     echo hi > "<main>/o-$(echo x|tr -d x).json"
+#     echo "$(id|tee <main>/evil.sh)"
+#     echo "$(id && cp /tmp/s <main>/e.sh)"
+#
+# Closing them needs the OTHER half of the canonical mechanism, which is a
+# behaviour change to qsplit() itself rather than a new helper beside it:
+#   1. a separator at substitution depth > 0 no longer splits the OUTER stream,
+#      so the enclosing token — a redirect target, an rm target, a `cd`
+#      argument — stays intact (repo#436);
+#   2. subst_inner() re-emits the commands those inner separators really do
+#      start as their own appended segments (repo#437).
+#
+# WHY IT IS AN OPT-IN `sdaware` FLAG AND NOT UNCONDITIONAL. In the canonical
+# guard, qsplit() has three consumers and all three want (1)+(2). In THIS copy
+# it has twelve, and one of them depends on the legacy split in the opposite
+# direction: parse_force_ops()-s #9312 `NAME="$(cd <literal-path> && pwd)"` cwd
+# recognizer is built ON the split at that inner `&&` — it matches the OPEN
+# first half (`NAME="$(cd <path>`) with extract_cdpwd_open() and resolves at the
+# top of the next segment, where the `pwd)"` close is expected (see that
+# function-s header comment, which states the dependency outright). That
+# recognizer has no canonical counterpart, so the canonical port carries no
+# information about it. Making depth-awareness unconditional would silently
+# turn those two segments into one, abandon every such capture unresolved, and
+# regress a vendored-only false-positive fix — with no corpus row to notice.
+#
+# So the depth-aware behaviour is a MODE: `qsplit(s, 1)`. The eleven other call
+# sites keep `qsplit($0)` and are byte-identical to the pre-#545 code path by
+# construction, not by measurement — every new branch is gated on `sdaware`,
+# and awk-s uninitialized parameter is 0 in those tests. Only
+# _extract_write_targets_scan() passes the flag, which is exactly the scope
+# both this file-s repo#441 port and the canonical repo#436/#437 change needed
+# for these shapes: all three are write-idiom confinement shapes. Widening the
+# mode to another consumer is a separate, separately-measured change.
+#
+# The five vendored-only qsplit() fixes this copy carries and canonical lacks
+# (#6472 closing-quote re-open, #6968 embedded-apostrophe idiom, #7978
+# backslash parity, #8025 escaped quote, #8166 escaped closing quote) are
+# untouched in both modes: the depth checks are added ALONGSIDE them, inside
+# the same walks, never in place of them.
 #
 # See `.loom/resync-ignore` for why this fix lives in the vendored copy rather
 # than arriving from upstream, and for how to retire that pin.
@@ -1993,6 +2041,59 @@ function subst_depth(s, d,   n, i, c, dep, kind, BQ) {
         d[i] = dep
         i++
     }
+}
+# subst_inner(s, d) — the inner commands that separators INSIDE a substitution
+# really do start, as "\n"-prefixed segments to append after the outer stream
+# (repo#436/#437, ported by repo#545). d[] comes from subst_depth().
+#
+# The exact COMPLEMENT of subst_heads() below: that one emits the text BEFORE a
+# substitution-s first inner separator (the head), this one emits what each
+# inner separator STARTS. Together they cover every simple command a
+# substitution runs, which is why the depth-aware qsplit() mode needs both.
+#
+# One segment per separator at depth > 0, running from just after that separator
+# to whichever comes first: the next separator at or below its depth, or the
+# close of the substitution that contains it. Text before a substitution-s FIRST
+# inner separator is NOT emitted here — under the legacy (non-depth-aware)
+# split it stayed part of the enclosing segment too, so this function only ever
+# reproduces boundaries the old lexer already produced.
+function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
+    n = length(s)
+    res = ""
+    seg = ""
+    cap = 0
+    capd = 0
+    split("", act)           # act[k] — a capture is open at depth k
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        # Leaving the depth the current capture belongs to ENDS it. Unwind to the
+        # nearest still-open enclosing capture, if any, so an inner substitution
+        # with its own separators does not silently swallow the rest of the outer
+        # one.
+        if (cap && d[i] < capd) {
+            res = res "\n" seg
+            seg = ""
+            while (capd > d[i]) { act[capd] = 0; capd-- }
+            cap = (capd > 0 && act[capd]) ? 1 : 0
+            # This byte is the substitution-s own closing `)`/backtick — a
+            # boundary, never the first byte of the enclosing capture resumed
+            # above.
+            continue
+        }
+        if (d[i] > 0 && (c == ";" || c == "&" || c == "|") && !bs_escaped(s, i)) {
+            if (cap) { res = res "\n" seg }
+            seg = ""
+            cap = 1
+            capd = d[i]
+            act[capd] = 1
+            # `&&` / `||` are one separator, not two.
+            if ((c == "&" || c == "|") && i < n && substr(s, i + 1, 1) == c) i++
+            continue
+        }
+        if (cap) seg = seg c
+    }
+    if (cap) res = res "\n" seg
+    return res
 }
 # subst_heads(s, sep) — the FIRST (or only) command of every `$( … )`/backtick
 # substitution in s, as `sep`-prefixed segments to append after the outer
@@ -2097,11 +2198,19 @@ function subst_heads(s, sep,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
     }
     return res
 }
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
+function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk, sdep) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
     n = length(s)
+    # SUBSTITUTION-DEPTH MODE (repo#436/#437, ported by repo#545) — OPT-IN.
+    # Computed only when the caller asks for it, so every legacy caller
+    # (`qsplit($0)`) runs the byte-identical pre-#545 code path: each new
+    # branch below is gated on `sdaware`, and an unpassed parameter is awk-s
+    # uninitialized value, which is 0 in the boolean tests here. See the
+    # `sdaware` paragraph in this block-s header for why the flag exists
+    # rather than the behaviour being unconditional.
+    if (sdaware) subst_depth(s, sdep)
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
@@ -2209,6 +2318,18 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
             k = i + 1
             while (k < ci) {
                 ch = substr(s, k, 1)
+                # A separator nested INSIDE this span-s own `$( … )`/backtick
+                # substitution is inert to the OUTER shell (repo#436): it is a
+                # pipeline separator of the SUBSHELL, never a top-level one, so
+                # splitting there tore the enclosing token in half. Copy it
+                # literally; the command it really does start is re-emitted as
+                # its own segment by subst_inner() at the bottom of this
+                # function. Depth mode only (`sdaware`).
+                if (sdaware && sdep[k] > 0 && (ch == ";" || ch == "&" || ch == "|")) {
+                    out = out ch
+                    k++
+                    continue
+                }
                 if (ch == ";") { out = out "\n"; k++; continue }
                 if (ch == "&") {
                     if (substr(s, k + 1, 1) == "&") { out = out "\n"; k += 2; continue }
@@ -2297,6 +2418,18 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
             i += 2
             continue
         }
+        # UNQUOTED substitution, same rule as the in-span walk above
+        # (repo#436): a `;`/`&`/`|` at substitution depth > 0 belongs to the
+        # subshell, so it must not tear the enclosing OUTER token — e.g. the
+        # redirect target in `echo hi > /tmp/o-$(echo x|tr -d x).json`. A
+        # genuine TOP-LEVEL subshell `( a ; b )` is unaffected: subst_depth()
+        # only nests a plain `(` when a substitution is already open, so those
+        # separators stay at depth 0 and still split. Depth mode only.
+        if (sdaware && sdep[i] > 0 && (c == ";" || c == "&" || c == "|")) {
+            out = out c
+            i++
+            continue
+        }
         if (c == ";") { out = out "\n"; i++; continue }
         if (c == "&") {
             if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n"; i += 2; continue }
@@ -2309,6 +2442,19 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
         out = out c
         i++
     }
+    # Depth mode re-emits the inner commands those now-unsplit separators
+    # really do start, appended after the outer stream (repo#437). Exactly the
+    # set of post-separator segments the legacy split produced, minus the text
+    # that TRAILED the substitution-s close (which belongs to the outer
+    # segment and stays there) — so the #3679/#3755 safety floor is kept, not
+    # relaxed: a smuggled `"$(cat f|sh -c …)"` still exposes `sh`, and a
+    # `"$(x|tee <in-repo>)"` still exposes the write target.
+    #
+    # Unbalanced input stays fail-closed by the same mechanism: an UNCLOSED
+    # `$(` leaves every later byte at depth > 0, but each separator after it
+    # still starts an inner segment, so a trailing `; <destructive command>`
+    # is still segmented and still reaches the scan.
+    if (sdaware) return out subst_inner(s, sdep)
     return out
 }
 '
@@ -8433,9 +8579,22 @@ _extract_write_targets_scan() {
         # consumers answer different questions, and handing them new segments
         # would widen denies this change did not measure.
         #
+        # SUBSTITUTION-DEPTH MODE (repo#436/#437, ported by repo#545): the `1`
+        # second argument puts qsplit() in its depth-aware mode for THIS
+        # consumer only — a separator inside a `$( … )`/backtick substitution
+        # stops splitting the outer stream (so a write TARGET carrying a
+        # substitution stays one whole token) and subst_inner() appends the
+        # commands those inner separators really do start. subst_heads() covers
+        # the head of each substitution, subst_inner() covers what each inner
+        # separator starts; together they put every simple command a
+        # substitution runs in front of the write-idiom scan. See the
+        # `sdaware` paragraphs in the _QSPLIT_AWK header for why this is a mode
+        # rather than qsplit()-s unconditional behaviour (parse_force_ops()-s
+        # #9312 recognizer depends on the legacy split).
+        #
         # The heads are kept in their OWN buffer (hbuf) until masking is done;
         # see the note at wbuf/gbuf below for why.
-        qbuf = qsplit(buf)
+        qbuf = qsplit(buf, 1)
         hbuf = subst_heads(buf, HSEP)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.
