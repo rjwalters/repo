@@ -4855,6 +4855,59 @@ assert_deny_tag "#439: a write in the HEAD before a | is now seen too" \
     "echo \"\$(id > $WTC439_MAIN/evil.sh|cat)\"" "$WTC439_WT" \
     "worktree-write-confinement"
 
+# ---- (e) Interplay with the span fixes that landed on main alongside this
+# ---- one: #453 (a nested `$( )` quote must not phantom-close the active span)
+# ---- and #433 (a backslash-ESCAPED backtick / `\$(` is literal text).
+#
+# A NESTED double quote inside the substitution. Two independent passes paired
+# quotes naively and each defeated subst_heads(): strip_datasink_literals()
+# closed the echo value on the inner `"` and redacted the rest as inert echo
+# data (the `>` and target never reached extract_write_targets()), and the
+# whole-buffer mask_gt()/mask_ws() threading carried the outer stream-s
+# quote mode into the appended head, masking its `>`. Both now follow #453-s
+# depth rule / mask each head from an unquoted start.
+assert_deny_tag "#439/#453: quoted \$( ) whose head holds a nested \"…\" denies" \
+    "echo \"\$(echo \"a\" > $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439/#453: quoted \$( ) with a nested-quoted TARGET denies" \
+    "echo \"\$(echo a > \"$WTC439_MAIN/e.sh\")\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439/#453: the #453 repro shape (apostrophe in a nested quote) denies" \
+    "echo \"x \$(echo \"y'z\" > $WTC439_MAIN/e.sh) q\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439/#453: the #453 shape in a BACKTICK span denies" \
+    "echo \"x \`echo \"y'z\" > $WTC439_MAIN/e.sh\` q\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_shell_accepts "#439/#453: the nested-quote head shape is real bash" \
+    "echo \"x \$(echo \"y'z\" > /dev/null) q\""
+# …and the same shapes aimed inside the acting worktree stay ALLOWED, so the
+# depth-matched pairing widens no deny beyond the main checkout.
+assert_allow "#439/#453: nested-quote head writing INSIDE the worktree is allowed" \
+    "echo \"\$(echo \"a\" > $WTC439_WT/ok.sh)\"" "$WTC439_WT"
+assert_allow "#439/#453: #453 shape writing to /tmp scratch is allowed" \
+    "echo \"x \$(echo \"y'z\" > /tmp/loom-439-scratch.txt) q\"" "$WTC439_WT"
+assert_allow "#439/#453: plain echo data with an inner-looking quote pair stays inert" \
+    "echo \"a > b\" \"c > d\"" "$WTC439_WT"
+
+# ESCAPED substitutions (#433) are literal text the shell never runs, so
+# subst_heads() must not re-emit them: bs_escaped() gates both openers.
+assert_allow "#439/#433: escaped backtick code span in prose is not a head" \
+    "gh pr comment 1 --body \"see \\\`id > $WTC439_MAIN/e.sh\\\` here\"" "$WTC439_WT"
+assert_allow "#439/#433: escaped \\\$( in echo data is not a head" \
+    "echo \"\\\$(id > $WTC439_MAIN/e.sh)\"" "$WTC439_WT"
+# …but a LIVE substitution beside an escaped code span is still seen, an
+# escaped backtick INSIDE a live head does not end it, and `\\` before a
+# backtick leaves that backtick live (parity, not presence).
+assert_deny_tag "#439/#433: live \$( ) beside an escaped code span denies" \
+    "echo \"see \\\`README\\\` \$(id > $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439/#433: escaped backtick inside a live head still denies" \
+    "echo \"\$(echo \\\`x\\\` > $WTC439_MAIN/e.sh)\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#439/#433: \\\\ before a backtick leaves it live and denies" \
+    "echo \"\\\\\`id > $WTC439_MAIN/e.sh\`\"" "$WTC439_WT" \
+    "worktree-write-confinement"
+
 git -C "$WTC439_MAIN" worktree remove --force "$WTC439_WT" >/dev/null 2>&1 || true
 if [[ -n "$WTC439_MAIN" && "$WTC439_MAIN" != "/" && -d "$WTC439_MAIN" ]]; then
     rm -rf "$WTC439_MAIN"

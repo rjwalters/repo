@@ -1561,8 +1561,14 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
 # the real shell, but treating it as a substitution here is the conservative
 # direction this lexer already takes everywhere else, and consistency with
 # subst_depth() matters more than recovering that one allow.
-function subst_heads(s,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
+#
+# `sep` (optional, default "\n") is the byte each head is PREFIXED with. The
+# one caller passes a byte that cannot be a real segment boundary so it can
+# tell one head from the next even when a head carries an embedded newline,
+# and quote-mask every head in isolation (see extract_write_targets()).
+function subst_heads(s, sep,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
     BQ = sprintf("%c", 96)   # backtick
+    if (sep == "") sep = "\n"
     subst_depth(s, d)
     n = length(s)
     split("", cseg)          # cseg[k] — text captured for the head at depth k
@@ -1576,7 +1582,7 @@ function subst_heads(s,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
         # A byte SHALLOWER than an open capture is that substitution-s own
         # closing `)`/backtick: the head ends there.
         while (top > dep) {
-            if (con[top]) { res = res "\n" cseg[top]; con[top] = 0; cseg[top] = "" }
+            if (con[top]) { res = res sep cseg[top]; con[top] = 0; cseg[top] = "" }
             top--
         }
         # `$(` opener. Both bytes belong to the ENCLOSING heads (verbatim
@@ -1602,7 +1608,7 @@ function subst_heads(s,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
         # A separator at the capture-s OWN depth ends the head; whatever it
         # starts is subst_inner()-s segment, not this function-s.
         if (dep > 0 && con[dep] && (c == ";" || c == "&" || c == "|") && !bs_escaped(s, i)) {
-            res = res "\n" cseg[dep]
+            res = res sep cseg[dep]
             con[dep] = 0
             cseg[dep] = ""
             for (k = 1; k < dep; k++) if (con[k]) cseg[k] = cseg[k] c
@@ -1615,7 +1621,7 @@ function subst_heads(s,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
     # Unclosed `$(`/backtick: emit what was captured rather than dropping it —
     # the same fail-closed direction subst_inner() takes for unbalanced input.
     while (top > 0) {
-        if (con[top]) { res = res "\n" cseg[top]; con[top] = 0 }
+        if (con[top]) { res = res sep cseg[top]; con[top] = 0 }
         top--
     }
     return res
@@ -2753,7 +2759,7 @@ strip_literal_text() {
 # directions because neither pass can create text the other keys on (see the
 # PASS 2 comment at the call site for the full argument).
 strip_datasink_literals() {
-    printf '%s' "$1" | awk -v qsinks="${2:-}" "$_HASLIVESUBST_AWK"'
+    printf '%s' "$1" | awk -v qsinks="${2:-}" "$_ESCAPE_AWK$_HASLIVESUBST_AWK"'
     # Raw text of the simple command starting at `start`, up to the first
     # UNQUOTED shell separator (or end of buffer). Quote-aware so an `awk`
     # program that contains `|` or `;` inside its quoted program text is read
@@ -2822,6 +2828,7 @@ strip_datasink_literals() {
     END {
         s = buf
         n = length(s)
+        subst_depth(s, sdep)   # per-byte `$( )`/backtick depth (repo#439, #453)
         out = ""
         i = 1
         atcmd = 1     # at the start of a simple command (command-word position)
@@ -2878,8 +2885,25 @@ strip_datasink_literals() {
             if (c == DQ || c == SQ) {
                 qc = c
                 ci = 0
+                # A DOUBLE-quoted span closes only on a `"` at the opener-s OWN
+                # `$( )`/backtick depth (the #453 rule, applied here for repo#439).
+                # A `"` one substitution level deeper belongs to the INNER
+                # shell-s quoting, so accepting it is a phantom close: for
+                # `echo "$(echo "a" > <main>/e.sh)"` the naive pairing split the
+                # value into `"$(echo "` (live, kept) and `" > <main>/e.sh)"`
+                # (no substitution, so REDACTED as echo data) — blanking the
+                # substitution-s own `>` and target before extract_write_targets()
+                # ever ran, so subst_heads() had nothing left to re-emit and the
+                # write into the main checkout was allowed. Depth-matched, the
+                # whole value is one span carrying a live `$(` and is never
+                # redacted. Single quotes are exempt exactly as in
+                # trusted_close(): they cannot nest, so their close is always
+                # the next single-quote byte. Escape handling is deliberately
+                # unchanged (only the depth filter is added), and a span with
+                # no depth-matched close falls to the unterminated branch below,
+                # which never redacts — the safe direction.
                 for (j = i + 1; j <= n; j++) {
-                    if (substr(s, j, 1) == qc) { ci = j; break }
+                    if (substr(s, j, 1) == qc && (qc != DQ || sdep[j] == sdep[i])) { ci = j; break }
                 }
                 if (ci == 0) {
                     # Unterminated quote: copy the rest verbatim, never redact.
@@ -5347,6 +5371,10 @@ extract_write_targets() {
     }
     BEGIN {
         SEP = sprintf("%c", 31)
+        # subst_heads() head delimiter (repo#439): RS, a byte no shell command
+        # carries as a separator, so one head is told from the next even when
+        # a head holds an embedded newline.
+        HSEP = sprintf("%c", 30)
         DQ = sprintf("%c", 34)
         SQ = sprintf("%c", 39)
         # Backtick — legacy command substitution. dequote_expandable()
@@ -5405,7 +5433,11 @@ extract_write_targets() {
         # consumers (command_has_shell_segment(), resolve_stash_cwd()) answer
         # different questions, and handing them new segments would widen denies
         # this issue did not measure.
-        $0 = qsplit(buf) subst_heads(buf)
+        #
+        # The heads are kept in their OWN buffer (hbuf) until masking is done;
+        # see the note at wbuf/gbuf below for why.
+        qbuf = qsplit(buf)
+        hbuf = subst_heads(buf, HSEP)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.
         #
@@ -5432,8 +5464,32 @@ extract_write_targets() {
         # masking the WHOLE buffer once, before any "\n"-splitting happens,
         # keeps quote state correctly threaded across every embedded newline,
         # heredoc or not.
-        wbuf = mask_ws($0)
+        #
+        # The subst_heads() segments are the ONE exception, and each is masked
+        # IN ISOLATION rather than threaded (repo#439). A head is a copy of
+        # text that ALSO appears inside the outer stream, so the outer stream-s
+        # quote state at its end says nothing about the head. Threading it
+        # through was an escape. For
+        #     echo "x $(echo "y<APOS>z" > <main>/e.sh) q"
+        # (<APOS> is an apostrophe, spelled out because this awk program is
+        # itself single-quoted) the outer segment reads, byte by byte, as `"x $(echo "` (closed) then
+        # an apostrophe that OPENS a single-quoted run the outer text never
+        # closes — so the mode carried into the appended head was "inside
+        # quotes", and the head-s own `>` was masked as data. The same applies
+        # head to head. Masking each head from an unquoted start is exactly
+        # the view the shell has of it (the substitution-s body is parsed by
+        # its own shell, from scratch). A head is never threaded INTO the outer
+        # stream either, because the outer stream is masked before any head.
+        wbuf = mask_ws(qbuf)
         gbuf = mask_gt(wbuf)
+        $0 = qbuf
+        nh = split(hbuf, heads, HSEP)
+        for (k = 2; k <= nh; k++) {
+            hw = mask_ws(heads[k])
+            $0 = $0 "\n" heads[k]
+            wbuf = wbuf "\n" hw
+            gbuf = gbuf "\n" mask_gt(hw)
+        }
         n = split($0, segs, "\n")
         nw = split(wbuf, wsegs, "\n")
         ng = split(gbuf, gsegs, "\n")
