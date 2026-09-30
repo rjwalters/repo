@@ -6645,6 +6645,13 @@ fi
 #   4. a `target-dir = <path>` line being WRITTEN into a cargo config file
 #      (`.cargo/config.toml`) — the persistent form of the same mistake
 #
+# …plus, since repo#462, the AMBIENT effective target dir on a bare `cargo`
+# invocation that assigns nothing at all: an exported `CARGO_TARGET_DIR`
+# inherited from the agent's environment, or a PRE-EXISTING `[build]
+# target-dir` in `.cargo/config.toml` (repo-local, walked-up, or
+# `$CARGO_HOME`). See the repo#462 header further down for that resolution
+# chain and the command-word gate that keeps it off the hot path.
+#
 # CLASSIFY BY MOUNT TYPE, NEVER BY PATH PREFIX. A hardcoded `/dev/shm` check
 # would be both over- and under-inclusive: a systemd host very commonly mounts
 # `/tmp` as tmpfs (so `TMPDIR=/tmp/build` is the same hazard under a completely
@@ -6814,20 +6821,228 @@ tmpfs_scratch_assignments() {
     }'
 }
 
+# =============================================================================
+# AMBIENT effective target dir (repo#462) — the PERSISTENT form of the same
+# hazard, where the command itself carries no assignment at all.
+#
+# Everything above keys on an EXPLICIT assignment carried by the command
+# (`CARGO_TARGET_DIR=…`, `TMPDIR=…`, `--target-dir`, a `target-dir = …` write
+# into a cargo config). That covers the loom#8512 incident shape, but it goes
+# silent on the two shapes where the RAM-backed target dir was configured
+# EARLIER and every subsequent build inherits it invisibly:
+#
+#   1. `CARGO_TARGET_DIR` already exported in the agent's own environment (a
+#      parent shell, a profile, a daemon env) — the hook is a child process,
+#      so it simply reads its own inherited value;
+#   2. a PRE-EXISTING `[build] target-dir` in `.cargo/config.toml` — repo-local,
+#      any walked-up ancestor, or `$CARGO_HOME/config.toml`.
+#
+# In both, the command is a bare `cargo build`, so the first build after the
+# setup is unguarded and so is every one after it.
+#
+# The three helpers below are ported from Loom's vendored
+# `guard-destructive-generic.sh` (`_cargo_toml_target_dir_value()`,
+# `_cargo_config_walk_up_target_dir()`, `_cargo_home_config_target_dir()`,
+# used there by `cargo_clean_effective_target_dir()` for the cargo-clean-scope
+# guard), per the ownership direction in `.loom/docs/guard-hooks.md`: this repo
+# is the canonical upstream and Loom re-vendors from here, so the resolution
+# chain needs to exist HERE rather than being referenced across the boundary.
+#
+# ONE DELIBERATE DEVIATION FROM THE VENDORED CHAIN: no `cargo config get
+# build.target-dir` probe. The vendored site runs it because it fires only on
+# a bare `cargo clean` (rare), whereas this site sees EVERY cargo invocation —
+# spawning a cargo process on each one is a real, per-command latency cost on
+# the hot path. It also buys almost nothing: `cargo config get` still requires
+# `-Z unstable-options` on stable cargo, so it fails and falls through to this
+# same manual walk-up in the overwhelmingly common case. The walk-up plus the
+# `$CARGO_HOME` fallback below reproduces cargo's documented precedence
+# (closest ancestor `.cargo/config.toml` wins, then the user-global one), which
+# is exactly the resolution set #462's acceptance criteria name.
+# =============================================================================
+
+# Minimal TOML reader for a single `[build]` -> `target-dir` key. Not a general
+# TOML parser: it only tracks top-level `[table]` headers so a `target-dir =
+# "..."` line is attributed to the literal `[build]` table (not `[build.foo]`
+# or an unrelated table), which is the one key this resolution needs.
+_cargo_toml_target_dir_value() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    awk '
+        function strip(v) {
+            gsub(/^[ \t]+/, "", v); gsub(/[ \t]+$/, "", v)
+            gsub(/^"/, "", v); gsub(/"$/, "", v)
+            gsub(/^\047/, "", v); gsub(/\047$/, "", v)
+            return v
+        }
+        BEGIN { in_build = 0 }
+        /^[ \t]*\[/ {
+            line = $0
+            gsub(/^[ \t]+/, "", line)
+            in_build = (line ~ /^\[build\][ \t]*(#.*)?$/) ? 1 : 0
+            next
+        }
+        in_build && /^[ \t]*target-dir[ \t]*=/ {
+            val = $0
+            sub(/^[^=]*=/, "", val)
+            sub(/#.*$/, "", val)
+            print strip(val)
+            exit
+        }
+    ' "$f" 2>/dev/null
+}
+
+# Walks up from $1 to the filesystem root looking for `.cargo/config.toml` /
+# `.cargo/config`, mirroring cargo's own directory-ancestor search order — the
+# CLOSEST ancestor that sets `build.target-dir` wins. A relative value is
+# resolved against the directory the config file itself was found in (cargo's
+# documented behavior: a relative target-dir is relative to the config file's
+# own location, not the invocation cwd). Prints "<path>\t<config file>".
+_cargo_config_walk_up_target_dir() {
+    local dir="$1" f val
+    while [[ -n "$dir" ]]; do
+        for f in "$dir/.cargo/config.toml" "$dir/.cargo/config"; do
+            if [[ -f "$f" ]]; then
+                val=$(_cargo_toml_target_dir_value "$f")
+                if [[ -n "$val" ]]; then
+                    [[ "$val" != /* ]] && val="$dir/$val"
+                    printf '%s\t%s' "$val" "$f"
+                    return 0
+                fi
+            fi
+        done
+        [[ "$dir" == "/" ]] && break
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Lowest-precedence fallback: the user-global $CARGO_HOME/config.toml (default
+# ~/.cargo/config.toml). Prints "<path>\t<config file>".
+_cargo_home_config_target_dir() {
+    local home="${CARGO_HOME:-$HOME/.cargo}" f val
+    [[ -n "$home" ]] || return 1
+    for f in "$home/config.toml" "$home/config"; do
+        if [[ -f "$f" ]]; then
+            val=$(_cargo_toml_target_dir_value "$f")
+            if [[ -n "$val" ]]; then
+                [[ "$val" != /* ]] && val="$home/$val"
+                printf '%s\t%s' "$val" "$f"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# =============================================================================
+# tmpfs_ambient_target_dir() — resolve the effective cargo target dir for a
+# command that carries NO explicit assignment of its own.
+#
+# Arg $1 = the acting cwd. Prints a single `<name><TAB><value><TAB><origin>`
+# record in exactly the shape the classification loop below consumes, or
+# nothing when no ambient setting exists (cargo's on-disk `<repo>/target`
+# default is never a hazard and is deliberately not emitted — "no ambient
+# setting" and "the default" are the same no-opinion answer here).
+#
+# Precedence follows cargo's own: the exported CARGO_TARGET_DIR wins over any
+# config file, and the closest ancestor config wins over $CARGO_HOME's.
+# =============================================================================
+tmpfs_ambient_target_dir() {
+    local base="$1" hit=""
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        printf '%s\t%s\t%s\n' "CARGO_TARGET_DIR" "$CARGO_TARGET_DIR" \
+            "exported in the agent's own environment, not by this command"
+        return 0
+    fi
+    [[ -n "$base" ]] || return 1
+    hit="$(_cargo_config_walk_up_target_dir "$base")" || hit=""
+    [[ -n "$hit" ]] || { hit="$(_cargo_home_config_target_dir)" || hit=""; }
+    [[ -n "$hit" ]] || return 1
+    printf '%s\t%s\t%s\n' "build.target-dir" "${hit%%$'\t'*}" \
+        "already set in ${hit#*$'\t'}, not by this command"
+}
+
+# =============================================================================
+# tmpfs_cargo_command_present() — the ambient path's cheap gate.
+#
+# The ambient shapes have NO substring in the command to key on (the command is
+# a bare `cargo build`), so the gate is a COMMAND-WORD anchor instead: prints
+# "1" only when some segment's actual command word — after stepping over
+# leading `VAR=value` assignments and `sudo`/`env`/`export` prefixes exactly as
+# tmpfs_scratch_assignments() does — is `cargo` or `cross`.
+#
+# This is what keeps the config walk-up and the guards.tmpfsScratch jq read off
+# the hot path: `git commit -m "note about cargo"` and `echo cargo build` reach
+# this awk (they contain the substring) but stop here, and a command with no
+# `cargo` substring at all never even reaches the awk.
+# =============================================================================
+tmpfs_cargo_command_present() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            j = 1
+            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) j++
+            while (j <= m && (toks[j] == "sudo" || toks[j] == "env" || toks[j] == "export")) {
+                j++
+                while (j <= m && toks[j] ~ /^-/) j++
+                while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) j++
+            }
+            if (j <= m && (toks[j] == "cargo" || toks[j] == "cross")) { found = 1; exit }
+        }
+    }
+    END { if (found) print "1" }'
+}
+
 # Cheap substring pre-check: nothing below runs — not the mount-table read, not
 # the config read — unless the command literally carries one of the assignment
-# spellings. Note `CARGO_TARGET_DIR` does not contain the lowercase
-# `target-dir`, so both spellings are needed here. The pre-check reads the
-# comment-stripped copy (the superset) rather than COMMAND_ASK_SCAN, because
-# shape 4 below deliberately scans that superset — gating the whole block on
-# the masked copy would skip shape 4 entirely.
+# spellings, or (for the ambient path) the bare word `cargo`/`cross`. Note
+# `CARGO_TARGET_DIR` does not contain the lowercase `target-dir`, so both
+# spellings are needed here. The pre-check reads the comment-stripped copy (the
+# superset) rather than COMMAND_ASK_SCAN, because shape 4 below deliberately
+# scans that superset — gating the whole block on the masked copy would skip
+# shape 4 entirely. Both arms are pure-bash `[[ == * *]]` globs: a command that
+# carries neither spelling nor the word `cargo` forks nothing at all.
+_TMPFS_EXPLICIT_HINT=0
 if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" == *"TMPDIR="* || \
       "$COMMAND_NO_COMMENT" == *"target-dir"* ]]; then
+    _TMPFS_EXPLICIT_HINT=1
+fi
+# `cross` is here for the same reason it is in shape 3's anchor: it is a cargo
+# wrapper and reads cargo's own config/env, so the ambient value applies to it
+# identically. It does mean a command containing an unrelated `cross`/`across`
+# pays one awk in tmpfs_cargo_command_present() — but no jq and no config read,
+# because that anchor rejects it on the command word.
+_TMPFS_CARGO_HINT=0
+if [[ "$COMMAND_NO_COMMENT" == *cargo* || "$COMMAND_NO_COMMENT" == *cross* ]]; then
+    _TMPFS_CARGO_HINT=1
+fi
+
+if [[ "$_TMPFS_EXPLICIT_HINT" == 1 || "$_TMPFS_CARGO_HINT" == 1 ]]; then
     _TMPFS_MOUNTS="$(tmpfs_mount_table_path)"
     # Unmeasurable => no opinion. This is the macOS/no-/proc/mounts exit, and it
     # is checked FIRST so a host that cannot classify never even reads config.
-    if [[ -r "$_TMPFS_MOUNTS" ]] && tmpfs_scratch_guard_enabled; then
-        _TMPFS_ASSIGNMENTS="$(tmpfs_scratch_assignments "$COMMAND_ASK_SCAN")" || _TMPFS_ASSIGNMENTS=""
+    _TMPFS_CARGO_CMD=0
+    if [[ -r "$_TMPFS_MOUNTS" && "$_TMPFS_CARGO_HINT" == 1 ]]; then
+        # Command-word anchor for the ambient path. Runs at most one awk, and
+        # only on a command that already contains the `cargo` substring.
+        [[ "$(tmpfs_cargo_command_present "$COMMAND_ASK_SCAN")" == "1" ]] && _TMPFS_CARGO_CMD=1
+    fi
+    if [[ -r "$_TMPFS_MOUNTS" ]] && \
+       [[ "$_TMPFS_EXPLICIT_HINT" == 1 || "$_TMPFS_CARGO_CMD" == 1 ]] && \
+       tmpfs_scratch_guard_enabled; then
+        # Explicit shapes 1-3. Skipped entirely when only the ambient gate let
+        # us in (a bare `cargo build` carries none of their spellings, so this
+        # awk could only ever return empty).
+        _TMPFS_ASSIGNMENTS=""
+        if [[ "$_TMPFS_EXPLICIT_HINT" == 1 ]]; then
+            _TMPFS_ASSIGNMENTS="$(tmpfs_scratch_assignments "$COMMAND_ASK_SCAN")" || _TMPFS_ASSIGNMENTS=""
+        fi
 
         _TMPFS_BASE="${CWD:-$REPO_ROOT}"
         [[ -n "$_TMPFS_BASE" ]] || _TMPFS_BASE="$PWD"
@@ -6890,6 +7105,29 @@ if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" ==
             fi
         fi
 
+        # Ambient shapes (repo#462): an exported CARGO_TARGET_DIR or a
+        # pre-existing `[build] target-dir` config, on a command that assigns
+        # nothing itself. Only consulted when a real cargo command word is
+        # present AND the command names no cargo target dir of its own —
+        # anything explicit SHADOWS the ambient value in cargo's own precedence
+        # (`--target-dir` > CARGO_TARGET_DIR > config), so classifying the
+        # ambient one too would deny on a path the build will never write to.
+        # TMPDIR is not an override of the cargo target dir and so does not
+        # shadow it (a `TMPDIR=… cargo build` still inherits the ambient one).
+        if [[ "$_TMPFS_CARGO_CMD" == 1 ]]; then
+            _TMPFS_EXPLICIT_TARGET=""
+            while IFS=$'\t' read -r _tmpfs_en _tmpfs_ev; do
+                [[ -n "$_tmpfs_ev" ]] || continue
+                case "$_tmpfs_en" in
+                    CARGO_TARGET_DIR|--target-dir|build.target-dir) _TMPFS_EXPLICIT_TARGET=1; break ;;
+                esac
+            done <<< "$_TMPFS_ASSIGNMENTS"
+            if [[ -z "$_TMPFS_EXPLICIT_TARGET" ]]; then
+                _TMPFS_AMBIENT="$(tmpfs_ambient_target_dir "$_TMPFS_BASE")" || _TMPFS_AMBIENT=""
+                [[ -n "$_TMPFS_AMBIENT" ]] && _TMPFS_ASSIGNMENTS+=$'\n'"$_TMPFS_AMBIENT"
+            fi
+        fi
+
         # The acting cwd's own mount, for the "already in RAM" exemption above.
         _TMPFS_CWD_MP=""
         if [[ "$_TMPFS_BASE" == /* ]]; then
@@ -6897,7 +7135,10 @@ if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" ==
             [[ -n "$_tmpfs_cwd_entry" ]] && _TMPFS_CWD_MP="${_tmpfs_cwd_entry#*$'\t'}"
         fi
 
-        while IFS=$'\t' read -r _tmpfs_name _tmpfs_value; do
+        # The third field is the AMBIENT origin (repo#462) — empty for every
+        # explicit shape above, which keeps their two-field records readable
+        # here unchanged.
+        while IFS=$'\t' read -r _tmpfs_name _tmpfs_value _tmpfs_origin; do
             [[ -n "$_tmpfs_name" && -n "$_tmpfs_value" ]] || continue
             # An unexpanded shell variable / substitution is unknowable to a
             # static scan — same no-opinion rule as an unreadable mount table.
@@ -6923,13 +7164,25 @@ if [[ "$COMMAND_NO_COMMENT" == *"CARGO_TARGET_DIR="* || "$COMMAND_NO_COMMENT" ==
             # are cargo-specific, so the repo's on-disk `target/` is the natural
             # default; TMPDIR is a generic scratch root with no such default, so
             # naming `<repo>/target` there would be inapplicable advice (#461 review).
-            if [[ "$_tmpfs_name" == "TMPDIR" ]]; then
+            _tmpfs_suggest="${REPO_ROOT:-$_TMPFS_BASE}/target"
+            if [[ -n "$_tmpfs_origin" ]]; then
+                # AMBIENT (repo#462): there is no assignment in this command to
+                # drop, so "drop the assignment" would be unfollowable advice —
+                # name the thing that actually has to change instead.
+                if [[ "$_tmpfs_name" == "CARGO_TARGET_DIR" ]]; then
+                    _tmpfs_advice="unset CARGO_TARGET_DIR (or re-export it at a disk-backed path) so the build lands on disk — cargo's own default is $_tmpfs_suggest"
+                else
+                    _tmpfs_advice="edit that file's [build] target-dir to a disk-backed path, or delete the key to fall back to cargo's default $_tmpfs_suggest"
+                fi
+                _tmpfs_where=" ($_tmpfs_origin)"
+            elif [[ "$_tmpfs_name" == "TMPDIR" ]]; then
                 _tmpfs_advice="point it at a disk-backed scratch path instead (e.g. ${REPO_ROOT:-$_TMPFS_BASE}/.tmp)"
+                _tmpfs_where=""
             else
-                _tmpfs_suggest="${REPO_ROOT:-$_TMPFS_BASE}/target"
                 _tmpfs_advice="drop the assignment to build into the default $_tmpfs_suggest, or point it at another disk-backed path (e.g. an on-disk [build] target-dir in .cargo/config.toml)"
+                _tmpfs_where=""
             fi
-            deny "BLOCKED: $_tmpfs_name=$_tmpfs_value resolves to $_tmpfs_abs, which is on a RAM-backed $_tmpfs_fs mount ($_tmpfs_mp). Build/scratch output written there consumes the host's memory for as long as it exists, and nothing deletes it when the build ends (rjwalters/loom#8512: a 6.2 GB target dir left in /dev/shm pinned RAM for 2.5 days and drove a worker into an OOM-kill storm). Use an on-disk location instead: $_tmpfs_advice. Set guards.tmpfsScratch:false in .claude/skills/repo/config.json if this host deliberately builds in RAM." "tmpfs-scratch-dir:$_tmpfs_name"
+            deny "BLOCKED: $_tmpfs_name=$_tmpfs_value$_tmpfs_where resolves to $_tmpfs_abs, which is on a RAM-backed $_tmpfs_fs mount ($_tmpfs_mp). Build/scratch output written there consumes the host's memory for as long as it exists, and nothing deletes it when the build ends (rjwalters/loom#8512: a 6.2 GB target dir left in /dev/shm pinned RAM for 2.5 days and drove a worker into an OOM-kill storm). Use an on-disk location instead: $_tmpfs_advice. Set guards.tmpfsScratch:false in .claude/skills/repo/config.json if this host deliberately builds in RAM." "tmpfs-scratch-dir:$_tmpfs_name"
         done <<< "$_TMPFS_ASSIGNMENTS"
     fi
 fi
