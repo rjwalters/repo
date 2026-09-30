@@ -22,6 +22,7 @@
 # commands/repo/tests/test-branches-loss-check.sh,
 # commands/repo/tests/test-repo-remote.sh,
 # commands/repo/tests/test-verify-fix-persistence.sh,
+# commands/repo/tests/test-gitignore-anchoring.sh,
 # commands/repo/tests/test-loom-quarantine-destination.sh,
 # commands/repo/tests/test-early-sync-switch.sh,
 # commands/repo/tests/test-tidy-keep-tiers.sh,
@@ -663,6 +664,45 @@ else
     PASS=$((PASS + VP_PASS))
     FAIL=$((FAIL + VP_FAIL))
     record_suite "test-verify-fix-persistence.sh" "$VP_PASS" "$VP_FAIL" "$VP_NOTE"
+fi
+
+# /repo:gitignore's redundancy model (gitignore anchoring, trailing-slash and
+# negation-precedence subtleties) and the `git check-ignore -v` before/after gate
+# that has to clear before a rule removal is applied (repo#531). Same delegation
+# shape as the suites above.
+echo
+echo "-- gitignore anchoring + ignore-status gate (delegated suite) --"
+GA_TEST="$TESTS_DIR/../../../commands/repo/tests/test-gitignore-anchoring.sh"
+if [[ ! -f "$GA_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-gitignore-anchoring.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-gitignore-anchoring.sh" "$GA_TEST"
+else
+    GA_OUT="$(bash "$GA_TEST" 2>&1)"
+    GA_STATUS=$?
+    GA_PASS="$(suite_count Passed "$GA_OUT")"
+    GA_FAIL="$(suite_count Failed "$GA_OUT")"
+    # Skips are neither pass nor fail — surfaced as a note only, same as above.
+    GA_SKIP="$(suite_count Skipped "$GA_OUT")"
+    GA_NOTE="gitignore anchoring + removal gate"
+    [[ "$GA_SKIP" =~ ^[0-9]+$ && "$GA_SKIP" -gt 0 ]] && GA_NOTE+=" — $GA_SKIP skipped"
+    if ! [[ "$GA_PASS" =~ ^[0-9]+$ && "$GA_FAIL" =~ ^[0-9]+$ ]]; then
+        GA_PASS=0
+        GA_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-gitignore-anchoring.sh" "$GA_STATUS"
+        strip_ansi "$GA_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GA_STATUS" -ne 0 || "$GA_FAIL" -ne 0 ]]; then
+        [[ "$GA_FAIL" -eq 0 ]] && GA_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-gitignore-anchoring.sh" "$GA_PASS" "$GA_FAIL" "$GA_STATUS"
+        strip_ansi "$GA_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-gitignore-anchoring.sh" "$GA_PASS"
+    fi
+    PASS=$((PASS + GA_PASS))
+    FAIL=$((FAIL + GA_FAIL))
+    record_suite "test-gitignore-anchoring.sh" "$GA_PASS" "$GA_FAIL" "$GA_NOTE"
 fi
 
 # The Loom-managed destination contract shared by docs.md / gitignore.md /
