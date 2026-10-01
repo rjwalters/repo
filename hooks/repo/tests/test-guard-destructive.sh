@@ -5109,15 +5109,17 @@ assert_deny_tag "#539: an escaped quote inside the \$( ) opens no inner span" \
 assert_deny_tag "#539: …and one before an in-substitution separator likewise" \
     "echo \"\$(printf \\\"x ; id > $WTC539_MAIN/z)\"" "$WTC539_WT" \
     "worktree-write-confinement"
-# BOUNDARY (not this issue's scope). An escaped `\"` in the OUTER double-quoted
-# span misaligns that span's own pairing, which swallows a trailing
-# `&& cp … <main>/f` — e.g. `echo "\"" && cp /tmp/a <main>/f; echo "z"`, which
-# carries no `$( )` at all and allows identically before and after this change.
-# That is a separate defect in the naive next-quote close scans (they do not
-# skip an escaped quote), not in subst_depth(); pinned here as an allow so the
-# boundary is explicit rather than silently absent.
-assert_allow "#539 boundary: an escaped quote in the OUTER span still swallows the tail (pre-existing)" \
-    "echo \"\\\"\" && cp /tmp/a $WTC539_MAIN/f; echo \"z\"" "$WTC539_WT"
+# FORMER BOUNDARY, now CLOSED by #548. An escaped `\"` in the OUTER
+# double-quoted span misaligned that span's own pairing and swallowed a trailing
+# `&& cp … <main>/f`. #539 pinned it here as an explicit allow because it is a
+# defect in the escape-blind next-quote close scans, not in subst_depth() — it
+# carries no `$( )` at all and allowed identically before and after #539's fix.
+# #548 made those scans escape-aware, so the row now DENIES; the assertion is
+# kept in place (flipped) so the #539 and #548 blocks stay wired together, and
+# the full family lives in the #548 block below.
+assert_deny_tag "#539 boundary (closed by #548): an escaped quote in the OUTER span no longer swallows the tail" \
+    "echo \"\\\"\" && cp /tmp/a $WTC539_MAIN/f; echo \"z\"" "$WTC539_WT" \
+    "worktree-write-confinement"
 # `$(( ))` arithmetic still reads as `$(` plus a plain `(`, unaffected by the
 # quote state machine.
 assert_allow "#539: \$(( )) arithmetic is unaffected by inner-quote tracking" \
@@ -5142,6 +5144,226 @@ assert_allow "#539: #433's escaped backtick code span is still not a head" \
 git -C "$WTC539_MAIN" worktree remove --force "$WTC539_WT" >/dev/null 2>&1 || true
 if [[ -n "$WTC539_MAIN" && "$WTC539_MAIN" != "/" && -d "$WTC539_MAIN" ]]; then
     rm -rf "$WTC539_MAIN"
+fi
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #548: an escaped quote no longer hides a write ---${NC}"
+# =========================================================================
+#
+# Several quote-pairing scans in the guard tested only the BYTE VALUE of a
+# candidate quote, so a backslash-ESCAPED `\"` was accepted as the close of an
+# outer double-quoted span. The span ended early, the following REAL `"` was
+# read as a NEW opener, and everything up to the next quote — a genuine
+# `&& cp … <main>/f` included — was treated as inert quoted data: redacted
+# (strip_datasink_literals(), mask_ask_positional_args(), strip_literal_text()),
+# copied verbatim (qsplit()/ml_segment()'s inert branch), or
+# whitespace/`>`-masked (mask_ws()/mask_gt()). The write still happens in bash.
+#
+# Sibling of #539 but a DISTINCT cause: the first row below carries no `$( )`
+# at all, so the misalignment comes purely from the escaped quote. The #539
+# block above pinned it as an explicit `boundary:` allow; that pin is now a
+# deny and the whole family lives here.
+#
+# The fix is the rule bash itself applies, in all of those scans at once:
+#   - an escaped quote never OPENS a span (what qsplit()/ml_segment() have done
+#     since #113, now also in strip_datasink_literals()/mask_ws()/mask_gt());
+#   - inside a DOUBLE-quoted span an escaped `"` never CLOSES it;
+#   - a SINGLE-quoted span still ends at its next quote — between `S…S` bash
+#     has no escape at all, so skipping one there would extend an inert span
+#     over live code. Row (e) below is what pins that asymmetry.
+# With those rules the span each scan sees is the span bash sees for any
+# parseable input, which is what makes the four denies below exact rather than
+# merely conservative — and keeps the passes in parity with each other.
+read -r WTC548_MAIN WTC548_WT <<< "$(make_wt_confinement_repo)"
+
+# ---- (a) The reported rows, plus the two further shapes the same defect
+# ---- family carried. All four really create their file in the main checkout
+# ---- when run under bash from the worktree cwd (verified with a
+# ---- two-directory fixture), and all four ALLOWED before this fix.
+assert_deny_tag "#548: an escaped quote in a double-quoted echo value then a cp into main denies" \
+    "echo \"\\\"\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: an escaped quote inside a \$( ) head then a cp into main denies" \
+    "echo \"\$(printf \\\"x )\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: an escaped quote as a bogus OPENER then a cp into main denies" \
+    "echo \\\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: an escaped quote MID-span then a cp into main denies" \
+    "echo \"a \\\" b\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+# Every row is a shape bash really parses — these denies guard executable
+# commands, not syntax errors (contrast the KNOWN LIMIT row in (g) below).
+assert_shell_accepts "#548: the escaped-quote echo-value shape is real bash" \
+    "echo \"\\\"\" && cp /tmp/a /dev/null; echo \"z\""
+assert_shell_accepts "#548: the escaped-quote-in-\$( ) shape is real bash" \
+    "echo \"\$(printf \\\"x )\" && cp /tmp/a /dev/null; echo \"z\""
+assert_shell_accepts "#548: the escaped-quote-as-opener shape is real bash" \
+    "echo \\\" && cp /tmp/a /dev/null; echo \"z\""
+assert_shell_accepts "#548: the mid-span escaped-quote shape is real bash" \
+    "echo \"a \\\" b\" && cp /tmp/a /dev/null; echo \"z\""
+
+# ---- (b) Every write idiom behind the same prefix, not just cp.
+assert_deny_tag "#548: escaped quote then a > into main denies" \
+    "echo \"\\\"\" && echo x > $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: escaped quote then tee into main denies" \
+    "echo \"\\\"\" && tee $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: escaped quote then sed -i on main denies" \
+    "echo \"\\\"\" && sed -i s/a/b/ $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_deny_tag "#548: escaped quote then mv into main denies" \
+    "echo \"\\\"\" && mv /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+
+# ---- (c) The same misalignment defeated the OTHER tiers too, because
+# ---- strip_datasink_literals() builds both the catastrophic and the ask
+# ---- working copies. Each of these ALLOWED before the fix.
+assert_deny "#548: a catastrophic payload behind an escaped quote denies" \
+    "echo \"\\\"\" && rm -rf /; echo \"z\"" "$WTC548_WT"
+assert_deny "#548: a lifecycle command behind an escaped quote denies" \
+    "echo \"\\\"\" && halt; echo \"z\"" "$WTC548_WT"
+assert_ask_env "#548: a force push behind an escaped quote still asks" \
+    "LOOM_FORCE_SCOPE=all" \
+    "echo \"\\\"\" && git push --force origin feature/x; echo \"z\"" "$WTC548_WT"
+
+# ---- (d) No widened deny: every reported shape aimed INSIDE the acting
+# ---- worktree, or at /tmp scratch, is still ALLOWED.
+assert_allow "#548: escaped-quote echo value then a cp INSIDE the worktree is allowed" \
+    "echo \"\\\"\" && cp /tmp/a $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: escaped quote in a \$( ) head then an in-worktree cp is allowed" \
+    "echo \"\$(printf \\\"x )\" && cp /tmp/a $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: escaped-quote OPENER then an in-worktree cp is allowed" \
+    "echo \\\" && cp /tmp/a $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: mid-span escaped quote then an in-worktree cp is allowed" \
+    "echo \"a \\\" b\" && cp /tmp/a $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: escaped-quote echo value then a cp to /tmp scratch is allowed" \
+    "echo \"\\\"\" && cp /tmp/a /tmp/loom-548-scratch.txt; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: escaped quote in a \$( ) head then a /tmp cp is allowed" \
+    "echo \"\$(printf \\\"x )\" && cp /tmp/a /tmp/loom-548-scratch.txt; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: escaped-quote OPENER then an in-worktree redirect is allowed" \
+    "echo \\\" && echo x > $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+assert_allow "#548: an escaped quote with no write idiom at all is allowed" \
+    "echo \"\\\"\"" "$WTC548_WT"
+
+# ---- (e) The SINGLE-quote exemption, pinned on its own. Between S...S bash
+# ---- has no escape: `S a\ S` really DOES end at that quote, and the text
+# ---- after it is live code. Skipping the quote there (treating `\S` as
+# ---- escaped, the way the DOUBLE-quote rule does) would extend the inert
+# ---- span over a real `&& cp … <main>/f` and REINTRODUCE this very bug for
+# ---- single-quoted spans — so this deny is what keeps the asymmetry honest.
+# ---- (S spelled out: the row is written with real apostrophes below.)
+assert_deny_tag "#548: a trailing backslash in a SINGLE-quoted span does not extend it" \
+    "echo 'a\\' && cp /tmp/a $WTC548_MAIN/f; echo 'z'" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_allow "#548: ...and the same shape aimed inside the worktree is allowed" \
+    "echo 'a\\' && cp /tmp/a $WTC548_WT/f; echo 'z'" "$WTC548_WT"
+assert_shell_accepts "#548: the trailing-backslash single-quoted shape is real bash" \
+    "echo 'a\\' && cp /tmp/a /dev/null; echo 'z'"
+# PARITY, NOT PRESENCE: `\\` is an escaped BACKSLASH, so the `"` after it is
+# LIVE and really does close the span — bs_escaped()'s odd-count rule, the
+# same one trusted_close() uses.
+assert_deny_tag "#548: an escaped BACKSLASH leaves the following quote live" \
+    "echo \"\\\\\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_allow "#548: ...and the same shape aimed inside the worktree is allowed" \
+    "echo \"\\\\\" && cp /tmp/a $WTC548_WT/f; echo \"z\"" "$WTC548_WT"
+
+# ---- (f) NO NEW FALSE POSITIVES. Escaped quotes in ordinary prose are the
+# ---- standard way to quote a quote inside a shell string, and such a value is
+# ---- inert data however many `>`/`cp`/`rm` words it mentions. The second and
+# ---- third rows are the direct regression guard for strip_literal_text(),
+# ---- whose span regex (a plain `"[^"]*"`, with no way to express "not an
+# ---- ESCAPED quote" in POSIX ERE) stopped at the `\"` and handed the REST of
+# ---- the --body value downstream as if it were unquoted shell text — which,
+# ---- once the masks became escape-aware, turned a `>` sitting in prose into a
+# ---- live redirection operator. It now extends the span to the close bash
+# ---- itself pairs, so the whole value is redacted as one inert unit.
+assert_allow "#548: escaped quotes in echo prose are still inert data" \
+    "echo \"he said \\\"hi\\\" and left\"" "$WTC548_WT"
+assert_allow "#548: a --body value whose escaped-quote prose holds a > is still inert" \
+    "gh pr comment 1 --body \"he said \\\"hi\\\" about id > $WTC548_MAIN/e.sh\"" "$WTC548_WT"
+assert_allow "#548: ...and one quoting a cp idiom alongside a > is too" \
+    "gh pr comment 1 --body \"use \\\"cp a b\\\" then env > conf\"" "$WTC548_WT"
+# ...but a REAL write chained AFTER such a value is still seen: the redaction
+# ends at the value's real close, it does not run on to end of buffer.
+assert_deny_tag "#548: a real cp after an escaped-quote --body value denies" \
+    "gh pr comment 1 --body \"he said \\\"hi\\\"\" && cp /tmp/a $WTC548_MAIN/f" \
+    "$WTC548_WT" "worktree-write-confinement"
+assert_deny_tag "#548: a real redirect after an escaped-quote -m value denies" \
+    "gh pr comment 1 -m \"a \\\"b\\\" c\" && echo x > $WTC548_MAIN/f" \
+    "$WTC548_WT" "worktree-write-confinement"
+assert_allow "#548: ...and the same -m shape aimed inside the worktree is allowed" \
+    "gh pr comment 1 -m \"a \\\"b\\\" c\" && echo x > $WTC548_WT/f" "$WTC548_WT"
+
+# ---- (g) KNOWN LIMIT, unchanged (the #130 family). Drop one quote and the
+# ---- shape has an ODD quote count: bash rejects it outright, so the lexer's
+# ---- pairing is unobservable and the allow is unreachable. Pinned with an
+# ---- assert_shell_rejects so the unparseability half is mechanical.
+assert_shell_rejects "#548 KNOWN LIMIT: the odd-quote-count variant is not parseable bash" \
+    "echo \"\\\" && cp /tmp/a /dev/null; echo \"z\""
+assert_allow "#548 KNOWN LIMIT: ...so its allow is not an executable bypass" \
+    "echo \"\\\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT"
+
+# ---- (h) The #113/#433/#439/#539 escape properties this change sits next to
+# ---- must not regress — the "re-verify every bs_escaped() consumer" half of
+# ---- this issue, spot-checked here beside the new rows (the full set stays in
+# ---- the blocks above, which also run against this same fixed guard).
+assert_allow "#548: #433's escaped backtick code span is still not a live head" \
+    "gh pr comment 1 --body \"see \\\`id > $WTC548_MAIN/e.sh\\\` here\"" "$WTC548_WT"
+assert_allow "#548: #433's escaped \\\$( in echo data is still not a live head" \
+    "echo \"\\\$(id > $WTC548_MAIN/e.sh)\"" "$WTC548_WT"
+assert_deny_tag "#548: #439's plain single-command \$( ) write still denies" \
+    "echo \"\$(id > $WTC548_MAIN/e.sh)\"" "$WTC548_WT" "worktree-write-confinement"
+assert_deny_tag "#548: #539's quoted-) \$( ) then a cp into main still denies" \
+    "echo \"\$(printf \")\" )\" && cp /tmp/a $WTC548_MAIN/f; echo \"z\"" "$WTC548_WT" \
+    "worktree-write-confinement"
+# #113's own repro shape, measured on the write-confinement tier rather than on
+# segmentation: an escaped quote sitting AFTER a closed active span. #113 fixed
+# the OPENER half in qsplit()/ml_segment() only, so this ALLOWED until now —
+# strip_datasink_literals() had no opener check at all, and mask_ws() paired the
+# escaped quote with the next real one. Parseable bash, and it really writes.
+assert_deny_tag "#548: #113's escaped quote after an active span now denies on the write tier too" \
+    "echo \"\$(id)\" \\\" && cp /tmp/a $WTC548_MAIN/f" "$WTC548_WT" \
+    "worktree-write-confinement"
+assert_shell_accepts "#548: the escaped-quote-after-an-active-span shape is real bash" \
+    "echo \"\$(id)\" \\\" && cp /tmp/a /dev/null"
+assert_allow "#548: ...and the same shape aimed inside the worktree is allowed" \
+    "echo \"\$(id)\" \\\" && cp /tmp/a $WTC548_WT/f" "$WTC548_WT"
+
+git -C "$WTC548_MAIN" worktree remove --force "$WTC548_WT" >/dev/null 2>&1 || true
+if [[ -n "$WTC548_MAIN" && "$WTC548_MAIN" != "/" && -d "$WTC548_MAIN" ]]; then
+    rm -rf "$WTC548_MAIN"
+fi
+
+# ---- (i) mask_ask_positional_args() carried the SAME escape-blind close
+# ---- scan, so an opted-in repo (guards.positionalMaskAllowlist) had the same
+# ---- bypass through an allowlisted command's quoted positional argument. The
+# ---- mandatory _POSITIONAL_MASK_NEVER set does not help here: the masked
+# ---- command word is the ALLOWLISTED one, and it is the chained `cp` AFTER it
+# ---- that the over-long span swallowed. Needs its own fixture (the allowlist
+# ---- is read from the acting worktree's repo config).
+read -r PM548_MAIN PM548_WT <<< "$(make_wt_confinement_repo)"
+mkdir -p "$PM548_WT/.claude/skills/repo"
+printf '%s' '{"guards":{"positionalMaskAllowlist":["mytool.sh"]}}' \
+    > "$PM548_WT/.claude/skills/repo/config.json"
+
+assert_deny_tag "#548: escaped quote in an allowlisted command's positional arg no longer hides a cp into main" \
+    "mytool.sh \"\\\"\" && cp /tmp/a $PM548_MAIN/f; echo \"z\"" "$PM548_WT" \
+    "worktree-write-confinement"
+assert_allow "#548: ...and the same shape aimed inside the worktree is allowed" \
+    "mytool.sh \"\\\"\" && cp /tmp/a $PM548_WT/f; echo \"z\"" "$PM548_WT"
+# The #195 feature itself is intact: an ordinary quoted positional argument is
+# still masked out of the ask tier.
+assert_allow "#548: #195's ordinary positional masking still narrows the ask tier" \
+    'mytool.sh "please run: gh release delete v1"' "$PM548_WT"
+
+git -C "$PM548_MAIN" worktree remove --force "$PM548_WT" >/dev/null 2>&1 || true
+if [[ -n "$PM548_MAIN" && "$PM548_MAIN" != "/" && -d "$PM548_MAIN" ]]; then
+    rm -rf "$PM548_MAIN"
 fi
 
 echo ""
