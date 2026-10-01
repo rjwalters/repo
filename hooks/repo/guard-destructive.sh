@@ -1765,8 +1765,23 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
         if ((c == DQ || c == SQ) && !bs_escaped(s, i)) {
             qc = c
             ci = 0
+            # …and a backslash-escaped `"` is not a CLOSE either (#548). Inside
+            # `"…"` bash reads `\"` as a literal quote and the span runs on, so
+            # ending it there made the following REAL close open a bogus span:
+            # for `echo "a \" b" && cp … <main>/f; echo "z"` the inert branch
+            # below then copied ` && cp … <main>/f; echo ` verbatim as quoted
+            # data, losing the separator and the write target. Skipping it
+            # makes `ci` the span close bash itself pairs — exact, not merely
+            # conservative, for every parseable input — so the inert branch
+            # copies exactly what the shell treats as data and no separator
+            # outside the span is ever swallowed. SINGLE quotes are
+            # deliberately NOT skipped: between `S…S` a backslash is an
+            # ordinary literal byte, so the next `S` really is the close and
+            # skipping it would extend an inert span over live code. The
+            # ACTIVE-span branch is unaffected either way — trusted_close()
+            # below already resolved escaped candidates itself.
             for (j = i + 1; j <= n; j++) {
-                if (substr(s, j, 1) == qc) { ci = j; break }
+                if (substr(s, j, 1) == qc && !(qc == DQ && bs_escaped(s, j))) { ci = j; break }
             }
             if (ci == 0) {
                 # Unterminated quote: fall back to separator-active processing so
@@ -2088,14 +2103,26 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
         # span pair with a much later quote and copy every real separator between
         # them as bogus inert text (`echo "$(id)" \" ; <destructive>`). Refusing
         # to open keeps the separators ACTIVE, which is the narrowing direction.
-        # The forward close scan below still ACCEPTS an escaped quote as the
-        # INERT-span boundary (ending a literal span earlier is also the active
-        # direction, and it is what the pre-#113 walk did), but the ACTIVE-span
-        # bookkeeping resolves a real close through trusted_close() (see below).
+        #
+        # The forward close scan below used to ACCEPT an escaped quote as the
+        # INERT-span boundary, on the theory that ending a literal span EARLIER
+        # is also the active direction. It is not (#548): the span does not
+        # just end early, the following REAL close is then read as a NEW opener
+        # and the inert branch copies everything up to the next quote — a real
+        # `&& <lifecycle command>` / `&& cp … <main>/f` included — verbatim as
+        # quoted data. `echo "\"" && halt; echo "z"` allowed on exactly that
+        # route. For DOUBLE quotes the scan therefore skips escaped candidates,
+        # which makes `ci` the close bash itself pairs (exact for any parseable
+        # input); SINGLE quotes keep the next-quote rule, which is likewise
+        # exact for them since a backslash inside `S…S` is an ordinary byte.
+        # The ACTIVE-span bookkeeping is unchanged — it resolves a real close
+        # through trusted_close() (see below), which already skipped escapes.
         if ((c == DQ || c == SQ) && !bs_escaped(s, i)) {
             qc = c
             ci = 0
-            for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { ci = j; break }
+            for (j = i + 1; j <= n; j++) {
+                if (substr(s, j, 1) == qc && !(qc == DQ && bs_escaped(s, j))) { ci = j; break }
+            }
             if (ci == 0) {
                 # Unterminated quote: advance ONE character with separators still
                 # ACTIVE, exactly like qsplit() (#113). Copying the whole rest of
@@ -2519,6 +2546,17 @@ parse_force_ops() {
 # and the raw copy is still scanned, so failing to dequote can only ever keep
 # the existing verdict, never widen it.
 #
+# DELIBERATELY ESCAPE-BLIND, re-verified under #548 (which made the file's
+# other quote-pairing scans escape-aware). This one is exempt because it only
+# ever REMOVES quote characters — it never redacts, never masks and never
+# segments — and its output is grep'"'"'ed for catastrophic patterns IN ADDITION
+# to (never instead of) the un-dequoted copy. A mis-paired span can therefore
+# only change WHICH extra text gets scanned, never hide text from the scan, so
+# no deny can be lost here however the quotes pair. Making it escape-aware
+# would change which spans get dequoted and so could only ADD denies — a
+# widening with its own risk and no safety gain, exactly the reason the
+# byte-presence `index()` test below is also kept as-is.
+#
 # NOTE: the awk program below is SINGLE-QUOTED. An apostrophe anywhere inside
 # it, including in a comment, terminates the string and breaks the guard for
 # every command in the repo. Keep comments here apostrophe-free.
@@ -2647,7 +2685,7 @@ dequote_inert_spans() {
 # keep the two files' behavior in sync.
 # =============================================================================
 strip_literal_text() {
-    printf '%s' "$1" | awk "$_HASLIVESUBST_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK"'
     # Mask the body of a `<flag> "$(cat <<QUOTED_DELIM … DELIM\n)"` heredoc.
     # See the header comment above for the four conditions and why each is
     # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
@@ -2753,6 +2791,34 @@ strip_literal_text() {
             }
             head  = substr(matched, 1, qpos)                              # up to & incl. opening quote
             qchar = substr(matched, qpos, 1)
+            # ESCAPED CLOSE (#548). `re`'"'"'s quoted-span class is a plain
+            # [^"]*, which has no way to express "not an ESCAPED quote" in
+            # POSIX ERE, so the match ends at the first `"` byte even when
+            # bash reads it as literal text. A value spelled
+            # `--body "he said \"hi\" about id > <main>/f"` was therefore
+            # redacted only as far as the `\"`, and the REST of the value —
+            # with its own escaped quotes still in it — was handed downstream
+            # as if it were unquoted shell text. Every later quote-tracking
+            # pass then paired quotes differently from bash, which is how a
+            # `>` sitting in prose became a live redirection operator and a
+            # purely textual `gh pr comment` false-DENIED on write
+            # confinement. Extend the span to the close bash itself pairs:
+            # scan on for the first UNESCAPED same-kind quote, and if there is
+            # none, leave the match exactly as the regex found it (never widen
+            # the redaction on unbalanced input). Only DOUBLE quotes can carry
+            # an escape — between `S…S` bash has no escape at all, so the
+            # regex close is already exact there.
+            if (qchar == DQ && bs_escaped(matched, length(matched))) {
+                comb = matched s
+                cl = 0
+                for (i = length(matched) + 1; i <= length(comb); i++) {
+                    if (substr(comb, i, 1) == qchar && !bs_escaped(comb, i)) { cl = i; break }
+                }
+                if (cl > 0) {
+                    matched = substr(comb, 1, cl)
+                    s = substr(comb, cl + 1)
+                }
+            }
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1) # between the quotes
             # Redact ONLY provably inert text (no command substitution / backtick).
             # gsub(/./) leaves embedded newlines untouched (awk `.` never matches a
@@ -2872,12 +2938,24 @@ strip_datasink_literals() {
     # UNQUOTED shell separator (or end of buffer). Quote-aware so an `awk`
     # program that contains `|` or `;` inside its quoted program text is read
     # as one unit — which is exactly what the vetoes below must see.
+    #
+    # Escape-aware on the same two rules as the main walk below (#548): an
+    # escaped quote opens nothing, and a `\"` does not close a DOUBLE-quoted
+    # span (a SINGLE-quoted one still ends at its next quote, since bash has
+    # no escape between `S…S`). Blindness here could end a span at a `\"` and
+    # make the NEXT separator a false command boundary, truncating the text the
+    # vetoes read — so a `sed -i` whose `-i` fell past that boundary was never
+    # vetoed and the command was admitted as an inert query sink.
     function qseg(s, start, n,    i, c, q, out) {
         out = ""; q = ""
         for (i = start; i <= n; i++) {
             c = substr(s, i, 1)
-            if (q != "") { out = out c; if (c == q) q = ""; continue }
-            if (c == SQ || c == DQ) { q = c; out = out c; continue }
+            if (q != "") {
+                out = out c
+                if (c == q && !(q == DQ && bs_escaped(s, i))) q = ""
+                continue
+            }
+            if ((c == SQ || c == DQ) && !bs_escaped(s, i)) { q = c; out = out c; continue }
             if (c == ";" || c == "&" || c == "|" || c == "\n") break
             out = out c
         }
@@ -2990,7 +3068,20 @@ strip_datasink_literals() {
                 out = out tok; i = j; continue
             }
             # Mid-command: a quoted span is redacted only inside a data sink.
-            if (c == DQ || c == SQ) {
+            #
+            # A BACKSLASH-ESCAPED quote never OPENS a span (#548) — the same
+            # rule qsplit()/ml_segment() have applied since #113. At an opener
+            # position this lexer is, by construction, OUTSIDE any quoted span
+            # (every span it recognises is consumed whole by the branch below),
+            # so an escaped quote there is exactly what bash reads it as:
+            # literal text. Opening a span on it was a write-confinement
+            # BYPASS of the same family as the close scans below — from a
+            # worktree cwd, `echo \" && cp /tmp/a <main>/f; echo "z"` paired
+            # the escaped quote with the `"` in the trailing `echo "z"` and
+            # redacted ` && cp /tmp/a <main>/f; echo ` as echo data, blanking
+            # the separator and the write target before
+            # extract_write_targets() ran. bash really performs that write.
+            if ((c == DQ || c == SQ) && !bs_escaped(s, i)) {
                 qc = c
                 ci = 0
                 # A DOUBLE-quoted span closes only on a `"` at the opener-s OWN
@@ -3006,12 +3097,30 @@ strip_datasink_literals() {
                 # whole value is one span carrying a live `$(` and is never
                 # redacted. Single quotes are exempt exactly as in
                 # trusted_close(): they cannot nest, so their close is always
-                # the next single-quote byte. Escape handling is deliberately
-                # unchanged (only the depth filter is added), and a span with
-                # no depth-matched close falls to the unterminated branch below,
-                # which never redacts — the safe direction.
+                # the next single-quote byte. A span with no depth-matched
+                # close falls to the unterminated branch below, which never
+                # redacts — the safe direction.
+                #
+                # A BACKSLASH-ESCAPED `"` is ALSO not a close (#548), for the
+                # same reason it is not an opener above: inside `"…"` bash
+                # reads `\"` as a literal quote character and the span runs on.
+                # Accepting it ended the echo value early, the following REAL
+                # `"` was read as a NEW opener, and everything up to the next
+                # quote — including a real `&& cp … <main>/f` — was redacted as
+                # echo data (`echo "\"" && cp /tmp/a <main>/f; echo "z"`, #548
+                # row 1; bash really performs that write). SINGLE quotes are
+                # exempt from the escape skip, and that exemption is exact
+                # rather than conservative: between `S…S` a backslash is an
+                # ORDINARY literal byte, so `S a\ S` really does end at that
+                # quote and skipping it would extend the redaction PAST what
+                # bash treats as data — the one direction that could hide a
+                # live write (`echo Sa\S && cp /tmp/a <main>/f` must keep
+                # denying). bs_escaped() is the same parity helper
+                # trusted_close() uses, so `\\"` (escaped BACKSLASH, live
+                # quote) still closes.
                 for (j = i + 1; j <= n; j++) {
-                    if (substr(s, j, 1) == qc && (qc != DQ || sdep[j] == sdep[i])) { ci = j; break }
+                    if (substr(s, j, 1) == qc && !(qc == DQ && bs_escaped(s, j)) && \
+                        (qc != DQ || sdep[j] == sdep[i])) { ci = j; break }
                 }
                 # Redact only when the depth-matched close AGREES with the
                 # naive next-quote close. This landed for the case subst_depth()
@@ -3027,8 +3136,17 @@ strip_datasink_literals() {
                 # a general ambiguity signal (an escaped quote, an unbalanced
                 # one) and falling to the unterminated branch below — copy
                 # verbatim, never redact — is the safe direction in every case.
+                #
+                # This scan carries the SAME escaped-close skip as the
+                # depth-matched one above (#548). It has to: the two are
+                # compared for agreement, so leaving one escape-blind would
+                # manufacture a permanent disagreement on every span holding a
+                # `\"` and silently disable the redaction (a false-positive
+                # source), while leaving BOTH escape-blind is the #548 bypass.
                 cn = 0
-                for (j = i + 1; j <= n; j++) if (substr(s, j, 1) == qc) { cn = j; break }
+                for (j = i + 1; j <= n; j++) {
+                    if (substr(s, j, 1) == qc && !(qc == DQ && bs_escaped(s, j))) { cn = j; break }
+                }
                 if (cn != ci) ci = 0
                 if (ci == 0) {
                     # Unterminated quote: copy the rest verbatim, never redact.
@@ -3118,7 +3236,7 @@ mask_ask_positional_args() {
     # would be silently decoded back to a bare "." before the regex engine
     # ever sees it, defeating the escaping and emitting a spurious "unknown
     # escape sequence" warning). ENVIRON values are passed through verbatim.
-    printf '%s' "$1" | CMDRE_FOR_AWK="$2" awk "$_HASLIVESUBST_AWK"'
+    printf '%s' "$1" | CMDRE_FOR_AWK="$2" awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK"'
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -3147,8 +3265,16 @@ mask_ask_positional_args() {
                 qc = substr(rest, 1, 1)
                 if (qc != DQ && qc != SQ) break
                 endpos = 0
+                # A backslash-escaped `"` does not close a DOUBLE-quoted span
+                # (#548) — bash reads it as a literal quote character. Ending
+                # the masked argument there let the following REAL close be
+                # read as a new opener, so this redaction could swallow a
+                # chained `&& cp … <main>/f` as if it were positional data and
+                # blank it out of extract_write_targets()-s view. SINGLE quotes
+                # keep the next-quote rule: between `S…S` bash has no escape,
+                # so skipping a quote there would mask live code instead.
                 for (i = 2; i <= length(rest); i++) {
-                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                    if (substr(rest, i, 1) == qc && !(qc == DQ && bs_escaped(rest, i))) { endpos = i; break }
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
@@ -4463,24 +4589,33 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 # DECIDE whether a token is a real (unquoted) redirection operator; the
 # ORIGINAL tokens are still used to extract the actual target text.
 #
-# Deliberately does NOT model backslash-escaped quotes -- same simplification
-# qsplit() (above) and strip_literal_text() already accept for this file's
-# other quote-tracking scans, and for good reason beyond just consistency: the
-# input mask_gt() actually receives (COMMAND_ASK_SCAN, see extract_write_targets()
-# below) has typically already been through strip_literal_text()'s OWN
-# escape-blind redaction, which can shift a quote's effective position (e.g. an
-# escaped `\"` inside a redacted --body value loses its backslash, since the
-# redaction's own quote-matching stops at the first bare `"` it finds). Layering
-# a stricter, escape-AWARE scan on top of that already-escape-blind text would
-# only desynchronize the two passes' quote parity -- worse, in the wrong
-# direction (masking too little). Matching qsplit()'s exact toggle-on-every-
-# quote-char behavior keeps both passes' parity in agreement. Same accepted
-# risk direction as qsplit(): pathological unbalanced-quote input could in
-# theory shift parity and mis-mask a genuine unquoted `>`, but that is the same
-# best-effort risk this file already accepts for `;|&` segmentation -- never a
-# NEW risk introduced here. An unterminated quote (no matching close before
-# end-of-string) just runs to the end of the string in that quote state --
-# never crashes, never mis-indexes.
+# ESCAPE PARITY (#548). This scan used to be deliberately escape-BLIND, on the
+# argument that its input has already been through other escape-blind passes and
+# that a stricter scan layered on top would only desynchronize their parity. It
+# is now escape-AWARE, in exactly the two places where bash itself is, because
+# blindness here was a confinement BYPASS rather than a mere simplification:
+#   - a backslash-escaped quote does not OPEN a span (`echo \" && cp …
+#     <main>/f; echo "z"` paired the escaped quote with the one in the trailing
+#     `echo "z"` and masked the whole write out of the whitespace split);
+#   - inside a DOUBLE-quoted span a `\"` does not CLOSE it (`echo "$(printf
+#     \"x )" && cp … <main>/f; echo "z"` ended the span at the `\"`, re-opened
+#     at the next `"`, and masked the separator and target the same way).
+# Both really write into the main checkout under bash, and both ALLOWED.
+# A SINGLE-quoted span keeps the next-quote rule: between `S…S` a backslash is
+# an ordinary literal byte, so its next `S` genuinely is the close, and skipping
+# it would mask live code. With those two rules the span this scan sees is the
+# span bash sees for any parseable input, which is also what keeps it in parity
+# with qsplit()/ml_segment()/strip_datasink_literals() — all of which now apply
+# the same two rules — rather than merely in parity with their old blindness.
+# Where an upstream redaction has already REMOVED a backslash (strip_literal_text()
+# blanking a `--body "…\"…"` value to `X`s) there is no escape left to see, so
+# the two passes still agree byte for byte. Same accepted risk direction as
+# qsplit(): pathological unbalanced-quote input could in theory shift parity and
+# mis-mask a genuine unquoted `>`, but that is the same best-effort risk this
+# file already accepts for `;|&` segmentation -- never a NEW risk introduced
+# here. An unterminated quote (no matching close before end-of-string) just runs
+# to the end of the string in that quote state -- never crashes, never
+# mis-indexes.
 # =============================================================================
 _MASKGT_AWK='
 function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
@@ -4494,21 +4629,25 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
     while (i <= n) {
         c = substr(s, i, 1)
         if (mode == 0) {
-            if (c == SQ) { mode = 1; out = out c; i++; continue }
-            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            # An escaped quote is literal text, not an opener (#548).
+            if (c == SQ && !bs_escaped(s, i)) { mode = 1; out = out c; i++; continue }
+            if (c == DQ && !bs_escaped(s, i)) { mode = 2; out = out c; i++; continue }
             out = out c
             i++
             continue
         }
         if (mode == 1) {
-            # Single-quoted: only the matching quote ends the span.
+            # Single-quoted: only the matching quote ends the span, escaped or
+            # not -- a backslash between S...S is an ordinary literal byte.
             if (c == SQ) { mode = 0; out = out c; i++; continue }
             out = out (c == ">" ? MASK : c)
             i++
             continue
         }
-        # mode == 2 (double-quoted): only the matching quote ends the span.
-        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        # mode == 2 (double-quoted): the matching quote ends the span unless it
+        # is backslash-escaped, in which case bash reads it as literal text and
+        # the span runs on (#548).
+        if (c == DQ && !bs_escaped(s, i)) { mode = 0; out = out c; i++; continue }
         out = out (c == ">" ? MASK : c)
         i++
     }
@@ -4549,13 +4688,15 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
 # always split into the SAME number of tokens at the SAME boundaries, because
 # mask_gt() only ever changes `>` bytes, never whitespace-ness.
 #
-# Deliberately does NOT model backslash-escaped quotes or attempt look-ahead
-# for a terminating quote — same simplification qsplit()/mask_gt() already
-# accept (see mask_gt()'s comment above for the accepted-risk rationale). An
-# unterminated quote just runs to the end of the string in that quote state;
-# never crashes, never mis-indexes, and never widens a deny into an allow
-# (the SAME fallback direction qsplit()'s own unterminated-quote handling
-# already uses, #4926).
+# Models backslash-escaped quotes exactly as mask_gt() above does (#548 — an
+# escaped quote opens nothing, and a `\"` inside a DOUBLE-quoted span does not
+# close it, while a SINGLE-quoted span still ends at its next quote); see
+# mask_gt()'s ESCAPE PARITY note for why that blindness was a write-confinement
+# bypass here rather than a safe simplification. It deliberately does NOT
+# attempt look-ahead for a terminating quote: an unterminated quote just runs to
+# the end of the string in that quote state; never crashes, never mis-indexes,
+# and never widens a deny into an allow (the SAME fallback direction qsplit()'s
+# own unterminated-quote handling already uses, #4926).
 #
 # This is scoped ONLY to extract_write_targets() -- qsplit() itself (and its
 # verbatim-quote-preservation contract depended on by extract_rm_targets() /
@@ -4574,14 +4715,16 @@ function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
     while (i <= n) {
         c = substr(s, i, 1)
         if (mode == 0) {
-            if (c == SQ) { mode = 1; out = out c; i++; continue }
-            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            # An escaped quote is literal text, not an opener (#548).
+            if (c == SQ && !bs_escaped(s, i)) { mode = 1; out = out c; i++; continue }
+            if (c == DQ && !bs_escaped(s, i)) { mode = 2; out = out c; i++; continue }
             out = out c
             i++
             continue
         }
         if (mode == 1) {
-            # Single-quoted: only the matching quote ends the span.
+            # Single-quoted: only the matching quote ends the span, escaped or
+            # not -- a backslash between S...S is an ordinary literal byte.
             if (c == SQ) { mode = 0; out = out c; i++; continue }
             if (c == " ") { out = out SPMASK; i++; continue }
             if (c == "\t") { out = out TABMASK; i++; continue }
@@ -4589,8 +4732,9 @@ function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
             i++
             continue
         }
-        # mode == 2 (double-quoted): only the matching quote ends the span.
-        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        # mode == 2 (double-quoted): the matching quote ends the span unless it
+        # is backslash-escaped (#548).
+        if (c == DQ && !bs_escaped(s, i)) { mode = 0; out = out c; i++; continue }
         if (c == " ") { out = out SPMASK; i++; continue }
         if (c == "\t") { out = out TABMASK; i++; continue }
         out = out c
