@@ -47,6 +47,7 @@
 # commands/repo/tests/test-assert-matches-sigpipe.sh,
 # commands/repo/tests/test-git-fixture-hermeticity.sh,
 # commands/repo/tests/test-deps-security-updates-paused.sh,
+# commands/repo/tests/test-deps-dependabot-alerts.sh,
 # commands/repo/tests/test-handoff-preflight.sh, and
 # commands/repo/tests/test_optimize_ci.py.
 #
@@ -1731,6 +1732,41 @@ else
     PASS=$((PASS + DP_PASS))
     FAIL=$((FAIL + DP_FAIL))
     record_suite "test-deps-security-updates-paused.sh" "$DP_PASS" "$DP_FAIL" "deps security-updates paused state"
+fi
+
+# /repo:deps step 1's open-Dependabot-alert read — the security-updates FLAG
+# and the bot-PR list cannot see an alert whose fix is blocked by a lockfile
+# pin or an override, so a `--check` run reported clean on a repo with 2 open
+# vulnerabilities (repo#551). Same delegation shape as every suite above.
+echo
+echo "-- deps open Dependabot alerts (delegated suite) --"
+DA_TEST="$TESTS_DIR/../../../commands/repo/tests/test-deps-dependabot-alerts.sh"
+if [[ ! -f "$DA_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-deps-dependabot-alerts.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-deps-dependabot-alerts.sh" "$DA_TEST"
+else
+    DA_OUT="$(bash "$DA_TEST" 2>&1)"
+    DA_STATUS=$?
+    DA_PASS="$(suite_count Passed "$DA_OUT")"
+    DA_FAIL="$(suite_count Failed "$DA_OUT")"
+    if ! [[ "$DA_PASS" =~ ^[0-9]+$ && "$DA_FAIL" =~ ^[0-9]+$ ]]; then
+        DA_PASS=0
+        DA_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-deps-dependabot-alerts.sh" "$DA_STATUS"
+        strip_ansi "$DA_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$DA_STATUS" -ne 0 || "$DA_FAIL" -ne 0 ]]; then
+        [[ "$DA_FAIL" -eq 0 ]] && DA_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-deps-dependabot-alerts.sh" "$DA_PASS" "$DA_FAIL" "$DA_STATUS"
+        strip_ansi "$DA_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-deps-dependabot-alerts.sh" "$DA_PASS"
+    fi
+    PASS=$((PASS + DA_PASS))
+    FAIL=$((FAIL + DA_FAIL))
+    record_suite "test-deps-dependabot-alerts.sh" "$DA_PASS" "$DA_FAIL" "deps open Dependabot alerts"
 fi
 
 # /repo:handoff's step-0 reader preflight — the command writes .claude/handoff.md
