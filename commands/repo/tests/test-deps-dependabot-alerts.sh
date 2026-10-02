@@ -228,7 +228,7 @@ assert_contains "the 403 ambiguity is disambiguated against the alerts flag" "$S
 assert_contains "alerts-disabled is reported as n/a, not as a zero count" "$STEP1_FLAT" \
     "n/a — alerts disabled"
 assert_matches "step 1's own read site warns that 403 is UNKNOWN, not 0" "$STEP1" \
-    '403 . UNKNOWN, never 0'
+    '403 .* UNKNOWN, never 0'
 # Safety Rule 2 is where this generalizes beyond step 1.
 assert_contains "Safety Rule 2 covers the open-alert read" "$DEPS_FLAT" \
     "UNKNOWN (not \`0 open\`) when it can't read \`/dependabot/alerts\`"
