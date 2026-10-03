@@ -2198,7 +2198,7 @@ function subst_heads(s, sep,   d, n, i, c, dep, k, res, cseg, con, top, BQ) {
     }
     return res
 }
-function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk, sdep) {
+function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk, sdep, tc, tj, actend, sdready) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -2210,7 +2210,9 @@ function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, sca
     # uninitialized value, which is 0 in the boolean tests here. See the
     # `sdaware` paragraph in this block-s header for why the flag exists
     # rather than the behaviour being unconditional.
-    if (sdaware) subst_depth(s, sdep)
+    sdready = 0
+    if (sdaware) { subst_depth(s, sdep); sdready = 1 }
+    actend = 0   # last byte of the widest TRUE active-span extent seen (#447)
     i = 1
     while (i <= n) {
         c = substr(s, i, 1)
@@ -2286,7 +2288,35 @@ function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, sca
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (!has_live_subst(inner)) {
+            # SINGLE-QUOTED SPANS ARE ALWAYS INERT AT THE TOP LEVEL (#447,
+            # porting canonical #443/#450/#453). Inside real single quotes bash
+            # performs NO expansion of any kind, so a dollar-paren or backtick
+            # there is plain data and a `;`/`&`/`|` there is a literal byte --
+            # keeping separators ACTIVE leaked a phantom top-level boundary and
+            # re-classified quoted DATA (an ssh remote payload such as
+            # T=$(mktemp -d); rm ..., or an echo argument X=$(true); rm ...)
+            # as a real command (false deny). Same rationale and same
+            # `qc == SQ ||` shape as the redaction site further down (#5783).
+            # DQ/unquoted spans are untouched: the #113/#3679/#3755 floor
+            # (separators stay ACTIVE inside a substitution-bearing span) is
+            # unchanged for them.
+            #
+            # CRITICAL -- the `i > actend` term is load-bearing (#450/#453); a
+            # bare `qc == SQ ||` regresses. An apostrophe reached while a LIVE
+            # double-quoted span is still open is literal text to bash, and the
+            # command substitution between two such apostrophes really executes
+            # (flat #450 shape: a DQ string with an apostrophe, then a
+            # substitution running a destructive command, then another
+            # apostrophe). qsplit() has no ACTIVE-span stack, so `actend`
+            # records where the widest substitution-bearing span REALLY ends;
+            # an SQ at or before it is not a top-level opener and stays on the
+            # active-walk path below. `actend` must be the TRUE close, not the
+            # first same-kind quote: a DQ nested one substitution level deeper
+            # is a PHANTOM close that would otherwise drop us to "top level"
+            # while still inside live code (#453), so the close search below
+            # skips quotes at a deeper subst_depth() -- the canonical
+            # trusted_close() mechanism, adapted to this single-pass walk.
+            if ((qc == SQ && i > actend) || !has_live_subst(inner)) {
                 # Inert quoted span: copy verbatim, separators inside are literal.
                 out = out substr(s, i, ci - i + 1)
                 i = ci + 1
@@ -2315,6 +2345,22 @@ function qsplit(s, sdaware,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, sca
             # segment'"'"'s `-i`-prefixed token ends up inside the earlier `sed`
             # segment'"'"'s own argument list, producing a phantom write-target `|`.
             out = out c   # the opening quote, emitted literally
+            # Record where this active span TRULY ends (#447, see above).
+            if (!sdready) { subst_depth(s, sdep); sdready = 1 }
+            tc = ci
+            if (qc == DQ) {
+                while (tc > 0 && sdep[tc] != sdep[i]) {
+                    tj = tc + 1
+                    tc = 0
+                    for (; tj <= n; tj++) {
+                        if (substr(s, tj, 1) == DQ && !bs_escaped(s, tj)) { tc = tj; break }
+                    }
+                }
+                # No same-depth close found: unbalanced, fail closed -- treat
+                # the rest of the command as still inside the span.
+                if (tc == 0) tc = n
+            }
+            if (tc > actend) actend = tc
             k = i + 1
             while (k < ci) {
                 ch = substr(s, k, 1)
