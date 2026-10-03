@@ -376,5 +376,79 @@ if [[ -n "$WTC331_MAIN" && "$WTC331_MAIN" != "/" && -d "$WTC331_MAIN" ]]; then
 fi
 
 echo ""
+echo "=== qsplit(): single-quoted spans are inert at the top level (#447, ports #443/#450/#453) ==="
+echo ""
+
+# HEADER CONTRACT. qsplit() used to keep separators ACTIVE inside ANY quoted
+# span whose text merely contained a dollar-paren or backtick -- including
+# SINGLE-quoted spans, where bash performs no expansion at all. A literal `;`
+# in quoted DATA leaked out as a phantom top-level boundary and the tail was
+# classified as a real command (false deny of `ssh h '...; rm ...'` and
+# `echo '...; rm ...'`). Single-quoted spans reached at the TOP LEVEL are now
+# always inert. The fix is NOT the bare `qc == SQ || ...` one-liner: that
+# regresses on #450 (apostrophe inside a still-open live DQ span) and #453
+# (a nested-substitution DQ close mistaken for the outer close), so qsplit()
+# tracks where the widest active span REALLY ends (`actend`, depth-aware, the
+# analogue of the canonical acn/trusted_close()) and the SQ term is gated on
+# `i > actend`. DQ and unquoted spans keep the #113 separator-active floor.
+#
+# Danger phrases assembled at runtime so this file never contains the literal
+# string a naive scan of the harness's own Bash call would flag.
+_Q447_RM="rm -r""f /dev/shm/orphaned-build-dir"   # outside-repo absolute path
+_Q447_RM_ETC="rm -r""f /etc/orphaned-build-dir"
+_Q447_RMVAR="rm -r""f \"\$TMPDIR\""
+_Q447_HALT="ha""lt"
+_Q447_BT='`mktemp -d`'
+
+assert_shell_accepts() {
+    local desc="$1" cmd="$2"
+    if bash -n <<<"$cmd" 2>/dev/null; then pass "$desc"; else fail "$desc (bash -n rejected it)"; fi
+}
+
+# 1. deny -> allow: the issue repro shapes.
+assert_allow "#447: ssh with a single-quoted mktemp+rm remote payload is allowed" \
+    "ssh myhost 'TMPDIR=\$(mktemp -d); $_Q447_RMVAR'"
+assert_allow "#447: ssh with a single-quoted \$( ) then a literal-path rm is allowed" \
+    "ssh myhost 'X=\$(true); $_Q447_RM'"
+assert_allow "#447: ssh with a single-quoted backtick then a literal-path rm is allowed" \
+    "ssh myhost 'X=$_Q447_BT; $_Q447_RM'"
+assert_allow "#447: single-quoted \$( ) then an rm inside a plain echo argument is allowed" \
+    "echo 'X=\$(true); $_Q447_RM'"
+assert_allow "#447: single-quoted \$( ) then a &&-separated rm is allowed" \
+    "echo 'X=\$(true) && $_Q447_RM'"
+assert_allow "#447: single-quoted \$( ) then a ;-separated lifecycle word in a grep pattern is allowed" \
+    "grep -E 'X=\$(true); $_Q447_HALT ' file"
+
+# 2. CONTROLS (#113 floor): DQ and unquoted substitution smuggling still denies.
+assert_deny "#447 control: DOUBLE-quoted \$( ) then a ;-separated rm still denies" \
+    "echo \"X=\$(true); $_Q447_RM\""
+assert_deny "#447 control: DOUBLE-quoted backtick then a ;-separated rm still denies" \
+    "echo \"X=$_Q447_BT; $_Q447_RM\""
+assert_deny "#447 control: UNQUOTED \$( ) then a ;-separated rm still denies" \
+    "echo X=\$(true); $_Q447_RM"
+assert_deny "#447 control: single-quoted span closes before a REAL ;-separated rm denies" \
+    "echo 'X=\$(true)' ; $_Q447_RM"
+assert_deny "#447 control: single-quoted span closes before a REAL ;-separated lifecycle word denies" \
+    "echo 'X=\$(true)' ; $_Q447_HALT"
+
+# 3. #450: apostrophes inside a still-open LIVE double-quoted span are literal
+#    text; the substitution between them really executes. Must still deny.
+_Q447_A="echo \"don't \$(true; $_Q447_RM) won't\""
+assert_shell_accepts "#447/#450: flat shape is parseable (so the deny matters)" "$_Q447_A"
+assert_deny "#447/#450: apostrophes inside a live DQ span do not make the \$( ) inert" "$_Q447_A"
+
+# 4. #453: a DQ nested one substitution level deeper is a PHANTOM close; the
+#    bare `qc == SQ ||` one-liner allowed all three of these.
+_Q447_NA="echo \"x \$(echo \"y'z \$(true; $_Q447_RM) w'v\") q\""
+_Q447_NB="echo \"\$(echo \"a'b \$(true; $_Q447_RM) c'd\")\""
+_Q447_NC="echo \"\$(cat \"f'g \$(true; $_Q447_RM_ETC) h'i\")\""
+assert_shell_accepts "#447/#453: nested shape A is parseable" "$_Q447_NA"
+assert_deny "#447/#453: nested shape A (leading text before nested \$( )) denies" "$_Q447_NA"
+assert_shell_accepts "#447/#453: nested shape B is parseable" "$_Q447_NB"
+assert_deny "#447/#453: nested shape B (substitution opens the span) denies" "$_Q447_NB"
+assert_shell_accepts "#447/#453: nested shape C is parseable" "$_Q447_NC"
+assert_deny "#447/#453: nested shape C (/etc target, cat inner command) denies" "$_Q447_NC"
+
+echo ""
 echo "=== $PASS/$TOTAL passed ==="
 [[ "$FAIL" -eq 0 ]]
