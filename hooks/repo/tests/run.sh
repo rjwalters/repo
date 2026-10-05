@@ -38,6 +38,7 @@
 # commands/repo/tests/test-work-log-docs-pr-self-loop.sh,
 # commands/repo/tests/test-followups-scrub-step.sh,
 # commands/repo/tests/test-followups-dedup-step.sh,
+# commands/repo/tests/test-followups-requested-by.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
@@ -1478,6 +1479,43 @@ else
     PASS=$((PASS + FD_PASS))
     FAIL=$((FAIL + FD_FAIL))
     record_suite "test-followups-dedup-step.sh" "$FD_PASS" "$FD_FAIL" "followups dedup match-type contract"
+fi
+
+# /repo:followups' requested-by attribution contract (repo#556): every newly
+# filed body must end with exactly one real
+# `<!-- loom:requested-by login=<login> via=<session|agent> -->` marker outside
+# code fences, resolved from the invocation context rather than the token's
+# login. Prose contract plus jq --rawfile serialization fixtures against a
+# stubbed gh; same delegation shape as every suite above.
+echo
+echo "-- followups requested-by attribution (delegated suite) --"
+FR_TEST="$TESTS_DIR/../../../commands/repo/tests/test-followups-requested-by.sh"
+if [[ ! -f "$FR_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-followups-requested-by.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-followups-requested-by.sh" "$FR_TEST"
+else
+    FR_OUT="$(bash "$FR_TEST" 2>&1)"
+    FR_STATUS=$?
+    FR_PASS="$(suite_count Passed "$FR_OUT")"
+    FR_FAIL="$(suite_count Failed "$FR_OUT")"
+    if ! [[ "$FR_PASS" =~ ^[0-9]+$ && "$FR_FAIL" =~ ^[0-9]+$ ]]; then
+        FR_PASS=0
+        FR_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-followups-requested-by.sh" "$FR_STATUS"
+        strip_ansi "$FR_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$FR_STATUS" -ne 0 || "$FR_FAIL" -ne 0 ]]; then
+        [[ "$FR_FAIL" -eq 0 ]] && FR_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-followups-requested-by.sh" "$FR_PASS" "$FR_FAIL" "$FR_STATUS"
+        strip_ansi "$FR_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-followups-requested-by.sh" "$FR_PASS"
+    fi
+    PASS=$((PASS + FR_PASS))
+    FAIL=$((FAIL + FR_FAIL))
+    record_suite "test-followups-requested-by.sh" "$FR_PASS" "$FR_FAIL" "followups requested-by attribution"
 fi
 
 # /repo:all's ownership of Audit-surfaced orphaned files (repo#301): a tracked,
