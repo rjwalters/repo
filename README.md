@@ -142,12 +142,36 @@ The installer copies the skill files into a target repository's `.claude/` (Clau
 # Dev mode: symlink source files for live editing (dogfooding)
 ./install.sh --dev .
 
+# Skip the destructive-command guard (persisted — see "Opting out of the guard")
+./install.sh --no-guard ~/projects/my-app
+
 # Opt into the shell `claude` wrapper (see "Optional: surface the note to the
 # human too" above) — off by default, edits your shell rc
 ./install.sh --shell-wrapper ~/projects/my-app
 ```
 
 To remove: `./uninstall.sh /path/to/target-repo`.
+
+### Opting out of the guard
+
+`./install.sh --no-guard <target>` installs everything except the Repo Skills
+destructive-command guard: `guard-destructive.sh` is neither copied nor (under
+`--dev`) symlinked, and no `PreToolUse` entry for it is added to
+`.claude/settings.json`. Other hooks, permissions, and commands are installed
+exactly as usual.
+
+The opt-out is **persisted** as `"guardHook": "disabled"` in the tracked
+`.claude/skills/repo/install-metadata.json` (and the Codex copy), so later plain
+`./install.sh <target>` runs and `resync-installed.sh` refreshes keep the guard
+out — even when no other guard is wired. `--dry-run` reports the effective
+policy without writing anything. `guardHookInstalled: false` on its own is *not*
+an opt-out (it also records deferral to another tool's guard).
+
+The opt-out does not remove a guard an earlier install already wired; delete
+that `PreToolUse` entry and `.claude/skills/repo/hooks/guard-destructive.sh` by
+hand if wanted. **To re-enable**, delete the `"guardHook": "disabled"` line from
+`.claude/skills/repo/install-metadata.json` and re-run `./install.sh <target>`
+without `--no-guard`; the default (coexistence-aware) behavior returns.
 
 ### Updating an existing install
 
@@ -208,7 +232,7 @@ before there was any way to say "this file is ours".
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
-- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall). **Conditional**: skipped entirely when another destructive-command guard is already wired in `.claude/settings.json` (e.g. an existing Loom install) — the same coexistence check the `.claude/settings.json` bullet below describes decides both whether to wire the hook *and* whether to even copy the script, so a deferred install never ships a copy of the ~6,700-line script nothing would run. The decision is recorded in `install-metadata.json`'s `guardHookInstalled` field so `resync-installed.sh` keeps respecting it on every later refresh
+- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall). **Conditional**: skipped entirely when another destructive-command guard is already wired in `.claude/settings.json` (e.g. an existing Loom install) — the same coexistence check the `.claude/settings.json` bullet below describes decides both whether to wire the hook *and* whether to even copy the script, so a deferred install never ships a copy of the ~6,700-line script nothing would run. The decision is recorded in `install-metadata.json`'s `guardHookInstalled` field so `resync-installed.sh` keeps respecting it on every later refresh. Also skipped (along with its `settings.json` entry) under an explicit `--no-guard` opt-out, persisted as `guardHook: "disabled"` — see "Opting out of the guard" above
 - `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall

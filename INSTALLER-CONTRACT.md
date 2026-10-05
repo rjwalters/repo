@@ -111,8 +111,21 @@ therefore **MUST NOT** contain an absolute path, a hostname, a username, or a
 timestamp — those go in the sidecar (C6).
 
 Additional fields are permitted as long as they preserve that property (Repo
-Skills also records `dev`, `filtered`, `guardHookInstalled`, and the selected
-`commands`).
+Skills also records `dev`, `filtered`, `guardHookInstalled`, the selected
+`commands`, and — only when the operator opted out — `guardHook`).
+
+**Recorded policy vs. recorded outcome.** A tracked field may record an
+operator *policy* that later runs must honor, as distinct from the *outcome* of
+one run. Repo Skills keeps the two apart for its destructive-command guard
+(repo#557): `guardHookInstalled` is the outcome (`false` also means "deferred to
+another tool's guard", re-evaluated on every install), while `"guardHook":
+"disabled"` — written only by `install.sh --no-guard` — is the policy. A policy
+field **MUST** be honored by every later installer run *and* by the C7 resync,
+and **MUST** be preserved through every metadata rewrite (both the Claude and
+Codex copies), so a plain reinstall or refresh never silently reverts it. An
+outcome field alone **MUST NOT** be read as a policy. Re-enabling is an explicit
+operator action: delete the `guardHook` line from
+`.claude/skills/repo/install-metadata.json` and re-run `install.sh`.
 
 > Spot-check: `jq -e '.version and .commit and .layout_version' <tool-root>/install-metadata.json`
 > and `jq -e 'has("source") or has("installed_at") | not' <tool-root>/install-metadata.json`
@@ -174,6 +187,11 @@ and:
 - **MUST NOT** uninstall. Removing installed surfaces is the uninstaller's job
   and stays a separate, explicit action. **A refresh that can delete is not a
   refresh.**
+- **MUST** honor and carry forward any recorded install *policy* (C5) — e.g.
+  Repo Skills' `"guardHook": "disabled"`: the guard is neither refreshed nor
+  re-added, and the field survives the metadata re-stamp. A resync whose source
+  emitter cannot write the policy **MUST** leave the metadata as is rather than
+  drop it.
 - **SHOULD** restamp the tool's own version token wherever consumer-facing
   prose states it (a `CLAUDE.md`/`AGENTS.md` pointer block, a README badge
   written at install time, etc.), even though that file's *installer-managed
