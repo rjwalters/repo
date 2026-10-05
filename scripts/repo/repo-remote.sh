@@ -138,6 +138,24 @@
 # session expected to survive a stop/start: it makes the expectation explicit
 # rather than re-derived from a tag that a fleet host can also be wearing.
 #
+# AWS root volume (repo#559): the root EBS volume is launched EXPLICITLY typed,
+# never left to the AMI default (gp2, whose 3 IOPS/GiB baseline — 150 IOPS at
+# 50 GiB — leaves sustained builds/tests stalled in disk wait once its burst
+# credits drain). Settings, all AWS-only, resolved through the same two config
+# layers as everything else:
+#   REPO_REMOTE_DISK_GB            root volume size in GiB (default 50)
+#   REPO_REMOTE_VOLUME_TYPE        gp3 (default) | gp2
+#   REPO_REMOTE_VOLUME_IOPS        gp3 only; default 3000 (the gp3 baseline)
+#   REPO_REMOTE_VOLUME_THROUGHPUT  gp3 only, MiB/s; default 125 (the baseline)
+# They are validated BEFORE any cloud call (exit 2): an unsupported type, a
+# non-positive-integer value, IOPS/throughput set alongside gp2, or a gp3 value
+# outside AWS's documented limits (IOPS 3000-80000 and <= 500 per GiB;
+# throughput 125-2000 MiB/s and <= 0.25 MiB/s per provisioned IOPS) is refused.
+# On REUSE, `up` inspects the instance's actual root volume and, if it is gp2,
+# prints a stderr advisory with the copyable `aws ec2 modify-volume` command and
+# the `ec2:ModifyVolume` permission it needs. It never runs that command, and a
+# failed inspection is a notice, never a failed `up`.
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure) — also
@@ -316,6 +334,9 @@ NAME=""
 INSTANCE_TYPE=""
 INSTANCE_ID=""
 DISK_GB=""
+VOLUME_TYPE=""       # AWS only: root EBS volume type, gp3 (default) | gp2 (repo#559)
+VOLUME_IOPS=""       # AWS only, gp3 only: provisioned IOPS (default 3000)
+VOLUME_THROUGHPUT="" # AWS only, gp3 only: provisioned throughput, MiB/s (default 125)
 IMAGE=""
 GPU_ACCEL=""       # GCP accelerator string, e.g. nvidia-l4:1
 IDLE_MIN=""
@@ -465,6 +486,13 @@ resolve_settings() {
 
   # Non-cost-relevant fields DO fall back to defaults (matches the prose command).
   DISK_GB="${REPO_REMOTE_DISK_GB:-50}"
+  # AWS root-volume type and performance (repo#559). The type is lower-cased
+  # and defaulted here; IOPS/throughput stay exactly as configured (possibly
+  # empty) so validate_aws_volume_config() can tell "explicitly set alongside
+  # gp2" apart from "unset", and it fills in the gp3 defaults itself.
+  VOLUME_TYPE="$(printf '%s' "${REPO_REMOTE_VOLUME_TYPE:-gp3}" | tr '[:upper:]' '[:lower:]')"
+  VOLUME_IOPS="${REPO_REMOTE_VOLUME_IOPS:-}"
+  VOLUME_THROUGHPUT="${REPO_REMOTE_VOLUME_THROUGHPUT:-}"
   IDLE_MIN="${REPO_REMOTE_IDLE_SHUTDOWN_MIN:-120}"
   # Idle-exit marker contract (see commands/repo/remote.md). A daemon-managed
   # host (e.g. one running loom-daemon) may write this file on clean idle-exit;
@@ -537,6 +565,103 @@ require_cost_config() {
     log "set them in ${SHARED_ENV} (shared) or ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (per-repo), or run /repo:remote --configure."
     exit 2
   fi
+}
+
+# ── AWS root-volume configuration (repo#559) ────────────────────────────────
+# Limits below are AWS's documented EBS values (Amazon EBS User Guide,
+# "General Purpose SSD volumes", checked 2026-10-05): gp3 = 1 GiB-64 TiB,
+# 3,000 IOPS / 125 MiB/s baseline included, provisionable up to 80,000 IOPS at
+# <= 500 IOPS per GiB and up to 2,000 MiB/s at <= 0.25 MiB/s per provisioned
+# IOPS; gp2 = 1 GiB-16 TiB with performance derived from size (3 IOPS/GiB), so
+# it takes no IOPS/throughput parameters at all. AWS has raised these ceilings
+# before; if they move again, update the constants rather than the logic.
+GP3_MIN_IOPS=3000
+GP3_MAX_IOPS=80000
+GP3_MAX_IOPS_PER_GIB=500
+GP3_MIN_THROUGHPUT=125
+GP3_MAX_THROUGHPUT=2000
+GP3_MAX_GIB=65536
+GP2_MAX_GIB=16384
+
+is_positive_int() {  # <value> -> 0 for a plain positive decimal integer
+  # Capped at 9 digits so the arithmetic below can never overflow.
+  [[ "$1" =~ ^[1-9][0-9]{0,8}$ ]]
+}
+
+# Validate (and default) the AWS root-volume settings. Runs for every AWS `up`
+# — dry run included — BEFORE any cloud call, so a bad value fails loudly
+# (exit 2) without spending or mutating anything. GCP never reaches this.
+validate_aws_volume_config() {
+  local -a bad=()
+  is_positive_int "$DISK_GB" \
+    || bad+=("REPO_REMOTE_DISK_GB='${DISK_GB}' must be a positive whole number of GiB")
+
+  case "$VOLUME_TYPE" in
+    gp3)
+      VOLUME_IOPS="${VOLUME_IOPS:-$GP3_MIN_IOPS}"
+      VOLUME_THROUGHPUT="${VOLUME_THROUGHPUT:-$GP3_MIN_THROUGHPUT}"
+      local iops_ok=false tp_ok=false
+      if ! is_positive_int "$VOLUME_IOPS"; then
+        bad+=("REPO_REMOTE_VOLUME_IOPS='${VOLUME_IOPS}' must be a positive whole number")
+      elif (( VOLUME_IOPS < GP3_MIN_IOPS || VOLUME_IOPS > GP3_MAX_IOPS )); then
+        bad+=("REPO_REMOTE_VOLUME_IOPS=${VOLUME_IOPS} is outside the gp3 range ${GP3_MIN_IOPS}-${GP3_MAX_IOPS}")
+      else
+        iops_ok=true
+      fi
+      if ! is_positive_int "$VOLUME_THROUGHPUT"; then
+        bad+=("REPO_REMOTE_VOLUME_THROUGHPUT='${VOLUME_THROUGHPUT}' must be a positive whole number of MiB/s")
+      elif (( VOLUME_THROUGHPUT < GP3_MIN_THROUGHPUT || VOLUME_THROUGHPUT > GP3_MAX_THROUGHPUT )); then
+        bad+=("REPO_REMOTE_VOLUME_THROUGHPUT=${VOLUME_THROUGHPUT} is outside the gp3 range ${GP3_MIN_THROUGHPUT}-${GP3_MAX_THROUGHPUT} MiB/s")
+      else
+        tp_ok=true
+      fi
+      if is_positive_int "$DISK_GB"; then
+        (( DISK_GB > GP3_MAX_GIB )) \
+          && bad+=("REPO_REMOTE_DISK_GB=${DISK_GB} exceeds the gp3 maximum of ${GP3_MAX_GIB} GiB")
+        # The 3,000 IOPS baseline is included at every size; only IOPS
+        # provisioned ABOVE it are bound by the per-GiB ratio.
+        if [[ "$iops_ok" == true ]] && (( VOLUME_IOPS > GP3_MIN_IOPS && VOLUME_IOPS > DISK_GB * GP3_MAX_IOPS_PER_GIB )); then
+          bad+=("REPO_REMOTE_VOLUME_IOPS=${VOLUME_IOPS} exceeds ${GP3_MAX_IOPS_PER_GIB} IOPS per GiB for a ${DISK_GB} GiB gp3 volume (max $(( DISK_GB * GP3_MAX_IOPS_PER_GIB ))); raise REPO_REMOTE_DISK_GB or lower the IOPS")
+        fi
+      fi
+      # 0.25 MiB/s per provisioned IOPS  <=>  throughput * 4 <= IOPS.
+      if [[ "$iops_ok" == true && "$tp_ok" == true ]] && (( VOLUME_THROUGHPUT * 4 > VOLUME_IOPS )); then
+        bad+=("REPO_REMOTE_VOLUME_THROUGHPUT=${VOLUME_THROUGHPUT} exceeds 0.25 MiB/s per provisioned IOPS (REPO_REMOTE_VOLUME_IOPS=${VOLUME_IOPS} allows at most $(( VOLUME_IOPS / 4 )) MiB/s)")
+      fi
+      ;;
+    gp2)
+      # gp2 performance is a function of size; AWS rejects Iops/Throughput on
+      # it. Refuse rather than silently drop a setting the operator asked for.
+      [[ -z "$VOLUME_IOPS" ]] \
+        || bad+=("REPO_REMOTE_VOLUME_IOPS is set but REPO_REMOTE_VOLUME_TYPE=gp2 does not accept provisioned IOPS (unset it, or use gp3)")
+      [[ -z "$VOLUME_THROUGHPUT" ]] \
+        || bad+=("REPO_REMOTE_VOLUME_THROUGHPUT is set but REPO_REMOTE_VOLUME_TYPE=gp2 does not accept provisioned throughput (unset it, or use gp3)")
+      if is_positive_int "$DISK_GB" && (( DISK_GB > GP2_MAX_GIB )); then
+        bad+=("REPO_REMOTE_DISK_GB=${DISK_GB} exceeds the gp2 maximum of ${GP2_MAX_GIB} GiB")
+      fi
+      ;;
+    *)
+      bad+=("REPO_REMOTE_VOLUME_TYPE='${VOLUME_TYPE}' is not supported (expected gp3 or gp2)")
+      ;;
+  esac
+
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    local b
+    log "cannot proceed — invalid AWS root-volume config (nothing was created or changed):"
+    for b in "${bad[@]}"; do log "  - $b"; done
+    log "see 'AWS root volume' in commands/repo/remote.md for supported values."
+    exit 2
+  fi
+}
+
+# The --block-device-mappings value for the root volume. Type-aware: gp3 gets
+# its explicit IOPS/throughput, gp2 gets neither (AWS rejects them there).
+aws_root_block_device_mapping() {
+  local ebs="VolumeSize=${DISK_GB},VolumeType=${VOLUME_TYPE}"
+  if [[ "$VOLUME_TYPE" == gp3 ]]; then
+    ebs+=",Iops=${VOLUME_IOPS},Throughput=${VOLUME_THROUGHPUT}"
+  fi
+  printf 'DeviceName=/dev/sda1,Ebs={%s}' "$ebs"
 }
 
 # ── the fleet-marker guard (reuse discovery, repo#164) ──────────────────────
@@ -1361,6 +1486,90 @@ aws_refresh_ssh_ingress() {  # [--no-create]
   aws_verify_ssh_ingress "$RESOLVED_SG"
 }
 
+# ── reused-instance root-volume advisory (repo#559) ─────────────────────────
+# An instance created before repo#559 (or by hand) may still have a gp2 root
+# volume. `up` cannot fix that at launch time — the box already exists — so on
+# REUSE it looks the actual root volume up and, if it is gp2, prints the
+# operator-run conversion command. It NEVER runs modify-volume itself: changing
+# a volume is the operator's decision and needs a permission (ec2:ModifyVolume)
+# this tooling does not otherwise require.
+#
+# Strictly best effort and stderr-only: every failure (API error, permission
+# denial, no root mapping, empty/"None" answers) ends in a NOTICE and a return
+# 0, never a failed `up`, and never a guessed volume id. The root volume is
+# found by matching the instance's RootDeviceName against its
+# BlockDeviceMappings — never "the first attached volume" — and the EC2 device
+# name (/dev/sda1) is used as reported, not the guest's NVMe name.
+aws_root_volume_advisory() {  # <instance-id>
+  local iid="$1" root_dev mappings vol vtype errf rc err
+  local how="to check it yourself: aws ec2 describe-instances --instance-ids ${iid} --region ${REGION} --query 'Reservations[0].Instances[0].[RootDeviceName,BlockDeviceMappings]' (needs ec2:DescribeInstances), then aws ec2 describe-volumes --volume-ids <root-volume-id> --region ${REGION} --query 'Volumes[0].VolumeType' (needs ec2:DescribeVolumes)."
+  local unknown="NOTICE: could not determine the root volume type of reused instance ${iid}, so the gp2 -> gp3 check was skipped (this does not affect the run)"
+
+  # Configured gp2 on purpose: an existing gp2 root is what was asked for.
+  [[ "$VOLUME_TYPE" == gp3 ]] || return 0
+
+  errf="$(mktemp)"
+  root_dev="$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].RootDeviceName' --output text 2>"$errf")"; rc=$?
+  err="$(head -n1 "$errf" 2>/dev/null)"
+  if [[ $rc -ne 0 ]]; then
+    rm -f "$errf"
+    log "${unknown}: describe-instances failed (exit ${rc}${err:+: ${err}}). ${how}"
+    return 0
+  fi
+  root_dev="$(printf '%s' "$root_dev" | tr -d '[:space:]')"
+  if [[ -z "$root_dev" || "$root_dev" == None ]]; then
+    rm -f "$errf"
+    log "${unknown}: the instance reports no RootDeviceName. ${how}"
+    return 0
+  fi
+
+  mappings="$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].BlockDeviceMappings[].[DeviceName,Ebs.VolumeId]' \
+    --output text 2>"$errf")"; rc=$?
+  err="$(head -n1 "$errf" 2>/dev/null)"
+  if [[ $rc -ne 0 ]]; then
+    rm -f "$errf"
+    log "${unknown}: describe-instances (block device mappings) failed (exit ${rc}${err:+: ${err}}). ${how}"
+    return 0
+  fi
+  vol="$(printf '%s\n' "$mappings" | awk -v d="$root_dev" '$1 == d { print $2; exit }')"
+  if [[ ! "$vol" =~ ^vol-[0-9a-zA-Z]+$ ]]; then
+    rm -f "$errf"
+    log "${unknown}: no EBS volume is attached at its root device ${root_dev}. ${how}"
+    return 0
+  fi
+
+  vtype="$(aws ec2 describe-volumes --volume-ids "$vol" \
+    --query 'Volumes[0].VolumeType' --output text 2>"$errf")"; rc=$?
+  err="$(head -n1 "$errf" 2>/dev/null)"
+  rm -f "$errf"
+  if [[ $rc -ne 0 ]]; then
+    log "${unknown}: describe-volumes on root volume ${vol} failed (exit ${rc}${err:+: ${err}}) — reading a volume's type needs the ec2:DescribeVolumes permission. ${how}"
+    return 0
+  fi
+  vtype="$(printf '%s' "$vtype" | tr -d '[:space:]')"
+  if [[ -z "$vtype" || "$vtype" == None ]]; then
+    log "${unknown}: describe-volumes returned no type for root volume ${vol}. ${how}"
+    return 0
+  fi
+
+  [[ "$vtype" == gp2 ]] || return 0
+
+  local cmd="aws ec2 modify-volume --volume-id ${vol} --volume-type gp3 --region ${REGION}"
+  if [[ "$VOLUME_IOPS" != "$GP3_MIN_IOPS" || "$VOLUME_THROUGHPUT" != "$GP3_MIN_THROUGHPUT" ]]; then
+    cmd+=" --iops ${VOLUME_IOPS} --throughput ${VOLUME_THROUGHPUT}"
+  fi
+  # One notice, several lines, same "repo-remote:" prefix as log(); the command
+  # sits alone on its line so it can be copied verbatim.
+  {
+    printf '%s\n' "repo-remote: WARNING: root volume ${vol} of reused instance ${iid} (region ${REGION}) is gp2. gp2's baseline is 3 IOPS per GiB (150 IOPS at 50 GiB); sustained builds/tests drain its burst credits and the box then crawls in disk wait. gp3 has a flat 3,000 IOPS / 125 MiB/s baseline with no burst credits. This run did NOT change the volume. To convert it (online, no stop or detach needed on current-generation instances), run:"
+    printf '%s\n' "repo-remote:   ${cmd}"
+    printf '%s\n' "repo-remote: That call needs the IAM permission ec2:ModifyVolume — request it if your AWS user is denied. A volume can be modified at most 4 times per rolling 24 hours; track progress with: aws ec2 describe-volumes-modifications --volume-ids ${vol} --region ${REGION}"
+  } >&2
+  return 0
+}
+
 # Belt-and-suspenders SSH access (repo#177): append the resolved public key to
 # ~ubuntu/.ssh/authorized_keys on every boot (this runs on every boot, same as
 # the idle-guard cron install below), so the box stays reachable even if
@@ -1418,7 +1627,8 @@ aws_create() {
   local -a args=(ec2 run-instances
     --image-id "$ami"
     --instance-type "$INSTANCE_TYPE"
-    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${DISK_GB}}"
+    # Explicit type (repo#559): left unset, EC2 uses the AMI default — gp2.
+    --block-device-mappings "$(aws_root_block_device_mapping)"
     --security-group-ids "$RESOLVED_SG"
     --tag-specifications "ResourceType=instance,Tags=[{Key=repo-remote,Value=${NAME}}]"
     # NOTE (repo#177): `--user-data` here takes `file://<path>` at LAUNCH time.
@@ -1583,6 +1793,9 @@ aws_up() {
     # --no-create: never conjure a group for a host that is already attached to
     # one (see aws_refresh_ssh_ingress).
     aws_refresh_ssh_ingress --no-create
+    # repo#559: a reused box keeps whatever root volume it was born with; flag
+    # a gp2 one (advice only, stderr only, never fatal, never modifies it).
+    aws_root_volume_advisory "$iid"
   fi
 
   aws ec2 wait instance-running --instance-ids "$iid" >/dev/null 2>&1 || true
@@ -2042,6 +2255,14 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     printf '"instance_type":"%s",' "$(json_escape "$INSTANCE_TYPE")"
     printf '"region":"%s",' "$(json_escape "$REGION")"
     printf '"disk_gb":%s,' "$DISK_GB"
+    if [[ "$PROVIDER" == aws ]]; then
+      printf '"volume_type":"%s",' "$(json_escape "$VOLUME_TYPE")"
+      if [[ "$VOLUME_TYPE" == gp3 ]]; then
+        printf '"volume_iops":%s,"volume_throughput_mibps":%s,' "$VOLUME_IOPS" "$VOLUME_THROUGHPUT"
+      else
+        printf '"volume_iops":null,"volume_throughput_mibps":null,'
+      fi
+    fi
     printf '"gpu":%s,' "$IS_GPU"
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"ssh_alias":"repo-remote-%s",' "$(json_escape "$NAME")"
@@ -2054,8 +2275,14 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     log "  provider:            $PROVIDER"
     log "  instance type:       $INSTANCE_TYPE$([[ "$IS_GPU" == true ]] && echo ' (GPU)')"
     log "  region/zone:         $REGION"
-    log "  disk:                ${DISK_GB} GB"
-    log "  idle shutdown:       ${IDLE_MIN} min"
+    if [[ "$PROVIDER" == aws && "$VOLUME_TYPE" == gp3 ]]; then
+      log "  disk:                ${DISK_GB} GB gp3 (${VOLUME_IOPS} IOPS, ${VOLUME_THROUGHPUT} MiB/s)"
+    elif [[ "$PROVIDER" == aws ]]; then
+      log "  disk:                ${DISK_GB} GB ${VOLUME_TYPE}"
+    else
+      log "  disk:                ${DISK_GB} GB"
+    fi
+    log "  idle shutdown:      ${IDLE_MIN} min"
     log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  ssh alias:           repo-remote-${NAME}"
   fi
@@ -2208,6 +2435,9 @@ main() {
   case "$ACTION" in
     up)
       require_cost_config
+      # repo#559: validate the root-volume settings before the plan or any
+      # cloud call, so a bad value never reaches run-instances.
+      [[ "$PROVIDER" == aws ]] && validate_aws_volume_config
       if [[ "$YES" != true ]]; then
         emit_plan          # dry-run: the plan (with cost) is shown, nothing spent
         exit 0

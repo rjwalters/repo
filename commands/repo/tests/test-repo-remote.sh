@@ -205,6 +205,35 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_FLEET_TAG:-None}"
       exit 0
     fi
+    # repo#559: the reused-instance root-volume advisory makes two more
+    # --instance-ids lookups, matched by their own query projections so they
+    # never fall through to MOCK_AWS_STATE. Defaults describe a healthy box
+    # (root /dev/sda1 -> vol-0root, which describe-volumes reports as gp3), so
+    # every pre-existing reuse test sees no advisory at all.
+    #   MOCK_AWS_ROOT_DEVICE      RootDeviceName answer (default /dev/sda1)
+    #   MOCK_AWS_ROOT_FAIL=1      that lookup fails (API error)
+    #   MOCK_AWS_BDM              "<device>\t<volume-id>" rows (default the root)
+    #   MOCK_AWS_BDM_FAIL=1       the mappings lookup fails
+    if printf '%s' "$*" | grep -qF "RootDeviceName"; then
+      if [[ "${MOCK_AWS_ROOT_FAIL:-0}" == 1 ]]; then
+        echo "An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation: Request limit exceeded." >&2
+        exit 254
+      fi
+      printf '%s\n' "${MOCK_AWS_ROOT_DEVICE-/dev/sda1}"
+      exit 0
+    fi
+    if printf '%s' "$*" | grep -qF "BlockDeviceMappings"; then
+      if [[ "${MOCK_AWS_BDM_FAIL:-0}" == 1 ]]; then
+        echo "An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation: Request limit exceeded." >&2
+        exit 254
+      fi
+      if [[ -n "${MOCK_AWS_BDM+x}" ]]; then
+        printf '%s\n' "$MOCK_AWS_BDM"
+      else
+        printf '/dev/sda1\tvol-0root\n'
+      fi
+      exit 0
+    fi
     # Post-create KeyName verification (repo#177) is ALSO a --instance-ids
     # describe-instances call, so it must be distinguished by its distinct
     # `.KeyName` query projection before falling into the generic
@@ -291,6 +320,15 @@ case "$1 $2" in
       prev="$a"
     done
     echo "${MOCK_AWS_NEW_ID:-i-0newinstance}"; exit 0 ;;
+  "ec2 describe-volumes")
+    # repo#559 root-volume type lookup. MOCK_AWS_VOLUME_TYPE is the answer
+    # (default gp3; set it empty or "None" for the no-answer cases);
+    # MOCK_AWS_VOLUMES_DENIED=1 simulates a missing ec2:DescribeVolumes grant.
+    if [[ "${MOCK_AWS_VOLUMES_DENIED:-0}" == 1 ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the DescribeVolumes operation: You are not authorized to perform this operation." >&2
+      exit 254
+    fi
+    printf '%s\n' "${MOCK_AWS_VOLUME_TYPE-gp3}"; exit 0 ;;
   "ec2 wait"|"ec2 start-instances"|"ec2 stop-instances"|"ec2 terminate-instances")
     exit 0 ;;
   *) exit 0 ;;
@@ -494,6 +532,12 @@ LOGTXT="$(cat "$MOCK_LOG")"
 assert_contains "instance tagged repo-remote=<name>" "$LOGTXT" "repo-remote,Value=myrepo"
 assert_contains "requested instance type is passed"  "$LOGTXT" "m5.2xlarge"
 assert_contains "disk size from config is applied"   "$LOGTXT" "VolumeSize=50"
+# repo#559: the root volume is explicitly gp3 at its baseline, never the AMI
+# default (gp2).
+assert_contains "root volume launches as explicit gp3 with baseline IOPS/throughput (repo#559)" \
+  "$LOGTXT" "DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp3,Iops=3000,Throughput=125}"
+assert_eq "fresh create runs no root-volume advisory lookup (reuse only)" \
+  "0" "$(grep -c 'describe-volumes' "$MOCK_LOG" 2>/dev/null)"
 assert_contains "user-data (idle guard) is passed"   "$LOGTXT" "user-data"
 assert_contains "the resolved security group is attached to run-instances" "$LOGTXT" "security-group-ids sg-0new"
 
@@ -2075,6 +2119,207 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- AWS root volume: gp3 launch config and validation (repo#559) --"
+# ---------------------------------------------------------------------------
+# The incident: run-instances passed only VolumeSize, so EC2 used the AMI
+# default gp2 (150 IOPS baseline at 50 GiB); after hours of test-suite runs the
+# burst credits drained and a 15-minute suite took 100 minutes in disk wait.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# json_valid <text> -> 0 when the text parses as JSON (python3), else 1.
+json_valid() { printf '%s' "$1" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; }
+
+# (a) Custom gp3 performance and size, from the per-repo layer.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_DISK_GB=200" \
+  "REPO_REMOTE_VOLUME_IOPS=6000" "REPO_REMOTE_VOLUME_THROUGHPUT=500"
+run_rr MOCK_AWS_NEW_ID=i-0gp3custom MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "custom gp3: up succeeds" "0" "$RR_RC"
+assert_contains "custom gp3: size, type, IOPS and throughput all reach run-instances" \
+  "$(cat "$MOCK_LOG")" "DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3,Iops=6000,Throughput=500}"
+
+# (b) The shared layer sets the type; a lower-case-insensitive value is accepted.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2" \
+  "REPO_REMOTE_VOLUME_TYPE=GP3"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_NEW_ID=i-0gp3upper MOCK_AWS_STATE=None -- up --yes --json
+assert_contains "type from the shared layer is honored (case-insensitive)" \
+  "$(cat "$MOCK_LOG")" "Ebs={VolumeSize=50,VolumeType=gp3,Iops=3000,Throughput=125}"
+
+# (c) Explicit gp2 omits the gp3-only fields entirely.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_VOLUME_TYPE=gp2"
+run_rr MOCK_AWS_NEW_ID=i-0gp2 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "explicit gp2: up succeeds" "0" "$RR_RC"
+GP2LOG="$(cat "$MOCK_LOG")"
+assert_contains "explicit gp2: mapping is type gp2 with the configured size" \
+  "$GP2LOG" "DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp2}"
+assert_not_contains "explicit gp2: no Iops field" "$GP2LOG" "Iops="
+assert_not_contains "explicit gp2: no Throughput field" "$GP2LOG" "Throughput="
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+
+# (d) The dry-run plan reports the resolved volume config.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --json
+assert_eq "plan: exit 0" "0" "$RR_RC"
+assert_eq "plan: volume_type is gp3" "gp3" "$(json_field "$RR_OUT" volume_type)"
+assert_eq "plan: volume_iops is 3000" "3000" "$(json_field "$RR_OUT" volume_iops)"
+assert_eq "plan: volume_throughput_mibps is 125" "125" "$(json_field "$RR_OUT" volume_throughput_mibps)"
+if command -v python3 >/dev/null 2>&1; then
+  json_valid "$RR_OUT" && ok "plan: JSON stdout still parses" || no "plan: JSON stdout still parses" "$RR_OUT"
+else
+  skip "plan: JSON stdout still parses" "python3 not available"
+fi
+run_rr -- up
+assert_contains "human plan names the volume type and performance" "$RR_ERR" "50 GB gp3 (3000 IOPS, 125 MiB/s)"
+
+# (e) Invalid / incompatible settings fail with exit 2 BEFORE any cloud call —
+#     with --yes (nothing launched) and in the dry run alike.
+invalid_case() {  # <label> <expected-stderr-fragment> <env-line...>
+  local label="$1" frag="$2"; shift 2
+  write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "$@"
+  run_rr MOCK_AWS_NEW_ID=i-0shouldnot MOCK_AWS_STATE=None -- up --yes --json
+  assert_eq "invalid ($label): exit 2" "2" "$RR_RC"
+  assert_contains "invalid ($label): says why" "$RR_ERR" "$frag"
+  assert_eq "invalid ($label): no cloud call at all" "0" "$(grep -c . "$MOCK_LOG" 2>/dev/null)"
+  assert_eq "invalid ($label): stdout is empty (no JSON on failure)" "" "$RR_OUT"
+}
+invalid_case "unsupported type"          "is not supported (expected gp3 or gp2)" "REPO_REMOTE_VOLUME_TYPE=io2"
+invalid_case "gp2 + IOPS"                "gp2 does not accept provisioned IOPS" "REPO_REMOTE_VOLUME_TYPE=gp2" "REPO_REMOTE_VOLUME_IOPS=3000"
+invalid_case "gp2 + throughput"          "gp2 does not accept provisioned throughput" "REPO_REMOTE_VOLUME_TYPE=gp2" "REPO_REMOTE_VOLUME_THROUGHPUT=125"
+invalid_case "non-numeric IOPS"          "REPO_REMOTE_VOLUME_IOPS='fast' must be a positive whole number" "REPO_REMOTE_VOLUME_IOPS=fast"
+invalid_case "zero throughput"           "REPO_REMOTE_VOLUME_THROUGHPUT='0' must be a positive whole number" "REPO_REMOTE_VOLUME_THROUGHPUT=0"
+invalid_case "negative disk size"        "REPO_REMOTE_DISK_GB='-5' must be a positive whole number" "REPO_REMOTE_DISK_GB=-5"
+invalid_case "IOPS below gp3 baseline"   "outside the gp3 range 3000-80000" "REPO_REMOTE_VOLUME_IOPS=2000"
+invalid_case "IOPS above gp3 max"        "outside the gp3 range 3000-80000" "REPO_REMOTE_DISK_GB=500" "REPO_REMOTE_VOLUME_IOPS=90000"
+invalid_case "throughput above gp3 max"  "outside the gp3 range 125-2000 MiB/s" "REPO_REMOTE_VOLUME_IOPS=16000" "REPO_REMOTE_VOLUME_THROUGHPUT=3000"
+invalid_case "IOPS over 500/GiB"         "exceeds 500 IOPS per GiB for a 50 GiB gp3 volume" "REPO_REMOTE_VOLUME_IOPS=30000"
+invalid_case "throughput over 0.25/IOPS" "exceeds 0.25 MiB/s per provisioned IOPS" "REPO_REMOTE_VOLUME_THROUGHPUT=1000"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_VOLUME_TYPE=standard"
+run_rr -- up --json
+assert_eq "invalid type fails the dry run too (exit 2)" "2" "$RR_RC"
+# Boundary values AWS accepts must pass: 4000 IOPS (needs 8 GiB) with
+# 1000 MiB/s (needs 4000 IOPS).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_DISK_GB=8" \
+  "REPO_REMOTE_VOLUME_IOPS=4000" "REPO_REMOTE_VOLUME_THROUGHPUT=1000"
+run_rr -- up --json
+assert_eq "boundary gp3 config (4000 IOPS @ 8 GiB, 1000 MiB/s) is accepted" "0" "$RR_RC"
+
+# (f) GCP ignores the AWS-only volume settings (no validation, no change).
+write_shared "REPO_REMOTE_PROVIDER=gcp" "GCP_PROJECT=p" "GCP_ZONE=us-central1-a" \
+  "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=n2-standard-8" "REPO_REMOTE_VOLUME_TYPE=io2"
+run_rr -- up --json
+assert_eq "gcp: AWS volume settings are ignored (dry run still exit 0)" "0" "$RR_RC"
+assert_not_contains "gcp: plan carries no AWS volume_type" "$RR_OUT" "volume_type"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS root volume: gp2 advisory on reuse (repo#559) --"
+# ---------------------------------------------------------------------------
+FIX_CMD="aws ec2 modify-volume --volume-id vol-0root --volume-type gp3 --region us-west-2"
+
+# (a) Pinned, running, gp2 root -> one stderr advisory with the real id/region.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_eq "gp2 reuse (pinned running): up still succeeds" "0" "$RR_RC"
+assert_contains "gp2 reuse: warns the root volume is gp2" "$RR_ERR" "root volume vol-0root of reused instance i-0pinned (region us-west-2) is gp2"
+assert_contains "gp2 reuse: prints the copyable conversion command" "$RR_ERR" "$FIX_CMD"
+assert_contains "gp2 reuse: names the required permission" "$RR_ERR" "ec2:ModifyVolume"
+assert_contains "gp2 reuse: says the run did not change the volume" "$RR_ERR" "did NOT change the volume"
+assert_eq "gp2 reuse: the advisory is printed once" "1" "$(printf '%s\n' "$RR_ERR" | grep -c 'is gp2')"
+ADVLOG="$(cat "$MOCK_LOG")"
+assert_contains "gp2 reuse: the volume type was read for the matched root volume" \
+  "$ADVLOG" "describe-volumes --volume-ids vol-0root"
+assert_not_contains "gp2 reuse: modify-volume is NEVER called" "$ADVLOG" "modify-volume"
+assert_contains "gp2 reuse: stdout is still the up result" "$RR_OUT" '"reused":true'
+assert_not_contains "gp2 reuse: the notice stays off stdout" "$RR_OUT" "modify-volume"
+if command -v python3 >/dev/null 2>&1; then
+  json_valid "$RR_OUT" && ok "gp2 reuse: JSON stdout still parses" || no "gp2 reuse: JSON stdout still parses" "$RR_OUT"
+else
+  skip "gp2 reuse: JSON stdout still parses" "python3 not available"
+fi
+
+# (b) Pinned, stopped -> started, gp2 root.
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_eq "gp2 reuse (pinned stopped): up still succeeds" "0" "$RR_RC"
+assert_contains "gp2 reuse (pinned stopped): the instance was started" "$(cat "$MOCK_LOG")" "start-instances"
+assert_contains "gp2 reuse (pinned stopped): advisory printed" "$RR_ERR" "$FIX_CMD"
+
+# (c) Root volume is NOT the first mapping: the advisory must name the root
+#     volume, never the first attached one.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_VOLUME_TYPE=gp2 \
+  MOCK_AWS_BDM=$'/dev/sdf\tvol-0data\n/dev/sda1\tvol-0root' -- up --yes --json
+assert_contains "root not first: names the root volume" "$RR_ERR" "$FIX_CMD"
+assert_not_contains "root not first: never names the data volume" "$RR_ERR" "vol-0data"
+assert_contains "root not first: looked up the root volume's type" "$(cat "$MOCK_LOG")" "describe-volumes --volume-ids vol-0root"
+
+# (d) Non-default gp3 settings carry into the suggested command.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned" \
+  "REPO_REMOTE_VOLUME_IOPS=6000" "REPO_REMOTE_VOLUME_THROUGHPUT=250"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_contains "custom gp3 settings carry into the conversion command" \
+  "$RR_ERR" "$FIX_CMD --iops 6000 --throughput 250"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+
+# (e) gp3 root -> no migration warning and no notice.
+run_rr MOCK_AWS_STATE=running MOCK_AWS_VOLUME_TYPE=gp3 -- up --yes --json
+assert_eq "gp3 reuse: up succeeds" "0" "$RR_RC"
+assert_not_contains "gp3 reuse: no migration warning" "$RR_ERR" "modify-volume"
+assert_not_contains "gp3 reuse: no inspection notice" "$RR_ERR" "root volume type"
+
+# (f) Best-effort failures: each is a NOTICE, exit 0, no fabricated volume id.
+adv_fail_case() {  # <label> <expected-notice-fragment> <mock-env...>
+  local label="$1" frag="$2"; shift 2
+  run_rr MOCK_AWS_STATE=running "$@" -- up --yes --json
+  assert_eq "inspection $label: up still succeeds" "0" "$RR_RC"
+  assert_contains "inspection $label: explains the check was skipped" "$RR_ERR" "gp2 -> gp3 check was skipped"
+  assert_contains "inspection $label: says why" "$RR_ERR" "$frag"
+  assert_contains "inspection $label: says how to investigate" "$RR_ERR" "aws ec2 describe-instances --instance-ids i-0pinned --region us-west-2"
+  assert_not_contains "inspection $label: no conversion command" "$RR_ERR" "aws ec2 modify-volume"
+  assert_not_contains "inspection $label: modify-volume never called" "$(cat "$MOCK_LOG")" "modify-volume"
+  assert_contains "inspection $label: JSON result still emitted" "$RR_OUT" '"reused":true'
+}
+adv_fail_case "root lookup error"       "RequestLimitExceeded"                 MOCK_AWS_ROOT_FAIL=1
+adv_fail_case "missing RootDeviceName"  "reports no RootDeviceName"            MOCK_AWS_ROOT_DEVICE=None
+adv_fail_case "empty RootDeviceName"    "reports no RootDeviceName"            MOCK_AWS_ROOT_DEVICE=
+adv_fail_case "mappings lookup error"   "block device mappings) failed"        MOCK_AWS_BDM_FAIL=1
+adv_fail_case "no root attachment"      "no EBS volume is attached at its root device /dev/sda1" \
+  MOCK_AWS_BDM=$'/dev/sdf\tvol-0data'
+adv_fail_case "empty mappings"          "no EBS volume is attached"            MOCK_AWS_BDM=
+adv_fail_case "None volume id"          "no EBS volume is attached"            MOCK_AWS_BDM=$'/dev/sda1\tNone'
+adv_fail_case "DescribeVolumes denied"  "ec2:DescribeVolumes"                  MOCK_AWS_VOLUMES_DENIED=1 MOCK_AWS_VOLUME_TYPE=gp2
+adv_fail_case "empty volume type"       "returned no type for root volume vol-0root" MOCK_AWS_VOLUME_TYPE=
+adv_fail_case "None volume type"        "returned no type for root volume vol-0root" MOCK_AWS_VOLUME_TYPE=None
+run_rr MOCK_AWS_STATE=running MOCK_AWS_BDM=$'/dev/sdf\tvol-0data' MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_not_contains "no root attachment: the data volume is never offered as the root" "$RR_ERR" "vol-0data"
+assert_eq "no root attachment: no volume type lookup on a guessed id" "0" "$(grep -c 'describe-volumes' "$MOCK_LOG" 2>/dev/null)"
+
+# (g) Explicitly configured gp2: an existing gp2 root is what was asked for.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned" "REPO_REMOTE_VOLUME_TYPE=gp2"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_eq "configured gp2 reuse: up succeeds" "0" "$RR_RC"
+assert_not_contains "configured gp2 reuse: no migration warning" "$RR_ERR" "modify-volume"
+
+# (h) Tag-discovered stopped reuse gets the same inspection.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="i-0found stopped" MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_eq "gp2 reuse (tag-discovered): up succeeds" "0" "$RR_RC"
+assert_contains "gp2 reuse (tag-discovered): advisory names the discovered instance" \
+  "$RR_ERR" "root volume vol-0root of reused instance i-0found (region us-west-2) is gp2"
+assert_contains "gp2 reuse (tag-discovered): conversion command printed" "$RR_ERR" "$FIX_CMD"
+assert_not_contains "gp2 reuse (tag-discovered): modify-volume never called" "$(cat "$MOCK_LOG")" "modify-volume"
+
+# (i) The fleet-marker refusal still comes first: a refused reuse inspects nothing.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr MOCK_AWS_STATE=running MOCK_AWS_FLEET_TAG=loom MOCK_AWS_VOLUME_TYPE=gp2 -- up --yes --json
+assert_eq "fleet-marked reuse is still refused (exit 5)" "5" "$RR_RC"
+assert_eq "fleet-marked reuse: no root-volume lookup" "0" "$(grep -c 'describe-volumes' "$MOCK_LOG" 2>/dev/null)"
+assert_not_contains "fleet-marked reuse: no advisory" "$RR_ERR" "modify-volume"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -2181,6 +2426,23 @@ assert_contains "remote.md documents the host-identity marker file" \
   "$MD" "/etc/repo-remote-instance-id"
 assert_contains "remote.md makes verification part of opening the session" \
   "$MD" "before you trust the session"
+
+# repo#559: the root-volume settings, the gp2 override, the advisory's
+# permissions and migration prerequisites, and I/O-pressure troubleshooting
+# are part of the implemented surface.
+assert_contains "remote.md documents the volume type var" "$MD" "REPO_REMOTE_VOLUME_TYPE"
+assert_contains "remote.md documents the volume IOPS var" "$MD" "REPO_REMOTE_VOLUME_IOPS"
+assert_contains "remote.md documents the volume throughput var" "$MD" "REPO_REMOTE_VOLUME_THROUGHPUT"
+assert_contains "remote.md documents the default gp3 launch mapping" "$MD" "VolumeType=gp3,Iops=3000,Throughput=125"
+assert_contains "remote.md documents the gp2 override mapping" "$MD" "Ebs={VolumeSize=<gb>,VolumeType=gp2}"
+assert_contains "remote.md documents the operator-run conversion command" "$MD" "aws ec2 modify-volume --volume-id"
+assert_contains "remote.md names the ec2:ModifyVolume permission" "$MD" "ec2:ModifyVolume"
+assert_contains "remote.md names the ec2:DescribeVolumes permission" "$MD" "ec2:DescribeVolumes"
+assert_contains "remote.md states up never runs the conversion" "$MD" "never runs it"
+assert_contains "remote.md documents the modification rate limit" "$MD" "four times per rolling 24 hours"
+assert_contains "remote.md documents I/O pressure stall info" "$MD" "/proc/pressure/io"
+assert_contains "remote.md documents the gp2 BurstBalance metric" "$MD" "BurstBalance"
+assert_contains "remote.md distinguishes disk wait from CPU saturation" "$MD" "check disk wait before blaming CPU"
 
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).

@@ -182,7 +182,10 @@ REPO_REMOTE_INSTANCE_ID=                  # RECOMMENDED: pin the exact instance 
                                            # live host against, and the only handle that survives a
                                            # stop/start unambiguously — see "Stale SSH aliases and
                                            # released public IPs" below.
-REPO_REMOTE_DISK_GB=100
+REPO_REMOTE_DISK_GB=100                   # root volume size in GiB (default 50)
+REPO_REMOTE_VOLUME_TYPE=gp3               # AWS only: root EBS type, gp3 (default) or gp2 — see "AWS root volume" below
+REPO_REMOTE_VOLUME_IOPS=3000              # AWS gp3 only: provisioned IOPS (default 3000); must be unset for gp2
+REPO_REMOTE_VOLUME_THROUGHPUT=125         # AWS gp3 only: provisioned MiB/s (default 125); must be unset for gp2
 REPO_REMOTE_IMAGE=                         # optional host-image override (else: Ubuntu LTS, or the GPU AMI on GPU hosts)
 REPO_REMOTE_GPU=                          # GCP accelerator (e.g. nvidia-l4:1); AWS infers GPU from the instance family
 
@@ -400,6 +403,10 @@ RUNNING → offer reuse; STOPPED → offer to start.
    `up` prints an explicit warning that the **alias was not refreshed** — the
    previously written `HostName` is therefore stale — rather than silently
    leaving the old value in place.
+   On AWS, reuse also **inspects the instance's actual root volume** and, if it
+   is still gp2, prints a stderr advisory with the exact `aws ec2
+   modify-volume` command to convert it — `up` never runs that command itself.
+   See **AWS root volume (gp3) and disk I/O pressure** below.
 5. **The refreshed alias is then proved to reach the right box.** After writing
    the alias, `up` asks the host at the other end for its own instance id and
    refuses (exit `6`) if it is not the instance this run resolved — see **Stale
@@ -416,6 +423,10 @@ Requirements for the created instance:
 - Label/tag it `repo-remote=<repo-name>` so `--status`/`--down` only ever touch
   instances this command created
 - Ubuntu LTS image, disk size from config
+- **AWS: an explicitly typed root volume** — gp3 at 3,000 IOPS / 125 MiB/s by
+  default (`Ebs={VolumeSize=…,VolumeType=gp3,Iops=3000,Throughput=125}`), never
+  the AMI's default type. See **AWS root volume (gp3) and disk I/O pressure**
+  below.
 - **AWS: always attach a key pair** (`--key-name`), resolved from
   `REPO_REMOTE_SSH_KEY`'s public key (`<REPO_REMOTE_SSH_KEY>.pub`) — an
   existing account key pair with a matching fingerprint is reused,
@@ -810,6 +821,110 @@ the address.
   attached to a running instance, so it is a deliberate cost trade-off this
   tooling does not make on your behalf; allocate and associate one by hand if
   the box is long-lived enough to be worth it.
+
+#### AWS root volume (gp3) and disk I/O pressure
+
+**Why it is explicit (repo#559).** Left unspecified, EC2 gives the root volume
+the AMI's default type — **gp2**, whose baseline is 3 IOPS per GiB (minimum
+100): a 50 GiB root gets **150 IOPS**, plus a burst bucket that refills slowly.
+Hours of repeated builds or full test-suite runs drain that bucket, and the box
+then *looks* broken — tests time out, a 15-minute suite takes 100 — when its
+disk is simply throttled. gp3 has a flat **3,000 IOPS / 125 MiB/s** baseline
+included in its price, with no burst credits to run out; in AWS's own EBS
+pricing examples it is also cheaper per GB than gp2 ($0.08 vs $0.10 per
+GB-month — check the [EBS pricing page](https://aws.amazon.com/ebs/pricing/)
+for your region rather than relying on that ratio).
+
+**Configuration** (AWS only; both config layers, like every other setting):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REPO_REMOTE_DISK_GB` | `50` | root volume size, GiB |
+| `REPO_REMOTE_VOLUME_TYPE` | `gp3` | `gp3` or `gp2` (case-insensitive); nothing else is supported |
+| `REPO_REMOTE_VOLUME_IOPS` | `3000` | gp3 only — provisioned IOPS |
+| `REPO_REMOTE_VOLUME_THROUGHPUT` | `125` | gp3 only — provisioned throughput, MiB/s |
+
+The launch mapping follows the type: gp3 sends
+`Ebs={VolumeSize=<gb>,VolumeType=gp3,Iops=<iops>,Throughput=<mibps>}`; an
+explicit `REPO_REMOTE_VOLUME_TYPE=gp2` sends `Ebs={VolumeSize=<gb>,VolumeType=gp2}`
+and nothing else, because gp2 performance is a function of size and takes no
+IOPS/throughput parameters. Values are checked **before any cloud call** (exit
+`2`, nothing created — the dry-run plan included) against AWS's documented gp3
+limits (*Amazon EBS User Guide → General Purpose SSD volumes*, checked
+2026-10-05): IOPS 3,000–80,000 and at most 500 per GiB above the 3,000
+baseline; throughput 125–2,000 MiB/s and at most 0.25 MiB/s per provisioned
+IOPS; size up to 64 TiB (gp2: 16 TiB). Also refused: an unsupported type, a
+value that is not a positive whole number, and `REPO_REMOTE_VOLUME_IOPS` or
+`REPO_REMOTE_VOLUME_THROUGHPUT` set alongside `gp2`. (gp3 above the baseline is
+billed extra; the cost estimate covers the instance, not the volume.)
+
+**Existing gp2 hosts: advisory on reuse, never automatic.** The volume type is
+fixed at launch, so an instance created before this change keeps gp2. Every
+AWS `up` that **reuses** an instance (pinned or tag-discovered, running or
+restarted) looks up its real root volume — `RootDeviceName` matched against its
+`BlockDeviceMappings`, never "the first attached volume" — and reads the type
+with `describe-volumes`. If it is gp2, `up` prints one stderr notice naming the
+volume, the region, and a copyable command:
+
+```bash
+aws ec2 modify-volume --volume-id <root-volume-id> --volume-type gp3 --region <region>
+```
+
+(with `--iops`/`--throughput` appended when you configured non-default gp3
+values). **`up` never runs it** — converting is your decision. Notes before you
+do:
+
+- **Permission:** the call needs the IAM action **`ec2:ModifyVolume`** on that
+  volume. It is not something the rest of this tooling needs, so many operator
+  users lack it — if the call is denied, ask your AWS admin for
+  `ec2:ModifyVolume` (optionally scoped to the volume's ARN).
+- **Online:** Elastic Volumes modifies a volume in place on all current-generation
+  instance types (and C1/C3/C4/G2/I2/M1/M3/M4/R3/R4), without detaching it or
+  stopping the instance. On an instance type that does not support Elastic
+  Volumes, stop the instance, modify the root volume, then start it.
+- **Timing and limits:** the modification passes through `modifying` →
+  `optimizing` → `completed` and can take minutes to hours; the new performance
+  applies progressively during `optimizing`. A volume can be modified at most
+  **four times per rolling 24 hours**, and only once its previous modification
+  has completed. Track it with
+  `aws ec2 describe-volumes-modifications --volume-ids <root-volume-id> --region <region>`.
+- No guest-side step is needed for a type change (unlike a size change, which
+  also needs the partition and filesystem grown).
+
+The inspection itself is best effort: if the instance lookup fails, the root
+mapping is missing, or `describe-volumes` is denied (it needs
+**`ec2:DescribeVolumes`**), `up` prints a NOTICE saying the check was skipped
+and how to run it by hand, and otherwise succeeds exactly as before — it never
+guesses a volume id. A gp3 root, or a configured `REPO_REMOTE_VOLUME_TYPE=gp2`,
+produces no notice. All of this goes to stderr; `--json` stdout is unchanged.
+
+**Troubleshooting: "the box is slow" — check disk wait before blaming CPU.** A
+throttled disk and a saturated CPU feel the same from the outside (timeouts,
+long runs) but have opposite fixes. On the host:
+
+```bash
+cat /proc/pressure/io      # I/O pressure stall info: "some avg10/avg60/avg300" = % of time tasks waited on I/O
+cat /proc/pressure/cpu     # the same for CPU — compare the two
+vmstat 5                   # high "wa" + many "b" (blocked) with low "us"/"sy" => disk-bound
+ps -eo state,pid,pcpu,comm | awk '$1 == "D"'   # processes stuck in uninterruptible disk wait
+iostat -x 5                # (sysstat) per-device r/s, w/s, await, %util
+```
+
+- **Disk-bound:** `/proc/pressure/io` `avg300` well above a few percent (the
+  original incident sat near 45%), processes in **D** state at low `%CPU`, high
+  `wa`. Then check the volume's type (`aws ec2 describe-volumes --volume-ids
+  <id> --query 'Volumes[0].VolumeType'`) and its CloudWatch `AWS/EBS` metrics:
+  **`BurstBalance`** (gp2 only — at or near 0% means the credits are gone and
+  the volume is pinned to its 3 IOPS/GiB baseline) and `VolumeQueueLength`.
+  For example:
+  `aws cloudwatch get-metric-statistics --namespace AWS/EBS --metric-name BurstBalance --dimensions Name=VolumeId,Value=<id> --statistics Minimum --period 300 --start-time <iso> --end-time <iso> --region <region>`
+  (needs `cloudwatch:GetMetricStatistics`). Fix: convert gp2 to gp3 as above,
+  or raise `REPO_REMOTE_VOLUME_IOPS`/`REPO_REMOTE_VOLUME_THROUGHPUT` for a gp3
+  volume that is genuinely at its provisioned limit (for a new host via config;
+  for an existing one with `modify-volume --iops/--throughput`).
+- **CPU-bound:** high `us`/`sy`, load average near the vCPU count, high
+  `/proc/pressure/cpu`, low I/O pressure. Fix: a larger instance type, or
+  fewer parallel workers.
 
 #### GPU hosts
 
