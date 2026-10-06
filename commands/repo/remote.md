@@ -438,6 +438,9 @@ Requirements for the created instance:
   public key is also injected into `~ubuntu/.ssh/authorized_keys` via
   cloud-init user-data on every boot, so the host stays reachable even if
   key-pair attachment itself ever regresses.
+- **AWS: pinned instance metadata options** — every launch passes
+  `--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled`
+  (IMDSv2 only, hop limit 1). See **AWS instance metadata (IMDSv2)** below.
 - For GPU hosts, see **GPU hosts** below — this needs a GPU-ready image and,
   on AWS, quota-aware handling.
 - Install an idle-shutdown guard (cron checking SSH sessions + CPU, running
@@ -821,6 +824,69 @@ the address.
   attached to a running instance, so it is a deliberate cost trade-off this
   tooling does not make on your behalf; allocate and associate one by hand if
   the box is long-lived enough to be worth it.
+
+#### AWS instance metadata (IMDSv2)
+
+**What a new instance gets (repo#562).** `aws_create()` passes, on its one
+`run-instances` call:
+
+```
+--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled
+```
+
+- `HttpTokens=required` — IMDSv2 only. A metadata request without a session
+  token is refused, so a plain unauthenticated GET (the typical SSRF shape)
+  cannot read metadata or user-data.
+- `HttpPutResponseHopLimit=1` — the token `PUT` response may cross one network
+  hop.
+- `HttpEndpoint=enabled` — the metadata service stays on; the host needs it.
+
+Launch parameters take precedence over AMI and account-level defaults, and AWS
+evaluates each option on its own (see AWS's
+[metadata options and precedence](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html)).
+So the settings above hold whichever image is launched — the default Ubuntu
+AMI, the GPU AMI, or a configured `REPO_REMOTE_IMAGE` — instead of depending on
+what that image or account happens to default to. There is no setting to relax
+them. If AWS rejects the launch (for example an image that cannot honor the
+options), `up` fails with the usual `aws ec2 run-instances failed: …` (exit
+`4`) after that single attempt; it never retries with weaker settings.
+
+**Host compatibility.** Everything this tool runs on the host already speaks
+IMDSv2: the cloud-init identity marker and the `verify` identity probe both
+`PUT /latest/api/token` first and send the token on their metadata `GET`s. The
+idle-shutdown guard does not query metadata at all. Nothing on the host needs
+IMDSv1.
+
+**Effect on containers.** A process in a container on Docker's default bridge
+network is one hop further from the metadata service than the host. With hop
+limit 1 the token `PUT` response does not reach it, and with tokens required
+there is no tokenless fallback — so code in a bridged container that reads
+instance metadata (an AWS SDK auto-detecting its region, a `curl` to
+`169.254.169.254`) will fail or time out. The dev container gets what it needs
+over SSH and through its environment, not from metadata, so this tool is
+unaffected. If your own workload needs metadata from inside a container, run
+that container with host networking or pass the values in (for example
+`AWS_REGION`). Treat the hop limit as narrowing the default path, not as an
+isolation guarantee: a container with host networking, or any other process
+on the host itself, still reaches the metadata service normally.
+
+**Existing instances keep their settings.** Metadata options are fixed at
+launch unless explicitly changed, and `up` does **not** inspect or change them
+when it reuses or restarts an instance. A box created before this change keeps
+whatever it was launched with — often `HttpTokens=optional` (IMDSv1) or a hop
+limit of `2`. Migrating it is a separate operator step, and needs
+`ec2:ModifyInstanceMetadataOptions` (which a scoped-down collaborator policy may
+not grant):
+
+```bash
+aws ec2 describe-instances --instance-ids <id> --region <region> \
+  --query 'Reservations[0].Instances[0].MetadataOptions'
+aws ec2 modify-instance-metadata-options --instance-id <id> --region <region> \
+  --http-tokens required --http-put-response-hop-limit 1 --http-endpoint enabled
+```
+
+Check first that nothing on that box (including any of your own containers)
+still relies on IMDSv1 or a hop limit of 2.
 
 #### AWS root volume (gp3) and disk I/O pressure
 

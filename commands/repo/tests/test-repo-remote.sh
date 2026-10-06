@@ -98,6 +98,7 @@ run_rr() {
     # The mock's Nth-poll public-IP counter (MOCK_AWS_PUBLIC_IP_AFTER) is a
     # sidecar of the log, so it must be reset per run alongside it (repo#451).
     rm -f "$MOCK_LOG.ipcount"
+    rm -f "$MOCK_LOG.metadata"        # per-run --metadata-options capture (repo#562)
     local errf; errf="$(mktemp)"
     # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
     # real 120s readiness window (repo#449); the assignments below come BEFORE
@@ -311,14 +312,25 @@ case "$1 $2" in
     # Capture the generated user-data (idle guard) so the suite can assert on the
     # guard script's content. --user-data is passed as `file://<path>`; the temp
     # file still exists at call time (repo-remote.sh deletes it only afterwards).
+    # Also record each --metadata-options VALUE as its own line (repo#562), so
+    # the suite asserts on the exact argv element, not a space-joined log line.
     prev=""
     for a in "$@"; do
       if [[ "$prev" == "--user-data" ]]; then
         f="${a#file://}"
         [[ -f "$f" ]] && cat "$f" >"${MOCK_AWS_LOG}.userdata"
       fi
+      if [[ "$prev" == "--metadata-options" ]]; then
+        printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.metadata"
+      fi
       prev="$a"
     done
+    # MOCK_AWS_METADATA_REJECT=1: AWS refuses the launch over its metadata
+    # options (repo#562) — the caller must fail, never retry weaker.
+    if [[ "${MOCK_AWS_METADATA_REJECT:-0}" == 1 ]]; then
+      echo "An error occurred (InvalidParameterCombination) when calling the RunInstances operation: The specified metadata options are not supported for this AMI." >&2
+      exit 254
+    fi
     echo "${MOCK_AWS_NEW_ID:-i-0newinstance}"; exit 0 ;;
   "ec2 describe-volumes")
     # repo#559 root-volume type lookup. MOCK_AWS_VOLUME_TYPE is the answer
@@ -540,6 +552,13 @@ assert_eq "fresh create runs no root-volume advisory lookup (reuse only)" \
   "0" "$(grep -c 'describe-volumes' "$MOCK_LOG" 2>/dev/null)"
 assert_contains "user-data (idle guard) is passed"   "$LOGTXT" "user-data"
 assert_contains "the resolved security group is attached to run-instances" "$LOGTXT" "security-group-ids sg-0new"
+# repo#562: IMDS options are pinned on the launch itself, as ONE argv element
+# with the complete value, on the recorded run-instances invocation.
+IMDS_PIN="HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
+assert_eq "run-instances carries the complete --metadata-options value (repo#562)" \
+  "$IMDS_PIN" "$(cat "$MOCK_LOG.metadata" 2>/dev/null)"
+assert_contains "the recorded run-instances line carries --metadata-options (repo#562)" \
+  "$(grep 'ec2 run-instances' "$MOCK_LOG")" "--metadata-options $IMDS_PIN"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -1501,6 +1520,46 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- IMDS launch hardening: metadata options pinned on every launch (repo#562) --"
+# ---------------------------------------------------------------------------
+IMDS_PIN="HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
+
+# (a) GPU family + an operator-configured image: the pin does not depend on the
+#     AMI (configured images may default to IMDSv1 or hop limit 2).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=g6e.xlarge" "REPO_REMOTE_IMAGE=ami-0configured"
+run_rr MOCK_AWS_NEW_ID=i-0imdsgpu MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "GPU + configured image provision -> exit 0" "0" "$RR_RC"
+assert_contains "configured image reaches run-instances" \
+  "$(grep 'ec2 run-instances' "$MOCK_LOG")" "--image-id ami-0configured"
+assert_contains "GPU type reaches run-instances" \
+  "$(grep 'ec2 run-instances' "$MOCK_LOG")" "--instance-type g6e.xlarge"
+assert_eq "GPU + configured image launch carries the complete metadata pin" \
+  "$IMDS_PIN" "$(cat "$MOCK_LOG.metadata" 2>/dev/null)"
+assert_contains "GPU + configured image JSON contract intact" "$RR_OUT" '"instance_id":"i-0imdsgpu"'
+
+# (b) AWS rejects the launch over its metadata options: the existing failure
+#     exit is kept, exactly ONE launch is attempted, and there is no fallback
+#     to optional tokens / a higher hop limit / no metadata options at all.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_METADATA_REJECT=1 MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "metadata-options rejection -> existing launch-failure exit 4" "4" "$RR_RC"
+assert_contains "rejection surfaces the AWS error" "$RR_ERR" "run-instances failed"
+assert_contains "rejection names the AWS error code" "$RR_ERR" "InvalidParameterCombination"
+assert_eq "rejection: exactly one run-instances attempt (no retry)" \
+  "1" "$(grep -c 'ec2 run-instances' "$MOCK_LOG")"
+assert_eq "rejection: the single attempt carried the hardened pin, nothing weaker" \
+  "$IMDS_PIN" "$(cat "$MOCK_LOG.metadata" 2>/dev/null)"
+assert_not_contains "rejection: never falls back to optional tokens" "$(cat "$MOCK_LOG")" "HttpTokens=optional"
+assert_not_contains "rejection: JSON stdout reports no instance" "$RR_OUT" '"instance_id":"i-'
+
+# (c) A dry run launches nothing, so it carries no metadata options.
+run_rr MOCK_AWS_STATE=None -- up --json
+assert_eq "dry run records no --metadata-options (nothing launched)" "0" \
+  "$( [[ -s "$MOCK_LOG.metadata" ]] && echo 1 || echo 0 )"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- status: lists tagged instances as JSON --"
 # ---------------------------------------------------------------------------
 run_rr MOCK_AWS_FIND="i-0abc running m5.2xlarge 1.2.3.4 2026-07-29T00:00:00Z" -- status --json
@@ -2447,6 +2506,15 @@ assert_contains "remote.md distinguishes disk wait from CPU saturation" "$MD" "c
 # The interactive steps must DELEGATE to the shared script, not re-issue cloud
 # CLI calls from prose (the "no behavior drift" acceptance criterion).
 assert_contains "remote.md delegates provisioning to the shared script" "$MD" "scripts/repo/repo-remote.sh"
+
+# repo#562: the IMDS pin, its container effect, and the migration boundary.
+assert_contains "remote.md documents the exact metadata-options launch value" "$MD" \
+  "--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
+assert_contains "remote.md documents the IMDSv2 section" "$MD" "#### AWS instance metadata (IMDSv2)"
+assert_contains "remote.md documents the bridged-container effect" "$MD" "**Effect on containers.**"
+assert_contains "remote.md documents that existing instances keep their settings" "$MD" \
+  "**Existing instances keep their settings.**"
+assert_contains "remote.md gives the separate migration command" "$MD" "modify-instance-metadata-options"
 
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"

@@ -1642,6 +1642,14 @@ aws_create() {
     # exists to prevent (repo#177); aws_resolve_keypair() above either
     # resolves one or dies loudly, so $key is never empty here.
     --key-name "$key"
+    # IMDS hardening (repo#562): pin the instance metadata options at LAUNCH,
+    # where they take precedence over AMI and account defaults, so a box never
+    # depends on the image for them (Ubuntu 22.04 AMIs default to IMDSv1). The
+    # host-side readers in our user-data and identity probe already request a
+    # token first; hop limit 1 is enough because nothing here reads IMDS from
+    # inside a bridged container. A launch AWS rejects stays a hard failure —
+    # never retried with weaker settings.
+    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
     --query 'Instances[0].InstanceId' --output text)
 
   iid="$(aws "${args[@]}" 2>"$errfile")"; rc=$?
