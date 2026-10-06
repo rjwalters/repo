@@ -8,6 +8,14 @@
 #   --skills=a,b,c    Install only these commands (default: all)
 #   --no-codex        Skip the Codex-side skill surface (.agents/skills/repo/)
 #                     and install only the Claude Code surface. Default: both
+#   --no-guard        Do not copy or wire the Repo Skills destructive-command
+#                     guard (hooks/guard-destructive.sh + its PreToolUse entry
+#                     in .claude/settings.json). The opt-out is PERSISTED as
+#                     "guardHook": "disabled" in .claude/skills/repo/
+#                     install-metadata.json, so later plain reinstalls and
+#                     resyncs keep it. Already-wired entries are not removed.
+#                     Re-enable: delete that "guardHook" line, then re-run
+#                     install.sh without --no-guard.
 #   --dev             Symlink source files instead of copying (for dogfooding);
 #                     allows installing into the source repo itself
 #   --list            List available commands and exit
@@ -30,6 +38,7 @@
 #   ./install.sh --skills=clean,remote .
 #   ./install.sh --dry-run ~/projects/my-app
 #   ./install.sh --dev .            # dogfood: live /repo:* here via symlinks
+#   ./install.sh -y --no-guard ~/projects/my-app   # install without the destructive guard (persisted)
 #   ./install.sh -y --shell-wrapper ~/projects/my-app   # opt into the shell wrapper non-interactively
 
 set -euo pipefail
@@ -167,13 +176,16 @@ YES=false
 DEV=false
 SHELL_WRAPPER=false
 CODEX=true
+# --no-guard given on THIS invocation (repo#557). The effective policy, which
+# also honors a saved opt-out, is resolved into GUARD_POLICY further down.
+NO_GUARD=false
 # Appended to the closing success line once the Codex surface is actually written.
 CODEX_HINT=""
 # Set true once the Codex surface is actually written this run, so the C9
 # gitignore sweep below knows whether to include it.
 CODEX_INSTALLED=false
 
-usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed '/^$/d; s/^# \{0,1\}//'; }
 
 list_commands() {
   for f in "$SOURCE_ROOT"/commands/repo/*.md; do
@@ -185,6 +197,7 @@ for arg in "$@"; do
   case "$arg" in
     --skills=*)      SKILLS_FILTER="${arg#--skills=}" ;;
     --no-codex)      CODEX=false ;;
+    --no-guard)      NO_GUARD=true ;;
     --dev)           DEV=true ;;
     --list)          list_commands; exit 0 ;;
     --dry-run)       DRY_RUN=true ;;
@@ -255,6 +268,68 @@ SESSIONSTART_SOURCES=(startup resume)
 
 SETTINGS_JSON="$TARGET/.claude/settings.json"
 
+# Resolve the destructive-guard POLICY (repo#557) before the --dry-run
+# enumeration below and before GUARD_HOOK_INSTALLED is computed, so both the
+# preview and the real run gate on the same answer. Precedence:
+#   1. --no-guard on this invocation              -> disabled
+#   2. "guardHook": "disabled" in the target's tracked install-metadata.json
+#                                                 -> disabled (persisted opt-out)
+#   3. otherwise                                  -> auto (the automatic,
+#      coexistence-aware behavior every install had before this policy existed)
+# Deliberately NOT inferred from `guardHookInstalled: false` (that also records
+# a deferral to another tool's guard, re-evaluated every run), from a missing
+# settings.json entry, or from another tool's guard being wired. Only the
+# Claude-side metadata is consulted: it is the file the docs tell an operator
+# to edit to re-enable, and both metadata copies are rewritten from the
+# resolved policy on every install.
+INSTALLED_METADATA="$TARGET/.claude/skills/repo/install-metadata.json"
+saved_guard_policy() {  # -> the saved guardHook string, or empty
+  [[ -f "$INSTALLED_METADATA" ]] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'if (.guardHook? | type) == "string" then .guardHook else empty end' \
+      "$INSTALLED_METADATA" 2>/dev/null || true
+  else
+    sed -n 's/.*"guardHook"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$INSTALLED_METADATA" | head -n1
+  fi
+}
+
+# existing_guard_wired <settings-file> <our-cmd>
+# True (0) when a destructive-command guard matching guard-destructive.sh is
+# ALREADY wired under a PreToolUse/Bash hook in <settings-file>, under some
+# command OTHER than our own <our-cmd>. Two call sites need this exact test
+# kept in lock-step (repo#490), or the decisions they make can silently
+# disagree with each other:
+#   1. further down, ahead of copying hooks/repo/guard-destructive.sh into the target
+#      — skip the copy entirely when nothing will ever run it;
+#   2. merge_settings_hook's own coexistence branch — skip adding a second
+#      PreToolUse entry.
+# A single implementation is what makes that guarantee possible. (Defined here,
+# ahead of the --dry-run enumeration, so the preview can use it too.)
+#
+# The `.command != $c` filter matters on a REPEAT install: by the second run
+# our own hook IS already wired, and without excluding it here every reinstall
+# would misdetect its own prior wiring as "another" guard and quietly stop
+# copying/maintaining its own file.
+existing_guard_wired() {
+  local settings="$1" cmd="$2"
+  [[ -f "$settings" ]] || return 1
+  jq -e --arg c "$cmd" '
+        (.hooks.PreToolUse // []) | any(.[]?;
+          (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
+            ((.command // "") | test("guard-destructive\\.sh")) and (.command != $c))))
+      ' "$settings" >/dev/null 2>&1
+}
+
+GUARD_POLICY=auto
+GUARD_POLICY_REASON=""
+if [[ "$NO_GUARD" == true ]]; then
+  GUARD_POLICY=disabled
+  GUARD_POLICY_REASON="--no-guard"
+elif [[ "$(saved_guard_policy)" == disabled ]]; then
+  GUARD_POLICY=disabled
+  GUARD_POLICY_REASON="saved in .claude/skills/repo/install-metadata.json"
+fi
+
 # Codex-side destinations. Declared here, next to the Claude-side constants and
 # ahead of the --dry-run enumeration, so listing and doing read from the same
 # values and cannot drift.
@@ -274,6 +349,9 @@ echo ""
 info "Repo Skills v$VERSION ($COMMIT) → $TARGET"
 [[ "$DEV" == true ]] && info "Dev mode: symlinking source files (edits are live)"
 info "Commands: $(echo "$COMMANDS" | tr '\n' ' ')"
+if [[ "$GUARD_POLICY" == disabled ]]; then
+  info "Destructive-command guard: disabled ($GUARD_POLICY_REASON) — not copied, not wired"
+fi
 echo ""
 
 if [[ "$DRY_RUN" == true ]]; then
@@ -283,14 +361,22 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "  $TARGET/.claude/skills/repo/SKILL.md"
   echo "  $TARGET/.claude/skills/repo/install-metadata.json"
   echo "  $TARGET/.claude/skills/repo/.install-local.json (machine-local, gitignored)"
-  echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
+  if [[ "$GUARD_POLICY" == disabled ]]; then
+    echo "  (guard policy: disabled via $GUARD_POLICY_REASON — guard-destructive.sh NOT copied or wired;"
+    echo "   install-metadata.json would record \"guardHook\": \"disabled\")"
+  elif existing_guard_wired "$SETTINGS_JSON" "$HOOK_CMD"; then
+    echo "  (guard policy: auto — another destructive-command guard is already wired; guard-destructive.sh skipped)"
+  else
+    echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
+  fi
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-org-policy.py"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-optimize-ci.py"
   echo "  $TARGET/.claude/skills/repo/scripts/resync-installed.sh"
-  echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
+  [[ "$GUARD_POLICY" == disabled ]] \
+    || echo "  $TARGET/.claude/settings.json (merge PreToolUse→Bash guard hook; idempotent, coexistence-aware)"
   echo "  $TARGET/.claude/settings.json (merge SessionStart→${SESSIONSTART_SOURCES[*]} handoff-note hook; idempotent, coexistence-aware)"
   while IFS= read -r cmd; do
     echo "  $TARGET/.claude/commands/repo/$cmd.md"
@@ -382,32 +468,6 @@ install_file() {  # <source-abs> <dest-abs> <label>
 # output untrustworthy, so the success line is gated on what actually happened.
 success_installed() {  # <dest-rel>
   [[ "$INSTALL_FILE_SKIPPED" == true ]] || success "Installed $1"
-}
-
-# existing_guard_wired <settings-file> <our-cmd>
-# True (0) when a destructive-command guard matching guard-destructive.sh is
-# ALREADY wired under a PreToolUse/Bash hook in <settings-file>, under some
-# command OTHER than our own <our-cmd>. Two call sites need this exact test
-# kept in lock-step (repo#490), or the decisions they make can silently
-# disagree with each other:
-#   1. below, ahead of copying hooks/repo/guard-destructive.sh into the target
-#      — skip the copy entirely when nothing will ever run it;
-#   2. merge_settings_hook's own coexistence branch — skip adding a second
-#      PreToolUse entry.
-# A single implementation is what makes that guarantee possible.
-#
-# The `.command != $c` filter matters on a REPEAT install: by the second run
-# our own hook IS already wired, and without excluding it here every reinstall
-# would misdetect its own prior wiring as "another" guard and quietly stop
-# copying/maintaining its own file.
-existing_guard_wired() {
-  local settings="$1" cmd="$2"
-  [[ -f "$settings" ]] || return 1
-  jq -e --arg c "$cmd" '
-        (.hooks.PreToolUse // []) | any(.[]?;
-          (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
-            ((.command // "") | test("guard-destructive\\.sh")) and (.command != $c))))
-      ' "$settings" >/dev/null 2>&1
 }
 
 # Idempotently wire the guard-destructive.sh PreToolUse/Bash hook into the
@@ -532,7 +592,12 @@ merge_settings_sessionstart_hook() {
 # for resync-installed.sh to respect on every later refresh (repo#490): a
 # target where another guard is already wired must never receive a copy of a
 # script nothing will ever run.
-if existing_guard_wired "$SETTINGS_JSON" "$HOOK_CMD"; then
+#
+# An explicit opt-out (GUARD_POLICY=disabled, repo#557) short-circuits this to
+# false before the coexistence check is even consulted.
+if [[ "$GUARD_POLICY" == disabled ]]; then
+  GUARD_HOOK_INSTALLED=false
+elif existing_guard_wired "$SETTINGS_JSON" "$HOOK_CMD"; then
   GUARD_HOOK_INSTALLED=false
 else
   GUARD_HOOK_INSTALLED=true
@@ -578,10 +643,15 @@ success "Installed $CMD_WRITTEN commands into .claude/commands/repo/$([[ "$CMD_P
 # to tell "never installed here" from "deliberately deferred" and would keep
 # re-adding a file nothing runs (repo#490).
 #
+# `guardHook` (repo#557) is the operator's explicit policy, kept separate from
+# that outcome: it is written only as "disabled" (from --no-guard or a saved
+# opt-out), and is what makes a later plain reinstall keep the guard out.
+#
 # The field list itself lives in lib/metadata.sh so the resync writes the same
 # shape — see that file for why one emitter matters here.
 metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
   "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
+  "$GUARD_POLICY" \
   >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
 
@@ -662,10 +732,21 @@ if [[ "$GUARD_HOOK_INSTALLED" == true ]]; then
     "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" "hooks/repo/guard-destructive.sh"
   chmod +x "$TARGET/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null || true
   success_installed ".claude/skills/repo/hooks/guard-destructive.sh"
+  merge_settings_hook
+elif [[ "$GUARD_POLICY" == disabled ]]; then
+  # Explicit opt-out (repo#557): neither the payload (copy OR --dev symlink)
+  # nor the settings.json entry. An entry or script left over from an earlier
+  # install is NOT removed — that stays an explicit operator action.
+  info "Destructive-command guard disabled ($GUARD_POLICY_REASON) — not copying or wiring guard-destructive.sh"
+  if [[ -e "$TARGET/$HOOK_INSTALL_REL" || -L "$TARGET/$HOOK_INSTALL_REL" ]] \
+    || { [[ -f "$SETTINGS_JSON" ]] && grep -qF "$HOOK_INSTALL_REL" "$SETTINGS_JSON" 2>/dev/null; }; then
+    warning "A Repo Skills guard from an earlier install is still present (script and/or settings.json"
+    warning "entry). The opt-out does not remove it; delete it by hand (or run uninstall.sh) if wanted."
+  fi
 else
   info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it)"
+  merge_settings_hook
 fi
-merge_settings_hook
 
 # 3c. SessionStart handoff hook + settings.json wiring. Same colocation and
 # chmod rationale as the guard above. Wired unconditionally, like the guard:
@@ -791,6 +872,7 @@ else
   # information.
   metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
     "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
+    "$GUARD_POLICY" \
     >"$CODEX_SKILL_DIR/install-metadata.json"
   success "Wrote $CODEX_SKILL_REL/install-metadata.json"
   CODEX_HINT=" In Codex CLI the same workflows are the \`$CODEX_SKILL_SLUG\` skill (\`/skills\`, or type \`\$$CODEX_SKILL_SLUG\`)."

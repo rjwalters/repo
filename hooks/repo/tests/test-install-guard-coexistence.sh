@@ -198,6 +198,151 @@ else
     fi
 fi
 
+# ===========================================================================
+# repo#557: explicit, PERSISTED opt-out (`install.sh --no-guard` ->
+# "guardHook": "disabled"). Distinct from the deferral above: deferral is
+# re-evaluated every run, the opt-out holds across plain reinstalls and
+# resyncs until the operator clears it.
+# ===========================================================================
+CODEX_META=".agents/skills/repo/install-metadata.json"
+
+# tree_fingerprint <dir> — content+mode manifest of every file (symlinks by
+# target), so "dry-run wrote nothing" is asserted rather than trusted.
+tree_fingerprint() {
+    ( cd "$1" && find . -path ./.git -prune -o \( -type f -o -type l \) -print | LC_ALL=C sort \
+      | while IFS= read -r f; do
+          if [[ -L "$f" ]]; then printf '%s SYMLINK %s\n' "$f" "$(readlink "$f")"
+          else printf '%s %s %s\n' "$f" "$(cksum <"$f")" "$([[ -x "$f" ]] && echo x || echo -)"; fi
+        done )
+}
+
+# Unrelated settings an opted-out install must leave alone.
+seed_unrelated_settings() {  # <target>
+    mkdir -p "$1/.claude"
+    cat >"$1/$SETTINGS" <<'EOF'
+{
+  "permissions": { "allow": ["Bash(ls:*)"], "deny": ["Read(./.env)"] },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "/opt/tools/edit-check.sh" } ] }
+    ],
+    "SessionStart": [
+      { "matcher": "startup", "hooks": [ { "type": "command", "command": "/opt/tools/hello.sh" } ] }
+    ]
+  }
+}
+EOF
+}
+
+echo ""
+echo "-- --dry-run --no-guard on a fresh target writes nothing and claims no guard (repo#557) --"
+T3="$(new_target optout)"
+seed_unrelated_settings "$T3"
+FP3_BEFORE="$(tree_fingerprint "$T3")"
+DRY3="$(bash "$INSTALL_SH" -y --dry-run --no-guard "$T3" 2>&1)"; RC3D=$?
+assert_eq "dry-run --no-guard exits 0" "0" "$RC3D"
+assert_eq "dry-run --no-guard leaves the target byte-identical" "$FP3_BEFORE" "$(tree_fingerprint "$T3")"
+assert_contains "dry-run reports the effective guard policy" "$DRY3" "guard policy: disabled via --no-guard"
+assert_not_contains "dry-run does not list guard-destructive.sh as a write" \
+    "$DRY3" "  $T3/.claude/skills/repo/hooks/guard-destructive.sh"
+assert_not_contains "dry-run does not claim PreToolUse guard wiring" "$DRY3" "merge PreToolUse"
+
+echo ""
+echo "-- --no-guard install: no payload, no wiring, policy persisted, unrelated settings kept --"
+PERMS3_BEFORE="$(jq -c '.permissions' "$T3/$SETTINGS")"
+PRE3_BEFORE="$(jq -c '.hooks.PreToolUse' "$T3/$SETTINGS")"
+OUT3="$(bash "$INSTALL_SH" -y --no-guard "$T3" 2>&1)"; RC3=$?
+assert_eq "--no-guard install exits 0" "0" "$RC3"
+if [[ ! -e "$T3/$GUARD_DEST" && ! -L "$T3/$GUARD_DEST" ]]; then
+    ok "--no-guard does not copy guard-destructive.sh"
+else
+    no "--no-guard does not copy guard-destructive.sh" "found $T3/$GUARD_DEST"
+fi
+assert_not_contains "--no-guard does not wire a guard into settings.json" \
+    "$(cat "$T3/$SETTINGS")" "guard-destructive.sh"
+assert_contains "metadata records guardHook:disabled" "$(cat "$T3/$META")" '"guardHook": "disabled"'
+assert_contains "metadata records guardHookInstalled:false" "$(cat "$T3/$META")" '"guardHookInstalled": false'
+assert_contains "Codex metadata records guardHook:disabled too" "$(cat "$T3/$CODEX_META" 2>/dev/null)" '"guardHook": "disabled"'
+assert_eq "permissions are unchanged" "$PERMS3_BEFORE" "$(jq -c '.permissions' "$T3/$SETTINGS")"
+assert_eq "unrelated PreToolUse entries are unchanged" "$PRE3_BEFORE" "$(jq -c '.hooks.PreToolUse' "$T3/$SETTINGS")"
+assert_contains "the pre-existing SessionStart hook is preserved" "$(cat "$T3/$SETTINGS")" "/opt/tools/hello.sh"
+assert_contains "the SessionStart handoff hook is still wired normally" \
+    "$(cat "$T3/$SETTINGS")" "session-start-handoff.sh"
+assert_not_contains "install does not claim the guard was installed" \
+    "$OUT3" "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+
+echo ""
+echo "-- a later PLAIN reinstall keeps the saved opt-out --"
+OUT3B="$(bash "$INSTALL_SH" -y "$T3" 2>&1)"; RC3B=$?
+assert_eq "plain reinstall exits 0" "0" "$RC3B"
+assert_contains "plain reinstall reports the saved policy" "$OUT3B" "saved in .claude/skills/repo/install-metadata.json"
+if [[ ! -e "$T3/$GUARD_DEST" ]]; then
+    ok "plain reinstall still does not copy guard-destructive.sh"
+else
+    no "plain reinstall still does not copy guard-destructive.sh"
+fi
+assert_not_contains "plain reinstall still does not wire the guard" "$(cat "$T3/$SETTINGS")" "guard-destructive.sh"
+assert_contains "the saved policy survives the plain reinstall" "$(cat "$T3/$META")" '"guardHook": "disabled"'
+assert_eq "permissions still unchanged after reinstall" "$PERMS3_BEFORE" "$(jq -c '.permissions' "$T3/$SETTINGS")"
+
+echo ""
+echo "-- dry-run with a SAVED opt-out writes nothing and claims no guard --"
+FP3B="$(tree_fingerprint "$T3")"
+DRY3B="$(bash "$INSTALL_SH" -y --dry-run "$T3" 2>&1)"
+assert_eq "dry-run with saved opt-out leaves the target byte-identical" "$FP3B" "$(tree_fingerprint "$T3")"
+assert_contains "dry-run reports the saved policy" "$DRY3B" "guard policy: disabled via saved"
+assert_not_contains "dry-run does not claim PreToolUse guard wiring" "$DRY3B" "merge PreToolUse"
+
+echo ""
+echo "-- resync honors the opt-out and preserves it in both metadata files --"
+if [[ -f "$RESYNC_SH" ]]; then
+    RS3="$(bash "$RESYNC_SH" --target "$T3" --source "$REPO_ROOT" 2>&1)"
+    if [[ ! -e "$T3/$GUARD_DEST" ]]; then
+        ok "resync does not add guard-destructive.sh under the opt-out"
+    else
+        no "resync does not add guard-destructive.sh under the opt-out"
+    fi
+    assert_contains "resync preserves guardHook:disabled (Claude metadata)" "$(cat "$T3/$META")" '"guardHook": "disabled"'
+    assert_contains "resync preserves guardHook:disabled (Codex metadata)" "$(cat "$T3/$CODEX_META")" '"guardHook": "disabled"'
+else
+    skip "resync honors the opt-out" "resync-installed.sh not found"
+fi
+
+echo ""
+echo "-- re-enable: clearing the policy field restores the default on the next install --"
+grep -v '"guardHook":' "$T3/$META" >"$T3/$META.new" && mv "$T3/$META.new" "$T3/$META"
+OUT3C="$(bash "$INSTALL_SH" -y "$T3" 2>&1)"
+assert_contains "re-enabled install copies the guard" "$OUT3C" "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+assert_contains "re-enabled install wires the guard" "$(cat "$T3/$SETTINGS")" "guard-destructive.sh"
+assert_not_contains "re-enabled install no longer records the opt-out" "$(cat "$T3/$META")" '"guardHook"'
+assert_not_contains "re-enabled install clears the Codex copy of the policy too" "$(cat "$T3/$CODEX_META")" '"guardHook"'
+
+echo ""
+echo "-- legacy guardHookInstalled:false (no policy field) is NOT a permanent opt-out --"
+# T1 deferred to a foreign guard. Remove that guard: with no saved policy the
+# next install must fall back to the automatic behavior and install ours.
+jq 'del(.hooks.PreToolUse)' "$T1/$SETTINGS" >"$T1/$SETTINGS.new" && mv "$T1/$SETTINGS.new" "$T1/$SETTINGS"
+assert_not_contains "precondition: T1 metadata has no guardHook policy" "$(cat "$T1/$META")" '"guardHook"'
+OUT1C="$(bash "$INSTALL_SH" -y "$T1" 2>&1)"
+assert_contains "install proceeds with the default guard" "$OUT1C" "Installed .claude/skills/repo/hooks/guard-destructive.sh"
+assert_contains "guardHookInstalled flips back to true" "$(cat "$T1/$META")" '"guardHookInstalled": true'
+
+echo ""
+echo "-- --dev --no-guard creates no guard symlink --"
+T4="$(new_target optout-dev)"
+bash "$INSTALL_SH" -y --dev --no-guard "$T4" >/dev/null 2>&1
+if [[ ! -e "$T4/$GUARD_DEST" && ! -L "$T4/$GUARD_DEST" ]]; then
+    ok "--dev --no-guard does not symlink guard-destructive.sh"
+else
+    no "--dev --no-guard does not symlink guard-destructive.sh"
+fi
+assert_contains "--dev --no-guard records the policy" "$(cat "$T4/$META")" '"guardHook": "disabled"'
+assert_not_contains "--dev --no-guard does not wire the guard" "$(cat "$T4/$SETTINGS" 2>/dev/null)" "guard-destructive.sh"
+
+echo ""
+echo "-- default installs stay byte-compatible (no policy field emitted) --"
+assert_not_contains "a default install does not emit guardHook" "$(cat "$T2/$META")" '"guardHook"'
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================="
