@@ -156,6 +156,40 @@
 # the `ec2:ModifyVolume` permission it needs. It never runs that command, and a
 # failed inspection is a notice, never a failed `up`.
 #
+# AWS transport (repo#564): how `up`/`verify` reach the box, AWS-only, resolved
+# through the same two config layers:
+#   REPO_REMOTE_TRANSPORT          ssh (default) | ssm
+#   REPO_REMOTE_INSTANCE_PROFILE   optional IAM instance profile NAME, passed to
+#                                  run-instances as --iam-instance-profile
+#                                  Name=<name> on a fresh launch. A profile alone
+#                                  never changes the transport.
+# ssh (default) is the behavior described above: a public IP, a per-caller /32
+# tcp/22 rule, and an alias whose HostName is that IP. ssm reaches the box over
+# AWS Systems Manager Session Manager instead: the alias's HostName is the
+# instance ID and a ProxyCommand runs `aws ssm start-session --region <region>
+# --target %h --document-name AWS-StartSSHSession --parameters portNumber=22`.
+# SSH user/key authentication is unchanged; readiness, the host-identity probe,
+# interactive ssh, and rsync all go through that alias. Under ssm:
+#   * a FRESH launch requires REPO_REMOTE_INSTANCE_PROFILE (exit 2 before any
+#     mutation otherwise) and gets a tool-owned security group tagged
+#     repo-remote-ssm=<name> with NO inbound rule. An explicit
+#     REPO_REMOTE_SECURITY_GROUP, or a previously created SSM group, that has
+#     any inbound rule is refused (exit 2) — its rules are never deleted.
+#   * no ingress is authorized or revoked, no current-IP lookup is made, and no
+#     public IP is polled — on create OR reuse. A reused instance's existing
+#     exposure is reported, never "fixed", and a reused instance without an
+#     instance profile gets a warning (a role is never attached automatically).
+#   * the local `session-manager-plugin` must be installed (exit 2 before any
+#     cloud call otherwise; REPO_REMOTE_SSM_PLUGIN overrides the binary name).
+#   * the readiness probe retries the agent-registration delay
+#     (TargetNotConnected) within REPO_REMOTE_SSH_READY_TIMEOUT, fails at once on
+#     an access denial or a missing plugin, and never falls back to direct SSH.
+# Invalid values (an unknown transport, ssm or a profile with GCP, a malformed
+# profile name, a region that is not a plain AWS region code) exit 2 before any
+# cloud call. The `up` JSON gains additive "transport", "connect_target" (the
+# alias HostName: IP or instance ID) and "instance_profile" fields; under ssm
+# "public_ip" is "" because none is looked up.
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure) — also
@@ -208,6 +242,9 @@
 #                                      /etc/repo-remote-instance-id; repo#458)
 #   REPO_REMOTE_VERIFY_SSH_TIMEOUT     ConnectTimeout for the single
 #                                      host-identity probe session (default 10)
+#   REPO_REMOTE_SSM_PLUGIN             name/path of the Session Manager plugin
+#                                      the ssm-transport preflight looks for
+#                                      (default session-manager-plugin)
 #
 set -uo pipefail
 
@@ -346,6 +383,8 @@ FLEET_TAG_VALUE="" # required value for that key ("" = any non-empty value)
 SSH_CIDR=""        # AWS only: pinned SSH-ingress CIDR override (see aws_resolve_ssh_cidr)
 SSH_MIN_PREFIX=""  # AWS only: narrowest IPv4 prefix length accepted for SSH ingress (default 32)
 ALLOW_WORLD_SSH="" # AWS only: "1" opts in to an SSH-ingress CIDR wider than SSH_MIN_PREFIX
+TRANSPORT=""        # AWS only: ssh (default) | ssm (repo#564)
+INSTANCE_PROFILE="" # AWS only: IAM instance profile name for a fresh launch
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -519,6 +558,11 @@ resolve_settings() {
   SSH_MIN_PREFIX="${REPO_REMOTE_SSH_MIN_PREFIX:-32}"
   ALLOW_WORLD_SSH="${REPO_REMOTE_ALLOW_WORLD_SSH:-0}"
 
+  # Transport + instance profile (repo#564). Validated, before any cloud call,
+  # by validate_transport_config().
+  TRANSPORT="$(printf '%s' "${REPO_REMOTE_TRANSPORT:-ssh}" | tr '[:upper:]' '[:lower:]')"
+  INSTANCE_PROFILE="${REPO_REMOTE_INSTANCE_PROFILE:-}"
+
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
     gcp) REGION="${GCP_ZONE:-}" ;;
@@ -662,6 +706,64 @@ aws_root_block_device_mapping() {
     ebs+=",Iops=${VOLUME_IOPS},Throughput=${VOLUME_THROUGHPUT}"
   fi
   printf 'DeviceName=/dev/sda1,Ebs={%s}' "$ebs"
+}
+
+# ── transport configuration (repo#564) ──────────────────────────────────────
+# Every value that ends up inside a generated SSH config line (and, for ssm,
+# inside a ProxyCommand that ssh hands to a shell) is matched against a strict
+# allow-list here, so a config value can never add an SSH directive or a shell
+# command. Runs for `up` (dry run included) and `verify` BEFORE any cloud call.
+is_aws_region() { [[ "$1" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$ ]]; }
+# IAM instance-profile names: 1-128 of [A-Za-z0-9+=,.@_-] (IAM naming rules).
+is_instance_profile_name() { [[ "$1" =~ ^[A-Za-z0-9+=,.@_-]{1,128}$ ]]; }
+# EC2 instance ids are i-<hex>; letters beyond hex are tolerated (still no
+# shell or ssh-config metacharacters) so fixtures can use readable ids.
+is_instance_id() { [[ "$1" =~ ^i-[A-Za-z0-9]{1,32}$ ]]; }
+
+validate_transport_config() {
+  local -a bad=()
+  case "$TRANSPORT" in
+    ssh|ssm) : ;;
+    *) bad+=("REPO_REMOTE_TRANSPORT='${TRANSPORT}' is not supported (expected ssh or ssm)") ;;
+  esac
+  if [[ "$PROVIDER" != aws ]]; then
+    [[ "$TRANSPORT" == ssm ]] \
+      && bad+=("REPO_REMOTE_TRANSPORT=ssm is AWS-only (provider is '${PROVIDER}'); GCP uses OS Login / IAP instead")
+    [[ -n "$INSTANCE_PROFILE" ]] \
+      && bad+=("REPO_REMOTE_INSTANCE_PROFILE is AWS-only (provider is '${PROVIDER}'); unset it")
+  fi
+  if [[ -n "$INSTANCE_PROFILE" ]] && ! is_instance_profile_name "$INSTANCE_PROFILE"; then
+    bad+=("REPO_REMOTE_INSTANCE_PROFILE='${INSTANCE_PROFILE}' is not a valid IAM instance profile NAME (1-128 of A-Z a-z 0-9 + = , . @ _ -; pass the name, not an ARN)")
+  fi
+  if [[ "$TRANSPORT" == ssm && "$PROVIDER" == aws ]]; then
+    [[ -z "$REGION" ]] || is_aws_region "$REGION" \
+      || bad+=("AWS_REGION='${REGION}' is not a plain AWS region code (e.g. us-west-2); it is written into the SSM ProxyCommand, so nothing else is accepted")
+  fi
+  local user="${REPO_REMOTE_SSH_USER:-ubuntu}"
+  [[ "$user" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] \
+    || bad+=("REPO_REMOTE_SSH_USER='${user}' is not a plain user name (letters, digits, . _ -)")
+  local key="${REPO_REMOTE_SSH_KEY:-~/.ssh/id_ed25519}"
+  [[ "$key" != *$'\n'* && "$key" != *$'\r'* ]] \
+    || bad+=("REPO_REMOTE_SSH_KEY contains a line break; it is written into the SSH config as one IdentityFile line")
+
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    local b
+    log "cannot proceed — invalid transport config (nothing was created or changed):"
+    for b in "${bad[@]}"; do log "  - $b"; done
+    log "see 'AWS transport: direct SSH or SSM Session Manager' in commands/repo/remote.md."
+    exit 2
+  fi
+}
+
+# The local half of the SSM prerequisites: the AWS CLI's Session Manager
+# plugin. Checked before any cloud call. The remote half (instance profile,
+# running agent, a network path to the regional SSM endpoints, the caller's
+# ssm:StartSession grant) cannot be proved locally; the readiness probe reports
+# those distinctly.
+ssm_plugin_present() { command -v "${REPO_REMOTE_SSM_PLUGIN:-session-manager-plugin}" >/dev/null 2>&1; }
+ssm_preflight() {
+  ssm_plugin_present && return 0
+  die 2 "REPO_REMOTE_TRANSPORT=ssm needs the AWS CLI Session Manager plugin ('${REPO_REMOTE_SSM_PLUGIN:-session-manager-plugin}' is not on PATH). Install it (AWS docs: \"Install the Session Manager plugin for the AWS CLI\"), or set REPO_REMOTE_TRANSPORT=ssh. Nothing was created or changed."
 }
 
 # ── the fleet-marker guard (reuse discovery, repo#164) ──────────────────────
@@ -1486,6 +1588,110 @@ aws_refresh_ssh_ingress() {  # [--no-create]
   aws_verify_ssh_ingress "$RESOLVED_SG"
 }
 
+# ── AWS: zero-inbound security group for the ssm transport (repo#564) ──────
+# Session Manager needs no inbound port at all, so an ssm launch gets a group
+# with an EMPTY inbound permission set. That group is deliberately a different
+# tool-owned group from the direct-SSH one: it carries the tag
+# repo-remote-ssm=<name> (not repo-remote=<name>), so neither transport's
+# lookup can pick up the other's group — a fresh ssm launch must never land in
+# the direct-SSH group's open tcp/22 while reporting a zero-ingress box.
+
+# aws_sg_ingress_count <sg-id> -- echoes the number of inbound permission
+# entries on the group; returns non-zero (echoing nothing) when the group
+# cannot be inspected.
+aws_sg_ingress_count() {
+  local out rc
+  out="$(aws ec2 describe-security-groups --group-ids "$1" \
+    --query 'length(SecurityGroups[0].IpPermissions)' --output text 2>/dev/null)"; rc=$?
+  out="$(printf '%s' "$out" | tr -d '[:space:]')"
+  [[ $rc -eq 0 && "$out" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+aws_find_tagged_ssm_sg() {
+  aws ec2 describe-security-groups \
+    --filters "Name=tag:repo-remote-ssm,Values=${NAME}" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null \
+    | grep -v '^None' || true
+}
+
+# Refuse (exit 2) an existing group that admits anything inbound. Its rules
+# are the operator's (or an earlier run's) and are never deleted here.
+aws_require_empty_ingress() {  # <sg-id> <how-it-was-resolved>
+  local sg="$1" how="$2" n
+  n="$(aws_sg_ingress_count "$sg")" \
+    || die 4 "could not inspect the inbound rules of security group ${sg} (${how}); an ssm launch must prove its group admits nothing inbound before run-instances. Check ec2:DescribeSecurityGroups."
+  [[ "$n" == 0 ]] && return 0
+  die 2 "refusing to launch with REPO_REMOTE_TRANSPORT=ssm into security group ${sg} (${how}): it has ${n} inbound rule(s), and an ssm box is promised a group with NO inbound rule. Its rules were left untouched (this tool never deletes them). Unset REPO_REMOTE_SECURITY_GROUP to get a tool-owned empty group, point it at an empty group, or remove the rules yourself after reviewing them: aws ec2 describe-security-groups --group-ids ${sg}"
+}
+
+# Resolve-or-create the zero-inbound group into RESOLVED_SG.
+aws_resolve_or_create_ssm_sg() {
+  local sg="${REPO_REMOTE_SECURITY_GROUP:-}"
+  if [[ -n "$sg" ]]; then
+    aws_require_empty_ingress "$sg" "REPO_REMOTE_SECURITY_GROUP"
+    RESOLVED_SG="$sg"
+    return 0
+  fi
+  sg="$(aws_find_tagged_ssm_sg)"
+  if [[ -n "$sg" ]]; then
+    aws_require_empty_ingress "$sg" "tagged repo-remote-ssm=${NAME}"
+    RESOLVED_SG="$sg"
+    log "reusing existing zero-inbound security group ${sg} (tagged repo-remote-ssm=${NAME})"
+    return 0
+  fi
+  local out rc
+  out="$(aws ec2 create-security-group \
+    --group-name "repo-remote-ssm-${NAME}" \
+    --description "repo-remote: SSM Session Manager only, no inbound, for ${NAME}" \
+    --tag-specifications "ResourceType=security-group,Tags=[{Key=repo-remote-ssm,Value=${NAME}}]" \
+    --query 'GroupId' --output text 2>&1)"; rc=$?
+  if [[ $rc -ne 0 || -z "$out" || "$out" == "None" ]]; then
+    die 4 "aws ec2 create-security-group failed: ${out:-unknown error}"
+  fi
+  RESOLVED_SG="$out"
+  log "created zero-inbound security group ${RESOLVED_SG} (tagged repo-remote-ssm=${NAME})"
+  # A new group starts with no inbound rule; prove it before spending money.
+  aws_require_empty_ingress "$RESOLVED_SG" "just created"
+}
+
+# Reused instance under ssm: report, never change. Any inbound rule on the
+# instance's own groups predates this run (e.g. a direct-SSH /32 from when the
+# box was launched with REPO_REMOTE_TRANSPORT=ssh); switching transport does not
+# remove it, and this says so instead of implying otherwise. Also warns when no
+# instance profile is attached — the most common reason a reused box never
+# registers with SSM — without attaching one. Best effort: an inspection
+# failure is a NOTICE, never a failed `up`.
+aws_ssm_reuse_notices() {  # <instance-id>
+  local iid="$1" out rc sg n
+  out="$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text 2>/dev/null)"; rc=$?
+  out="$(printf '%s' "$out" | tr -d '[:space:]')"
+  if [[ $rc -ne 0 ]]; then
+    log "NOTICE: could not read the instance profile of reused instance ${iid}; if SSM never connects, check it has one with AmazonSSMManagedInstanceCore."
+  elif [[ -z "$out" || "$out" == None ]]; then
+    log "WARNING: reused instance ${iid} has NO IAM instance profile attached, so its SSM agent most likely cannot register and the ssm transport will time out (TargetNotConnected). This run does not attach one. Attach a profile whose role has AmazonSSMManagedInstanceCore yourself: aws ec2 associate-iam-instance-profile --instance-id ${iid} --iam-instance-profile Name=<profile> --region ${REGION}"
+  fi
+
+  out="$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId' --output text 2>/dev/null)"; rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log "NOTICE: could not list the security groups of reused instance ${iid}, so any existing inbound exposure was not reported."
+    return 0
+  fi
+  for sg in $out; do
+    [[ "$sg" == None ]] && continue
+    if ! n="$(aws_sg_ingress_count "$sg")"; then
+      log "NOTICE: could not inspect the inbound rules of ${sg} (attached to reused instance ${iid})."
+      continue
+    fi
+    if [[ "$n" != 0 ]]; then
+      log "NOTICE: security group ${sg} on reused instance ${iid} still has ${n} inbound rule(s) (e.g. a tcp/22 rule from a direct-SSH launch). The ssm transport does not need them, and this run did NOT remove or change them. Review and revoke them yourself if they are no longer wanted: aws ec2 describe-security-groups --group-ids ${sg} --region ${REGION}"
+    fi
+  done
+  return 0
+}
+
 # ── reused-instance root-volume advisory (repo#559) ─────────────────────────
 # An instance created before repo#559 (or by hand) may still have a gp2 root
 # volume. `up` cannot fix that at launch time — the box already exists — so on
@@ -1613,13 +1819,26 @@ aws_userdata() {  # <pubkey-line>
 CREATED_ID=""
 aws_create() {
   local ami key udfile errfile iid rc err attached
+
+  # repo#564: an ssm launch without an instance profile would boot a box whose
+  # agent cannot register — unreachable by design. Refuse before ANY mutation
+  # (the key-pair import and security-group creation below included).
+  if [[ "$TRANSPORT" == ssm && -z "$INSTANCE_PROFILE" ]]; then
+    die 2 "REPO_REMOTE_TRANSPORT=ssm needs REPO_REMOTE_INSTANCE_PROFILE for a fresh launch: an instance profile whose role has the AmazonSSMManagedInstanceCore policy, so the SSM agent can register. Nothing was created. Set REPO_REMOTE_INSTANCE_PROFILE=<profile-name> (the caller also needs iam:PassRole on its role), or set REPO_REMOTE_TRANSPORT=ssh."
+  fi
+
   aws_resolve_image; ami="$RESOLVED_AMI"
   aws_resolve_keypair; key="$RESOLVED_KEY_NAME"
 
-  # Resolve-or-create the security group and prove it actually allows SSH
-  # BEFORE spending money on run-instances (repo#176). The reuse paths in
-  # aws_up() run the same chain (repo#451).
-  aws_refresh_ssh_ingress                               # sets RESOLVED_SG
+  if [[ "$TRANSPORT" == ssm ]]; then
+    # repo#564: zero-inbound group; no ingress authorization, no IP lookup.
+    aws_resolve_or_create_ssm_sg                        # sets RESOLVED_SG
+  else
+    # Resolve-or-create the security group and prove it actually allows SSH
+    # BEFORE spending money on run-instances (repo#176). The reuse paths in
+    # aws_up() run the same chain (repo#451).
+    aws_refresh_ssh_ingress                             # sets RESOLVED_SG
+  fi
 
   udfile="$(mktemp)"; aws_userdata "$RESOLVED_PUB_KEY_LINE" >"$udfile"
   errfile="$(mktemp)"
@@ -1651,6 +1870,10 @@ aws_create() {
     # never retried with weaker settings.
     --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
     --query 'Instances[0].InstanceId' --output text)
+  # repo#564: attach the configured instance profile on either transport. The
+  # caller needs iam:PassRole on its role; AWS rejects the launch otherwise,
+  # and that rejection is surfaced below like any other.
+  [[ -n "$INSTANCE_PROFILE" ]] && args+=(--iam-instance-profile "Name=${INSTANCE_PROFILE}")
 
   iid="$(aws "${args[@]}" 2>"$errfile")"; rc=$?
   err="$(cat "$errfile" 2>/dev/null)"
@@ -1664,6 +1887,9 @@ aws_create() {
       else
         die 4 "AWS standard vCPU quota exceeded (VcpuLimitExceeded). Request a limit >= this type's vCPUs at Service Quotas -> EC2 -> quota code L-1216C47A (Running On-Demand Standard instances), then retry."
       fi
+    fi
+    if [[ -n "$INSTANCE_PROFILE" ]] && printf '%s' "$err" | grep -qiE 'iam:PassRole|IamInstanceProfile|instance profile'; then
+      die 4 "aws ec2 run-instances rejected the instance profile '${INSTANCE_PROFILE}' (REPO_REMOTE_INSTANCE_PROFILE): ${err}. Check that the profile exists in this account and that the caller has iam:PassRole on its role (condition iam:PassedToService = ec2.amazonaws.com). Nothing was launched."
     fi
     die 4 "aws ec2 run-instances failed: ${err:-unknown error}"
   fi
@@ -1713,8 +1939,34 @@ ssh_error_is_boot_in_progress() {  # <ssh-stderr>
     'Connection refused|Operation timed out|Connection timed out|No route to host|Connection reset|Connection closed by remote host|Network is unreachable|Host is unreachable'
 }
 
-aws_check_reachability() {  # <ssh-alias> <ip>
-  local alias="$1" ip="$2"
+# ssm_error_class <ssh-stderr> (repo#564) -- classify a failed probe over the
+# SSM ProxyCommand. The proxy's own error lands on ssh's stderr ahead of ssh's
+# generic "Connection closed" line, so the specific causes are matched FIRST:
+#   denied      the caller lacks ssm:StartSession (or the document) — hard fail
+#   plugin      the local Session Manager plugin is missing — hard fail
+#   registering TargetNotConnected: the agent has not registered yet — retry
+#   other       anything else — hard fail (never burn the window on it)
+ssm_error_class() {  # <ssh-stderr>
+  local e="$1"
+  if printf '%s' "$e" | grep -Eq 'AccessDenied|not authorized to perform|UnauthorizedOperation'; then
+    printf 'denied'
+  elif printf '%s' "$e" | grep -Eqi 'SessionManagerPlugin is not found|session-manager-plugin.*not found'; then
+    printf 'plugin'
+  elif printf '%s' "$e" | grep -Eq 'TargetNotConnected|is not connected'; then
+    printf 'registering'
+  else
+    printf 'other'
+  fi
+}
+
+# The remote SSM prerequisites, named in every ssm readiness failure so the
+# operator gets the whole checklist rather than one guess.
+ssm_prereq_hint() {
+  printf '%s' "SSM prerequisites: the instance has an instance profile whose role carries AmazonSSMManagedInstanceCore; its SSM agent is running (preinstalled on Ubuntu AMIs) with outbound HTTPS to the regional ssm, ssmmessages and ec2messages endpoints (or VPC endpoints for them); the caller may call ssm:StartSession on the instance and on the AWS-StartSSHSession document; the local session-manager-plugin is installed."
+}
+
+aws_check_reachability() {  # <ssh-alias> <target> [ssm]
+  local alias="$1" ip="$2" via="${3:-ssh}"
   if [[ -z "$ip" ]]; then
     log "no public IP resolved yet; skipping the end-of-run SSH reachability check"
     return 0
@@ -1722,7 +1974,43 @@ aws_check_reachability() {  # <ssh-alias> <ip>
 
   local started; started="$(date +%s)"
   local deadline=$(( started + REPO_REMOTE_SSH_READY_TIMEOUT ))
-  local attempts=0 err=""
+  local attempts=0 err="" cls=""
+
+  if [[ "$via" == ssm ]]; then
+    # repo#564: same bounded budget, same probe, through the SSM alias. There
+    # is NO fallback to direct SSH on any failure.
+    while true; do
+      attempts=$(( attempts + 1 ))
+      if err="$(ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$alias" true 2>&1 >/dev/null)"; then
+        if (( attempts > 1 )); then
+          log "SSH-over-SSM reachability check passed (${alias} -> ${ip}) after ${attempts} attempts / $(( $(date +%s) - started ))s of readiness wait"
+        else
+          log "SSH-over-SSM reachability check passed (${alias} -> ${ip})"
+        fi
+        return 0
+      fi
+      cls="$(ssm_error_class "$err")"
+      case "$cls" in
+        denied)
+          die 4 "SSH-over-SSM failed for ${alias} (${ip}): access denied by AWS — the caller needs ssm:StartSession on this instance and on the AWS-StartSSHSession document. Not retrying and not falling back to direct SSH. Error: ${err}" ;;
+        plugin)
+          die 4 "SSH-over-SSM failed for ${alias} (${ip}): the AWS CLI could not find the Session Manager plugin. Install session-manager-plugin. Not falling back to direct SSH. Error: ${err}" ;;
+        other)
+          # A not-listening-yet sshd behind a registered agent looks like the
+          # direct-SSH boot case; anything else (Permission denied, a bad key)
+          # cannot be fixed by waiting.
+          if ! ssh_error_is_boot_in_progress "$err" || printf '%s' "$err" | grep -q 'An error occurred'; then
+            die 4 "SSH-over-SSM failed for ${alias} (${ip}) and the failure does not look like an agent that is still registering, so waiting longer will not help: ${err:-(ssh produced no error output)}. Check REPO_REMOTE_SSH_KEY and REPO_REMOTE_SSH_USER. $(ssm_prereq_hint) Not falling back to direct SSH."
+          fi
+          ;;
+      esac
+      if [[ $(date +%s) -ge $deadline ]]; then
+        die 4 "SSH-over-SSM did not become ready for ${alias} (${ip}) within ${REPO_REMOTE_SSH_READY_TIMEOUT}s (${attempts} attempt(s)); last error: ${err:-(none)}. The instance id was already recorded, so the box is not orphaned. $(ssm_prereq_hint) An agent can take a minute or more to register after boot: raise REPO_REMOTE_SSH_READY_TIMEOUT, or retry: ssh ${alias}. Not falling back to direct SSH."
+      fi
+      log "SSM target not ready yet on ${alias} (attempt ${attempts}: ${err:-no error output}); retrying in ${REPO_REMOTE_SSH_READY_POLL_INTERVAL}s (up to ${REPO_REMOTE_SSH_READY_TIMEOUT}s total)"
+      sleep "$REPO_REMOTE_SSH_READY_POLL_INTERVAL"
+    done
+  fi
 
   while true; do
     attempts=$(( attempts + 1 ))
@@ -1749,6 +2037,8 @@ aws_check_reachability() {  # <ssh-alias> <ip>
 }
 
 aws_up() {
+  # repo#564: the local SSM prerequisite is checked before any cloud call.
+  [[ "$TRANSPORT" == ssm ]] && ssm_preflight
   aws_authenticate
   local iid="" state="" reused=false
 
@@ -1800,13 +2090,40 @@ aws_up() {
     # still be able to refuse a run before it touches any cloud resource.
     # --no-create: never conjure a group for a host that is already attached to
     # one (see aws_refresh_ssh_ingress).
-    aws_refresh_ssh_ingress --no-create
+    if [[ "$TRANSPORT" == ssm ]]; then
+      # repo#564: ssm needs no inbound rule, so the direct-SSH refresh (and its
+      # current-IP lookup) is skipped ENTIRELY; existing exposure and a missing
+      # instance profile are reported, never changed.
+      aws_ssm_reuse_notices "$iid"
+    else
+      aws_refresh_ssh_ingress --no-create
+    fi
     # repo#559: a reused box keeps whatever root volume it was born with; flag
     # a gp2 one (advice only, stderr only, never fatal, never modifies it).
     aws_root_volume_advisory "$iid"
   fi
 
   aws ec2 wait instance-running --instance-ids "$iid" >/dev/null 2>&1 || true
+
+  if [[ "$TRANSPORT" == ssm ]]; then
+    # repo#564: the connection target is the instance ID, not an IP — no public
+    # IP is polled, and its absence is not a warning. The id is persisted
+    # BEFORE the readiness probe can die, exactly as on the ssh path.
+    is_instance_id "$iid" \
+      || die 4 "unexpected instance id '${iid}' from AWS; refusing to write it into an SSM ProxyCommand alias"
+    writeback_instance_id "$iid"
+    local alias
+    if ! alias="$(write_ssh_alias "$iid" "$REGION")"; then
+      die 4 "SSH alias write for ${alias} was rejected (see error above); the SSH config was left untouched. The instance id ${iid} was recorded. Not falling back to direct SSH."
+    fi
+    aws_check_reachability "$alias" "$iid" ssm
+    verify_host_identity "$alias" "$iid" "this run's resolved instance" advisory
+    if [[ -n "$HOST_ID_OBSERVED" ]]; then
+      log "host identity verified: ${alias} reaches ${HOST_ID_OBSERVED}"
+    fi
+    emit_up_result "$iid" "" "$alias" "$reused" "$iid"
+    return 0
+  fi
   # Bounded poll rather than a single query (repo#451): a just-restarted
   # instance's NEW public IP is not always propagated by the time `wait
   # instance-running` returns, and an empty value here silently leaves the
@@ -1855,7 +2172,7 @@ aws_up() {
     log "WARNING: no public IP resolved, so ${alias} was not refreshed and its host identity could not be verified -- whatever HostName it still carries is from a previous session and may now resolve to an unrelated instance. Re-run 'repo-remote up --yes' once the IP is available, then 'repo-remote verify', before using it."
   fi
 
-  emit_up_result "$iid" "$ip" "$alias" "$reused"
+  emit_up_result "$iid" "$ip" "$alias" "$reused" "$ip"
 }
 
 # `verify` (repo#458): resolve the instance id this repo EXPECTS at the alias,
@@ -2169,8 +2486,16 @@ release_ssh_alias_lock() {  # <cfg>
 # Honors REPO_REMOTE_SSH_CONFIG (default ~/.ssh/config) so tests never touch a
 # real config. Echoes the alias name. Returns non-zero (without touching
 # $cfg) if the generated stanza fails validation -- see below.
-write_ssh_alias() {  # <ip>
-  local ip="$1" alias="repo-remote-${NAME}"
+#
+# repo#564: with a second argument (an AWS region) the alias is written for the
+# ssm transport — <ip> is then an instance ID used as HostName, and a
+# ProxyCommand opens the connection through `aws ssm start-session`. Both
+# values are allow-list validated first (they reach a shell via ProxyCommand);
+# a rejected value returns non-zero WITHOUT touching $cfg. Rewriting an alias
+# replaces its whole block, so switching transport in either direction drops
+# the previous HostName/ProxyCommand lines and leaves other Host blocks alone.
+write_ssh_alias() {  # <ip | instance-id> [ssm-region]
+  local ip="$1" ssm_region="${2:-}" alias="repo-remote-${NAME}"
   local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
   local key="${REPO_REMOTE_SSH_KEY:-~/.ssh/id_ed25519}"
   local user="${REPO_REMOTE_SSH_USER:-ubuntu}"
@@ -2191,6 +2516,22 @@ write_ssh_alias() {  # <ip>
     return 0
   fi
   ip="$ip_trimmed"
+
+  # Config-line hygiene for every transport: none of these may smuggle in a
+  # second SSH directive (repo#564).
+  if [[ ! "$user" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ || "$key" == *$'\n'* || "$key" == *$'\r'* \
+        || "$ip" =~ [[:space:]] ]]; then
+    log "refusing to write SSH alias '${alias}': REPO_REMOTE_SSH_USER, REPO_REMOTE_SSH_KEY or the host value contains characters that are not allowed in a single SSH config line -- leaving ${cfg} untouched"
+    printf '%s' "$alias"
+    return 1
+  fi
+  if [[ -n "$ssm_region" ]]; then
+    if ! is_instance_id "$ip" || ! is_aws_region "$ssm_region"; then
+      log "refusing to write SSM SSH alias '${alias}': instance id '${ip}' or region '${ssm_region}' failed validation -- leaving ${cfg} untouched"
+      printf '%s' "$alias"
+      return 1
+    fi
+  fi
 
   mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
   acquire_ssh_alias_lock "$cfg"
@@ -2216,6 +2557,9 @@ write_ssh_alias() {  # <ip>
     printf '    HostName %s\n' "$ip"
     printf '    User %s\n' "$user"
     printf '    IdentityFile %s\n' "$key"
+    if [[ -n "$ssm_region" ]]; then
+      printf '    ProxyCommand aws ssm start-session --region %s --target %%h --document-name AWS-StartSSHSession --parameters portNumber=22\n' "$ssm_region"
+    fi
   } >>"$tmp"
 
   # Validate the WRITTEN temp file is actually parseable before it ever
@@ -2270,6 +2614,10 @@ emit_plan() {  # dry-run plan (no cloud mutation)
       else
         printf '"volume_iops":null,"volume_throughput_mibps":null,'
       fi
+      # repo#564 (additive): which transport a run would use, and the profile a
+      # fresh launch would attach ("" = none).
+      printf '"transport":"%s",' "$(json_escape "$TRANSPORT")"
+      printf '"instance_profile":"%s",' "$(json_escape "$INSTANCE_PROFILE")"
     fi
     printf '"gpu":%s,' "$IS_GPU"
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
@@ -2293,11 +2641,25 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     log "  idle shutdown:      ${IDLE_MIN} min"
     log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  ssh alias:           repo-remote-${NAME}"
+    if [[ "$PROVIDER" == aws ]]; then
+      if [[ "$TRANSPORT" == ssm ]]; then
+        log "  transport:           ssm (SSH over SSM Session Manager to the instance ID; zero-inbound security group, no public IP needed)"
+      else
+        log "  transport:           ssh (direct SSH to the public IP; tcp/22 from your address only)"
+      fi
+      log "  instance profile:    ${INSTANCE_PROFILE:-(none)}"
+      if [[ "$TRANSPORT" == ssm && -z "$INSTANCE_PROFILE" ]]; then
+        log "  NOTE: a FRESH ssm launch requires REPO_REMOTE_INSTANCE_PROFILE and would be refused; reusing an existing instance does not."
+      fi
+      if [[ "$TRANSPORT" == ssm ]] && ! ssm_plugin_present; then
+        log "  NOTE: session-manager-plugin is not on PATH; 'up --yes' would be refused until it is installed."
+      fi
+    fi
   fi
 }
 
-emit_up_result() {  # <id> <ip> <alias> <reused>
-  local id="$1" ip="$2" alias="$3" reused="$4"
+emit_up_result() {  # <id> <ip> <alias> <reused> [connect-target]
+  local id="$1" ip="$2" alias="$3" reused="$4" target="${5-$2}"
   if [[ "$JSON_OUT" == true ]]; then
     printf '{'
     printf '"action":"up",'
@@ -2306,6 +2668,13 @@ emit_up_result() {  # <id> <ip> <alias> <reused>
     printf '"instance_id":"%s",' "$(json_escape "$id")"
     printf '"public_ip":"%s",' "$(json_escape "$ip")"
     printf '"ssh_alias":"%s",' "$(json_escape "$alias")"
+    if [[ "$PROVIDER" == aws ]]; then
+      # repo#564 (additive): the transport, the alias HostName it resolves to
+      # (public IP for ssh, instance ID for ssm), and the configured profile.
+      printf '"transport":"%s",' "$(json_escape "$TRANSPORT")"
+      printf '"connect_target":"%s",' "$(json_escape "$target")"
+      printf '"instance_profile":"%s",' "$(json_escape "$INSTANCE_PROFILE")"
+    fi
     printf '"instance_type":"%s",' "$(json_escape "$INSTANCE_TYPE")"
     printf '"region":"%s",' "$(json_escape "$REGION")"
     printf '"gpu":%s,' "$IS_GPU"
@@ -2316,7 +2685,11 @@ emit_up_result() {  # <id> <ip> <alias> <reused>
     printf '"estimated_cost_basis":"%s"' "$(json_escape "$COST_BASIS")"
     printf '}\n'
   else
-    log "$([[ "$reused" == true ]] && echo reused || echo created) instance $id (${INSTANCE_TYPE}) @ ${ip:-<no public ip>}"
+    if [[ "$PROVIDER" == aws && "$TRANSPORT" == ssm ]]; then
+      log "$([[ "$reused" == true ]] && echo reused || echo created) instance $id (${INSTANCE_TYPE}) via SSM Session Manager (region ${REGION})"
+    else
+      log "$([[ "$reused" == true ]] && echo reused || echo created) instance $id (${INSTANCE_TYPE}) @ ${ip:-<no public ip>}"
+    fi
     log "  ssh alias:        $alias"
     log "  est. hourly cost: \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  teardown:         repo-remote down --yes   (or /repo:remote --down)"
@@ -2446,6 +2819,8 @@ main() {
       # repo#559: validate the root-volume settings before the plan or any
       # cloud call, so a bad value never reaches run-instances.
       [[ "$PROVIDER" == aws ]] && validate_aws_volume_config
+      # repo#564: transport/profile values are validated just as early.
+      validate_transport_config
       if [[ "$YES" != true ]]; then
         emit_plan          # dry-run: the plan (with cost) is shown, nothing spent
         exit 0
@@ -2468,6 +2843,10 @@ main() {
       # No cost gate: `verify` spends nothing and mutates nothing — it opens one
       # SSH session and compares strings (repo#458).
       [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for verify"
+      # repo#564: an ssm alias needs the local plugin; say so plainly rather
+      # than as an opaque probe failure.
+      validate_transport_config
+      [[ "$PROVIDER" == aws && "$TRANSPORT" == ssm ]] && ssm_preflight
       case "$PROVIDER" in
         aws) aws_verify ;;
         gcp) gcp_verify ;;
