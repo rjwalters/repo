@@ -67,6 +67,15 @@ apart from a vCPU-count-scaled guess or a last-resort flat heuristic for an
 instance type with no price data at all — a confidently-wrong flat number is
 worse for cost consent than an honestly-vague one.
 
+On AWS, the `--json` output for `up` also carries three **additive** fields
+(repo#564): `transport` (`"ssh"` or `"ssm"`), `instance_profile` (the
+configured `REPO_REMOTE_INSTANCE_PROFILE`, `""` if none), and — on a real
+provision — `connect_target`, the `HostName` the SSH alias resolves to: the
+public IP for `ssh`, the instance ID for `ssm`. Existing fields keep their
+meaning; under `ssm`, `public_ip` is `""` because no public IP is looked up.
+See [AWS transport: direct SSH or SSM Session
+Manager](#aws-transport-direct-ssh-or-ssm-session-manager).
+
 `--force` is a **separate** override with a single job: it lets `up` reuse, or
 `down` stop/terminate, an instance carrying a **fleet marker** (see
 [Fleet-marked hosts: the reuse and teardown
@@ -207,6 +216,13 @@ REPO_REMOTE_SSH_CIDR=                     # optional: pin the SG's SSH-ingress C
 REPO_REMOTE_SSH_MIN_PREFIX=32             # narrowest IPv4 prefix accepted for SSH ingress (default 32 = one address;
                                            # set e.g. 24 to allow a known ISP block)
 REPO_REMOTE_ALLOW_WORLD_SSH=              # "1" opts in, loudly, to a CIDR wider than the minimum (0.0.0.0/0, ::/0)
+
+# --- transport (AWS only; see "AWS transport: direct SSH or SSM Session Manager" below) ---
+REPO_REMOTE_TRANSPORT=ssh                 # ssh (default: public IP + tcp/22 from your address) or
+                                           # ssm (SSH over SSM Session Manager; NO inbound rule, no public IP needed)
+REPO_REMOTE_INSTANCE_PROFILE=             # optional IAM instance profile NAME attached at launch
+                                           # (--iam-instance-profile Name=<name>); REQUIRED for a fresh ssm launch.
+                                           # Setting it alone does not change the transport.
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -403,6 +419,10 @@ RUNNING → offer reuse; STOPPED → offer to start.
    `up` prints an explicit warning that the **alias was not refreshed** — the
    previously written `HostName` is therefore stale — rather than silently
    leaving the old value in place.
+   With `REPO_REMOTE_TRANSPORT=ssm` none of that runs: reuse makes no ingress
+   change and no current-IP or public-IP lookup, and re-points the alias at the
+   instance ID instead — see [AWS transport: direct SSH or SSM Session
+   Manager](#aws-transport-direct-ssh-or-ssm-session-manager).
    On AWS, reuse also **inspects the instance's actual root volume** and, if it
    is still gp2, prints a stderr advisory with the exact `aws ec2
    modify-volume` command to convert it — `up` never runs that command itself.
@@ -441,6 +461,9 @@ Requirements for the created instance:
 - **AWS: pinned instance metadata options** — every launch passes
   `--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled`
   (IMDSv2 only, hop limit 1). See **AWS instance metadata (IMDSv2)** below.
+- **AWS: the configured instance profile, if any** — `REPO_REMOTE_INSTANCE_PROFILE=<name>`
+  adds `--iam-instance-profile Name=<name>` to `run-instances` on either
+  transport. A fresh `ssm` launch requires it.
 - For GPU hosts, see **GPU hosts** below — this needs a GPU-ready image and,
   on AWS, quota-aware handling.
 - Install an idle-shutdown guard (cron checking SSH sessions + CPU, running
@@ -450,8 +473,9 @@ Requirements for the created instance:
   idle-exit marker contract.
 - AWS: security group allowing SSH from the user's IP only, using
   `REPO_REMOTE_SSH_KEY`'s public key — see **Security group and SSH ingress
-  (AWS)** below for exactly how the CIDR is resolved and verified. GCP: prefer
-  OS Login / IAP.
+  (AWS)** below for exactly how the CIDR is resolved and verified. With
+  `REPO_REMOTE_TRANSPORT=ssm` the group has **no** inbound rule at all instead.
+  GCP: prefer OS Login / IAP.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
 alternative zone or the next type down rather than failing.
@@ -577,6 +601,124 @@ it would just leak an unused group per repo while looking like a repair. The
 same limitation applies whenever a reused instance is attached to some *other*
 security group (created outside this tooling): the group refreshed here is not
 the one guarding it, and that group must be fixed by hand.
+
+Everything in this section describes the default `ssh` transport. With
+`REPO_REMOTE_TRANSPORT=ssm`, none of it runs — see the next section.
+
+#### AWS transport: direct SSH or SSM Session Manager
+
+`REPO_REMOTE_TRANSPORT` chooses how `up`, `verify`, and your own `ssh`/`rsync`
+reach an AWS box (AWS only; both settings use the usual two config layers):
+
+| Setting | `ssh` (default) | `ssm` |
+|---|---|---|
+| Alias `HostName` | the public IP | the instance ID |
+| Alias `ProxyCommand` | none | `aws ssm start-session --region <region> --target %h --document-name AWS-StartSSHSession --parameters portNumber=22` |
+| Security group | tool-owned, tagged `repo-remote=<name>`, tcp/22 from your address | tool-owned, tagged `repo-remote-ssm=<name>`, **no inbound rule** |
+| Current-IP lookup / public-IP poll | yes | **no** — a box with no public IP works |
+| SSH user and key | `REPO_REMOTE_SSH_USER` / `REPO_REMOTE_SSH_KEY` | the same |
+
+```bash
+# per-repo (or shared) config
+REPO_REMOTE_TRANSPORT=ssm
+REPO_REMOTE_INSTANCE_PROFILE=repo-remote-ssm   # an existing instance profile; its role needs AmazonSSMManagedInstanceCore
+```
+
+`REPO_REMOTE_INSTANCE_PROFILE` on its own only attaches the role at launch
+(`--iam-instance-profile Name=<name>`); it never switches the transport. The
+generated alias for `ssm` looks like this, and every connection goes through it:
+the readiness probe, the host-identity check, your interactive `ssh
+repo-remote-<name>`, and both `rsync` flows in steps 5 and 6a:
+
+```
+Host repo-remote-<name>
+    HostName i-0123456789abcdef0
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyCommand aws ssm start-session --region us-west-2 --target %h --document-name AWS-StartSSHSession --parameters portNumber=22
+```
+
+**Prerequisites checklist (`ssm`).** Check these against the current AWS
+Session Manager documentation for your account. An instance profile does not by
+itself make the agent ready or give it a network path.
+
+- **Local:** the AWS CLI and its **Session Manager plugin**
+  (`session-manager-plugin`). `up --yes` and `verify` refuse to start (exit
+  `2`, before any cloud call) when the plugin is not on `PATH`.
+- **Caller (your AWS identity):** `ssm:StartSession` on the instance and on the
+  `AWS-StartSSHSession` document; for a fresh launch, `iam:PassRole` on the
+  profile's role (condition `iam:PassedToService = ec2.amazonaws.com`) plus the
+  EC2 permissions the default transport already needs. A `run-instances`
+  rejection over the profile is reported with `iam:PassRole` named.
+- **Instance profile:** a role with the `AmazonSSMManagedInstanceCore` managed
+  policy (or equivalent), so the agent can register.
+- **Instance:** a running SSM agent (preinstalled on the Ubuntu AMIs this tool
+  launches) with outbound HTTPS to the regional `ssm`, `ssmmessages`, and
+  `ec2messages` endpoints, through a NAT/internet gateway or VPC endpoints. The
+  tool-owned group keeps the default allow-all outbound rule.
+- **Interactive use outside `repo-remote`:** the `ProxyCommand` runs `aws` with
+  whatever credentials your shell has. During `up`/`verify` those are the
+  resolved config credentials. In a plain terminal, export the same credentials
+  or set `AWS_PROFILE` to one that may call `ssm:StartSession`.
+
+**Fresh launch (`ssm`).** Before any mutation, `up` requires
+`REPO_REMOTE_INSTANCE_PROFILE` (exit `2` otherwise; nothing is imported,
+created, or launched). It resolves the security group like this:
+
+1. An explicit `REPO_REMOTE_SECURITY_GROUP` is inspected first. If it has any
+   inbound rule, the run is **refused** (exit `2`) and the rules are left alone.
+2. Otherwise a group tagged `repo-remote-ssm=<name>` from an earlier run is
+   reused, after the same check.
+3. Otherwise a new `repo-remote-ssm-<name>` group is created, tagged
+   `repo-remote-ssm=<name>`, and checked to have no inbound rule before
+   `run-instances`.
+
+The direct-SSH group (tag `repo-remote=<name>`) is never picked up for an `ssm`
+launch, so a zero-ingress box never lands in a group with open tcp/22. No
+`authorize-security-group-ingress` or `revoke-security-group-ingress` call is
+made, and no current-IP or public-IP lookup happens.
+
+**Readiness (`ssm`).** The SSM agent needs a while after boot to register, and
+until it does `start-session` fails with `TargetNotConnected`. The probe retries
+that error within the same `REPO_REMOTE_SSH_READY_TIMEOUT` /
+`REPO_REMOTE_SSH_READY_POLL_INTERVAL` budget used for the default transport. It
+fails **at once**, with a distinct message, on an access denial (naming
+`ssm:StartSession`), a missing plugin, or an SSH key/user rejection. When the
+budget runs out it exits `4` with the prerequisites checklist. The instance ID
+is written back **before** the first probe, so a timeout never orphans the box.
+It **never falls back to direct SSH**. A host-identity mismatch through the
+alias still exits `6`.
+
+**Reused instances (`ssm`).** No profile is needed in config to reuse a box.
+Reuse skips the direct-SSH ingress refresh entirely: no group lookup, no IP
+lookup, no rule change, and no group creation. Two limitations are reported
+instead of fixed:
+
+- If the instance has **no instance profile**, `up` prints a warning with the
+  `aws ec2 associate-iam-instance-profile` command. It never attaches a role
+  itself. The readiness probe will most likely then time out with
+  `TargetNotConnected`.
+- If a security group on the instance still has inbound rules (for example a
+  tcp/22 `/32` from when it was launched with `ssh`), `up` names the group and
+  the rule count and says plainly that it did **not** remove them. Switching
+  the transport does not reduce an existing box's exposure. Review and revoke
+  those rules yourself, or launch a fresh box under `ssm`.
+
+Automatic conversion of existing groups or instances, and creating IAM roles or
+policies, are out of scope.
+
+**Switching transport.** Re-running `up` rewrites the whole
+`Host repo-remote-<name>` block, so switching either way drops the previous
+`HostName`/`ProxyCommand` and leaves every other `Host` block alone. The dry
+run (`repo-remote up` without `--yes`) shows the transport and profile and
+flags a missing profile or plugin. It starts no session and touches no
+resource.
+
+Invalid values fail before any cloud call (exit `2`): an unknown transport,
+`ssm` or a profile with GCP, a profile value that is not a plain IAM profile
+*name* (an ARN is refused), an `AWS_REGION` that is not a plain region code
+under `ssm` (it goes into the `ProxyCommand`), and an SSH user or key path
+that would add a line to the SSH config.
 
 #### The idle-shutdown guard
 
@@ -1045,8 +1187,12 @@ Update the line in place if present, else append it. Report the edit.
 ```bash
 rsync -az --delete \
   --filter=':- .gitignore' --exclude '.git/' \
-  ./ <host>:~/<repo-name>/
+  ./ repo-remote-<name>:~/<repo-name>/
 ```
+
+Always target the SSH alias `repo-remote-<name>`, not a raw IP. The alias
+carries the user, key, and on `REPO_REMOTE_TRANSPORT=ssm` the SSM
+`ProxyCommand`, so the same command works on both transports.
 
 **Never copy the *provisioning* `.env` or cloud keys to the VM** — the
 `.gitignore` filter already excludes a gitignored `.env`; double-check it's
@@ -1123,9 +1269,10 @@ VM to interactive login.
    # local -> VM, over the SSH channel; never the provisioning creds.
    # NOTE: rsync --chmod is GNU-rsync only and fails on macOS's system rsync,
    # so set the perms in a follow-up ssh step instead of relying on it.
-   rsync -az -e "ssh -i $REPO_REMOTE_SSH_KEY" \
-     "<resolved-tokens-dir>/" <host>:~/<repo-name>/.loom/tokens/
-   ssh -i "$REPO_REMOTE_SSH_KEY" <host> \
+   # The alias supplies the key (and, on the ssm transport, the ProxyCommand).
+   rsync -az \
+     "<resolved-tokens-dir>/" repo-remote-<name>:~/<repo-name>/.loom/tokens/
+   ssh repo-remote-<name> \
      'chmod 700 ~/<repo-name>/.loom/tokens && chmod 600 ~/<repo-name>/.loom/tokens/*.token'
    ```
 
@@ -1142,6 +1289,8 @@ Host repo-remote-<name>
     HostName <ip-or-iap-alias>
     User <user>
     IdentityFile <REPO_REMOTE_SSH_KEY>
+    # AWS + REPO_REMOTE_TRANSPORT=ssm: HostName is the instance ID, plus
+    #   ProxyCommand aws ssm start-session --region <region> --target %h --document-name AWS-StartSSHSession --parameters portNumber=22
     # GCP+IAP: use a ProxyCommand via `gcloud compute start-iap-tunnel`
 ```
 

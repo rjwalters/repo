@@ -99,6 +99,7 @@ run_rr() {
     # sidecar of the log, so it must be reset per run alongside it (repo#451).
     rm -f "$MOCK_LOG.ipcount"
     rm -f "$MOCK_LOG.metadata"        # per-run --metadata-options capture (repo#562)
+    rm -f "$MOCK_LOG.profile" "$MOCK_LOG.sg"  # per-run profile / SG capture (repo#564)
     local errf; errf="$(mktemp)"
     # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
     # real 120s readiness window (repo#449); the assignments below come BEFORE
@@ -136,6 +137,31 @@ case "$1 $2" in
   "ec2 describe-images")
     echo "${MOCK_AWS_AMI:-ami-0ubuntu2204}"; exit 0 ;;
   "ec2 describe-security-groups")
+    # repo#564: the ssm transport inspects a group's inbound permission COUNT
+    # (aws_sg_ingress_count). MOCK_AWS_SG_OPEN_IDS is a space-separated list of
+    # group ids that have MOCK_AWS_SG_OPEN_COUNT (default 1) inbound rules;
+    # every other group reports 0. MOCK_AWS_SG_INSPECT_FAIL=1 fails the call.
+    if printf '%s' "$*" | grep -qF 'length(SecurityGroups[0].IpPermissions)'; then
+      if [[ "${MOCK_AWS_SG_INSPECT_FAIL:-0}" == 1 ]]; then
+        echo "An error occurred (UnauthorizedOperation) when calling the DescribeSecurityGroups operation" >&2
+        exit 254
+      fi
+      lookup_sg=""; prev=""
+      for a in "$@"; do
+        [[ "$prev" == "--group-ids" ]] && lookup_sg="$a"
+        prev="$a"
+      done
+      case " ${MOCK_AWS_SG_OPEN_IDS:-} " in
+        *" $lookup_sg "*) printf '%s\n' "${MOCK_AWS_SG_OPEN_COUNT:-1}" ;;
+        *) printf '0\n' ;;
+      esac
+      exit 0
+    fi
+    # The ssm transport's own tool-owned group lookup (tag repo-remote-ssm).
+    if printf '%s' "$*" | grep -qF 'tag:repo-remote-ssm,'; then
+      printf '%s\n' "${MOCK_AWS_SSM_SG_FIND:-None}"
+      exit 0
+    fi
     if printf '%s' "$*" | grep -qF 'starts_with(Description'; then
       # Tool-owned rule lookup (aws_tool_owned_ssh_cidrs, repo#487): the CIDRs
       # of tcp/22 rules whose Description carries the repo-remote:<name>:
@@ -235,6 +261,17 @@ case "$1 $2" in
       fi
       exit 0
     fi
+    # repo#564: the ssm reuse notices read the instance profile and the
+    # attached security groups. Defaults: a profile is attached, and the
+    # instance sits in sg-0attached.
+    if printf '%s' "$*" | grep -qF "IamInstanceProfile.Arn"; then
+      printf '%s\n' "${MOCK_AWS_INSTANCE_PROFILE_ARN-arn:aws:iam::123456789012:instance-profile/rr-ssm}"
+      exit 0
+    fi
+    if printf '%s' "$*" | grep -qF "SecurityGroups[].GroupId"; then
+      printf '%s\n' "${MOCK_AWS_INSTANCE_SGS:-sg-0attached}"
+      exit 0
+    fi
     # Post-create KeyName verification (repo#177) is ALSO a --instance-ids
     # describe-instances call, so it must be distinguished by its distinct
     # `.KeyName` query projection before falling into the generic
@@ -323,8 +360,21 @@ case "$1 $2" in
       if [[ "$prev" == "--metadata-options" ]]; then
         printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.metadata"
       fi
+      # repo#564: each --iam-instance-profile VALUE, one per line.
+      if [[ "$prev" == "--iam-instance-profile" ]]; then
+        printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.profile"
+      fi
+      # repo#564: the exact --security-group-ids value.
+      if [[ "$prev" == "--security-group-ids" ]]; then
+        printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.sg"
+      fi
       prev="$a"
     done
+    # MOCK_AWS_PROFILE_REJECT=1: the caller lacks iam:PassRole (repo#564).
+    if [[ "${MOCK_AWS_PROFILE_REJECT:-0}" == 1 ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the RunInstances operation: You are not authorized to perform: iam:PassRole on resource: arn:aws:iam::123456789012:role/rr-ssm" >&2
+      exit 254
+    fi
     # MOCK_AWS_METADATA_REJECT=1: AWS refuses the launch over its metadata
     # options (repo#562) — the caller must fail, never retry weaker.
     if [[ "${MOCK_AWS_METADATA_REJECT:-0}" == 1 ]]; then
@@ -453,6 +503,16 @@ fi
 exit 0
 MOCK
 chmod +x "$MOCK_BIN/ssh"
+
+# repo#564: the ssm transport's local preflight only checks that the Session
+# Manager plugin is on PATH. A test drives the missing-plugin case with
+# REPO_REMOTE_SSM_PLUGIN=<a name that does not exist>.
+cat >"$MOCK_BIN/session-manager-plugin" <<'MOCK'
+#!/usr/bin/env bash
+printf 'session-manager-plugin %s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/session-manager-plugin"
 
 echo "repo-remote.sh test suite"
 echo "========================="
@@ -2379,6 +2439,425 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- AWS transport: instance profile on the default direct-SSH path (repo#564) --"
+# ---------------------------------------------------------------------------
+# A profile alone attaches the role; it must NOT silently change the transport.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+rm -f "$SCRATCH/ssh_config"
+run_rr MOCK_AWS_NEW_ID=i-0sshprof MOCK_AWS_PUBLIC_IP=203.0.113.60 MOCK_SSH_HOST_ID=i-0sshprof \
+  REPO_REMOTE_INSTANCE_PROFILE=rr-ssm -- up --yes --json
+assert_eq "ssh + profile: up succeeds" "0" "$RR_RC"
+assert_eq "ssh + profile: run-instances gets --iam-instance-profile Name=<profile>" \
+  "Name=rr-ssm" "$(cat "$MOCK_LOG.profile" 2>/dev/null)"
+SSHPLOG="$(cat "$MOCK_LOG")"
+assert_contains "ssh + profile: tcp/22 ingress is still authorized (default transport kept)" \
+  "$SSHPLOG" "authorize-security-group-ingress"
+assert_contains "ssh + profile: current-IP detection still runs" "$SSHPLOG" "curl "
+assert_eq "ssh + profile: JSON transport is ssh" "ssh" "$(json_field "$RR_OUT" transport)"
+assert_eq "ssh + profile: public_ip keeps its meaning" "203.0.113.60" "$(json_field "$RR_OUT" public_ip)"
+assert_eq "ssh + profile: connect_target is the public IP" "203.0.113.60" "$(json_field "$RR_OUT" connect_target)"
+assert_eq "ssh + profile: instance_profile reported" "rr-ssm" "$(json_field "$RR_OUT" instance_profile)"
+SSHPCFG="$(cat "$SCRATCH/ssh_config" 2>/dev/null)"
+assert_contains "ssh + profile: alias HostName is the public IP" "$SSHPCFG" "HostName 203.0.113.60"
+assert_not_contains "ssh + profile: alias has no ProxyCommand" "$SSHPCFG" "ProxyCommand"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# Without a profile, nothing about the launch changes.
+run_rr MOCK_AWS_NEW_ID=i-0sshplain MOCK_AWS_PUBLIC_IP=203.0.113.61 -- up --yes --json
+assert_eq "ssh, no profile: up succeeds" "0" "$RR_RC"
+assert_not_contains "ssh, no profile: no --iam-instance-profile argument" "$(cat "$MOCK_LOG")" "iam-instance-profile"
+assert_eq "ssh, no profile: instance_profile is empty" "" "$(json_field "$RR_OUT" instance_profile)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: ssm fresh launch has no inbound rule and no public IP (repo#564) --"
+# ---------------------------------------------------------------------------
+SSM_ENV=(REPO_REMOTE_TRANSPORT=ssm REPO_REMOTE_INSTANCE_PROFILE=rr-ssm)
+rm -f "$SCRATCH/ssh_config"
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmbox MOCK_AWS_PUBLIC_IP=203.0.113.99 \
+  MOCK_AWS_SG_FIND=sg-0direct MOCK_SSH_HOST_ID=i-0ssmbox -- up --yes --json
+assert_eq "ssm create: up succeeds" "0" "$RR_RC"
+SSMLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "ssm create: no ingress is authorized" "$SSMLOG" "authorize-security-group-ingress"
+assert_not_contains "ssm create: no ingress is revoked" "$SSMLOG" "revoke-security-group-ingress"
+assert_not_contains "ssm create: no current-IP detection" "$SSMLOG" "curl "
+assert_not_contains "ssm create: no public-IP polling" "$SSMLOG" "PublicIpAddress"
+assert_contains "ssm create: a tool-owned SSM group is created" "$SSMLOG" "--group-name repo-remote-ssm-myrepo"
+assert_contains "ssm create: the SSM group carries its own tag" "$SSMLOG" "Key=repo-remote-ssm,Value=myrepo"
+assert_contains "ssm create: the new group's empty inbound set is verified" "$SSMLOG" \
+  "describe-security-groups --group-ids sg-0new --query length(SecurityGroups[0].IpPermissions)"
+assert_eq "ssm create: launched into the new zero-inbound group, NOT the direct-SSH group" \
+  "sg-0new" "$(cat "$MOCK_LOG.sg" 2>/dev/null)"
+assert_eq "ssm create: --iam-instance-profile Name=<profile>" "Name=rr-ssm" "$(cat "$MOCK_LOG.profile" 2>/dev/null)"
+assert_contains "ssm create: metadata hardening is still applied" "$(cat "$MOCK_LOG.metadata" 2>/dev/null)" "HttpTokens=required"
+assert_contains "ssm create: a key pair is still attached" "$SSMLOG" "--key-name"
+assert_eq "ssm create: JSON transport" "ssm" "$(json_field "$RR_OUT" transport)"
+assert_eq "ssm create: JSON connect_target is the instance id" "i-0ssmbox" "$(json_field "$RR_OUT" connect_target)"
+assert_contains "ssm create: JSON public_ip is empty (none looked up)" "$RR_OUT" '"public_ip":""'
+assert_eq "ssm create: JSON instance_profile" "rr-ssm" "$(json_field "$RR_OUT" instance_profile)"
+assert_contains "ssm create: JSON still carries the alias" "$RR_OUT" '"ssh_alias":"repo-remote-myrepo"'
+SSMCFG="$(cat "$SCRATCH/ssh_config" 2>/dev/null)"
+assert_contains "ssm create: alias HostName is the instance id" "$SSMCFG" "HostName i-0ssmbox"
+assert_contains "ssm create: alias ProxyCommand is region-qualified SSM" "$SSMCFG" \
+  "ProxyCommand aws ssm start-session --region us-west-2 --target %h --document-name AWS-StartSSHSession --parameters portNumber=22"
+assert_contains "ssm create: alias keeps key authentication" "$SSMCFG" "IdentityFile $SSH_KEY_FIXTURE"
+assert_not_contains "ssm create: no missing-public-IP warning" "$RR_ERR" "no public IP"
+assert_contains "ssm create: readiness went through the SSM alias" "$RR_ERR" "SSH-over-SSM reachability check passed"
+assert_contains "ssm create: host identity verified through the alias" "$RR_ERR" "host identity verified: repo-remote-myrepo reaches i-0ssmbox"
+assert_contains "ssm create: instance id persisted" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0ssmbox"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# Human-readable result names the transport rather than "@ <no public ip>".
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmtext MOCK_SSH_HOST_ID=i-0ssmtext -- up --yes
+assert_eq "ssm create (text): up succeeds" "0" "$RR_RC"
+assert_contains "ssm create (text): result names SSM" "$RR_ERR" "via SSM Session Manager (region us-west-2)"
+assert_not_contains "ssm create (text): no '<no public ip>' line" "$RR_ERR" "<no public ip>"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: ssm security-group refusals keep operator rules (repo#564) --"
+# ---------------------------------------------------------------------------
+# (a) Explicit group WITH inbound rules: refused before launch, rules untouched.
+run_rr "${SSM_ENV[@]}" REPO_REMOTE_SECURITY_GROUP=sg-0open MOCK_AWS_SG_OPEN_IDS=sg-0open -- up --yes --json
+assert_eq "ssm + open explicit SG: refused (exit 2)" "2" "$RR_RC"
+assert_contains "ssm + open explicit SG: names the group and the count" "$RR_ERR" "sg-0open (REPO_REMOTE_SECURITY_GROUP): it has 1 inbound rule(s)"
+assert_contains "ssm + open explicit SG: says rules were left alone" "$RR_ERR" "left untouched"
+OPENLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "ssm + open explicit SG: no launch" "$OPENLOG" "run-instances"
+assert_not_contains "ssm + open explicit SG: no rule revoked" "$OPENLOG" "revoke-security-group-ingress"
+assert_not_contains "ssm + open explicit SG: no rule added" "$OPENLOG" "authorize-security-group-ingress"
+assert_not_contains "ssm + open explicit SG: no group created instead" "$OPENLOG" "create-security-group"
+
+# (b) Explicit EMPTY group: used as-is.
+run_rr "${SSM_ENV[@]}" REPO_REMOTE_SECURITY_GROUP=sg-0empty MOCK_AWS_NEW_ID=i-0ssmempty \
+  MOCK_SSH_HOST_ID=i-0ssmempty -- up --yes --json
+assert_eq "ssm + empty explicit SG: up succeeds" "0" "$RR_RC"
+assert_eq "ssm + empty explicit SG: launched into it" "sg-0empty" "$(cat "$MOCK_LOG.sg" 2>/dev/null)"
+assert_not_contains "ssm + empty explicit SG: no group created" "$(cat "$MOCK_LOG")" "create-security-group"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (c) A previously created SSM group that has since gained a rule: refused.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_SSM_SG_FIND=sg-0ssmold MOCK_AWS_SG_OPEN_IDS=sg-0ssmold -- up --yes --json
+assert_eq "ssm + tagged SSM group with a rule: refused (exit 2)" "2" "$RR_RC"
+assert_contains "ssm + tagged SSM group with a rule: names it" "$RR_ERR" "sg-0ssmold (tagged repo-remote-ssm=myrepo)"
+assert_not_contains "ssm + tagged SSM group with a rule: no rule revoked" "$(cat "$MOCK_LOG")" "revoke-security-group-ingress"
+assert_not_contains "ssm + tagged SSM group with a rule: no launch" "$(cat "$MOCK_LOG")" "run-instances"
+
+# (d) A previously created, still-empty SSM group: reused, not recreated.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_SSM_SG_FIND=sg-0ssmold MOCK_AWS_NEW_ID=i-0ssmreusesg \
+  MOCK_SSH_HOST_ID=i-0ssmreusesg -- up --yes --json
+assert_eq "ssm + empty tagged SSM group: up succeeds" "0" "$RR_RC"
+assert_eq "ssm + empty tagged SSM group: launched into it" "sg-0ssmold" "$(cat "$MOCK_LOG.sg" 2>/dev/null)"
+assert_not_contains "ssm + empty tagged SSM group: not recreated" "$(cat "$MOCK_LOG")" "create-security-group"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (e) The group cannot be inspected: no launch on an unproven group.
+run_rr "${SSM_ENV[@]}" REPO_REMOTE_SECURITY_GROUP=sg-0opaque MOCK_AWS_SG_INSPECT_FAIL=1 -- up --yes --json
+assert_eq "ssm + uninspectable SG: fails (exit 4)" "4" "$RR_RC"
+assert_not_contains "ssm + uninspectable SG: no launch" "$(cat "$MOCK_LOG")" "run-instances"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: pre-mutation failures (repo#564) --"
+# ---------------------------------------------------------------------------
+# Missing profile for a FRESH ssm launch: refused before key import, SG
+# creation, or launch.
+run_rr REPO_REMOTE_TRANSPORT=ssm -- up --yes --json
+assert_eq "ssm fresh launch without a profile: exit 2" "2" "$RR_RC"
+assert_contains "ssm fresh launch without a profile: names the setting" "$RR_ERR" "REPO_REMOTE_INSTANCE_PROFILE"
+assert_contains "ssm fresh launch without a profile: names the managed policy" "$RR_ERR" "AmazonSSMManagedInstanceCore"
+NOPROFLOG="$(cat "$MOCK_LOG")"
+assert_not_contains "no profile: no key pair imported" "$NOPROFLOG" "import-key-pair"
+assert_not_contains "no profile: no group created" "$NOPROFLOG" "create-security-group"
+assert_not_contains "no profile: no launch" "$NOPROFLOG" "run-instances"
+
+# Missing local plugin: refused before ANY cloud call.
+run_rr "${SSM_ENV[@]}" REPO_REMOTE_SSM_PLUGIN=rr-no-such-plugin -- up --yes --json
+assert_eq "missing session-manager-plugin: exit 2" "2" "$RR_RC"
+assert_contains "missing plugin: names it" "$RR_ERR" "Session Manager plugin"
+assert_eq "missing plugin: no aws call at all" "" "$(cat "$MOCK_LOG")"
+
+# Malformed / unsupported values: all exit 2 with no cloud call, dry run included.
+for case_env in \
+  "REPO_REMOTE_TRANSPORT=bogus" \
+  "REPO_REMOTE_TRANSPORT=ssm REPO_REMOTE_INSTANCE_PROFILE=arn:aws:iam::123456789012:instance-profile/rr" \
+  "REPO_REMOTE_INSTANCE_PROFILE=rr;touch\${IFS}/tmp/pwned" ; do
+  # shellcheck disable=SC2086  # deliberate word-splitting into env assignments
+  run_rr $case_env -- up --yes --json
+  assert_eq "invalid transport config ($case_env): exit 2" "2" "$RR_RC"
+  assert_eq "invalid transport config ($case_env): no cloud call" "" "$(cat "$MOCK_LOG")"
+  # shellcheck disable=SC2086
+  run_rr $case_env -- up --json
+  assert_eq "invalid transport config ($case_env): dry run refused too" "2" "$RR_RC"
+done
+# AWS_REGION in the shared file is sourced after the environment, so the
+# region case needs the repo layer to carry the bad value.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "AWS_REGION='us-west-2 -o ProxyCommand=evil'"
+run_rr "${SSM_ENV[@]}" -- up --yes --json
+assert_eq "ssm + injection-shaped AWS_REGION: exit 2" "2" "$RR_RC"
+assert_contains "ssm + injection-shaped AWS_REGION: names the region rule" "$RR_ERR" "not a plain AWS region code"
+assert_eq "ssm + injection-shaped AWS_REGION: no cloud call" "" "$(cat "$MOCK_LOG")"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr "${SSM_ENV[@]}" "REPO_REMOTE_SSH_USER=ubuntu
+    ProxyCommand touch /tmp/pwned" -- up --yes --json
+assert_eq "SSH user with an embedded config line: exit 2" "2" "$RR_RC"
+assert_eq "SSH user with an embedded config line: no cloud call" "" "$(cat "$MOCK_LOG")"
+
+# ssm / a profile with GCP: unsupported combination.
+run_rr REPO_REMOTE_TRANSPORT=ssm GCP_PROJECT=p GCP_ZONE=us-central1-a GOOGLE_APPLICATION_CREDENTIALS=/x \
+  -- up --yes --json gcp
+assert_eq "ssm with gcp: exit 2" "2" "$RR_RC"
+assert_contains "ssm with gcp: says AWS-only" "$RR_ERR" "AWS-only"
+assert_eq "ssm with gcp: no cloud call" "" "$(cat "$MOCK_LOG")"
+run_rr REPO_REMOTE_INSTANCE_PROFILE=rr-ssm GCP_PROJECT=p GCP_ZONE=us-central1-a GOOGLE_APPLICATION_CREDENTIALS=/x \
+  -- up --yes --json gcp
+assert_eq "profile with gcp: exit 2" "2" "$RR_RC"
+
+# AWS rejects the profile (no iam:PassRole): a clear failure, nothing launched.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_PROFILE_REJECT=1 -- up --yes --json
+assert_eq "profile rejected by AWS: exit 4" "4" "$RR_RC"
+assert_contains "profile rejected by AWS: names iam:PassRole" "$RR_ERR" "iam:PassRole"
+assert_contains "profile rejected by AWS: names the profile" "$RR_ERR" "rr-ssm"
+assert_not_contains "profile rejected by AWS: no instance id recorded" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: ssm reuse touches no ingress and needs no public IP (repo#564) --"
+# ---------------------------------------------------------------------------
+# A reused instance needs no profile in config; the ingress refresh is skipped
+# ENTIRELY (no group lookup, no IP lookup, no rule change, no group creation).
+ssm_reuse_absences() {  # <label>
+  local l; l="$(cat "$MOCK_LOG")"
+  assert_not_contains "$1: no ingress authorized" "$l" "authorize-security-group-ingress"
+  assert_not_contains "$1: no ingress revoked" "$l" "revoke-security-group-ingress"
+  assert_not_contains "$1: no current-IP detection" "$l" "curl "
+  assert_not_contains "$1: no public-IP polling" "$l" "PublicIpAddress"
+  assert_not_contains "$1: no group created" "$l" "create-security-group"
+  assert_not_contains "$1: nothing launched" "$l" "run-instances"
+  assert_not_contains "$1: no role attached automatically" "$l" "associate-iam-instance-profile"
+}
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_STATE=running MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "ssm reuse (running pinned): up succeeds" "0" "$RR_RC"
+assert_contains "ssm reuse (running pinned): reused" "$RR_OUT" '"reused":true'
+assert_eq "ssm reuse (running pinned): connect_target" "i-0pinned" "$(json_field "$RR_OUT" connect_target)"
+ssm_reuse_absences "ssm reuse (running pinned)"
+assert_contains "ssm reuse (running pinned): alias targets the instance id" \
+  "$(cat "$SCRATCH/ssh_config")" "HostName i-0pinned"
+
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_STATE=stopped MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "ssm reuse (stopped pinned): up succeeds" "0" "$RR_RC"
+assert_contains "ssm reuse (stopped pinned): started" "$(cat "$MOCK_LOG")" "start-instances"
+ssm_reuse_absences "ssm reuse (stopped pinned)"
+
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_FIND="i-0found running" MOCK_SSH_HOST_ID=i-0found -- up --yes --json
+assert_eq "ssm reuse (running tag-discovered): up succeeds" "0" "$RR_RC"
+ssm_reuse_absences "ssm reuse (running tag-discovered)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_FIND="i-0found stopped" MOCK_SSH_HOST_ID=i-0found -- up --yes --json
+assert_eq "ssm reuse (stopped tag-discovered): up succeeds" "0" "$RR_RC"
+assert_contains "ssm reuse (stopped tag-discovered): started" "$(cat "$MOCK_LOG")" "start-instances"
+ssm_reuse_absences "ssm reuse (stopped tag-discovered)"
+
+# Existing exposure is EXPLAINED, never claimed fixed, never changed.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_STATE=running MOCK_AWS_SG_OPEN_IDS=sg-0attached \
+  MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "ssm reuse with an open attached SG: up still succeeds" "0" "$RR_RC"
+assert_contains "ssm reuse with an open attached SG: names the group" "$RR_ERR" "security group sg-0attached on reused instance i-0pinned still has 1 inbound rule(s)"
+assert_contains "ssm reuse with an open attached SG: says it was NOT removed" "$RR_ERR" "did NOT remove or change them"
+ssm_reuse_absences "ssm reuse with an open attached SG"
+
+# No instance profile on the reused box: actionable warning, no auto-attach.
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_AWS_STATE=running MOCK_AWS_INSTANCE_PROFILE_ARN=None \
+  MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "ssm reuse without a profile: run continues to the probe" "0" "$RR_RC"
+assert_contains "ssm reuse without a profile: warns" "$RR_ERR" "has NO IAM instance profile attached"
+assert_contains "ssm reuse without a profile: gives the manual command" "$RR_ERR" "aws ec2 associate-iam-instance-profile --instance-id i-0pinned"
+ssm_reuse_absences "ssm reuse without a profile"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: ssm readiness, diagnostics and identity (repo#564) --"
+# ---------------------------------------------------------------------------
+TNC="An error occurred (TargetNotConnected) when calling the StartSession operation: i-0ssmslow is not connected."
+# (a) Registration delay, then success: retried within the budget.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmslow MOCK_SSH_HOST_ID=i-0ssmslow \
+  MOCK_SSH_FAIL_COUNT=2 MOCK_SSH_STDERR="$TNC" \
+  REPO_REMOTE_SSH_READY_TIMEOUT=30 REPO_REMOTE_SSH_READY_POLL_INTERVAL=0 -- up --yes --json
+assert_eq "ssm registration delay then success: up succeeds" "0" "$RR_RC"
+assert_eq "ssm registration delay: probed 3 times" "3" "$(ssh_probe_count)"
+assert_contains "ssm registration delay: explains the wait" "$RR_ERR" "SSM target not ready yet"
+assert_eq "ssm registration delay: exactly one launch" "1" "$(grep -c 'run-instances' "$MOCK_LOG")"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (b) Registration never happens: bounded, clear, id retained, no fallback.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmslow MOCK_SSH_FAIL=1 MOCK_SSH_STDERR="$TNC" \
+  REPO_REMOTE_SSH_READY_TIMEOUT=2 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 -- up --yes --json
+assert_eq "ssm registration timeout: exit 4" "4" "$RR_RC"
+assert_contains "ssm registration timeout: names the window" "$RR_ERR" "within 2s"
+assert_contains "ssm registration timeout: names the profile prerequisite" "$RR_ERR" "AmazonSSMManagedInstanceCore"
+assert_contains "ssm registration timeout: names the endpoint prerequisite" "$RR_ERR" "ssmmessages"
+assert_contains "ssm registration timeout: no fallback" "$RR_ERR" "Not falling back to direct SSH"
+[[ "$(ssh_probe_count)" -ge 2 ]] \
+  && ok "ssm registration timeout: retried before dying ($(ssh_probe_count) attempts)" \
+  || no "ssm registration timeout: expected >= 2 attempts, got $(ssh_probe_count)"
+assert_contains "ssm registration timeout: instance id persisted" "$(cat "$REPO/.env")" "REPO_REMOTE_INSTANCE_ID=i-0ssmslow"
+assert_not_contains "ssm registration timeout: no ingress opened as a fallback" "$(cat "$MOCK_LOG")" "authorize-security-group-ingress"
+assert_not_contains "ssm registration timeout: no public IP looked up as a fallback" "$(cat "$MOCK_LOG")" "PublicIpAddress"
+assert_contains "ssm registration timeout: alias still targets the instance id" "$(cat "$SCRATCH/ssh_config")" "HostName i-0ssmslow"
+assert_not_contains "ssm registration timeout: no up result" "$RR_OUT" '"action":"up"'
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (c) Access denied: fails on the first attempt with the permission named.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmdenied MOCK_SSH_FAIL=1 \
+  MOCK_SSH_STDERR="An error occurred (AccessDeniedException) when calling the StartSession operation: User: arn:aws:iam::123456789012:user/test is not authorized to perform: ssm:StartSession on resource: arn:aws:ec2:us-west-2:123456789012:instance/i-0ssmdenied" \
+  REPO_REMOTE_SSH_READY_TIMEOUT=60 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 -- up --yes --json
+assert_eq "ssm access denied: exit 4" "4" "$RR_RC"
+assert_eq "ssm access denied: not retried" "1" "$(ssh_probe_count)"
+assert_contains "ssm access denied: says access denied" "$RR_ERR" "access denied by AWS"
+assert_contains "ssm access denied: names the permission" "$RR_ERR" "ssm:StartSession"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (d) Plugin failure surfaced through the probe: distinct, not retried.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmnoplugin MOCK_SSH_FAIL=1 \
+  MOCK_SSH_STDERR="SessionManagerPlugin is not found. Please refer to SessionManager Documentation here: http://docs.aws.amazon.com/console/systems-manager/session-manager-plugin-not-found" \
+  REPO_REMOTE_SSH_READY_TIMEOUT=60 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 -- up --yes --json
+assert_eq "ssm plugin failure at probe: exit 4" "4" "$RR_RC"
+assert_eq "ssm plugin failure at probe: not retried" "1" "$(ssh_probe_count)"
+assert_contains "ssm plugin failure at probe: names the plugin" "$RR_ERR" "Session Manager plugin"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (e) Key auth failure behind SSM: fails at once (waiting cannot fix it).
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmauth MOCK_SSH_FAIL=1 \
+  MOCK_SSH_STDERR="ubuntu@i-0ssmauth: Permission denied (publickey)." \
+  REPO_REMOTE_SSH_READY_TIMEOUT=60 REPO_REMOTE_SSH_READY_POLL_INTERVAL=1 -- up --yes --json
+assert_eq "ssm key failure: exit 4" "4" "$RR_RC"
+assert_eq "ssm key failure: not retried" "1" "$(ssh_probe_count)"
+assert_contains "ssm key failure: names the key setting" "$RR_ERR" "REPO_REMOTE_SSH_KEY"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (f) Host-identity mismatch through the SSM alias: still exit 6.
+run_rr "${SSM_ENV[@]}" MOCK_AWS_NEW_ID=i-0ssmbox MOCK_SSH_HOST_ID=i-0someoneelse -- up --yes --json
+assert_eq "ssm identity mismatch: exit 6" "6" "$RR_RC"
+assert_contains "ssm identity mismatch: the usual loud refusal" "$RR_ERR" "HOST IDENTITY MISMATCH"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# (g) `verify` over an ssm alias: plugin preflight, then the same strict check.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr REPO_REMOTE_TRANSPORT=ssm MOCK_SSH_HOST_ID=i-0pinned -- verify --json
+assert_eq "ssm verify: exit 0" "0" "$RR_RC"
+assert_contains "ssm verify: verified" "$RR_OUT" '"verified":true'
+run_rr REPO_REMOTE_TRANSPORT=ssm REPO_REMOTE_SSM_PLUGIN=rr-no-such-plugin MOCK_SSH_HOST_ID=i-0pinned -- verify --json
+assert_eq "ssm verify without the plugin: exit 2" "2" "$RR_RC"
+assert_contains "ssm verify without the plugin: names it" "$RR_ERR" "Session Manager plugin"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: dry run and config-layer precedence (repo#564) --"
+# ---------------------------------------------------------------------------
+run_rr "${SSM_ENV[@]}" -- up --json
+assert_eq "ssm dry run: exit 0" "0" "$RR_RC"
+assert_eq "ssm dry run: plan names the transport" "ssm" "$(json_field "$RR_OUT" transport)"
+assert_eq "ssm dry run: plan names the profile" "rr-ssm" "$(json_field "$RR_OUT" instance_profile)"
+assert_eq "ssm dry run: no cloud call, no session, no ssh at all" "" "$(cat "$MOCK_LOG")"
+run_rr REPO_REMOTE_TRANSPORT=ssm -- up
+assert_eq "ssm dry run (text, no profile): exit 0" "0" "$RR_RC"
+assert_contains "ssm dry run (text): names the transport" "$RR_ERR" "transport:           ssm"
+assert_contains "ssm dry run (text): flags the missing profile for a fresh launch" "$RR_ERR" "FRESH ssm launch requires REPO_REMOTE_INSTANCE_PROFILE"
+assert_eq "ssm dry run (text): no cloud call" "" "$(cat "$MOCK_LOG")"
+run_rr -- up --json
+assert_eq "default dry run: transport defaults to ssh" "ssh" "$(json_field "$RR_OUT" transport)"
+assert_eq "default dry run: no profile" "" "$(json_field "$RR_OUT" instance_profile)"
+
+# Shared layer sets ssm + a profile; the repo layer overrides both.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2" \
+  "REPO_REMOTE_TRANSPORT=ssm" "REPO_REMOTE_INSTANCE_PROFILE=shared-prof"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --json
+assert_eq "precedence: shared transport applies" "ssm" "$(json_field "$RR_OUT" transport)"
+assert_eq "precedence: shared profile applies" "shared-prof" "$(json_field "$RR_OUT" instance_profile)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_TRANSPORT=ssh" "REPO_REMOTE_INSTANCE_PROFILE=repo-prof"
+run_rr -- up --json
+assert_eq "precedence: repo transport overrides shared" "ssh" "$(json_field "$RR_OUT" transport)"
+assert_eq "precedence: repo profile overrides shared" "repo-prof" "$(json_field "$RR_OUT" instance_profile)"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS transport: generated alias parsed by the REAL ssh -G (repo#564) --"
+# ---------------------------------------------------------------------------
+# These call write_ssh_alias() directly (sourced) with the real ssh on PATH, so
+# the config-parse backstop and the assertions below use OpenSSH itself.
+REAL_SSH="$(command -v ssh || true)"
+# The key paths below are deliberately literal '~/...' strings: that is what an
+# operator's config holds and what ssh itself expands.
+# shellcheck disable=SC2088
+if [[ -z "$REAL_SSH" || "$REAL_SSH" == "$MOCK_BIN/ssh" ]]; then
+  skip "real ssh not available; skipping ssh -G alias checks"
+else
+  ALIAS_CFG="$SCRATCH/alias_fixture/config"
+  mkdir -p "$(dirname "$ALIAS_CFG")"
+  printf 'Host before\n    HostName 10.9.9.8\n    User keepme\n\nHost repo-remote-myrepo\n    HostName 192.0.2.1\n    User ubuntu\n\nHost after\n    HostName 10.9.9.9\n' >"$ALIAS_CFG"
+  # wsa <user> <key> <host> [region] -> runs write_ssh_alias in a sourced shell.
+  # ($0 must NOT be the script path, or its source-guard would run main().)
+  wsa() {
+    # shellcheck disable=SC2016  # expanded by the inner bash, not here
+    REPO_REMOTE_SSH_CONFIG="$ALIAS_CFG" REPO_REMOTE_SSH_USER="$1" REPO_REMOTE_SSH_KEY="$2" \
+      bash -c 'source "$1"; NAME=myrepo; write_ssh_alias "$2" "$3" >/dev/null' wsa "$RR" "$3" "${4:-}" 2>/dev/null
+  }
+  sshg() { "$REAL_SSH" -G -F "$ALIAS_CFG" "$1" 2>/dev/null; }
+
+  # direct -> ssm, with a custom region/user/key
+  wsa ec2-user "~/.ssh/custom_key" i-0abc123def eu-central-1
+  assert_eq "ssh -G: switch to ssm succeeds" "0" "$?"
+  G="$(sshg repo-remote-myrepo)"
+  assert_contains "ssh -G: ssm HostName is the instance id" "$G" "hostname i-0abc123def"
+  assert_contains "ssh -G: ssm ProxyCommand is region-qualified" "$G" \
+    "proxycommand aws ssm start-session --region eu-central-1 --target %h --document-name AWS-StartSSHSession --parameters portNumber=22"
+  assert_contains "ssh -G: custom user kept" "$G" "user ec2-user"
+  assert_contains "ssh -G: custom key kept" "$G" "identityfile ~/.ssh/custom_key"
+  assert_eq "ssh -G: exactly one block for the alias" "1" "$(grep -c '^Host repo-remote-myrepo$' "$ALIAS_CFG")"
+  assert_not_contains "ssh -G: old direct HostName removed" "$(cat "$ALIAS_CFG")" "192.0.2.1"
+  assert_contains "ssh -G: unrelated block before preserved" "$(sshg before)" "hostname 10.9.9.8"
+  assert_contains "ssh -G: unrelated block before keeps its user" "$(sshg before)" "user keepme"
+  assert_contains "ssh -G: unrelated block after preserved" "$(sshg after)" "hostname 10.9.9.9"
+
+  # ssm -> direct: the ProxyCommand must go away with the old block.
+  wsa ubuntu "~/.ssh/id_ed25519" 198.51.100.7
+  assert_eq "ssh -G: switch back to direct succeeds" "0" "$?"
+  G="$(sshg repo-remote-myrepo)"
+  assert_contains "ssh -G: direct HostName is the IP" "$G" "hostname 198.51.100.7"
+  assert_not_contains "ssh -G: no ProxyCommand left behind" "$(cat "$ALIAS_CFG")" "ProxyCommand"
+  assert_not_contains "ssh -G: no instance-id HostName left behind" "$(cat "$ALIAS_CFG")" "i-0abc123def"
+  assert_contains "ssh -G: unrelated blocks survive the switch back" "$(sshg after)" "hostname 10.9.9.9"
+
+  # Injection-shaped values are refused and leave the file byte-identical.
+  BEFORE_SUM="$(cksum <"$ALIAS_CFG")"
+  wsa ubuntu "~/.ssh/id_ed25519" 'i-0abc;touch' us-west-2
+  assert_eq "alias: instance id with a shell metacharacter refused" "1" "$?"
+  wsa ubuntu "~/.ssh/id_ed25519" i-0abc 'us-west-2 -o ProxyCommand=x'
+  assert_eq "alias: region with extra tokens refused" "1" "$?"
+  wsa "ubuntu
+    ProxyCommand touch /tmp/pwned" "~/.ssh/id_ed25519" i-0abc us-west-2
+  assert_eq "alias: user with an embedded config line refused" "1" "$?"
+  wsa ubuntu "~/.ssh/k
+    ProxyCommand touch /tmp/pwned" 198.51.100.7
+  assert_eq "alias: key with an embedded config line refused (direct transport too)" "1" "$?"
+  assert_eq "alias: refused writes left the config untouched" "$BEFORE_SUM" "$(cksum <"$ALIAS_CFG")"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -2515,6 +2994,29 @@ assert_contains "remote.md documents the bridged-container effect" "$MD" "**Effe
 assert_contains "remote.md documents that existing instances keep their settings" "$MD" \
   "**Existing instances keep their settings.**"
 assert_contains "remote.md gives the separate migration command" "$MD" "modify-instance-metadata-options"
+
+# repo#564: the optional SSM transport, its prerequisites, the zero-inbound
+# launch, the reused-instance limits, the additive JSON fields, and both rsync
+# flows going through the alias.
+assert_contains "remote.md documents the transport setting" "$MD" "REPO_REMOTE_TRANSPORT=ssm"
+assert_contains "remote.md documents the instance profile setting" "$MD" "REPO_REMOTE_INSTANCE_PROFILE"
+assert_contains "remote.md documents the transport section" "$MD" "#### AWS transport: direct SSH or SSM Session Manager"
+assert_contains "remote.md documents the launch argument" "$MD" "--iam-instance-profile Name=<name>"
+assert_contains "remote.md documents the exact ProxyCommand" "$MD" \
+  "ProxyCommand aws ssm start-session --region us-west-2 --target %h --document-name AWS-StartSSHSession --parameters portNumber=22"
+assert_contains "remote.md names the local plugin prerequisite" "$MD" "session-manager-plugin"
+assert_contains "remote.md names the caller's session permission" "$MD" "ssm:StartSession"
+assert_contains "remote.md names the PassRole condition" "$MD" "iam:PassedToService = ec2.amazonaws.com"
+assert_contains "remote.md names the managed policy" "$MD" "AmazonSSMManagedInstanceCore"
+assert_contains "remote.md names the agent endpoints" "$MD" "ssmmessages"
+assert_contains "remote.md documents the SSM group tag" "$MD" "repo-remote-ssm=<name>"
+assert_contains "remote.md documents the registration retry" "$MD" "TargetNotConnected"
+assert_contains "remote.md says there is no direct-SSH fallback" "$MD" "never falls back to direct SSH"
+assert_contains "remote.md documents the reused-instance exposure limit" "$MD" "does not reduce an existing box's exposure"
+assert_contains "remote.md documents the additive connect_target field" "$MD" "connect_target"
+assert_contains "remote.md: working-tree rsync targets the alias" "$MD" "./ repo-remote-<name>:~/<repo-name>/"
+assert_contains "remote.md: working-tree rsync keeps the provisioning-secret exclusion" "$MD" "--filter=':- .gitignore' --exclude '.git/'"
+assert_contains "remote.md: token rsync targets the alias" "$MD" "repo-remote-<name>:~/<repo-name>/.loom/tokens/"
 
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"
