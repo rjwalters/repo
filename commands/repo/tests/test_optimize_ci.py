@@ -942,6 +942,78 @@ class DefaultBranchReportTests(unittest.TestCase):
         self.assertIn("alternatives, not additive", text)
 
 
+class PerWorkflowSamplingTests(unittest.TestCase):
+    """Issue #573: per-workflow sampling, true totals, scaling, job spread."""
+
+    SENTINEL = "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\njobs:\n  s:\n    runs-on: x\n    steps:\n      - run: true\n"
+
+    def setUp(self):
+        self.sent = [mrun(100 + i, f"2026-09-01T00:{i:02d}:00Z", 1, event="workflow_run",
+                          path=".github/workflows/sentinel.yml") for i in range(5)]
+        self.ci = [mrun(i, f"2026-09-02T00:{i:02d}:00Z", 10, event="pull_request", branch=f"b{i}")
+                   for i in range(1, 4)]
+
+    def report(self, runs_per_wf, totals, jobs_by_run=None, max_runs=3):
+        routes = {"repos/o/r/rules": [],
+                  "repos/o/r/actions/workflows/ci.yml/runs": {"workflow_runs": runs_per_wf["ci"], "total_count": totals["ci"]},
+                  "repos/o/r/actions/workflows/sentinel.yml/runs": {"workflow_runs": runs_per_wf["sentinel"], "total_count": totals["sentinel"]},
+                  "repos/o/r/actions/runs/": jobs_by_run or job_route(10)}
+        tmp, root = make_repo({"ci.yml": WastedRunTests.PR_ONLY, "sentinel.yml": self.SENTINEL})
+        with tmp:
+            ns = type("A", (), dict(repo="o/r", root=str(root), remote=False, default_branch=None,
+                                    runs=max_runs, days=30, no_history=False, json=True))()
+            return oc.run_report(ns, gh=FakeGitHub(routes))
+
+    def test_cheap_workflow_cannot_crowd_out_expensive_one(self):
+        report = self.report({"ci": self.ci, "sentinel": self.sent[:3]}, {"ci": 3, "sentinel": 5000})
+        pw = report["history"]["perWorkflow"]
+        self.assertEqual(pw[".github/workflows/ci.yml"]["runs"], 3)
+        self.assertEqual(pw[".github/workflows/sentinel.yml"]["runs"], 3)
+        self.assertEqual(pw[".github/workflows/sentinel.yml"]["totalRuns"], 5000)
+        self.assertTrue(pw[".github/workflows/sentinel.yml"]["sampleCapped"])
+        self.assertFalse(pw[".github/workflows/ci.yml"]["sampleCapped"])
+        self.assertTrue(report["history"]["sampleCapped"])
+
+    def test_total_minutes_scale_by_true_run_count(self):
+        report = self.report({"ci": self.ci, "sentinel": self.sent[:3]}, {"ci": 300, "sentinel": 3})
+        ci = report["history"]["perWorkflow"][".github/workflows/ci.yml"]
+        self.assertEqual(ci["scale"], 100.0)
+        self.assertEqual(ci["totalRunnerMinutes"], 10.0 * 300)
+
+    def test_text_says_sample_is_capped(self):
+        report = self.report({"ci": self.ci, "sentinel": self.sent[:3]}, {"ci": 300, "sentinel": 3})
+        text = oc.render_text(report)
+        self.assertIn("sampled 3 of 300 runs", text)
+        self.assertIn("CAPPED", text)
+
+    def test_job_spread_median_and_p90_over_more_than_five_runs(self):
+        runs = [mrun(i, f"2026-09-02T00:{i:02d}:00Z", 10, event="pull_request", branch=f"b{i}")
+                for i in range(1, 11)]
+        report = self.report({"ci": runs, "sentinel": self.sent[:3]}, {"ci": 10, "sentinel": 3},
+                             max_runs=10)
+        ci = report["history"]["perWorkflow"][".github/workflows/ci.yml"]
+        self.assertEqual(ci["sampledRuns"], 10)
+        self.assertEqual(ci["jobSpread"]["a"]["n"], 10)
+
+    def test_percentile(self):
+        self.assertEqual(oc._percentile([1, 1, 1, 1, 1, 1, 1, 1, 1, 30], 50), 1)
+        self.assertEqual(oc._percentile([1, 1, 1, 1, 1, 1, 1, 1, 1, 30], 90), 1)
+        self.assertEqual(oc._percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 30], 90), 9)
+        self.assertEqual(oc._percentile([4], 90), 4)
+
+    def test_falls_back_to_repo_wide_listing_when_per_workflow_unreadable(self):
+        tmp, root = make_repo({"ci.yml": WastedRunTests.PR_ONLY})
+        routes = {"repos/o/r/rules": [], "repos/o/r/actions/workflows/": 404,
+                  "repos/o/r/actions/runs?": {"workflow_runs": self.ci},
+                  "repos/o/r/actions/runs/": job_route(10)}
+        with tmp:
+            ns = type("A", (), dict(repo="o/r", root=str(root), remote=False, default_branch=None,
+                                    runs=50, days=30, no_history=False, json=True))()
+            report = oc.run_report(ns, gh=FakeGitHub(routes))
+        self.assertFalse(report["history"]["perWorkflowSampling"])
+        self.assertEqual(report["history"]["runs"], 3)
+
+
 class ReadOnlyAndCliTests(unittest.TestCase):
     def test_every_github_call_is_a_get(self):
         with patch.object(oc.subprocess, "run") as mock_run:
@@ -969,7 +1041,8 @@ if __name__ == "__main__":
     suite = unittest.TestSuite()
     for case in (YamlReaderTests, GlobTests, RequiredCheckSafetyTests, UnderFilterTests, CacheTests,
                  WastedRunTests, DefaultBranchStaticTests, ReplayTests, MainStatsTests,
-                 ReportTests, DefaultBranchReportTests, ReadOnlyAndCliTests):
+                 ReportTests, DefaultBranchReportTests, PerWorkflowSamplingTests,
+                 ReadOnlyAndCliTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     failed = len(result.failures) + len(result.errors)

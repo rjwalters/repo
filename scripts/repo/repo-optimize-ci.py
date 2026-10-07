@@ -1210,27 +1210,81 @@ def main_stats(gh, repo, wf_runs, branch, main_sample=MAIN_JOBS_SAMPLE):
     return stats
 
 
-def gather_history(gh, repo, max_runs=100, days=30, jobs_sample=5, pr_sample=30,
-                   default_branch=None, main_sample=MAIN_JOBS_SAMPLE):
-    """Recent runs, per-workflow runner-minutes, default-branch stats, per-PR changed files."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    runs, page, capped = [], 1, False
-    while len(runs) < max_runs:
-        data = gh.api(f"repos/{repo}/actions/runs?per_page={min(100, max_runs)}&page={page}"
+def _percentile(values, pct):
+    """Nearest-rank percentile of a non-empty list."""
+    ordered = sorted(values)
+    idx = max(int(-(-pct * len(ordered) // 100)) - 1, 0)
+    return ordered[min(idx, len(ordered) - 1)]
+
+
+def _list_runs(gh, repo, endpoint, cap, since):
+    """Completed runs from one runs-listing endpoint, newest first, up to `cap`.
+
+    Returns (runs, total_count): total_count is the API's count of completed
+    runs in the window, so it can exceed len(runs) when the cap bites.
+    """
+    runs, page, total = [], 1, None
+    per_page = min(100, cap)
+    while len(runs) < cap:
+        data = gh.api(f"{endpoint}?per_page={per_page}&page={page}&status=completed"
                       f"&created=%3E%3D{since}") or {}
         batch = data.get("workflow_runs") or []
+        if total is None and isinstance(data.get("total_count"), int):
+            total = data["total_count"]
         runs += batch
-        if len(batch) < min(100, max_runs):
+        if len(batch) < per_page:
             break
         page += 1
-    capped = len(runs) >= max_runs
-    runs = [r for r in runs[:max_runs] if r.get("status") == "completed"]
+    runs = runs[:cap]
+    return runs, (total if total is not None and total >= len(runs) else len(runs))
+
+
+def _span_days(rs, default):
+    created = sorted(t for t in (_ts(r.get("created_at")) for r in rs) if t)
+    if len(created) > 1:
+        return max((created[-1] - created[0]).total_seconds() / 86400.0, 1.0)
+    return float(default)
+
+
+def gather_history(gh, repo, max_runs=100, days=30, jobs_sample=20, pr_sample=30,
+                   default_branch=None, main_sample=MAIN_JOBS_SAMPLE, workflows=None):
+    """Recent runs, per-workflow runner-minutes, default-branch stats, per-PR changed files.
+
+    With `workflows`, up to `max_runs` completed runs are sampled PER WORKFLOW
+    (so a cheap, bursty workflow cannot crowd out an expensive one) and each
+    workflow's true run count for the window (`total_count`) is recorded so
+    estimates can be scaled. Without it (or if no per-workflow listing is
+    readable) it falls back to one repo-wide listing capped at `max_runs`.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    runs, totals, caps = [], {}, {}
+    for wf in workflows or []:
+        path = getattr(wf, "path", "")
+        if getattr(wf, "error", None) or not path:
+            continue
+        try:
+            wf_runs, total = _list_runs(
+                gh, repo, f"repos/{repo}/actions/workflows/{Path(path).name}/runs", max_runs, since)
+        except ApiError:
+            continue
+        wf_runs = [r for r in wf_runs if r.get("status") == "completed"]
+        for r in wf_runs:
+            r.setdefault("path", path)
+        runs += wf_runs
+        totals[path] = max(total, len(wf_runs))
+        caps[path] = totals[path] > len(wf_runs)
+    per_wf_mode = bool(totals)
+    if not per_wf_mode:
+        runs, _ = _list_runs(gh, repo, f"repos/{repo}/actions/runs", max_runs, since)
+        capped = len(runs) >= max_runs
+        runs = [r for r in runs if r.get("status") == "completed"]
+    else:
+        capped = any(caps.values())
     # A capped sample covers only the newest part of the window: measure the
     # span it really covers instead of presenting it as the full window.
-    created = sorted(t for t in (_ts(r.get("created_at")) for r in runs) if t)
     window_days = float(days)
-    if capped and len(created) > 1:
-        window_days = max((created[-1] - created[0]).total_seconds() / 86400.0, 1.0)
+    if capped and not per_wf_mode:
+        window_days = _span_days(runs, days)
     by_path = {}
     for run in runs:
         by_path.setdefault(_run_path(run), []).append(run)
@@ -1238,6 +1292,8 @@ def gather_history(gh, repo, max_runs=100, days=30, jobs_sample=5, pr_sample=30,
     for path, wf_runs in by_path.items():
         sampled, job_minutes = 0, {}
         total_sample = 0.0
+        total_runs = totals.get(path, len(wf_runs)) if per_wf_mode else len(wf_runs)
+        wf_capped = caps.get(path, False) if per_wf_mode else False
         for run in wf_runs[:jobs_sample]:
             try:
                 jobs = (gh.api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100") or {}).get("jobs") or []
@@ -1255,9 +1311,16 @@ def gather_history(gh, repo, max_runs=100, days=30, jobs_sample=5, pr_sample=30,
             per_run = sum(walls) / len(walls) if walls else 0.0
         per_workflow[path] = {
             "runs": len(wf_runs),
+            "totalRuns": total_runs,
+            "sampleCapped": wf_capped,
+            "scale": round(total_runs / len(wf_runs), 4) if wf_runs else 1.0,
+            "windowDays": round(_span_days(wf_runs, days), 2) if wf_capped else float(days),
             "avgRunnerMinutesPerRun": round(per_run, 2),
-            "totalRunnerMinutes": round(per_run * len(wf_runs), 1),
+            "totalRunnerMinutes": round(per_run * total_runs, 1),
             "jobs": {k: round(sum(v) / len(v), 2) for k, v in sorted(job_minutes.items())},
+            "jobSpread": {k: {"n": len(v), "median": round(_percentile(v, 50), 2),
+                              "p90": round(_percentile(v, 90), 2)}
+                          for k, v in sorted(job_minutes.items())},
             "sampledRuns": sampled,
         }
     # A run's `pull_requests` array is emptied once its PR merges and the
@@ -1296,7 +1359,8 @@ def gather_history(gh, repo, max_runs=100, days=30, jobs_sample=5, pr_sample=30,
     return {"since": since, "runs": runs, "perWorkflow": per_workflow, "prFiles": pr_files,
             "prSampled": len(pr_files), "prSeen": len(pr_numbers), "defaultBranch": default_branch,
             "main": main, "sampleCapped": capped, "windowDays": round(window_days, 2),
-            "requestedDays": days, "maxRuns": max_runs}
+            "requestedDays": days, "maxRuns": max_runs,
+            "perWorkflowSampling": per_wf_mode}
 
 
 def estimate(findings, history):
@@ -1370,9 +1434,25 @@ def estimate(findings, history):
         elif f["measure"] == "job-minutes":
             f["estNote"] = (f"not measured (cache hit/miss needs job logs); workflow averages "
                             f"{per_run} runner-min/run over {stats['runs']} runs")
+        scale = stats.get("scale", 1.0)
+        if scale > 1.0 and f["measure"] in ("doc-only-pr-runs", "superseded-pr-runs",
+                                            "duplicate-push-runs", "default-branch-overlap"):
+            for key in ("estMinutesSaved", "estDefaultBranchMinutes"):
+                if f.get(key) is not None:
+                    f[key] = round(f[key] * scale, 1)
+            f["estNote"] = (f.get("estNote") or "") + (
+                f"; scaled x{scale:g} from a sample of {stats['runs']} to the window's "
+                f"{stats['totalRuns']} runs")
 
 
 def _sample_note(history):
+    if history.get("perWorkflowSampling"):
+        capped = [Path(p).name for p, w in (history.get("perWorkflow") or {}).items()
+                  if w.get("sampleCapped")]
+        if capped:
+            return (f"per-workflow sample capped at {history.get('maxRuns')} runs for "
+                    f"{', '.join(capped)}: rates use each sample's own span")
+        return f"full {history.get('requestedDays')}-day window (every run sampled)"
     if history.get("sampleCapped"):
         return (f"sample capped at {history.get('maxRuns')} runs: covers ~{history.get('windowDays')} "
                 f"of the {history.get('requestedDays')} requested days, so totals are over that span only")
@@ -1405,7 +1485,9 @@ def heavy_findings(workflows, history, default_branch, threshold=DEFAULT_HEAVY_M
         main = (history.get("main") or {}).get(wf.path)
         if not main or not main.get("batching"):
             continue
-        days = history.get("windowDays") or history.get("requestedDays") or 1.0
+        wf_stats = (history.get("perWorkflow") or {}).get(wf.path) or {}
+        days = (wf_stats.get("windowDays") if history.get("perWorkflowSampling") else None) \
+            or history.get("windowDays") or history.get("requestedDays") or 1.0
         daily = main["eligibleRuns"] * main["perRunMinutes"] / days
         if daily < threshold:
             continue
@@ -1514,7 +1596,21 @@ def render_text(report):
     if h["state"] == "measured":
         lines.append(f"Run history: {h['runs']} completed runs since {h['since']}; "
                      f"PR file lists for {h['prSampled']}/{h['prSeen']} PRs (minutes are over this window)")
-        if h.get("sampleCapped"):
+        if h.get("perWorkflowSampling"):
+            lines.append(f"Per-workflow sampling (up to {h.get('maxRuns')} completed runs each); "
+                         "estimates are scaled to each workflow's true run count:")
+            for path, w in sorted((h.get("perWorkflow") or {}).items()):
+                tag = "  CAPPED" if w.get("sampleCapped") else ""
+                lines.append(f"  {Path(path).name}: sampled {w['runs']} of {w['totalRuns']} runs{tag}; "
+                             f"~{w['avgRunnerMinutesPerRun']} runner-min/run, "
+                             f"~{w['totalRunnerMinutes']} runner-min total")
+                for name, sp in (w.get("jobSpread") or {}).items():
+                    lines.append(f"      job {name}: median {sp['median']} / p90 {sp['p90']} min "
+                                 f"(n={sp['n']})")
+            if h.get("sampleCapped"):
+                lines.append("Sample CAPPED for at least one workflow: its true run count exceeds the "
+                             "sample (raise --runs for a bigger sample)")
+        elif h.get("sampleCapped"):
             lines.append(f"Sample CAPPED at {h.get('maxRuns')} runs: covers ~{h.get('windowDays')} of "
                          f"{h.get('requestedDays')} requested days; per-day figures use that span "
                          "(raise --runs for a fuller window)")
@@ -1582,7 +1678,8 @@ def run_report(args, gh=None):
     history_info = {"state": "not measured", "reason": "--no-history"}
     if not args.no_history and workflows:
         try:
-            hist = gather_history(gh, repo, args.runs, args.days, default_branch=branch)
+            hist = gather_history(gh, repo, args.runs, args.days, default_branch=branch,
+                                  workflows=workflows)
             if hist["runs"]:
                 threshold = getattr(args, "heavy_main_minutes_per_day", None)
                 if threshold is None:
@@ -1594,6 +1691,7 @@ def run_report(args, gh=None):
                                 "perWorkflow": hist["perWorkflow"], "defaultBranchRuns": hist["main"],
                                 "sampleCapped": hist["sampleCapped"], "windowDays": hist["windowDays"],
                                 "requestedDays": hist["requestedDays"], "maxRuns": hist["maxRuns"],
+                                "perWorkflowSampling": hist["perWorkflowSampling"],
                                 "heavyThresholdMinutesPerDay": threshold}
             else:
                 history_info = {"state": "not measured", "reason": f"no completed runs since {hist['since']}"}
@@ -1620,7 +1718,7 @@ def main(argv=None):
     rep.add_argument("--remote", action="store_true",
                      help="read workflows via the contents API instead of a local checkout")
     rep.add_argument("--default-branch")
-    rep.add_argument("--runs", type=int, default=100, help="max recent runs to sample")
+    rep.add_argument("--runs", type=int, default=100, help="max completed runs to sample PER WORKFLOW (repo-wide fallback if per-workflow listing is unreadable)")
     rep.add_argument("--days", type=int, default=30, help="history window in days")
     rep.add_argument("--heavy-main-minutes-per-day", type=float,
                      default=DEFAULT_HEAVY_MAIN_MINUTES_PER_DAY,
