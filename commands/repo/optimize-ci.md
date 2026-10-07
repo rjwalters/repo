@@ -125,6 +125,13 @@ Check each finding against the repo before it goes in the report:
   workflow the jobs call. It does not see monorepo sub-package lockfiles or
   shared directories like `lib/` that the build reads implicitly — read the
   job's commands and add those yourself.
+- **Cache false positives.** `cache-key-no-lockfile-hash` is suppressed when
+  the key embeds a resolved tool version (`steps.*.outputs.*version*` or a
+  literal like `1.2.3`); if it still fires, confirm the key really tracks the
+  inputs. `cache-matrix-key-collision` is `medium` only when other steps in the
+  job reference `matrix.*` (so cached content can differ per leg); otherwise it
+  is `info` — check whether the legs truly install identical content before
+  recommending a per-leg key.
 - **Required-check matching.** A job's check context is its `name:` (or job id),
   with ` (matrix values)` appended for matrix legs and `caller / callee` for
   reusable workflows. Confirm the helper's match by eye when names contain

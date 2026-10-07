@@ -278,11 +278,11 @@ CACHE_WF = """\
 """
 
 
-def cache_wf(key, restore=None, matrix=False):
+def cache_wf(key, restore=None, matrix=False, extra=""):
     return CACHE_WF.format(
         key=key,
         restore=f"\n              restore-keys: {restore}" if restore else "",
-        matrix="\n        strategy:\n          matrix:\n            node: [18, 20]" if matrix else "")
+        matrix="\n        strategy:\n          matrix:\n            node: [18, 20]" if matrix else "") + extra
 
 
 class CacheTests(unittest.TestCase):
@@ -309,10 +309,24 @@ class CacheTests(unittest.TestCase):
                                          restore="${{ runner.os }}-npm-")})
         self.assertEqual(cache_ids(report), [])
 
-    def test_matrix_without_matrix_key_collides(self):
+    def test_version_keyed_cache_is_not_flagged_for_missing_hash(self):
+        for key in ("${{ runner.os }}-tool-${{ steps.v.outputs.version }}",
+                    "${{ runner.os }}-tool-${{ steps.get.outputs.tool-version }}",
+                    "${{ runner.os }}-tool-1.2.3"):
+            self.assertNotIn("cache-key-no-lockfile-hash", ids(scan({"c.yml": cache_wf(key)})), key)
+
+    def test_matrix_without_matrix_key_collides_when_legs_differ(self):
+        extra = "          - run: npm i pkg@${{ matrix.node }}\n"
+        report = scan({"c.yml": cache_wf("${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}",
+                                         restore="x", matrix=True, extra=extra)})
+        self.assertEqual(only(report, "cache-matrix-key-collision")["severity"], "medium")
+
+    def test_matrix_shared_cache_is_info_when_legs_do_not_differ(self):
         report = scan({"c.yml": cache_wf("${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}",
                                          restore="x", matrix=True)})
-        self.assertIn("cache-matrix-key-collision", ids(report))
+        self.assertEqual(only(report, "cache-matrix-key-collision")["severity"], "info")
+
+    def test_matrix_in_key_is_not_a_collision(self):
         report = scan({"c.yml": cache_wf("${{ matrix.node }}-${{ hashFiles('package-lock.json') }}",
                                          restore="x", matrix=True)})
         self.assertNotIn("cache-matrix-key-collision", ids(report))
