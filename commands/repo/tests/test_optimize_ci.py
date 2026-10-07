@@ -600,6 +600,348 @@ class ReportTests(unittest.TestCase):
         self.assertIn("nothing to audit", oc.render_text(report))
 
 
+PUSH_ONLY = "on:\n  push:\n    branches: [main]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n"
+
+
+class DefaultBranchStaticTests(unittest.TestCase):
+    def conc(self, group="g-${{ github.workflow }}-${{ github.ref }}", cancel=None, base=PUSH_ONLY):
+        block = f"concurrency:\n  group: {group}\n"
+        if cancel is not None:
+            block += f"  cancel-in-progress: {cancel}\n"
+        return base.replace("jobs:", block + "jobs:", 1)
+
+    def test_push_only_without_group_is_flagged(self):
+        f = only(scan({"w.yml": PUSH_ONLY}), "missing-default-branch-concurrency")
+        self.assertIn("cancel-in-progress: false", f["recommendation"])
+        self.assertEqual(f["measure"], "default-branch-overlap")
+
+    def test_push_only_with_cancel_true_is_flagged_literal_and_string(self):
+        for val in ("true", "'true'", "${{ true }}"):
+            self.assertIn("cancel-on-default-branch", ids(scan({"w.yml": self.conc(cancel=val)})), val)
+
+    def test_pr_scoped_cancel_expression_is_safe_but_unknown_expression_is_uncertain(self):
+        safe = self.conc(cancel="${{ github.event_name == 'pull_request' }}")
+        self.assertEqual(ids(scan({"w.yml": safe})), [])
+        unknown = scan({"w.yml": self.conc(cancel="${{ inputs.cancel }}")})
+        self.assertIn("uncertain-default-branch-cancel", ids(unknown))
+        self.assertNotIn("cancel-on-default-branch", ids(unknown))
+        by_ref = self.conc(cancel="${{ github.ref != 'refs/heads/main' }}")
+        self.assertEqual(ids(scan({"w.yml": by_ref})), [])
+
+    def test_workflow_that_never_runs_on_default_branch_is_not_asked(self):
+        for on in ("on:\n  push:\n    branches: [release]\n", "on:\n  push:\n    tags: ['v*']\n",
+                   "on:\n  push:\n    branches-ignore: [main]\n", "on:\n  workflow_dispatch:\n",
+                   "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
+                   "on:\n  push:\n    branches: ['**', '!main']\n"):
+            wf = on + PUSH_ONLY.split("jobs:", 1)[0].replace("on:\n  push:\n    branches: [main]\n", "") \
+                + "jobs:" + PUSH_ONLY.split("jobs:", 1)[1]
+            self.assertEqual(ids(scan({"w.yml": wf})), [], on)
+
+    def test_branches_ignore_other_branch_still_runs_on_default(self):
+        wf = PUSH_ONLY.replace("branches: [main]", "branches-ignore: [dev]")
+        self.assertIn("missing-default-branch-concurrency", ids(scan({"w.yml": wf})))
+
+    def test_alternate_default_branch(self):
+        wf = PUSH_ONLY.replace("[main]", "[trunk]")
+        tmp, root = make_repo({"w.yml": wf})
+        with tmp:
+            ns = argparse_ns(["scan", "--root", str(root), "--default-branch", "trunk"])
+            self.assertIn("missing-default-branch-concurrency", ids(oc.run_scan(ns)))
+            ns = argparse_ns(["scan", "--root", str(root)])
+            self.assertEqual(ids(oc.run_scan(ns)), [])
+
+    def test_job_level_group_counts_only_when_every_job_has_one(self):
+        two = PUSH_ONLY + "  u:\n    runs-on: x\n    steps:\n      - run: make\n"
+        job_conc = "    concurrency:\n      group: j-${{ github.workflow }}-${{ github.ref }}\n"
+        one = two.replace("  t:\n", "  t:\n" + job_conc, 1)
+        self.assertIn("missing-default-branch-concurrency", ids(scan({"w.yml": one})))
+        both = one.replace("  u:\n", "  u:\n" + job_conc, 1)
+        self.assertEqual(ids(scan({"w.yml": both})), [])
+        wf = one.replace(job_conc, job_conc + "      cancel-in-progress: true\n")
+        wf = wf.replace("  u:\n", "  u:\n" + job_conc, 1)
+        f = only(scan({"w.yml": wf}), "cancel-on-default-branch")
+        self.assertEqual(f["job"], "t")
+
+    def test_scalar_group_and_group_quality(self):
+        scalar = PUSH_ONLY.replace("jobs:", "concurrency: deploy-prod\njobs:", 1)
+        self.assertEqual(ids(scan({"w.yml": scalar})), [])
+        ref_only = scan({"w.yml": self.conc(group="${{ github.ref }}")})
+        self.assertIn("unsafe-default-branch-group", ids(ref_only))
+        unique = scan({"w.yml": self.conc(group="x-${{ github.sha }}")})
+        self.assertIn("unsafe-default-branch-group", ids(unique))
+        opaque = scan({"w.yml": self.conc(group="${{ inputs.env }}")})
+        self.assertIn("uncertain-default-branch-group", ids(opaque))
+        self.assertNotIn("unsafe-default-branch-group", ids(opaque))
+        self.assertEqual(oc.classify_group("ci-${{ github.ref }}"), ("ref", True))
+
+    def test_pr_workflows_keep_pr_behavior_and_get_no_duplicate_missing_finding(self):
+        r = scan({"w.yml": WastedRunTests.PR_ONLY})
+        self.assertIn("missing-concurrency", ids(r))
+        self.assertNotIn("missing-default-branch-concurrency", ids(r))
+        both = WastedRunTests.PR_ONLY.replace("on:\n  pull_request:", "on:\n  pull_request:\n  push:\n    branches: [main]")
+        self.assertNotIn("missing-default-branch-concurrency", ids(scan({"w.yml": both})))
+        self.assertNotIn("duplicate-push-pr", ids(scan({"w.yml": PUSH_ONLY.replace("branches: [main]", "")})))
+
+
+def rows_from(spec):
+    """spec: [(id, created_min, wall_min)] -> normalized rows at a fixed UTC origin."""
+    base = oc._ts("2026-09-01T00:00:00Z")
+    from datetime import timedelta
+    return [{"id": i, "created": base + timedelta(minutes=c), "start": base + timedelta(minutes=c),
+             "end": base + timedelta(minutes=c + w), "conclusion": "success", "wall": float(w)}
+            for i, c, w in spec]
+
+
+class ReplayTests(unittest.TestCase):
+    def test_zero_overlap(self):
+        rows = rows_from([(1, 0, 10), (2, 20, 10)])
+        self.assertEqual(oc.observed_overlap(rows), 0)
+        self.assertEqual(oc.replay_queue(rows), (2, []))
+
+    def test_lone_arrival_during_run_is_observed_overlap_but_not_avoided(self):
+        rows = rows_from([(1, 0, 10), (2, 5, 10)])
+        self.assertEqual(oc.observed_overlap(rows), 1)
+        self.assertEqual(oc.replay_queue(rows), (2, []))
+
+    def test_multiple_queued_arrivals_only_newest_survives(self):
+        rows = rows_from([(1, 0, 10), (2, 2, 10), (3, 4, 10), (4, 6, 10)])
+        self.assertEqual(oc.observed_overlap(rows), 3)
+        executed, superseded = oc.replay_queue(rows)
+        self.assertEqual((executed, superseded), (2, [2, 3]))
+
+    def test_pending_starts_at_end_of_running_and_blocks_later_arrival(self):
+        # 1 runs 0-10; 2 pending runs 10-20; 3 at minute 15 becomes pending (nothing replaced
+        # because 2 already started); 4 at 16 supersedes 3.
+        rows = rows_from([(1, 0, 10), (2, 5, 10), (3, 15, 10), (4, 16, 10)])
+        self.assertEqual(oc.replay_queue(rows), (3, [3]))
+
+    def test_boundary_timestamps_do_not_overlap(self):
+        rows = rows_from([(1, 0, 10), (2, 10, 10)])
+        self.assertEqual(oc.observed_overlap(rows), 0)
+        self.assertEqual(oc.replay_queue(rows), (2, []))
+
+    def test_simultaneous_arrivals_are_ordered_by_id(self):
+        rows = rows_from([(2, 0, 10), (1, 0, 10), (3, 0, 10)])
+        self.assertEqual(oc.replay_queue(rows), (2, [2]))
+
+    def test_buckets_are_fixed_utc_and_hand_calculated(self):
+        # Arrivals at 00:10, 00:50, 01:05, 02:59, 03:00 (UTC).
+        rows = rows_from([(i, m, 1) for i, m in enumerate((10, 50, 65, 179, 180))])
+        h = oc.bucket_estimate(rows, 20.0, 1)
+        self.assertEqual((h["occupiedBuckets"], h["baselineMinutes"], h["estimatedMinutes"],
+                          h["savedMinutes"], h["savedPct"]), (4, 100.0, 80.0, 20.0, 20.0))
+        t = oc.bucket_estimate(rows, 20.0, 3)
+        self.assertEqual((t["occupiedBuckets"], t["estimatedMinutes"], t["savedMinutes"], t["savedPct"]),
+                         (2, 40.0, 60.0, 60.0))
+        self.assertIn("counterfactual", t["kind"])
+
+    def test_bucket_boundary_across_utc_midnight(self):
+        from datetime import timedelta
+        base = oc._ts("2026-09-01T23:59:00Z")
+        rows = [{"id": i, "created": base + timedelta(minutes=m), "start": base, "end": base,
+                 "conclusion": "success", "wall": 1.0} for i, m in enumerate((0, 1))]
+        self.assertEqual(oc.bucket_estimate(rows, 10.0, 3)["occupiedBuckets"], 2)
+
+
+def mrun(i, created, minutes, branch="main", event="push", conclusion="success", attempt=1,
+         path=".github/workflows/ci.yml", updated=True):
+    from datetime import timedelta
+    start = oc._ts(created)
+    r = run(i, event, branch, created, (start + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f"s{i}", conclusion=conclusion)
+    r["path"], r["run_attempt"] = path, attempt
+    if not updated:
+        r["updated_at"] = None
+    return r
+
+
+def job_route(minutes):
+    return {"jobs": [{"name": "a", "started_at": "2026-09-01T00:00:00Z",
+                      "completed_at": f"2026-09-01T00:{minutes:02d}:00Z"}]}
+
+
+class MainStatsTests(unittest.TestCase):
+    def stats(self, runs, jobs=None, **kw):
+        gh = FakeGitHub({"repos/o/r/actions/runs/": jobs if jobs is not None else 403})
+        return oc.main_stats(gh, "o/r", runs, "main", **kw)
+
+    def test_population_filters_and_counts(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10),
+                mrun(2, "2026-09-01T00:05:00Z", 10, conclusion="cancelled"),
+                mrun(3, "2026-09-01T01:00:00Z", 10, conclusion="failure"),
+                mrun(4, "2026-09-01T02:00:00Z", 10, attempt=2),            # rerun: excluded
+                mrun(5, "2026-09-01T03:00:00Z", 10, updated=False),         # missing timestamp
+                mrun(6, "2026-09-01T04:00:00Z", 10, branch="dev"),          # other branch
+                mrun(7, "2026-09-01T05:00:00Z", 10, event="pull_request")]  # other event
+        st = self.stats(runs, jobs=job_route(8))
+        self.assertEqual((st["pushRuns"], st["originalRuns"], st["rerunAttempts"], st["missingTimestamps"],
+                          st["cancelledRuns"], st["eligibleRuns"]), (5, 4, 1, 1, 1, 2))
+        self.assertEqual((st["costBasis"], st["perRunMinutes"]), ("job-minutes", 8.0))
+        # Runs 1 and 2 overlap observed; replay: 2 is pending (lone) so nothing superseded.
+        self.assertEqual((st["observedOverlap"], st["replay"]["superseded"]), (1, 0))
+
+    def test_unequal_job_and_wall_time_and_wall_fallback_is_labeled(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10)]
+        st = self.stats(runs, jobs=job_route(30))
+        self.assertEqual((st["costBasis"], st["perRunMinutes"]), ("job-minutes", 30.0))
+        fallback = self.stats(runs)  # jobs API unreadable
+        self.assertEqual((fallback["costBasis"], fallback["perRunMinutes"], fallback["sampledJobRuns"]),
+                         ("wall-time", 10.0, 0))
+
+    def test_no_eligible_runs_is_not_measured(self):
+        st = self.stats([mrun(1, "2026-09-01T00:00:00Z", 10, conclusion="cancelled")])
+        self.assertIsNone(st["perRunMinutes"])
+        self.assertIsNone(st["replay"]["estMinutesSaved"])
+        self.assertIsNone(st["batching"])
+
+    def test_replay_estimate_uses_job_minutes_not_wall(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10), mrun(2, "2026-09-01T00:02:00Z", 10),
+                mrun(3, "2026-09-01T00:04:00Z", 10)]
+        st = self.stats(runs, jobs=job_route(20))
+        self.assertEqual(st["observedOverlap"], 2)
+        self.assertEqual((st["replay"]["superseded"], st["replay"]["estMinutesSaved"]), (1, 20.0))
+
+
+class DefaultBranchReportTests(unittest.TestCase):
+    report = ReportTests.report
+
+    def routes(self, runs, jobs=None, **extra):
+        r = {"repos/o/r/rules": [], "repos/o/r/actions/runs?": {"workflow_runs": runs},
+             "repos/o/r/actions/runs/": jobs or job_route(10)}
+        r.update(extra)
+        return r
+
+    def test_push_only_workflow_gets_overlap_and_replay_estimate(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10), mrun(2, "2026-09-01T00:02:00Z", 10),
+                mrun(3, "2026-09-01T00:04:00Z", 10)]
+        report, _ = self.report(self.routes(runs), {"ci.yml": PUSH_ONLY})
+        f = only(report, "missing-default-branch-concurrency")
+        self.assertEqual(f["estMinutesSaved"], 10.0)
+        self.assertIn("observed: 2 of 3", f["estNote"])
+        self.assertIn("1 superseded", f["estNote"])
+        self.assertIn("lone arrival", f["estNote"])
+
+    def heavy_report(self, minutes, threshold=None, **kw):
+        runs = [mrun(i, f"2026-09-01T{h:02d}:{m:02d}:00Z", 5)
+                for i, (h, m) in enumerate([(0, 0), (0, 30), (1, 0), (4, 0)], 1)]
+        ns = dict(heavy_main_minutes_per_day=threshold) if threshold is not None else {}
+        ns.update(kw)
+        wf = WastedRunTests.PR_ONLY.replace("on:\n  pull_request:", "on:\n  pull_request:\n  push:\n    branches: [main]")
+        return self.report(self.routes(runs, jobs=job_route(minutes)), {"ci.yml": wf}, **ns)[0]
+
+    def test_heavy_suite_estimates_hourly_and_three_hourly_separately(self):
+        # 4 runs x 10 min = 40 runner-min over a 30-day window: below default.
+        self.assertNotIn("heavy-default-branch-suite", ids(self.heavy_report(10)))
+        report = self.heavy_report(10, threshold=1.0)
+        f = only(report, "heavy-default-branch-suite")
+        h, t = f["alternatives"]["hourly"], f["alternatives"]["threeHourly"]
+        self.assertEqual((h["occupiedBuckets"], h["estimatedMinutes"], h["savedMinutes"], h["savedPct"]),
+                         (3, 30.0, 10.0, 25.0))
+        self.assertEqual((t["occupiedBuckets"], t["estimatedMinutes"], t["savedMinutes"], t["savedPct"]),
+                         (2, 20.0, 20.0, 50.0))
+        self.assertEqual(f["estMinutesSaved"], 10.0)  # canonical = hourly, never hourly + 3 h
+        self.assertTrue(f["reportOnly"])
+        self.assertFalse(f["applyEligible"])
+        self.assertIn("schedule", f["recommendation"])
+        self.assertIn("never part of --apply", f["recommendation"])
+        self.assertIn("counterfactual", f["estNote"])
+        self.assertIn("of 40.0 min", f["estNote"])
+
+    def test_threshold_boundary_is_inclusive(self):
+        # 4 runs x 10 min / 30 days = 1.3333 min/day.
+        daily = 40.0 / 30
+        self.assertIn("heavy-default-branch-suite", ids(self.heavy_report(10, threshold=daily)))
+        self.assertNotIn("heavy-default-branch-suite", ids(self.heavy_report(10, threshold=daily + 0.01)))
+        self.assertEqual(oc.DEFAULT_HEAVY_MAIN_MINUTES_PER_DAY, 300.0)
+
+    def test_pr_only_and_push_only_workflows_are_never_heavy(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 5)]
+        for wf in (PUSH_ONLY, WastedRunTests.PR_ONLY):
+            report = self.report(self.routes(runs, jobs=job_route(50)), {"ci.yml": wf},
+                                 heavy_main_minutes_per_day=0.0)[0]
+            self.assertNotIn("heavy-default-branch-suite", ids(report))
+
+    def test_capped_sample_is_visible_and_uses_observed_span(self):
+        report = self.heavy_report(10, threshold=1.0, runs=4)
+        h = report["history"]
+        self.assertTrue(h["sampleCapped"])
+        self.assertLess(h["windowDays"], h["requestedDays"])
+        f = only(report, "heavy-default-branch-suite")
+        self.assertIn("sample capped at 4 runs", f["estNote"])
+        self.assertIn("Sample CAPPED", oc.render_text(report))
+        full = self.heavy_report(10, threshold=1.0, runs=50)
+        self.assertFalse(full["history"]["sampleCapped"])
+        self.assertEqual(full["history"]["windowDays"], 30.0)
+
+    def test_wall_time_fallback_is_labeled_not_job_minutes(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10)]
+        routes = self.routes(runs)
+        routes["repos/o/r/actions/runs/"] = 403
+        wf = WastedRunTests.PR_ONLY.replace("on:\n  pull_request:", "on:\n  pull_request:\n  push:\n    branches: [main]")
+        rep = self.report(routes, {"ci.yml": wf}, heavy_main_minutes_per_day=0.1)[0]
+        f = only(rep, "heavy-default-branch-suite")
+        self.assertIn("wall-time fallback, not job-minutes", f["estNote"])
+
+    def test_unreadable_history_and_no_history_degrade(self):
+        for kw, routes in (({}, {"repos/o/r/actions": 403, "repos/o/r/rules": []}),
+                           ({"no_history": True}, {"repos/o/r/rules": []})):
+            report = self.report(routes, {"ci.yml": PUSH_ONLY}, **kw)[0]
+            self.assertEqual(report["history"]["state"], "not measured")
+            f = only(report, "missing-default-branch-concurrency")
+            self.assertIsNone(f["estMinutesSaved"])
+            self.assertNotIn("heavy-default-branch-suite", ids(report))
+            self.assertIn("not measured", oc.render_text(report))
+
+    def test_unreadable_job_samples_fall_back_without_failing(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10), mrun(2, "2026-09-01T00:05:00Z", 10)]
+        routes = self.routes(runs)
+        routes["repos/o/r/actions/runs/"] = 403
+        report = self.report(routes, {"ci.yml": PUSH_ONLY})[0]
+        self.assertEqual(report["history"]["defaultBranchRuns"][".github/workflows/ci.yml"]["costBasis"],
+                         "wall-time")
+
+    def test_two_workflows_are_measured_independently(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10), mrun(2, "2026-09-01T00:01:00Z", 10),
+                mrun(3, "2026-09-01T00:02:00Z", 10),
+                mrun(4, "2026-09-01T00:00:00Z", 10, path=".github/workflows/b.yml"),
+                mrun(5, "2026-09-01T00:30:00Z", 10, path=".github/workflows/b.yml")]
+        report = self.report(self.routes(runs), {"ci.yml": PUSH_ONLY, "b.yml": PUSH_ONLY})[0]
+        by = {f["workflow"]: f for f in report["findings"] if f["id"] == "missing-default-branch-concurrency"}
+        self.assertEqual(by[".github/workflows/ci.yml"]["estMinutesSaved"], 10.0)
+        self.assertEqual(by[".github/workflows/b.yml"]["estMinutesSaved"], 0.0)
+
+    def test_cancelled_default_branch_runs_are_reported_on_cancel_finding(self):
+        runs = [mrun(1, "2026-09-01T00:00:00Z", 10, conclusion="cancelled"),
+                mrun(2, "2026-09-01T01:00:00Z", 10)]
+        wf = PUSH_ONLY.replace("jobs:", "concurrency:\n  group: g-${{ github.workflow }}-${{ github.ref }}\n"
+                                       "  cancel-in-progress: true\njobs:", 1)
+        report = self.report(self.routes(runs), {"ci.yml": wf})[0]
+        f = only(report, "cancel-on-default-branch")
+        self.assertIn("1 of 2 default-branch push run(s)", f["estNote"])
+        self.assertIsNone(f["estMinutesSaved"])
+
+    def test_summary_counts_default_branch_savings_once_and_critical_first(self):
+        crit = {"id": "c", "severity": "critical", "workflow": "a.yml", "estMinutesSaved": None}
+        a = {"id": "heavy", "severity": "low", "workflow": "w.yml", "estMinutesSaved": 40.0,
+             "estDefaultBranchMinutes": 40.0}
+        b = {"id": "overlap", "severity": "medium", "workflow": "w.yml", "estMinutesSaved": 15.0,
+             "estDefaultBranchMinutes": 15.0}
+        c = {"id": "pr", "severity": "medium", "workflow": "w.yml", "estMinutesSaved": 30.0}
+        d = {"id": "mixed", "severity": "medium", "workflow": "x.yml", "estMinutesSaved": 12.0,
+             "estDefaultBranchMinutes": 2.0}
+        self.assertEqual(oc.summarize([a, b, c, d, crit])["estMinutesSavedTotal"], 82.0)
+        ranked = oc.rank([a, b, c, crit])
+        self.assertEqual(ranked[0]["id"], "c")
+
+    def test_json_and_text_serialization(self):
+        report = self.heavy_report(10, threshold=1.0)
+        data = json.loads(json.dumps(report, default=str))
+        self.assertIn("alternatives", only(data, "heavy-default-branch-suite"))
+        text = oc.render_text(report)
+        self.assertIn("heavy-default-branch-suite", text)
+        self.assertIn("alternatives, not additive", text)
+
+
 class ReadOnlyAndCliTests(unittest.TestCase):
     def test_every_github_call_is_a_get(self):
         with patch.object(oc.subprocess, "run") as mock_run:
@@ -626,7 +968,8 @@ if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
     for case in (YamlReaderTests, GlobTests, RequiredCheckSafetyTests, UnderFilterTests, CacheTests,
-                 WastedRunTests, ReportTests, ReadOnlyAndCliTests):
+                 WastedRunTests, DefaultBranchStaticTests, ReplayTests, MainStatsTests,
+                 ReportTests, DefaultBranchReportTests, ReadOnlyAndCliTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     failed = len(result.failures) + len(result.errors)
