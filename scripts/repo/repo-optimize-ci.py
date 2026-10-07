@@ -671,6 +671,15 @@ def _key_text(value):
     return _text(value)
 
 
+def _key_has_version(key):
+    """True if the cache key embeds a resolved tool version (step output or literal)."""
+    if re.search(r"steps\.[\w-]+\.outputs\.[\w-]*version[\w-]*", key, re.I):
+        return True
+    if re.search(r"(?<![\w.])v?\d+\.\d+(\.\d+)?(?![\w.])", re.sub(r"\$\{\{.*?\}\}", "", key)):
+        return True
+    return False
+
+
 def _cache_findings(wf):
     out = []
     for jid, job in wf.jobs.items():
@@ -692,7 +701,7 @@ def _cache_findings(wf):
                            "cache and evicts useful ones)" if restore else ""),
                         "Key on the inputs instead: `${{ runner.os }}-<tool>-${{ hashFiles('<lockfile>') }}`"
                         " with a `restore-keys:` prefix fallback.", job=jid))
-                elif "hashFiles(" not in key:
+                elif "hashFiles(" not in key and not _key_has_version(key):
                     out.append(finding(
                         "cache-key-no-lockfile-hash", "high", "cache", wf,
                         f"cache key `{key}` has no `hashFiles(...)` of a lockfile, so it never "
@@ -705,12 +714,20 @@ def _cache_findings(wf):
                         "cache has no `restore-keys:` fallback, so every lockfile change is a full "
                         "cold miss", "Add `restore-keys: ${{ runner.os }}-<tool>-`.", job=jid))
                 if has_matrix and "matrix." not in key:
+                    varies = any("matrix." in json.dumps(
+                        {k: v for k, v in o.items() if k in ("run", "with", "env", "if")},
+                        default=str) for o in steps if o is not step)
                     out.append(finding(
-                        "cache-matrix-key-collision", "medium", "cache", wf,
+                        "cache-matrix-key-collision", "medium" if varies else "info", "cache", wf,
                         "matrix job caches under a key with no `matrix.*` component — matrix legs "
-                        "race to save and restore each other's (wrong) caches",
+                        "race to save and restore each other's (wrong) caches" if varies else
+                        "matrix job caches under a key with no `matrix.*` component, but no other "
+                        "step references `matrix.*`, so the cached content is likely identical "
+                        "across legs (shared cache is probably intentional)",
                         "Include the distinguishing matrix values (e.g. `${{ matrix.os }}`, "
-                        "`${{ matrix.node }}`) in the key.", job=jid))
+                        "`${{ matrix.node }}`) in the key." if varies else
+                        "No action unless the legs install different content; then add "
+                        "`matrix.*` to the key.", job=jid))
             if "swatinem/rust-cache" in uses:
                 job_caches = True
         out += _toolchain_cache_findings(wf, jid, steps, job_caches)
