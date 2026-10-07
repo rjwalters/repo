@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#574**: optimize-ci: false positives for version-keyed caches and matrix legs that share one cache
+_None._
 
 ## PRs Awaiting Review
 
@@ -38,7 +38,6 @@ _None._
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
-- **#576**: fix(optimize-ci): cache false positives for version keys and shared matrix caches
 
 ## Proposed
 
@@ -46,7 +45,6 @@ Issues carrying `loom:curated`.
 
 - **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
-- **#574**: optimize-ci: false positives for version-keyed caches and matrix legs that share one cache *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,10 +61,10 @@ _None._
 | Operator merge-risk holds | 1 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 3 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

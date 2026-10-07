@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-07
+- **PR #576**: fix(optimize-ci): cache false positives for version keys and shared matrix caches
+- **Issue #574** (closed): optimize-ci: false positives for version-keyed caches and matrix legs that share one cache
 - **PR #575**: optimize-ci: per-workflow run sampling with true totals and job spread
 - **Issue #573** (closed): optimize-ci: default run sample is far too small on busy repos, and bursty workflow_run workflows crowd it out
 - **PR #571**: feat(remote): per-session GitHub credentials via repo-remote attach (#565)
