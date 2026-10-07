@@ -2,6 +2,58 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-07
+- **PR #567**: feat(remote): optional SSM Session Manager transport for AWS
+- **Issue #564** (closed): repo-remote: optional SSM Session Manager transport (instance profile at launch, no inbound :22)
+### 2026-10-06
+- **PR #563**: fix(repo-remote): pin IMDSv2 hop-limit-1 metadata options on AWS launch
+- **Issue #562** (closed): repo-remote: pass --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 on run-instances (launches IMDSv1 / hop 2 today)
+### 2026-10-05
+- **PR #561**: feat: launch AWS root volume as gp3 and warn on gp2 roots at reuse
+- **PR #558**: followups: attribute filed issues with a requested-by marker (#556)
+- **Issue #559** (closed): repo-remote (AWS): root volume launches as gp2 (default) — burst credits drain under sustained builds/tests and the box crawls; launch gp3 and expose REPO_REMOTE_VOLUME_TYPE/IOPS/THROUGHPUT
+- **Issue #556** (closed): /repo:followups: write a <!-- loom:requested-by login=… via=… --> marker naming who asked
+### 2026-10-03
+- **PR #555**: fix(guard): single-quoted spans inert in vendored qsplit() (#447)
+- **Issue #447** (closed): Upstream the repo#443 single-quoted-span inertness fix to Loom's vendored guard
+### 2026-10-02
+- **PR #554**: fix: locale-independent 403 assertion in deps alerts test
+- **Issue #553** (closed): test-deps-dependabot-alerts.sh: 403 assertion fails under C/unset locale
+### 2026-10-01
+- **PR #552**: feat: report open Dependabot alerts in deps --check and /repo:all
+- **PR #550**: fix(guard): never pair an escaped quote as a span close or opener
+- **Issue #551** (closed): deps --check (and /repo:all) does not report open Dependabot security alerts
+- **Issue #548** (closed): guard: an escaped \" in a double-quoted span hides a write into the main checkout
+### 2026-09-30
+- **PR #549**: fix(guard): make subst_depth() quote-aware inside an open $( ) substitution
+- **PR #547**: fix(guard): port the repo#436/#437 separator-inside-$( ) fixes to Loom's vendored guard
+- **PR #546**: fix(guard): port repo#439 subst_heads() into Loom's vendored guard
+- **PR #544**: feat(guard): classify the ambient effective cargo target dir in tmpfsScratch (#462)
+- **PR #543**: docs(repo): add a branch+PR destination arm and consolidate the ladder into docs.md
+- **PR #542**: fix: stop version.sh bump/set from committing mid merge/rebase/cherry-pick
+- **PR #541**: perf(tidy): batch the reference scans and add a --fast/--deep cost dial
+- **PR #540**: fix(remote): warn when a linked worktree's in-tree .env is read or written (#538)
+- **PR #537**: docs(update-tools): land tool bumps via branch+PR when default branch is protected
+- **PR #534**: fix(gitignore): model anchoring and gate rule removals on git check-ignore
+- **PR #529**: New /repo:browser environment command — browser-automation stack health + confirm-gated installs (#528)
+- **PR #461**: feat(guard): deny a build/scratch dir that resolves onto a tmpfs mount
+- **PR #442**: fix(guard): reach into a quoted single-command $( ) for write-target extraction
+- **PR #433**: fix(guard): a backslash-escaped backtick no longer vetoes span masking
+- **Issue #545** (closed): Port the repo#436/#437 separator-inside-$( ) fixes to Loom's vendored guard
+- **Issue #539** (closed): guard: quote-blind subst_depth() lets a quoted ')' inside $( ) hide a write into the main checkout
+- **Issue #538** (closed): repo-remote writes .env into the caller's working directory (instance pin), working against repo secrets hygiene
+- **Issue #536** (closed): scripts/version.sh set auto-commits, so running it mid-merge creates a commit without the caller's trailers
+- **Issue #535** (closed): gitignore anchoring table mis-classifies `dir/**/name` as unanchored, and the removal gate's `ipaths()` is masked by a global excludesFile
+- **Issue #532** (closed): docs/gitignore/links destination ladder has no branch+PR arm for PR-protected repos without an issue number
+- **Issue #533** (closed): tidy inventory exceeds the command timeout on very large repos (git clean -ndX plus per-directory git grep)
+- **Issue #531** (closed): gitignore redundancy check ignores pattern anchoring; require git check-ignore verification before applying
+- **Issue #530** (closed): update-tools step 5 lands on the local default branch; unpushable when the default branch is PR-protected
+- **Issue #528** (closed): New /repo:browser environment command — check (and confirm-gated install) the fleet-standard browser-automation stack (Browser Use CLI + official skill + auth/credits health)
+- **Issue #462** (closed): guards.tmpfsScratch misses the ambient effective target dir (exported CARGO_TARGET_DIR, pre-existing .cargo/config.toml build.target-dir)
+- **Issue #454** (closed): Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount
+- **Issue #441** (closed): Upstream the repo#439 quoted-$( ) write-confinement fix to Loom's vendored guard
+- **Issue #439** (closed): Worktree-write-confinement: a quoted single-command $( ) substitution writes into the main checkout in both guards
+
 ### 2026-09-29
 - **Issue #524** (closed): test: hooks/repo/tests fixtures are not hermetic against inherited core.hooksPath (git-fixture.sh header claims they are)
 - **PR #525**: test: remove stray `.` line and mojibake left by the #518 adoption commit
