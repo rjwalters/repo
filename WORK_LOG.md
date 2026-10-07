@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-07
+- **PR #569**: optimize-ci: cover push-only default-branch workflows; measure overlap and heavy main suites
+- **Issue #566** (closed): optimize-ci: cover push-only default-branch workflows, and measure default-branch overlap and scheduled batching of heavy main suites
 - **PR #567**: feat(remote): optional SSM Session Manager transport for AWS
 - **Issue #564** (closed): repo-remote: optional SSM Session Manager transport (instance profile at launch, no inbound :22)
 ### 2026-10-06
@@ -625,4 +627,3 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #2** (closed): /repo:tidy SAFE category can delete gitignored secrets/data (.env, .venv) — "gitignored" ≠ "regenerable"
 - **PR #3**: docs(tidy): make SAFE an allowlist and add never-delete denylist for secrets/venvs
 - **Issue #1** (closed): /repo:remote: support GPU instances (GPU AMI + accelerator types + driver/toolkit bootstrap)
-
