@@ -3,6 +3,7 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-07
+- **PR #571**: feat(remote): per-session GitHub credentials via repo-remote attach (#565)
 - **PR #569**: optimize-ci: cover push-only default-branch workflows; measure overlap and heavy main suites
 - **Issue #566** (closed): optimize-ci: cover push-only default-branch workflows, and measure default-branch overlap and scheduled batching of heavy main suites
 - **PR #567**: feat(remote): optional SSM Session Manager transport for AWS
