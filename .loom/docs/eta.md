@@ -270,12 +270,15 @@ only.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
 | `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
+| `land-2026-10-06-swift-tern` | `land` | quick-tern made **drift-aware** (#10524 slice 3, #10528): when the stage's CUSUM drift check trips (residuals centred on the shift quick-tern would serve), the half-life ladder starts at 1.5 h instead of 6 h. The interval inflation the check asks for is recorded but not applied. Otherwise quick-tern's answer. Recorded as `calibration` with `ipcw.drift{…}` | at the merge |
+| `land-2026-10-06-bold-lark` | `land` | keen-wren's priority-aware estimate (#10508) wrapped by the same IPCW split-conformal calibrator as quick-tern (#10524 slice 4). Only keen-wren's logged rows are evidence. Recorded as `calibration` with `base = land-2026-10-06-keen-wren` | at the merge |
 | `land-2026-10-06-held-heron` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, except a PR that is **held** (`merge_hold`) or **sequenced** (`merge_wait` with `loom:sequenced`) at `as_of`. That PR is answered by a competing-risks hold and sequencing chain whose hazards are events ÷ exposure over the 14 days before `as_of`, read from the stage episodes and the PR flag timeline; there are no draws. Too little evidence answers as twin-otter-b. Recorded as `held_heron` (#10523) | at the merge |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
 | `land-2026-10-06-keen-wren` | `land` | twin-otter-b's **priority-aware** successor (#10508): pre-PR stages from the work finder's dispatch-plan position and `land-v2`'s path rules (`combination.method` is `dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v2`** file, fed the item's recorded `features.priority` (see [The `eta-fit/v2` priority inputs](#the-eta-fitv2-priority-inputs-10508)). Refuses its PR stages `no_model` until a v2 file exists. Shadow, tier `candidate` | at the merge |
+| `land-2026-10-06-tandem-wren` | `land` | `land-2026-10-04-twin-otter-b` composed over the dependency graph (#10510, [Dependency-aware ETAs](#dependency-aware-etas-10510)): a blocked or parked item starts after its parents land, a stacked or sequenced PR merges after its parent. An item with no parent that applies at `as_of` gets twin-otter-b's own explanation, bit for bit (re-identified) | at the merge |
 
 ### Retired heuristics
 
@@ -542,10 +545,57 @@ unresolved[]}`. The result recomputes from the explanation:
 `run_explanation` replays twin-otter's own record, or the land-v2 path, and
 then applies `shift`.
 
+`land-2026-10-06-swift-tern` (#10524, slice 3) is quick-tern made
+**drift-aware** with #10528's drift check (`eta::regime`). Quick-tern itself
+is unchanged (ids are immutable). Swift-tern ships the same way: registered,
+not current, tier `candidate`, it models the hold, and it is registered just
+after quick-tern. The method is `eta::conformal_ipcw::calibrate_drift_aware`.
+
+- **The check.** For a stage cell, the residuals `ln(actual / p50)` of
+  twin-otter-b's landings known before `as_of` go through the regime CUSUM
+  (6 h recent window, 7-day baseline spread, `k = 0.5`, `h = 8`). The CUSUM
+  is centred on the p50 shift quick-tern would serve, **not** on the
+  baseline mean (`regime::drift_about`). So a shift the calibrator has
+  already absorbed does not keep the flag up for the 7 days it takes the
+  baseline to turn over.
+- **Adaptive half-life.** When the check trips, the ladder restarts at
+  `6 h / 4 = 1.5 h` (`recency::DRIFTED_DIVISOR`). It still doubles until the
+  effective-N floor of 20 is met.
+- **Inflation is recorded, not applied.** The check is re-run about the
+  shorter fit's p50 shift. The widening #10528 would apply for the drift
+  that is left (`regime::Drift::inflation`, 1 to 2, about p50 on the log
+  scale) goes into `ipcw.drift.withheld_inflation`. Right after a shift, the
+  recent residuals are a mixture of both regimes. So the check stays up
+  after the shorter window has caught up, and applying the widening
+  over-covers. On the x0.1 fixture it would push p25–p75 coverage above
+  0.8, where the served range stays within about 0.42–0.62. Serving it
+  needs a gate and live evidence first, as #10563 found for the residual
+  tracker.
+- **The recompute.** `run_explanation` recomputes the answer by applying
+  `shift`, as for quick-tern.
+- **Otherwise** (not drifted, a pooled cell, or below the check's floor of
+  recent landings) the answer is quick-tern's exactly.
+- **The record.** `calibration.method` is `ipcw_split_conformal_log_drift`.
+  `ipcw.drift{n_recent, n_baseline, center, statistic, drifted,
+  half_life_start_sec, residual_statistic, withheld_inflation}` is present
+  whenever the check ran.
+- **Fixture evidence** (synthetic only, `eta::tests::conformal_ipcw_drift`):
+  - on the no-shift fixture the check never trips, and the answer equals
+    quick-tern's at every half hour from −12 h to +24 h;
+  - the x3, x2, x1/2 and x1/3 shifts never trip it either, so on them
+    swift-tern is quick-tern (`t_cov ≤ 12 h`). A slow-down shows first as
+    landings that have *not* happened yet, which the residual check cannot
+    see; IPCW already handles that side;
+  - a x0.1 speed-up trips it. P25–p75 coverage first reaches 40% within 1 h
+    (quick-tern: 4.5 h). Over the first 12 h the mean `|coverage − 0.5|`
+    is 0.10 (quick-tern: 0.15), and `t_cov ≤ 12 h`.
+
+  Nothing here is live-coverage evidence.
+
 *Deferred* (#10524, #10528):
-- interval inflation when #10528's drift flag is set (no drift signal exists
-  yet);
-- a drift- or regime-driven adaptive half-life;
+- serving the drift inflation, behind a gate that live evidence supports;
+- the drift signal is computed per estimate from the calibration log, not
+  consumed from a fleet-level #10528 drift event (none is emitted yet);
 - history-aware (HAPS) conditioning;
 - other bases (#10508, #10523);
 - the loom-experiments walk-forward acceptance backtest.
@@ -712,7 +762,8 @@ past 13 also needs the alternates cap raised on both sides (loom-ui's
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
 (`land-2026-10-06-calm-plover` is calibration over `land-v2`;
-`land-2026-10-06-quick-tern` is IPCW calibration over
+`land-2026-10-06-quick-tern` is IPCW calibration over, and
+`land-2026-10-06-tandem-wren` the dependency wrapper over,
 `land-2026-10-04-twin-otter-b`; `land-2026-10-06-held-heron` is
 twin-otter-b with held and sequenced PRs routed to the hold simulator). It
 is never
@@ -1194,13 +1245,28 @@ for a fit or backtest to report.
   v1 transform exactly as before; all `FEATURES_V2` names use
   `model_features_v2` with `twin_otter.input.priority`. So a v2 explanation
   recomputes from its own record, as v1's does.
-- **Roster history.** The tracker's roster history is set with
-  `Tracker::set_fleet_history` and the fit's with `rows::build_with_context`.
-  Today no reader of the fleet store's `repos.yml` commit history feeds
-  either, so both sides pass `None`. `repo_rank` and
-  `ahead_dispatch_fleet` are then unknown in training and serving alike (the
-  indicators are 1, the standardized columns constant). They are not
-  silently filled from today's file.
+- **Roster history** (`eta::roster_history`, #10586). On the ETA
+  authority, each fleet refresh cycle polls the fleet store (`fleet.repo`,
+  `fleet.ref`) before the fit: `GET repos/{store}/commits?path=repos.yml`,
+  paginated over the last 21 days (the 14-day window plus margin), plus the
+  newest earlier commit as the anchor in force when the window opens. Each
+  revision's `repos.yml` is cached content-addressed under
+  `.loom/state/eta/roster-history/`. The fit (`fit::run`) and the tracker's
+  pass (`Tracker::set_fleet_history`) both load that one cache, so the two
+  sides read one history value.
+  - *Knowability convention.* `committed_at` is the committer date.
+    `observed_at` is set only for a commit first listed by a poll that
+    follows an earlier successful poll: it is that poll's time, a bound that
+    is never early. So a backdated or late-pushed edit counts only from when
+    it was seen. Commits listed by a cache's first poll have no observation
+    and use their commit date. `FitReport.roster_history` counts each basis.
+  - *Unknown, never today's file.* The history is `None` when there is no
+    cache (no `fleet.repo`, or no successful poll yet), when any cached
+    revision is unreadable or not a valid roster, or when the last
+    successful poll is over 24 h old. `repo_rank` and
+    `ahead_dispatch_fleet` are then unknown on both sides, with their
+    indicators at 1. A failed poll leaves the cache and `last_poll_at`
+    unchanged.
 - **`ready_wait`.** keen-wren's start comes from the item's position in the
   work finder's own dispatch plan. The planner sorts that plan with the real
   comparator: level, star, star time, main-red fix, the workspace's
@@ -1208,12 +1274,11 @@ for a fit or backtest to report.
   issue is therefore earlier in the plan and gets an earlier start. No
   second ordering is defined for the ETA to drift from (#10528).
 - **Status.** keen-wren is registered in shadow (tier `candidate`,
-  after `held-heron`, before the twin-otter pair). Still open in #10508: the
-  fleet-store roster-history reader; publishing the v2 file from the captain
-  to other hosts (`fit::publish` carries v1 only, so only the fitting host
-  has a v2 file); the walk-forward backtest against twin-otter-b; and live
-  evidence that the ETA authority, the loom-ui chooser and the nightly
-  scoring pick the new id up.
+  after `held-heron`, before the twin-otter pair). Still open in #10508:
+  publishing the v2 file from the captain to other hosts (`fit::publish`
+  carries v1 only, so only the fitting host has a v2 file, #10586); the
+  walk-forward backtest against twin-otter-b; and live evidence that the ETA
+  authority, the loom-ui chooser and the nightly scoring pick the new id up.
 
 ### Friction predictors and cumulative stage age (#10521)
 
@@ -1259,6 +1324,116 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   `eta-fit/v3` carries them, and no heuristic reads a v3 file yet. A new
   datestamped shadow heuristic adopts them under that schema once the
   loom-experiments walk-forward backtest passes (#10550).
+
+### Dependency-aware ETAs (#10510)
+
+A blocked item used to get no estimate (`blocked`, `no_dispatch_plan`), and
+a stacked or sequenced PR got one that ignored its parent.
+`eta::dependency` is a composition layer over **any** base `land`
+heuristic that reports p25/p50/p75/p90. It ships as the shadow
+`land-2026-10-06-tandem-wren`, over `land-2026-10-04-twin-otter-b`.
+
+**Edge sources.** Each edge names a child, a parent and a `known_at`:
+
+| source (`sources[]`) | kind | meaning |
+|---|---|---|
+| `park_record` | start | `<!-- loom:park Blocked by: #N -->` on a parked item (same repo) |
+| `native_dependency` | start | a forge-native "blocked by" issue dependency (any repo) |
+| `sub_issue` | start | a sub-issue of an epic |
+| `epic_phase` | start | `loom:epic-phase` order: phase k+1 after phase k |
+| `stacked_pr` | merge | a PR based on another PR's head branch |
+| `sequence` | merge | a merge-sequencing marker, `<!-- loom:sequence after=N -->` (#9686); soft or hard, it bounds only the merge |
+
+A **start** edge means the child cannot start before the parent lands. It
+applies only to an item that has not started (refused `blocked` or
+`no_dispatch_plan`, or in `ready_wait`), and is dropped once the item has
+started. A **merge** edge means the child cannot merge before the parent
+merges. It applies at every stage, but never answers an item the base
+refuses.
+
+**Point in time.** An edge is used only when its `known_at` is strictly
+before `as_of`, so a replay never sees an edge filed after its own instant
+and leaves no trace of it. The live `known_at` is the instant the daemon
+first read the edge. A parent counts as landed only when it closed before
+`as_of`.
+
+**Composition.** Each node draws one uniform per Monte Carlo draw (4000),
+from its own seed, derived from `(heuristic, as_of, node)`. A node's land
+draw is the base's four quantiles read as a quantile function. The function
+is linear between p25, p50, p75 and p90. Below p25 it follows the p25–p50
+slope, floored at zero. Above p90 it is the exponential tail matched to the
+p75–p90 rise. Per draw:
+
+```text
+land[s] = max( own[s],                            if the base answers the item
+               max over start parents of land_p[s] + path[s],
+               max over merge parents of land_p[s] )
+```
+
+`path` is the base's estimate of the item from dispatch (`sweep.curator`,
+age 0), drawn from the same uniform as `own`. This is the max of the item's
+own ready time and its parents' land times, plus the path. It is not the max
+of medians, since E[max] is larger than the max of the medians. Because a
+node has one draw per sample, an ancestor shared by two parents (a diamond)
+contributes the same time to both: **common random numbers**, so it is not
+double counted. The DAG is resolved recursively, with each node estimated
+once per estimate. The result is the nearest-rank p25/p50/p75/p90 of the
+totals.
+
+**Refusals carry the reason upward.** These apply in order:
+- An item the base refuses for a reason a start edge does not explain keeps
+  its own reason.
+- An item on a cycle is refused `dependency_cycle`.
+- An item whose parent is not in the graph is refused
+  `blocked_by_unknown`.
+- An item whose parent has no estimate is refused `blocked_by`, and
+  `dependencies.blocked_by` names the parent and its reason, nested along the
+  chain: `blocked_by:owner/repo#2 (blocked_by:owner/repo#1 (blocked))`. The
+  dashboard can say "waiting on #2, which waits on #1, held".
+- A closure past 64 nodes is refused `blocked_by` (`graph_too_large`).
+
+**Explanation.** A composed or refused estimate carries `dependencies`.
+Absent means the item had no parent that applies, and then the explanation
+is the base's own.
+- `parents[]`: each parent with `edge`, `sources`, `known_at` and `status`
+  (`estimated` / `landed` / `refused` / `unknown`). Also its own `reason`,
+  `p50_sec`, `p90_sec` and `binding_share` (the share of draws in which it set
+  the max).
+- `binding_parent` / `binding_share`: the parent that most often set the max,
+  absent when the item's own path did more often. This is what "why this
+  ETA?" reports as what the item is waiting on. A landed parent never binds.
+- `nodes[]`: every node read, subject first, each with its seed and its
+  `own_sec` / `path_sec` quantiles and parents. `simulate::run_explanation`
+  recomputes the result from these alone. `enforce_cap` drops them
+  (`truncated: ["dependencies.nodes"]`) before the stage grids.
+
+`combination.method` is `dependency_max_over_parents_crn`. `result.stage_marks`
+is empty, because the base's marks describe its own path, not the composed
+one.
+
+**Where the edges come from (live).** Only the ETA authority (#10498) runs
+the pass, so it is the one host that reads edges. Before each pass's `as_of`
+it makes at most 8 `(item, source)` reads, never-read and oldest first, each
+at most every 15 minutes (`observability::eta_dependency`):
+- A **parked** tracked item (unstarted, refused `blocked` or
+  `no_dispatch_plan`, no PR): `issues/{n}` for its park records, and
+  `issues/{n}/dependencies/blocked_by` for the native ones with their state.
+  It also reads `issues/{N}` once for each park-record parent the tracker
+  does not hold open, to learn whether and when it closed.
+- A tracked PR under **`loom:sequenced`**: its trusted comment bodies for the
+  newest live sequence marker. The predecessor PR maps to the tracked issue
+  it closes, and one the tracker does not hold is skipped.
+
+A failed read keeps the edges already observed. `sub_issue`, `epic_phase`
+and `stacked_pr` are understood by the composition, but the live pass does
+not read them yet. A parent's node is its tracked `land` input (the modeled
+view for a base that models the hold, #10284). An open parent the tracker
+does not track is unknown.
+
+**Acceptance still pending (post-merge).** The loom-experiments walk-forward
+backtest must show, on items with at least one dependency, a pinball and
+answer-rate win over twin-otter-b with point-in-time edges, and no change on
+dependency-free items. The loom-ui ETA chooser entry is loom-ui#2031.
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -1716,6 +1891,9 @@ ORDER BY share;
 | `unknown_stage` | no stage label, or contradictory ones |
 | `stale_inputs` | a ready item whose dispatch plan is older than 15 minutes (or three ticks) |
 | `no_model` | a fitted heuristic (`land-2026-10-04-twin-otter`) has no usable coefficient file: none loaded (always, in the CLI), no direct model, a cutoff at or after `as_of`, or malformed coefficients |
+| `dependency_cycle` | a dependency composition (`land-2026-10-06-tandem-wren`): the item is on a dependency cycle (#10510) |
+| `blocked_by_unknown` | a dependency composition: a parent is not in the graph; `dependencies.blocked_by` names it |
+| `blocked_by` | a dependency composition: a parent has no estimate; `dependencies.blocked_by` names it and its reason, e.g. `blocked_by:owner/repo#N (blocked)` |
 
 A refusal is emitted as an `eta.estimate` with no `result`, when its reason
 first appears.
@@ -2158,6 +2336,7 @@ of what is on disk and never needs a refetch.
 | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` (floor 60) |
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
+| `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true` (#10492): the captain's nightly walk-forward backtest folds ([below](#nightly-backtest-folds-autonomousetanightlyfolds-10492)). Runs only with `enabled` too; read at start |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
 | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
@@ -2381,6 +2560,61 @@ them with a daemon restart.
   wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works. Declare
   `fleet.captain` so only one of them refreshes it; the others fit from it.
 
+### Nightly backtest folds (`autonomous.eta.nightlyFolds`, #10492)
+
+The promotion gate's backtest half (#10233: at least 7 walk-forward daily
+folds) used to run only when someone invoked `eta backtest` / `eta promote`.
+A daemon task now computes it every day, on the **fleet captain**, after 00:30
+UTC (`observability::eta_nightly_folds`; checked hourly, folds once per UTC
+day, catches up at most 7 missed days oldest first).
+
+- **Gate.** Each check passes `fleet.captain` first; the captain arms the
+  `eta-nightly-folds` singleton job and folds, every other host stands down and
+  emits nothing. With no captain declared **no host folds** (fail-closed, like
+  ci-telemetry; logged at `warn` and listed in
+  `host.health.captainless_singleton_jobs`), so set `fleet.captain` for the
+  scoreboard to exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.
+- **Records** (OTLP-only, `loom.eta.backtest.*` attributes, body = the JSON):
+  - `eta.backtest.fold` — one per registered `land` heuristic per UTC day,
+    over that day's **cohort**: the cases first known (resolved) on it,
+    whichever day they were predicted on, so a case crossing midnight is
+    folded exactly once, on the day it resolves:
+    `heuristic`, `day`, `n_cases`, `answer_rate`, `pinball4_loss_sec`,
+    `cov_25_75`, `late_surprise`, the paired deltas against `current`
+    (`delta_pinball4_loss_sec`, `delta_answer_rate`, `delta_late_surprise`,
+    `paired_pairs`, `win`) and `fit_id`. A rate over no cases is omitted, not `0`.
+  - `eta.backtest.summary` — one per non-`current` heuristic: the rolling
+    per-day wins against `current` (`days`, `wins`, `ties`), the 95% Wilson
+    bounds, `gate_ready` and the gate's own `gate_detail`. Every case is
+    scored as its daily fold scored it, with its prediction day's coefficient
+    file; cases predicted before the oldest retained file (the fitter keeps
+    14) are left out and counted (`fitted_from`, `cases_before_fit`), not
+    charged a `no_model` refusal. `gate_ready` uses
+    the same gate function as `eta promote` (`shadow::backtest_gate`), not the
+    same data: the summary also replays fleet snapshots and the offline PR
+    cache, `eta promote` local data only.
+  - Both give `land-2026-10-06-calm-plover` the replay calibration evidence
+    `eta backtest` / `eta promote` do (`backtest::with_replay_calibration`,
+    built from the already-cut cases), so it is not folded as plain `land-v2`.
+- **Strictly point-in-time.** Before replaying, the run drops every input
+  observed at or after the day's cutoff (the end of the day): outcome
+  envelopes, journal rows, history samples, and cases not yet resolved. Each
+  case's coefficient file is the newest cut off strictly before its prediction
+  day began, and its estimate reads only history before its own `as_of`.
+  Perturbing post-cutoff data leaves the day's records bit-identical (pinned by
+  a test). A case still open at the cutoff joins the cohort of the day it
+  resolves.
+- **No forge call.** Inputs are this host's journals, the cached fleet
+  snapshots (through `historyScope`) and, if present, the offline merged-PR
+  cache `.loom/state/eta/backtest/pr-history.json` (what
+  `eta backtest --forge-pr-cases --save-pr-history` writes); without it only
+  cases a local sweep witnessed are replayed.
+- **State.** `.loom/state/eta/backtest/fold-<day>.json` (one per day; its
+  existence makes a restart idempotent) and `summary.json` (the newest run).
+- **`eta doctor`** prints the `backtest` link: the newest fold day, then one
+  `scoreboard <heuristic>` line per challenger (wins/days, lower bound,
+  READY / not ready, the gate's reason).
+
 ### SigNoz in-sweep half (`fleetRefresh.signoz`, #9758)
 
 The forge snapshot cannot see inside a sweep, so `finish` refuses at `scope =
@@ -2424,6 +2658,36 @@ of snapshot together.
   --credential-file PATH | --from-file export.jsonl] [--as-of T] [--dry-run]`,
   `… signoz show`, and `… signoz query` (the SQL, for a manual
   `clickhouse-client --format JSONEachRow` export).
+
+### SigNoz timeline reader (#10519)
+
+`eta::fleet_signoz_timeline` builds, from SigNoz rows alone, each PR's and
+issue's label timeline, its merge and close instants, CI state per `(repo,
+ref)` (the latest run of each workflow, with its jobs) and the latest ready
+queue. It is a pure reader. The query (`TIMELINE_SQL`), row admission and the
+page walk are in `eta::fleet_signoz_timeline_rows`. Slice 3 (#10520) makes it
+the primary history source, with forge reads only filling gaps.
+
+- **Two sources.** The loom-ui webhook export (`service.name =
+  loom-ui-d1-export`) carries exact receipt times. The daemon's rows are
+  polling-time: stage-journal label sets (diffed into changes; an item's first
+  set is a baseline), `pr.resolved`, `ci.*` and `queue.snapshot`. When both
+  saw one change of one `(repo, number, label, transition)`, it is one event
+  dated by the webhook. A daemon change with no webhook partner keeps the
+  daemon time. Repeats within a source collapse.
+- **Merge and close instants.** Webhook `closed` rows are primary. The daemon's
+  `pr.resolved` record (see [telemetry-schema](telemetry-schema.md)) covers
+  windows and repos the export does not. It is built from the pass's existing
+  reads, with no new forge read.
+- **Point-in-time.** Every row is filtered by `observed_at <= cutoff`
+  (`eta::point_in_time`) before anything else, so a later row cannot change an
+  earlier answer. A webhook row is knowable at its receipt time. A daemon row
+  is knowable at its own `observed_at` field, else at the SigNoz
+  `observed_timestamp`. A row with neither is never knowable.
+- **Coverage.** `Timeline::coverage` gives the earliest knowable row per
+  family and source. `covers(family, cutoff, WINDOW_DAYS)` is true only once
+  the whole fit window (60 days) lies after it. For `ci.*` and `queue.snapshot`
+  that is about 2026-11-27.
 
 ## Queries
 
