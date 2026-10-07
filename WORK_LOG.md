@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-07
+- **PR #575**: optimize-ci: per-workflow run sampling with true totals and job spread
+- **Issue #573** (closed): optimize-ci: default run sample is far too small on busy repos, and bursty workflow_run workflows crowd it out
 - **PR #571**: feat(remote): per-session GitHub credentials via repo-remote attach (#565)
 - **PR #569**: optimize-ci: cover push-only default-branch workflows; measure overlap and heavy main suites
 - **Issue #566** (closed): optimize-ci: cover push-only default-branch workflows, and measure default-branch overlap and scheduled batching of heavy main suites
