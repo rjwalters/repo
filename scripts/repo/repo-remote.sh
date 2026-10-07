@@ -51,6 +51,30 @@
 #       With --yes: stop them; add --delete to terminate (disk goes with it).
 #       --force overrides the fleet-marker guard described below, same as `up`.
 #
+#   repo-remote attach|--attach [--container|--host] [--command <cmd>] [aws|gcp]
+#       Open a session on THIS repo's existing instance, carrying a freshly
+#       resolved GitHub credential (repo#565). It is the credential-aware
+#       connect AND reconnect entry point: every attach resolves the
+#       credential again, so re-running it after a short-lived token expires
+#       gives the new session a new token while reusing the same instance and
+#       container (nothing is provisioned, started, or stopped; no cloud
+#       mutation at all). Order, each step gating the next:
+#         1. validate config (transport, gateway, repo name) — no network;
+#         2. open ONE SSH master connection over repo-remote-<name> and verify
+#            the host identity over it exactly like `verify` (exit 6 on a
+#            mismatch or an unverifiable host — fails closed);
+#         3. only then resolve the credential (run REPO_REMOTE_GH_TOKEN_CMD, or
+#            read the static REPO_REMOTE_GH_TOKEN) — exit 7 if the command
+#            fails, with NO fallback to the static token;
+#         4. open the session over that same verified master connection, with
+#            the token carried as an SSH environment value (never argv), and
+#            land in the dev container (`docker exec`) when it is running,
+#            else in ~/<repo> on the host. --container / --host force one;
+#            --command runs <cmd> non-interactively instead of a login shell.
+#       Processes already running on the VM keep the environment they started
+#       with; only the new attachment sees the replacement token.
+#       See "GitHub credentials on the VM" below.
+#
 # Config: two layers, shared first then repo (repo overrides), matching the
 # skill exactly:
 #   1. ${XDG_CONFIG_HOME:-$HOME/.config}/repo/remote.env   (shared cloud creds)
@@ -190,6 +214,52 @@
 # alias HostName: IP or instance ID) and "instance_profile" fields; under ssm
 # "public_ip" is "" because none is looked up.
 #
+# GitHub credentials on the VM (repo#565): `attach` is the only subcommand
+# that touches a dev-session credential; `up` (dry run or --yes), `status`,
+# `verify` and `down` never run the token command or send a token anywhere.
+# Settings, resolved through the same two config layers (repo wins):
+#   REPO_REMOTE_GH_TOKEN_CMD   RECOMMENDED. A command run LOCALLY by
+#                              `bash -c` (stdin </dev/null) whose stdout is the
+#                              token, e.g. a GitHub App installation-token
+#                              minter. When non-empty it takes precedence over
+#                              REPO_REMOTE_GH_TOKEN. It runs with this
+#                              process's environment and the operator's own
+#                              trust (the config files are already sourced as
+#                              shell); it may use local credentials, which are
+#                              never transmitted — only its stdout is. Fails
+#                              closed (exit 7, nothing sent, no static-token
+#                              fallback) on a non-zero exit, empty output,
+#                              more than one line, or any whitespace/control
+#                              character in the token. Its stdout and stderr
+#                              are never displayed.
+#   REPO_REMOTE_GH_TOKEN       a static token (legacy). Still delivered the same
+#                              way, with a one-line notice recommending the
+#                              command form. Never written anywhere.
+#   REPO_REMOTE_GH_API_HOST    optional API gateway hostname (bare DNS name, no
+#                              scheme/port/path; github.com and *.github.com
+#                              refused). The gateway must serve the GitHub
+#                              Enterprise Server API layout over HTTPS with a
+#                              certificate the VM trusts (gh offers no
+#                              verification bypass). The session then gets
+#                              GH_HOST=<gw>, GH_REPO=<gw>/<owner>/<repo> (from
+#                              this checkout's github.com origin) and the token
+#                              as GH_ENTERPRISE_TOKEN, with GH_TOKEN emptied —
+#                              gh would otherwise talk to github.com directly.
+#                              git keeps its github.com remote and authenticates
+#                              there with the same token. Invalid values exit 2
+#                              before anything connects.
+# Delivery: the token travels as the SSH environment value
+# LC_REPO_REMOTE_GH_TOKEN (SendEnv; Ubuntu's stock sshd has `AcceptEnv LANG
+# LC_*`) on a session multiplexed over the verified master connection. The
+# remote bootstrap unsets that variable and exports the token only into the
+# process it starts: `docker exec -e GH_TOKEN` (name only — exec environment
+# is not part of the container's persisted configuration) or the host login
+# shell. git is pointed at it through GIT_CONFIG_* environment entries that
+# reset any configured github.com credential helper (so no `store` helper can
+# persist it) and add one that reads the variable by NAME. Nothing is written
+# to remote.env, the per-repo config, the SSH config, or the VM's disk; no
+# `gh auth login`, no stored git credential.
+#
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure) — also
@@ -204,7 +274,11 @@
 #   6  host-identity verification failed — the host reachable at the SSH alias
 #      is not the instance this repo expects, or its identity could not be
 #      established (NOT overridable with --force)
+#   7  `attach` could not resolve the dev-session credential:
+#      REPO_REMOTE_GH_TOKEN_CMD failed or printed a malformed token. Nothing
+#      was sent to the VM and the static token was NOT used instead.
 #   64 usage error
+# (`attach` otherwise exits with the remote session's own status.)
 #
 # Testability hooks (honored so the suite can exercise the full contract against
 # mocked cloud CLIs without touching real infrastructure or a real ~/.ssh):
@@ -245,6 +319,10 @@
 #   REPO_REMOTE_SSM_PLUGIN             name/path of the Session Manager plugin
 #                                      the ssm-transport preflight looks for
 #                                      (default session-manager-plugin)
+#   REPO_REMOTE_ATTACH_CTL_BASE        parent directory for `attach`'s private
+#                                      (mode 700) SSH control-socket directory
+#                                      (default /tmp — short, because a unix
+#                                      socket path is limited to ~104 bytes)
 #
 set -uo pipefail
 
@@ -256,7 +334,10 @@ JSON_OUT=false   # --json
 YES=false        # --yes
 FORCE=false      # --force (override the fleet-marker guard)
 DELETE=false     # --down --delete
-ACTION=""        # up | down | status
+ATTACH_MODE=auto       # attach: auto | container | host (repo#565)
+ATTACH_COMMAND=""      # attach --command <cmd>
+ATTACH_HAS_COMMAND=false
+ACTION=""        # up | down | status | verify | attach
 PROVIDER_ARG=""  # aws | gcp (positional override)
 
 # ── JSON emission (no jq dependency for output; values are controlled) ──────
@@ -347,6 +428,11 @@ resolve_paths() {
 }
 
 load_config() {
+  # Config files hold secrets (cloud keys, REPO_REMOTE_GH_TOKEN): sourcing them
+  # under `bash -x` would print every assignment, so tracing is suspended here
+  # (repo#565) and restored afterwards.
+  local _x=""
+  [[ $- == *x* ]] && { _x=1; set +x; }
   set -a
   # shellcheck disable=SC1090
   [[ -f "$SHARED_ENV" ]] && . "$SHARED_ENV"
@@ -363,6 +449,8 @@ load_config() {
   # shellcheck disable=SC1090
   [[ -n "$REPO_ENV" && -f "$REPO_ENV" ]] && . "$REPO_ENV"
   set +a
+  [[ -n "$_x" ]] && set -x
+  return 0
 }
 
 # ── effective settings ──────────────────────────────────────────────────────
@@ -562,6 +650,10 @@ resolve_settings() {
   # by validate_transport_config().
   TRANSPORT="$(printf '%s' "${REPO_REMOTE_TRANSPORT:-ssh}" | tr '[:upper:]' '[:lower:]')"
   INSTANCE_PROFILE="${REPO_REMOTE_INSTANCE_PROFILE:-}"
+
+  # Dev-session GitHub credential (repo#565). Only the SOURCE is decided here;
+  # nothing is run or read beyond the config values themselves.
+  resolve_gh_credential_config
 
   case "$PROVIDER" in
     aws) REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ;;
@@ -1001,14 +1093,18 @@ EOF
 # start, or otherwise touch a cloud resource.
 REMOTE_HOST_IDENTITY=""
 REMOTE_HOST_IDENTITY_ERR=""
+SSH_MUX_OPTS=()
 remote_host_identity() {  # <alias>
   local alias="$1" script out rc errf
   REMOTE_HOST_IDENTITY=""
   REMOTE_HOST_IDENTITY_ERR=""
   script="$(host_identity_probe)"
   errf="$(mktemp)"
+  # SSH_MUX_OPTS (repo#565) is set only by `attach`, which runs this probe over
+  # the SAME master connection the credential is later delivered on.
   out="$(ssh -o ConnectTimeout="$REPO_REMOTE_VERIFY_SSH_TIMEOUT" -o BatchMode=yes \
-             -o StrictHostKeyChecking=accept-new "$alias" 'sh -s' <<<"$script" 2>"$errf")"
+             -o StrictHostKeyChecking=accept-new \
+             ${SSH_MUX_OPTS[@]+"${SSH_MUX_OPTS[@]}"} "$alias" 'sh -s' <<<"$script" 2>"$errf")"
   rc=$?
   REMOTE_HOST_IDENTITY_ERR="$(cat "$errf" 2>/dev/null)"
   rm -f "$errf"
@@ -2181,24 +2277,33 @@ aws_up() {
 # recommending the pin: verification stays cheap enough to run before every
 # session, and the expectation is explicit rather than re-derived from a tag
 # that some other host may also be wearing.
-aws_verify() {
-  local expected="" src=""
+#
+# aws_expected_identity sets EXPECTED_ID / EXPECTED_SRC (globals, so the die
+# propagates); shared by `verify` and `attach` (repo#565), which must agree on
+# what "this repo's instance" means.
+EXPECTED_ID=""
+EXPECTED_SRC=""
+aws_expected_identity() {
+  EXPECTED_ID=""; EXPECTED_SRC=""
   if [[ -n "$INSTANCE_ID" ]]; then
-    expected="$INSTANCE_ID"
-    src="pinned REPO_REMOTE_INSTANCE_ID"
+    EXPECTED_ID="$INSTANCE_ID"
+    EXPECTED_SRC="pinned REPO_REMOTE_INSTANCE_ID"
   else
     aws_authenticate
     local found; found="$(aws_find_tagged)"
     if [[ -n "$found" ]]; then
-      expected="$(printf '%s' "$found" | awk '{print $1}')"
-      src="discovered via the repo-remote=${NAME} tag"
+      EXPECTED_ID="$(printf '%s' "$found" | awk '{print $1}')"
+      EXPECTED_SRC="discovered via the repo-remote=${NAME} tag"
     fi
   fi
-  [[ -n "$expected" ]] || die 2 "nothing to verify against: REPO_REMOTE_INSTANCE_ID is not set and no instance is tagged repo-remote=${NAME}. Pin REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (the recommended configuration for any session that outlives a stop/start), or run 'repo-remote up --yes' to provision one."
+  [[ -n "$EXPECTED_ID" ]] || die 2 "nothing to verify against: REPO_REMOTE_INSTANCE_ID is not set and no instance is tagged repo-remote=${NAME}. Pin REPO_REMOTE_INSTANCE_ID in ${REPO_ENV:-<git-root>/.env or REPO_REMOTE_ENV_FILE} (the recommended configuration for any session that outlives a stop/start), or run 'repo-remote up --yes' to provision one."
+}
 
+aws_verify() {
+  aws_expected_identity
   local alias="repo-remote-${NAME}"
-  verify_host_identity "$alias" "$expected" "$src" strict
-  emit_verify_result "$alias" "$expected" "$HOST_ID_OBSERVED" "$src"
+  verify_host_identity "$alias" "$EXPECTED_ID" "$EXPECTED_SRC" strict
+  emit_verify_result "$alias" "$EXPECTED_ID" "$HOST_ID_OBSERVED" "$EXPECTED_SRC"
 }
 
 aws_status() {
@@ -2327,18 +2432,21 @@ gcp_status() {
 # NAME (what the metadata server's instance/name key reports), and gcp_up()
 # derives that name deterministically as repo-remote-<name> — so, unlike AWS,
 # there is nothing to discover and no cloud call is ever needed here.
-gcp_verify() {
-  local expected src
+gcp_expected_identity() {
   if [[ -n "$INSTANCE_ID" ]]; then
-    expected="$INSTANCE_ID"
-    src="pinned REPO_REMOTE_INSTANCE_ID"
+    EXPECTED_ID="$INSTANCE_ID"
+    EXPECTED_SRC="pinned REPO_REMOTE_INSTANCE_ID"
   else
-    expected="repo-remote-${NAME}"
-    src="the instance name derived from this repo"
+    EXPECTED_ID="repo-remote-${NAME}"
+    EXPECTED_SRC="the instance name derived from this repo"
   fi
+}
+
+gcp_verify() {
+  gcp_expected_identity
   local alias="repo-remote-${NAME}"
-  verify_host_identity "$alias" "$expected" "$src" strict
-  emit_verify_result "$alias" "$expected" "$HOST_ID_OBSERVED" "$src"
+  verify_host_identity "$alias" "$EXPECTED_ID" "$EXPECTED_SRC" strict
+  emit_verify_result "$alias" "$EXPECTED_ID" "$HOST_ID_OBSERVED" "$EXPECTED_SRC"
 }
 
 gcp_down() {
@@ -2583,6 +2691,337 @@ write_ssh_alias() {  # <ip | instance-id> [ssm-region]
   printf '%s' "$alias"
 }
 
+# ── dev-session GitHub credential + attach (repo#565) ───────────────────────
+# See "GitHub credentials on the VM" in the header block for the contract. The
+# shape, in one line: verify the host, THEN resolve the credential, THEN hand
+# it over as data on the connection that was just verified — never in argv, a
+# command string, a log line, a config file, or anything on the VM's disk.
+GH_TOKEN_CMD=""        # REPO_REMOTE_GH_TOKEN_CMD — run ONLY by attach
+GH_TOKEN_STATIC=""     # REPO_REMOTE_GH_TOKEN, held in an unexported variable
+GH_CRED_SOURCE="none"  # command | static | none
+GH_API_HOST=""         # REPO_REMOTE_GH_API_HOST (optional gateway)
+GH_GATEWAY_REPO=""     # <owner>/<repo> for GH_REPO in gateway mode
+GH_SESSION_TOKEN=""    # the resolved token; set only inside attach's untraced window
+ATTACH_CTL_DIR=""      # private dir holding attach's SSH control socket
+# The SSH environment name the token travels under. LC_* because that is what
+# a stock Ubuntu sshd accepts (`AcceptEnv LANG LC_*`); the remote bootstrap
+# unsets it before starting anything.
+RR_TOKEN_ENV=LC_REPO_REMOTE_GH_TOKEN
+
+# Decide the credential SOURCE from config. Runs for every subcommand (it is
+# part of resolve_settings) and therefore must never execute or read anything
+# beyond the two config values. Precedence: a non-empty
+# REPO_REMOTE_GH_TOKEN_CMD wins over REPO_REMOTE_GH_TOKEN; the usual layer rule
+# (per-repo file over shared file) decides each value first, so a per-repo
+# `REPO_REMOTE_GH_TOKEN_CMD=` (empty) switches a shared command off.
+resolve_gh_credential_config() {
+  local _x=""
+  [[ $- == *x* ]] && { _x=1; set +x; }
+  GH_TOKEN_CMD="${REPO_REMOTE_GH_TOKEN_CMD:-}"
+  GH_TOKEN_STATIC="${REPO_REMOTE_GH_TOKEN:-}"
+  GH_API_HOST="${REPO_REMOTE_GH_API_HOST:-}"
+  # load_config sources the layers under `set -a`, which EXPORTS every value:
+  # left alone, the static token would be inherited by every child process
+  # (aws, curl, ssh, the token command itself). Keep both shell-local.
+  export -n REPO_REMOTE_GH_TOKEN REPO_REMOTE_GH_TOKEN_CMD 2>/dev/null || true
+  if [[ -n "$GH_TOKEN_CMD" ]]; then
+    GH_CRED_SOURCE="command"
+  elif [[ -n "$GH_TOKEN_STATIC" ]]; then
+    GH_CRED_SOURCE="static"
+  else
+    GH_CRED_SOURCE="none"
+  fi
+  [[ -n "$_x" ]] && set -x
+  return 0
+}
+
+# gh_token_problem <value> -- prints why <value> is not a usable single token,
+# or nothing when it is. NEVER prints the value itself.
+gh_token_problem() {
+  local v="$1"
+  if [[ -z "$v" ]]; then
+    printf 'it is empty'
+  elif [[ "$v" == *$'\n'* || "$v" == *$'\r'* ]]; then
+    printf 'it is more than one line'
+  elif ! [[ "$v" =~ ^[[:graph:]]+$ ]]; then
+    printf 'it contains whitespace or control characters'
+  elif (( ${#v} > 4096 )); then
+    printf 'it is longer than 4096 characters'
+  fi
+}
+
+# A gateway is a bare DNS name with at least one dot: no scheme, port, path,
+# user info, or whitespace. Ports are refused because nothing here has
+# verified gh's handling of host:port; https on 443 is the tested shape.
+is_gateway_hostname() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+# origin_github_repo -- echoes <owner>/<repo> of this checkout's github.com
+# origin, or returns 1. Used only in gateway mode (GH_REPO needs it).
+origin_github_repo() {
+  local url path
+  url="$(git -C "${GIT_ROOT:-.}" remote get-url origin 2>/dev/null)" || return 1
+  case "$url" in
+    https://github.com/*)   path="${url#https://github.com/}" ;;
+    git@github.com:*)       path="${url#git@github.com:}" ;;
+    ssh://git@github.com/*) path="${url#ssh://git@github.com/}" ;;
+    *) return 1 ;;
+  esac
+  path="${path%/}"
+  path="${path%.git}"
+  [[ "$path" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  printf '%s' "$path"
+}
+
+# The gateway contract (evidence: gh 2.102.0 with GH_DEBUG=api against an
+# unresolvable host — see "GitHub API gateway" in remote.md):
+#   * GH_HOST alone does NOT route a github.com clone: gh refuses ("none of the
+#     git remotes ... correspond to the GH_HOST environment variable");
+#   * GH_REPO=<gw>/<owner>/<repo> routes `gh issue`/`gh pr` to
+#     https://<gw>/api/graphql, but `gh api` follows GH_HOST, not GH_REPO —
+#     so both are set;
+#   * a non-github.com host is sent GH_ENTERPRISE_TOKEN, never GH_TOKEN.
+# Anything outside that shape is refused here, before any connection.
+validate_gh_gateway_config() {
+  [[ -n "$GH_API_HOST" ]] || return 0
+  local h="$GH_API_HOST" lower why=""
+  lower="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$h" == *://* ]]; then
+    why="give a bare hostname, not a URL (the scheme is always https; plain http is not supported)"
+  elif ! is_gateway_hostname "$h"; then
+    why="it is not a bare DNS hostname (no port, path, user, or whitespace; at least one dot)"
+  elif [[ "$lower" == github.com || "$lower" == *.github.com ]]; then
+    why="github.com is not a gateway; unset REPO_REMOTE_GH_API_HOST to talk to GitHub directly"
+  elif [[ "$GH_CRED_SOURCE" == none ]]; then
+    why="a gateway needs a credential, and so does git; set REPO_REMOTE_GH_TOKEN_CMD (recommended) or REPO_REMOTE_GH_TOKEN"
+  elif ! GH_GATEWAY_REPO="$(origin_github_repo)"; then
+    why="gateway mode routes gh with GH_REPO=<gateway>/<owner>/<repo>, so this checkout's origin must be a github.com repository (https://github.com/<owner>/<repo> or git@github.com:<owner>/<repo>)"
+  fi
+  [[ -z "$why" ]] && return 0
+  die 2 "REPO_REMOTE_GH_API_HOST='${h}' is not supported: ${why}. Nothing was connected and no credential was resolved. See 'GitHub API gateway' in commands/repo/remote.md."
+}
+
+# Resolve the session credential into GH_SESSION_TOKEN. Called ONLY by
+# attach_session, after the host identity is verified, with xtrace disabled.
+# Fails closed: a failed or malformed command result is exit 7 and NEVER falls
+# back to the static token. The command's stdout/stderr are never displayed.
+resolve_gh_session_token() {
+  GH_SESSION_TOKEN=""
+  local out="" rc why
+  case "$GH_CRED_SOURCE" in
+    command)
+      if [[ -n "$GH_TOKEN_STATIC" ]]; then
+        log "NOTICE: REPO_REMOTE_GH_TOKEN_CMD is set, so the static REPO_REMOTE_GH_TOKEN is ignored (it is never used as a fallback)."
+      fi
+      out="$("${BASH:-bash}" -c "$GH_TOKEN_CMD" </dev/null 2>/dev/null)"
+      rc=$?
+      if (( rc != 0 )); then
+        out=""
+        die 7 "REPO_REMOTE_GH_TOKEN_CMD exited ${rc}: no credential was resolved, nothing was sent to the VM, and the static REPO_REMOTE_GH_TOKEN was NOT used instead. The command's output is never displayed (it may carry credential material); run it yourself to debug."
+      fi
+      why="$(gh_token_problem "$out")"
+      if [[ -n "$why" ]]; then
+        out=""
+        die 7 "REPO_REMOTE_GH_TOKEN_CMD succeeded but its output is not a usable token (${why}); it must print exactly one line holding the token. Nothing was sent to the VM, and the static REPO_REMOTE_GH_TOKEN was NOT used instead."
+      fi
+      GH_SESSION_TOKEN="$out"
+      out=""
+      log "GitHub credential: minted for this session by REPO_REMOTE_GH_TOKEN_CMD."
+      ;;
+    static)
+      GH_SESSION_TOKEN="$GH_TOKEN_STATIC"
+      log "NOTICE: using the static REPO_REMOTE_GH_TOKEN; set REPO_REMOTE_GH_TOKEN_CMD to mint a short-lived token for each attach instead (see 'GitHub credentials on the VM' in remote.md)."
+      ;;
+    *)
+      log "GitHub credential: none configured (REPO_REMOTE_GH_TOKEN_CMD and REPO_REMOTE_GH_TOKEN are unset); gh and git-over-https on the VM stay unauthenticated."
+      ;;
+  esac
+}
+
+# sq <string> -- <string> as one POSIX single-quoted word.
+sq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# attach_bootstrap <with-credential:0|1> -- the POSIX sh program run on the VM
+# for one attachment. It carries NO secret: the token arrives separately, as
+# the ${RR_TOKEN_ENV} SSH environment value, and is read here by name.
+attach_bootstrap() {
+  local cred="$1" tty=1
+  [[ "$ATTACH_HAS_COMMAND" == true ]] && tty=0
+  printf '%s\n' "# repo-remote attach bootstrap (repo#565): generated; carries no secret."
+  printf 'rr_name=%s\n'    "$(sq "$NAME")"
+  printf 'rr_mode=%s\n'    "$(sq "$ATTACH_MODE")"
+  printf 'rr_tty=%s\n'     "$tty"
+  printf 'rr_cmd=%s\n'     "$(sq "$ATTACH_COMMAND")"
+  printf 'rr_cred=%s\n'    "$cred"
+  printf 'rr_gw=%s\n'      "$(sq "$GH_API_HOST")"
+  printf 'rr_gw_repo=%s\n' "$(sq "$GH_GATEWAY_REPO")"
+  cat <<'EOF'
+rr_t="${LC_REPO_REMOTE_GH_TOKEN-}"
+unset LC_REPO_REMOTE_GH_TOKEN
+rr_envs=""
+if [ "$rr_cred" = 1 ]; then
+  if [ -z "$rr_t" ]; then
+    echo "repo-remote: ERROR: the session credential did not arrive on the VM. Its SSH server must accept LC_* environment values ('AcceptEnv LANG LC_*', the Ubuntu default). Not opening a session without it." >&2
+    exit 97
+  fi
+  if [ -n "$rr_gw" ]; then
+    # Gateway mode: gh sends GH_ENTERPRISE_TOKEN to a non-github.com host and
+    # needs GH_HOST (gh api) plus GH_REPO (gh issue/pr) to route there. GH_TOKEN
+    # is emptied so nothing reaches github.com's API directly.
+    GH_ENTERPRISE_TOKEN="$rr_t"; GH_HOST="$rr_gw"; GH_REPO="$rr_gw/$rr_gw_repo"; GH_TOKEN=
+    export GH_ENTERPRISE_TOKEN GH_HOST GH_REPO GH_TOKEN
+    rr_var=GH_ENTERPRISE_TOKEN
+    rr_envs="GH_ENTERPRISE_TOKEN GH_HOST GH_REPO"
+  else
+    GH_TOKEN="$rr_t"; export GH_TOKEN
+    rr_var=GH_TOKEN
+    rr_envs="GH_TOKEN"
+  fi
+  # git keeps its own remote. An EMPTY helper value clears every credential
+  # helper configured so far for github.com (so a `store` helper can never
+  # write the token to disk); the one added after it reads the token from the
+  # environment by NAME when git asks, and ignores store/erase.
+  GIT_CONFIG_COUNT=2
+  GIT_CONFIG_KEY_0=credential.https://github.com.helper
+  GIT_CONFIG_VALUE_0=
+  GIT_CONFIG_KEY_1=credential.https://github.com.helper
+  GIT_CONFIG_VALUE_1="!f() { test \"\$1\" = get || return 0; echo username=x-access-token; echo \"password=\$$rr_var\"; }; f"
+  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+  rr_envs="$rr_envs GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1"
+fi
+unset rr_t
+rr_ctr="repo-remote-$rr_name"
+rr_use_ctr=0
+if [ "$rr_mode" != host ] && command -v docker >/dev/null 2>&1 \
+   && [ "$(docker inspect -f '{{.State.Running}}' "$rr_ctr" 2>/dev/null)" = true ]; then
+  rr_use_ctr=1
+fi
+if [ "$rr_mode" = container ] && [ "$rr_use_ctr" != 1 ]; then
+  echo "repo-remote: ERROR: --container was given, but the dev container '$rr_ctr' is not running on this host." >&2
+  exit 98
+fi
+if [ "$rr_use_ctr" = 1 ]; then
+  if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$rr_ctr" 2>/dev/null | grep -q '^GH_TOKEN='; then
+    echo "repo-remote: WARNING: container '$rr_ctr' was created with GH_TOKEN in its configuration, which Docker stores on the VM's disk. This session overrides it; recreate the container without '-e GH_TOKEN' to remove the stored copy." >&2
+  fi
+  # `-e NAME` passes the value from this process's environment: the token is
+  # never in docker's argv, and exec environment is not part of the
+  # container's persisted configuration.
+  set -- docker exec
+  if [ "$rr_tty" = 1 ]; then set -- "$@" -it; else set -- "$@" -i; fi
+  set -- "$@" -w /work
+  for rr_v in $rr_envs; do set -- "$@" -e "$rr_v"; done
+  if [ "$rr_cred" = 1 ]; then
+    set -- "$@" -e GIT_CONFIG_VALUE_0=
+    if [ -n "$rr_gw" ]; then set -- "$@" -e GH_TOKEN=; fi
+  fi
+  set -- "$@" "$rr_ctr"
+  if [ "$rr_tty" = 1 ]; then exec "$@" bash -l; fi
+  exec "$@" bash -lc "$rr_cmd"
+fi
+cd "$HOME/$rr_name" 2>/dev/null || cd "$HOME" || exit 98
+if [ "$rr_tty" = 1 ]; then exec "${SHELL:-/bin/sh}" -l; fi
+exec "${SHELL:-/bin/sh}" -lc "$rr_cmd"
+EOF
+}
+
+attach_cleanup() {
+  [[ -n "$ATTACH_CTL_DIR" ]] || return 0
+  ssh -o ControlPath="$ATTACH_CTL_DIR/cm" -O exit "repo-remote-${NAME}" >/dev/null 2>&1 || true
+  rm -rf "$ATTACH_CTL_DIR" 2>/dev/null || true
+  ATTACH_CTL_DIR=""
+}
+
+# `attach` (repo#565). Returns the remote session's exit status.
+attach_session() {
+  local alias="repo-remote-${NAME}"
+
+  # 1. Config only — nothing has connected and nothing has been run yet.
+  [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die 2 "the repo name '${NAME}' contains characters attach will not put into a remote command (allowed: letters, digits, . _ -)"
+  validate_transport_config
+  [[ "$PROVIDER" == aws && "$TRANSPORT" == ssm ]] && ssm_preflight
+  validate_gh_gateway_config
+  if [[ "$GH_CRED_SOURCE" == static ]]; then
+    local why _x=""
+    [[ $- == *x* ]] && { _x=1; set +x; }
+    why="$(gh_token_problem "$GH_TOKEN_STATIC")"
+    [[ -z "$why" ]] || die 2 "REPO_REMOTE_GH_TOKEN is not a usable token (${why}); nothing was connected or sent."
+    [[ -n "$_x" ]] && set -x
+  fi
+  case "$PROVIDER" in
+    aws) aws_expected_identity ;;
+    gcp) gcp_expected_identity ;;
+  esac
+
+  # 2. One master connection; the identity probe and the session both ride it,
+  #    so the credential goes to exactly the host that was verified.
+  local base="${REPO_REMOTE_ATTACH_CTL_BASE:-/tmp}"
+  ATTACH_CTL_DIR="$(mktemp -d "${base%/}/rr-attach.XXXXXX" 2>/dev/null)" \
+    || die 4 "could not create a private SSH control directory under ${base} (set REPO_REMOTE_ATTACH_CTL_BASE)"
+  chmod 700 "$ATTACH_CTL_DIR"
+  trap attach_cleanup EXIT
+  trap 'exit 130' INT TERM HUP
+  local ctl="$ATTACH_CTL_DIR/cm" errf merr
+  errf="$(mktemp)"
+  # The master must itself carry the SendEnv pattern: a session multiplexed
+  # over a master without it arrives with the variable EMPTY (observed with
+  # OpenSSH 10.3). Its own environment never holds the token.
+  if ! env -u "$RR_TOKEN_ENV" ssh -o ControlMaster=yes -o ControlPath="$ctl" -o ControlPersist=yes \
+        -o ConnectTimeout="$REPO_REMOTE_VERIFY_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new -o SendEnv="$RR_TOKEN_ENV" \
+        -f -N "$alias" </dev/null 2>"$errf"; then
+    merr="$(cat "$errf" 2>/dev/null)"; rm -f "$errf"
+    printf '%s\n' "repo-remote: ERROR: could not open an SSH connection over alias '${alias}' to verify the host." >&2
+    log "  expected instance: ${EXPECTED_ID} (${EXPECTED_SRC})"
+    log "  reason: ${merr:-(ssh produced no error output)}"
+    log "  Failing closed: the host identity could not be established, so no credential was resolved or sent. Re-run 'repo-remote up --yes' if the instance was stopped, then attach again."
+    exit 6
+  fi
+  rm -f "$errf"
+  SSH_MUX_OPTS=(-o ControlPath="$ctl" -o ControlMaster=no)
+  verify_host_identity "$alias" "$EXPECTED_ID" "$EXPECTED_SRC" strict
+  log "host identity verified: ${alias} reaches ${HOST_ID_OBSERVED} (${EXPECTED_SRC})"
+
+  # 3. Credential — tracing off for the whole window the token is in memory.
+  local had_x=false
+  case "$-" in *x*) had_x=true; set +x ;; esac
+  resolve_gh_session_token
+  if ! ssh "${SSH_MUX_OPTS[@]}" -O check "$alias" >/dev/null 2>&1; then
+    GH_SESSION_TOKEN=""
+    die 6 "the verified SSH connection to ${alias} closed before the session started; no credential was sent. Run attach again."
+  fi
+
+  # 4. The session, over the verified master. StrictHostKeyChecking=yes is the
+  #    backstop: were the master gone, a fresh connection must still present
+  #    the host key recorded when the identity was verified.
+  local -a args=()
+  if [[ "$ATTACH_HAS_COMMAND" == true ]]; then args+=(-T); else args+=(-t); fi
+  args+=("${SSH_MUX_OPTS[@]}" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+  local cred=0 remote rc
+  [[ -n "$GH_SESSION_TOKEN" ]] && cred=1
+  # /bin/sh runs the bootstrap whatever the login shell is.
+  remote="exec /bin/sh -c $(sq "$(attach_bootstrap "$cred")")"
+  if [[ "$cred" == 1 ]]; then
+    # The token is in ssh's ENVIRONMENT only; SendEnv carries it as data.
+    LC_REPO_REMOTE_GH_TOKEN="$GH_SESSION_TOKEN" \
+      ssh "${args[@]}" -o SendEnv="$RR_TOKEN_ENV" "$alias" "$remote"
+    rc=$?
+  else
+    env -u "$RR_TOKEN_ENV" ssh "${args[@]}" "$alias" "$remote"
+    rc=$?
+  fi
+  GH_SESSION_TOKEN=""
+  [[ "$had_x" == true ]] && set -x
+  case "$rc" in
+    97) log "the credential handoff failed on the VM (see the error above); nothing else was started." ;;
+  esac
+  return "$rc"
+}
+
 # ── result emitters ─────────────────────────────────────────────────────────
 # cost_note_human -> a human-readable suffix explaining COST_BASIS/COST_APPROX
 # on the printed cost line. A vcpu-scaled or heuristic guess says so
@@ -2622,6 +3061,10 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     printf '"gpu":%s,' "$IS_GPU"
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"ssh_alias":"repo-remote-%s",' "$(json_escape "$NAME")"
+    # repo#565 (additive): where `attach` would get the GitHub credential —
+    # "command" | "static" | "none". Reported, never resolved: a dry run does
+    # not run the command.
+    printf '"gh_credential_source":"%s",' "$(json_escape "$GH_CRED_SOURCE")"
     printf '"estimated_hourly_cost_usd":%s,' "$COST_HOURLY"
     printf '"estimated_cost_approximate":%s,' "$COST_APPROX"
     printf '"estimated_cost_basis":"%s"' "$(json_escape "$COST_BASIS")"
@@ -2641,6 +3084,11 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     log "  idle shutdown:      ${IDLE_MIN} min"
     log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  ssh alias:           repo-remote-${NAME}"
+    case "$GH_CRED_SOURCE" in
+      command) log "  gh credential:       minted per attach by REPO_REMOTE_GH_TOKEN_CMD (not run in a dry run)" ;;
+      static)  log "  gh credential:       static REPO_REMOTE_GH_TOKEN (consider REPO_REMOTE_GH_TOKEN_CMD)" ;;
+      *)       log "  gh credential:       none (the VM stays unauthenticated)" ;;
+    esac
     if [[ "$PROVIDER" == aws ]]; then
       if [[ "$TRANSPORT" == ssm ]]; then
         log "  transport:           ssm (SSH over SSM Session Manager to the instance ID; zero-inbound security group, no public IP needed)"
@@ -2691,6 +3139,7 @@ emit_up_result() {  # <id> <ip> <alias> <reused> [connect-target]
       log "$([[ "$reused" == true ]] && echo reused || echo created) instance $id (${INSTANCE_TYPE}) @ ${ip:-<no public ip>}"
     fi
     log "  ssh alias:        $alias"
+    log "  attach:           repo-remote attach   (verifies the host, then opens a session with a fresh GitHub credential)"
     log "  est. hourly cost: \$${COST_HOURLY}/hr$(cost_note_human)"
     log "  teardown:         repo-remote down --yes   (or /repo:remote --down)"
   fi
@@ -2787,12 +3236,20 @@ usage() {
 }
 
 parse_args() {
+  local attach_flag=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      up|status|down|verify) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
+      up|status|down|verify|attach) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
       --status)       ACTION="status" ;;
       --down)         ACTION="down" ;;
       --verify)       ACTION="verify" ;;
+      --attach)       ACTION="attach" ;;
+      --container)    [[ "$ATTACH_MODE" == host ]] && die 64 "--container and --host are mutually exclusive"
+                      ATTACH_MODE=container; attach_flag=true ;;
+      --host)         [[ "$ATTACH_MODE" == container ]] && die 64 "--container and --host are mutually exclusive"
+                      ATTACH_MODE=host; attach_flag=true ;;
+      --command)      [[ $# -ge 2 ]] || die 64 "--command needs a command string"
+                      ATTACH_COMMAND="$2"; ATTACH_HAS_COMMAND=true; attach_flag=true; shift ;;
       --yes|-y)       YES=true ;;
       --force)        FORCE=true ;;
       --json)         JSON_OUT=true ;;
@@ -2803,7 +3260,13 @@ parse_args() {
     esac
     shift
   done
-  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | verify | down; see --help)"
+  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | verify | down | attach; see --help)"
+  if [[ "$attach_flag" == true && "$ACTION" != attach ]]; then
+    die 64 "--container, --host and --command apply only to attach"
+  fi
+  if [[ "$ACTION" == attach && "$JSON_OUT" == true ]]; then
+    die 64 "attach opens a session; it has no --json output"
+  fi
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -2851,6 +3314,16 @@ main() {
         aws) aws_verify ;;
         gcp) gcp_verify ;;
         *)   die 2 "unknown provider '$PROVIDER'" ;;
+      esac
+      ;;
+    attach)
+      # No cost gate and no cloud mutation: attach reaches an EXISTING
+      # instance (repo#565). It verifies the host before resolving any
+      # credential, so the token command never runs for the wrong box.
+      [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for attach"
+      case "$PROVIDER" in
+        aws|gcp) attach_session; exit $? ;;
+        *)       die 2 "unknown provider '$PROVIDER'" ;;
       esac
       ;;
     down)

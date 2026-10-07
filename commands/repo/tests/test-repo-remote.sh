@@ -88,6 +88,14 @@ ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_FIXTURE" -q
 MOCK_BIN="$SCRATCH/bin"
 MOCK_LOG="$SCRATCH/aws.log"
 mkdir -p "$MOCK_BIN"
+# repo#565: the simulated VM an `attach` session lands on (see the mock ssh),
+# and the fixture token command's working directory.
+VM_HOME="$SCRATCH/vmhome"
+VM_BIN="$SCRATCH/vmbin"
+VM_DOCKER_BIN="$SCRATCH/vmdockerbin"
+MOCK_VM_LOG="$SCRATCH/vm.log"
+MINT_DIR="$SCRATCH/mint"
+mkdir -p "$VM_HOME/myrepo" "$VM_BIN" "$VM_DOCKER_BIN" "$MINT_DIR"
 RR_OUT=""; RR_ERR=""; RR_RC=0
 run_rr() {
     local -a envs=()
@@ -100,6 +108,10 @@ run_rr() {
     rm -f "$MOCK_LOG.ipcount"
     rm -f "$MOCK_LOG.metadata"        # per-run --metadata-options capture (repo#562)
     rm -f "$MOCK_LOG.profile" "$MOCK_LOG.sg"  # per-run profile / SG capture (repo#564)
+    # repo#565: per-run attach captures -- the SSH-environment payload, the
+    # master's own environment, child-env leak probes, and the simulated VM.
+    rm -f "$MOCK_LOG.payload" "$MOCK_LOG.masterenv" "$MOCK_LOG.staticenv" "$MOCK_LOG.minterenv"
+    rm -f "$MOCK_VM_LOG".*
     local errf; errf="$(mktemp)"
     # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
     # real 120s readiness window (repo#449); the assignments below come BEFORE
@@ -116,8 +128,11 @@ run_rr() {
         MOCK_AWS_LOG="$MOCK_LOG" \
         REPO_REMOTE_IP_POLL_ATTEMPTS=2 \
         REPO_REMOTE_IP_POLL_INTERVAL=0 \
+        REPO_REMOTE_ATTACH_CTL_BASE="$SCRATCH" \
+        MOCK_VM_HOME="$VM_HOME" MOCK_VM_BIN="$VM_BIN" MOCK_VM_DOCKER_BIN="$VM_DOCKER_BIN" \
+        MOCK_VM_LOG="$MOCK_VM_LOG" MINT_DIR="$MINT_DIR" MINT_COUNT="$MINT_DIR/count" \
         "${envs[@]}" \
-        bash "$RR" "$@" 2>"$errf")"
+        bash ${RR_BASH_X:+-x} "$RR" "$@" 2>"$errf")"
     RR_RC=$?
     RR_ERR="$(cat "$errf")"; rm -f "$errf"
 }
@@ -453,6 +468,59 @@ for a in "$@"; do
   fi
 done
 
+# repo#565 leak probe: the static token must never be in ssh's environment.
+[[ -n "${REPO_REMOTE_GH_TOKEN+x}" ]] && printf 'leaked\n' >>"${MOCK_AWS_LOG:-/dev/null}.staticenv"
+
+# repo#565: `attach` opens ONE master connection (ControlMaster=yes -f -N),
+# runs the identity probe and the session over it, checks it with `-O check`
+# and closes it with `-O exit`.
+#   MOCK_SSH_MASTER_FAIL=1     the master connection cannot be opened
+#   MOCK_SSH_MUX_CHECK_FAIL=1  the master is gone by the time of `-O check`
+for a in "$@"; do
+  if [[ "$a" == "-O" ]]; then
+    if [[ "${MOCK_SSH_MUX_CHECK_FAIL:-0}" == 1 ]] && printf '%s' "$*" | grep -q -- '-O check'; then
+      exit 255
+    fi
+    exit 0
+  fi
+  if [[ "$a" == "ControlMaster=yes" ]]; then
+    # The master must never itself hold the token in its environment.
+    [[ -n "${LC_REPO_REMOTE_GH_TOKEN+x}" ]] && printf 'present\n' >>"${MOCK_AWS_LOG:-/dev/null}.masterenv"
+    if [[ "${MOCK_SSH_MASTER_FAIL:-0}" == 1 ]]; then
+      printf 'ssh: connect to host mock port 22: Connection refused\n' >&2
+      exit 255
+    fi
+    exit 0
+  fi
+done
+
+# repo#565: an attach SESSION carries the generated bootstrap as its remote
+# command. Simulate the VM faithfully: the remote side sees a CLEAN environment
+# plus only what SendEnv forwards, runs the command string through a shell
+# (as sshd runs it through the login shell), and finds mock `docker` / login
+# shell binaries on its PATH. The forwarded value is ALSO captured on its own
+# (the "transport payload"), separately from argv and logs.
+last=""; sendenv=false
+for a in "$@"; do
+  last="$a"
+  [[ "$a" == "SendEnv=LC_REPO_REMOTE_GH_TOKEN" ]] && sendenv=true
+done
+if [[ "$last" == *"repo-remote attach bootstrap"* ]]; then
+  fwd=()
+  if [[ "$sendenv" == true && -n "${LC_REPO_REMOTE_GH_TOKEN+x}" ]]; then
+    printf '%s\n' "$LC_REPO_REMOTE_GH_TOKEN" >>"${MOCK_AWS_LOG:-/dev/null}.payload"
+    # MOCK_SSH_DROP_ENV=1: an sshd without `AcceptEnv LC_*` drops the value.
+    [[ "${MOCK_SSH_DROP_ENV:-0}" == 1 ]] || fwd=("LC_REPO_REMOTE_GH_TOKEN=$LC_REPO_REMOTE_GH_TOKEN")
+  fi
+  vmpath="$MOCK_VM_BIN"
+  [[ "${MOCK_VM_NO_DOCKER:-0}" == 1 ]] || vmpath="$MOCK_VM_DOCKER_BIN:$vmpath"
+  env -i PATH="$vmpath:/usr/bin:/bin" HOME="$MOCK_VM_HOME" SHELL="$MOCK_VM_BIN/vmshell" \
+    MOCK_VM_LOG="$MOCK_VM_LOG" MOCK_DOCKER_RUNNING="${MOCK_DOCKER_RUNNING:-}" \
+    MOCK_DOCKER_CONFIG_ENV="${MOCK_DOCKER_CONFIG_ENV:-}" MOCK_VM_SHELL_RC="${MOCK_VM_SHELL_RC:-0}" \
+    ${fwd[@]+"${fwd[@]}"} /bin/sh -c "$last"
+  exit $?
+fi
+
 # The host-identity probe (repo#458) is the OTHER non-reachability ssh call:
 # repo-remote.sh runs it as `ssh <opts> <alias> 'sh -s'` with the probe script
 # on stdin. It is matched (and answered) BEFORE the readiness-probe counter
@@ -503,6 +571,63 @@ fi
 exit 0
 MOCK
 chmod +x "$MOCK_BIN/ssh"
+
+# repo#565: the simulated VM's binaries. `docker` answers the two inspect
+# queries the bootstrap makes and records an exec's argv (one element per line)
+# and the GH_*/GIT_CONFIG_* environment it was started with; `vmshell` stands
+# in for the login shell on the no-container path and records the same.
+#   MOCK_DOCKER_RUNNING=true     the dev container is running
+#   MOCK_DOCKER_CONFIG_ENV=...   the container's persisted Config.Env lines
+cat >"$VM_DOCKER_BIN/docker" <<'MOCK'
+#!/bin/sh
+case "$1" in
+  inspect)
+    case "$3" in
+      *State.Running*) printf '%s\n' "$MOCK_DOCKER_RUNNING" ;;
+      *Config.Env*)    printf '%s\n' "$MOCK_DOCKER_CONFIG_ENV" ;;
+    esac
+    exit 0 ;;
+  exec)
+    for a in "$@"; do printf '%s\n' "$a"; done >"$MOCK_VM_LOG.dockerargv"
+    env | grep -E '^(GH_|GIT_CONFIG_|LC_REPO_REMOTE)' | sort >"$MOCK_VM_LOG.dockerenv"
+    exit 0 ;;
+esac
+exit 0
+MOCK
+chmod +x "$VM_DOCKER_BIN/docker"
+cat >"$VM_BIN/vmshell" <<'MOCK'
+#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >"$MOCK_VM_LOG.shellargv"
+env | grep -E '^(GH_|GIT_CONFIG_|LC_REPO_REMOTE)' | sort >"$MOCK_VM_LOG.shellenv"
+pwd >"$MOCK_VM_LOG.shellpwd"
+exit "${MOCK_VM_SHELL_RC:-0}"
+MOCK
+chmod +x "$VM_BIN/vmshell"
+
+# repo#565: the fixture token command. It logs that it ran (into the same log
+# as every ssh/aws call, so ordering is assertable), counts its runs, records
+# whether the static token leaked into its environment, and prints
+# $MINT_DIR/canary.<run> -- so two attaches get two DIFFERENT tokens.
+#   MINT_MODE=fail       exit 3, with a secret-looking line on stderr
+#   MINT_MODE=empty      print nothing, exit 0
+#   MINT_MODE=multiline  print the token and a second line
+#   MINT_MODE=space      print a value containing a space
+cat >"$MINT_DIR/minter.sh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'minter-ran\n' >>"${MOCK_AWS_LOG:-/dev/null}"
+[[ -n "${REPO_REMOTE_GH_TOKEN+x}" ]] && printf 'static-token-in-minter-env\n' >>"${MOCK_AWS_LOG:-/dev/null}.minterenv"
+n=$(( $(cat "$MINT_COUNT" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$n" >"$MINT_COUNT"
+case "${MINT_MODE:-ok}" in
+  fail)      printf 'LEAKY-STDERR-%s\n' "$(cat "$MINT_DIR/canary.1")" >&2; cat "$MINT_DIR/canary.1"; exit 3 ;;
+  empty)     exit 0 ;;
+  multiline) cat "$MINT_DIR/canary.1"; printf '\nsecond-line-%s\n' "$(cat "$MINT_DIR/canary.1")"; exit 0 ;;
+  space)     printf 'two words\n'; exit 0 ;;
+esac
+f="$MINT_DIR/canary.$n"; [[ -f "$f" ]] || f="$MINT_DIR/canary.1"
+cat "$f"; printf '\n'
+MOCK
+chmod +x "$MINT_DIR/minter.sh"
 
 # repo#564: the ssm transport's local preflight only checks that the Session
 # Manager plugin is on PATH. A test drives the missing-plugin case with
@@ -2858,6 +2983,547 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- attach: short-lived GitHub credential, verified handoff (repo#565) --"
+# ---------------------------------------------------------------------------
+# The problem: the VM's gh/git auth was a long-lived personal token kept in
+# remote.env and pushed into the container's environment at creation time —
+# where Docker persists it on the VM's disk. `attach` resolves the credential
+# per session (REPO_REMOTE_GH_TOKEN_CMD), only AFTER the host identity is
+# verified, and hands it over as an SSH environment value on that verified
+# connection. These tests use synthetic canary tokens full of shell
+# punctuation, so any interpolation into a command string, an eval, or a log
+# line shows up as a failure (or, for CANARY_2, as a file it creates).
+CANARY_1='ghs_C4n4ry1-$&;"'"'"'|<>`!*\~#%(){}[]=x'
+CANARY_2="ghs_C4n4ry2-\$(id>$SCRATCH/pwned2)\`id>$SCRATCH/pwned3\`;x"
+STATIC_CANARY='ghp_St4tic-$&;"|<>!*x'
+printf '%s' "$CANARY_1" >"$MINT_DIR/canary.1"
+printf '%s' "$CANARY_2" >"$MINT_DIR/canary.2"
+# A second command, for the shared-vs-repo layer test.
+cat >"$MINT_DIR/other.sh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'other-ran\n' >>"${MOCK_AWS_LOG:-/dev/null}"
+printf 'ghs_from_the_shared_layer\n'
+MOCK
+chmod +x "$MINT_DIR/other.sh"
+
+reset_mint() { rm -f "$MINT_DIR/count"; }
+mint_count() { cat "$MINT_DIR/count" 2>/dev/null || printf '0'; }
+argv_has() {  # <label> <argv-file> <exact-element>
+  if [[ -f "$2" ]] && grep -qxF -- "$3" "$2"; then ok "$1"; else no "$1" "no argv element [$3] in $(basename "$2")"; fi
+}
+line_of() {  # <fixed-string> -> first line number in $MOCK_LOG holding it (0 if none)
+  local n; n="$(grep -nF -- "$1" "$MOCK_LOG" | head -n1 | cut -d: -f1)"; printf '%s' "${n:-0}"
+}
+# assert_canary_absent <label> <canary> [config-holds-it]
+# Everywhere a credential must NEVER land: stdout/stderr, every recorded argv
+# (ssh/aws/curl, docker, the login shell), the config files (unless the test's
+# config deliberately holds a static token), the SSH config, the simulated
+# VM's disk, and the control-socket directory (which must be gone).
+assert_canary_absent() {
+  local label="$1" c="$2" cfg="${3:-}" where="" f
+  [[ "$RR_OUT" == *"$c"* ]] && where+=" stdout"
+  [[ "$RR_ERR" == *"$c"* ]] && where+=" stderr"
+  for f in "$MOCK_LOG" "$MOCK_VM_LOG.dockerargv" "$MOCK_VM_LOG.shellargv" "$SCRATCH/ssh_config"; do
+    [[ -f "$f" ]] && grep -qF -e "$c" "$f" && where+=" $(basename "$f")"
+  done
+  if [[ -z "$cfg" ]]; then
+    for f in "$REPO/.env" "$SHARED"; do
+      [[ -f "$f" ]] && grep -qF -e "$c" "$f" && where+=" $(basename "$f")"
+    done
+  fi
+  grep -rqF -e "$c" "$VM_HOME" 2>/dev/null && where+=" vm-disk"
+  compgen -G "$SCRATCH/rr-attach.*" >/dev/null && where+=" control-dir-left-behind"
+  if [[ -z "$where" ]]; then ok "$label"; else no "$label" "found in:$where"; fi
+}
+
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+CMD_ENV_LINE="REPO_REMOTE_GH_TOKEN_CMD='$MINT_DIR/minter.sh'"
+STATIC_ENV_LINE="REPO_REMOTE_GH_TOKEN='$STATIC_CANARY'"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE"
+ENV_SUM_BEFORE="$(cksum <"$REPO/.env")"
+SHARED_SUM_BEFORE="$(cksum <"$SHARED")"
+
+# (a) Command-only config, dev container running: the happy path.
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "attach (token command, container): exit 0" "0" "$RR_RC"
+assert_eq "attach: the token command ran exactly once" "1" "$(mint_count)"
+assert_eq "attach: the SSH-environment payload is the minted token, byte for byte" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_canary_absent "attach: minted token absent from argv, logs, config, SSH config and VM disk" "$CANARY_1"
+DENV="$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)"
+cp "$MOCK_VM_LOG.dockerenv" "$SCRATCH/attach-a.dockerenv" 2>/dev/null
+assert_contains "attach: the container session gets GH_TOKEN = the minted token" "$DENV" "GH_TOKEN=$CANARY_1"
+assert_not_contains "attach: the transport variable is unset before the session starts" "$DENV" "LC_REPO_REMOTE_GH_TOKEN"
+assert_eq "attach: the container is entered with docker exec (never a new docker run)" "exec" "$(head -n1 "$MOCK_VM_LOG.dockerargv" 2>/dev/null)"
+argv_has "attach: docker exec passes GH_TOKEN by NAME only" "$MOCK_VM_LOG.dockerargv" "GH_TOKEN"
+argv_has "attach: interactive container session gets a TTY (-it)" "$MOCK_VM_LOG.dockerargv" "-it"
+argv_has "attach: lands at the mounted repo (/work)" "$MOCK_VM_LOG.dockerargv" "/work"
+argv_has "attach: targets this repo's dev container" "$MOCK_VM_LOG.dockerargv" "repo-remote-myrepo"
+assert_eq "attach: opens a login shell in the container" "-l" "$(tail -n1 "$MOCK_VM_LOG.dockerargv" 2>/dev/null)"
+assert_contains "attach: git gets an env-only github.com credential helper" "$DENV" "GIT_CONFIG_KEY_1=credential.https://github.com.helper"
+assert_contains "attach: the helper reads the token by variable NAME" "$DENV" 'password=$GH_TOKEN'
+assert_contains "attach: an empty first helper entry resets configured helpers" "$DENV" "GIT_CONFIG_VALUE_0="
+assert_eq "attach: the master connection never held the token" "0" "$(cat "$MOCK_LOG.masterenv" 2>/dev/null | wc -l | tr -d ' ')"
+SESSION_LINE="$(grep -F 'attach bootstrap' "$MOCK_LOG" | head -n1)"
+assert_contains "attach: the session forwards the token with SendEnv" "$SESSION_LINE" "SendEnv=LC_REPO_REMOTE_GH_TOKEN"
+assert_contains "attach: the session is multiplexed over the verified master" "$SESSION_LINE" "ControlMaster=no"
+assert_contains "attach: the session requires the already-recorded host key" "$SESSION_LINE" "StrictHostKeyChecking=yes"
+assert_contains "attach: interactive session asks ssh for a TTY" "$SESSION_LINE" " -t "
+assert_contains "attach: the bootstrap runs under /bin/sh, whatever the login shell" "$SESSION_LINE" "exec /bin/sh -c"
+PROBE_LINE="$(grep -F 'sh -s' "$MOCK_LOG" | head -n1)"
+assert_contains "attach: the identity probe rides the same master connection" "$PROBE_LINE" "ControlMaster=no"
+L_MASTER="$(line_of 'ControlMaster=yes')"; L_PROBE="$(line_of 'sh -s')"
+L_MINT="$(line_of 'minter-ran')"; L_SESSION="$(line_of 'attach bootstrap')"
+if (( L_MASTER > 0 && L_MASTER < L_PROBE && L_PROBE < L_MINT && L_MINT < L_SESSION )); then
+  ok "attach: order is connect -> verify identity -> mint -> deliver"
+else
+  no "attach: order is connect -> verify identity -> mint -> deliver" "master=$L_MASTER probe=$L_PROBE mint=$L_MINT session=$L_SESSION"
+fi
+assert_eq "attach: a pinned instance needs no cloud call at all" "0" "$(grep -c '^ec2 ' "$MOCK_LOG")"
+assert_eq "attach: no static token reached any ssh environment" "0" "$(cat "$MOCK_LOG.staticenv" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "attach: per-repo config untouched (no write-back)" "$ENV_SUM_BEFORE" "$(cksum <"$REPO/.env")"
+assert_eq "attach: shared remote.env untouched" "$SHARED_SUM_BEFORE" "$(cksum <"$SHARED")"
+assert_contains "attach: says the token was minted (without printing it)" "$RR_ERR" "minted for this session"
+assert_contains "attach: reports the verified identity" "$RR_ERR" "host identity verified"
+
+# (b) Refresh: attach AGAIN. The command runs again and the NEW session gets
+#     the NEW token; the same instance and container are reused and nothing is
+#     provisioned. CANARY_2 is a command-substitution canary: if anything ever
+#     evaluated it, $SCRATCH/pwned2|3 would exist.
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "refresh: second attach -> exit 0" "0" "$RR_RC"
+assert_eq "refresh: the token command ran again (2 runs in total)" "2" "$(mint_count)"
+assert_eq "refresh: the new session's payload is the replacement token" "$CANARY_2" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+DENV="$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)"
+assert_contains "refresh: the new session gets the replacement token" "$DENV" "GH_TOKEN=$CANARY_2"
+assert_not_contains "refresh: the old token is not delivered again" "$DENV" "$CANARY_1"
+argv_has "refresh: the same dev container is reused" "$MOCK_VM_LOG.dockerargv" "repo-remote-myrepo"
+assert_eq "refresh: nothing is provisioned, started or stopped" "0" \
+  "$(grep -cE 'run-instances|start-instances|stop-instances|terminate-instances|security-group' "$MOCK_LOG")"
+assert_canary_absent "refresh: replacement token absent from argv, logs, config and VM disk" "$CANARY_2"
+if [[ ! -e "$SCRATCH/pwned2" && ! -e "$SCRATCH/pwned3" ]]; then
+  ok "refresh: a command-substitution token is never evaluated anywhere"
+else
+  no "refresh: a command-substitution token is never evaluated anywhere" "pwned marker exists"
+fi
+
+# (c) Host path: no running container -> the login shell in ~/<repo>.
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "host session: exit 0" "0" "$RR_RC"
+assert_contains "host session: the login shell gets GH_TOKEN" "$(cat "$MOCK_VM_LOG.shellenv" 2>/dev/null)" "GH_TOKEN=$CANARY_1"
+assert_eq "host session: a login shell (-l)" "-l" "$(head -n1 "$MOCK_VM_LOG.shellargv" 2>/dev/null)"
+assert_eq "host session: starts in ~/<repo>" "$VM_HOME/myrepo" "$(cat "$MOCK_VM_LOG.shellpwd" 2>/dev/null)"
+assert_eq "host session: docker exec was not used" "no" "$([[ -f "$MOCK_VM_LOG.dockerargv" ]] && echo yes || echo no)"
+assert_canary_absent "host session: token absent from argv, logs, config and VM disk" "$CANARY_1"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_VM_NO_DOCKER=1 -- attach
+assert_eq "host session: a VM without docker lands on the host" "-l" "$(head -n1 "$MOCK_VM_LOG.shellargv" 2>/dev/null)"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach --host
+assert_eq "--host: forces the host shell even with a container running" "-l" "$(head -n1 "$MOCK_VM_LOG.shellargv" 2>/dev/null)"
+assert_eq "--host: no docker exec" "no" "$([[ -f "$MOCK_VM_LOG.dockerargv" ]] && echo yes || echo no)"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach --container
+assert_eq "--container with no running container -> exit 98 (refused on the VM)" "98" "$RR_RC"
+assert_contains "--container: says the container is not running" "$RR_ERR" "is not running"
+assert_eq "--container: no shell was started instead" "no" "$([[ -f "$MOCK_VM_LOG.shellargv" ]] && echo yes || echo no)"
+
+# (d) --command: non-interactive, no TTY, the command string intact.
+reset_mint
+ATTACH_CMD="printf '%s\n' \"it's\" && gh auth status"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach --command "$ATTACH_CMD"
+assert_eq "--command (container): exit 0" "0" "$RR_RC"
+argv_has "--command: docker exec without a TTY (-i)" "$MOCK_VM_LOG.dockerargv" "-i"
+assert_eq "--command: runs under bash -lc in the container" "-lc" "$(tail -n2 "$MOCK_VM_LOG.dockerargv" | head -n1)"
+assert_eq "--command: the command string arrives intact (quotes and all)" "$ATTACH_CMD" "$(tail -n1 "$MOCK_VM_LOG.dockerargv")"
+assert_contains "--command: ssh is asked for no TTY" "$(grep -F 'attach bootstrap' "$MOCK_LOG" | head -n1)" " -T "
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach --host --command "$ATTACH_CMD"
+assert_eq "--command (host): runs under the login shell -lc" "-lc" "$(head -n1 "$MOCK_VM_LOG.shellargv" 2>/dev/null)"
+assert_eq "--command (host): the command string arrives intact" "$ATTACH_CMD" "$(tail -n1 "$MOCK_VM_LOG.shellargv" 2>/dev/null)"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_VM_SHELL_RC=5 -- attach --host --command "false"
+assert_eq "--command: attach exits with the remote command's status" "5" "$RR_RC"
+
+# (e) Static token only: today's behavior, delivered the same way, plus a
+#     one-line notice that names the command form and never the token.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "static only: exit 0" "0" "$RR_RC"
+assert_eq "static only: the payload is the static token" "$STATIC_CANARY" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_contains "static only: the container session gets it" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_TOKEN=$STATIC_CANARY"
+assert_eq "static only: no token command ran" "0" "$(mint_count)"
+NOTICE="$(grep -F 'NOTICE: using the static REPO_REMOTE_GH_TOKEN' <<<"$RR_ERR")"
+assert_eq "static only: exactly one notice line" "1" "$(grep -c . <<<"$NOTICE")"
+assert_contains "static only: the notice recommends REPO_REMOTE_GH_TOKEN_CMD" "$NOTICE" "REPO_REMOTE_GH_TOKEN_CMD"
+assert_canary_absent "static only: the static token appears nowhere but its own config line" "$STATIC_CANARY" config-holds-it
+assert_eq "static only: the static token is never exported to child processes (ssh)" "0" "$(cat "$MOCK_LOG.staticenv" 2>/dev/null | wc -l | tr -d ' ')"
+
+# (f) Neither: a plain session, nothing forwarded, nothing exported.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "no credential: exit 0 (a plain session)" "0" "$RR_RC"
+assert_not_contains "no credential: nothing is forwarded" "$(grep -F 'attach bootstrap' "$MOCK_LOG")" "SendEnv=LC_REPO_REMOTE_GH_TOKEN"
+assert_eq "no credential: no payload" "no" "$([[ -f "$MOCK_LOG.payload" ]] && echo yes || echo no)"
+assert_not_contains "no credential: no GH_TOKEN in the session" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_TOKEN"
+assert_not_contains "no credential: no git helper either" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GIT_CONFIG_"
+assert_contains "no credential: says the VM stays unauthenticated" "$RR_ERR" "none configured"
+
+# (g) Both: the command wins, the static token is ignored — never delivered,
+#     never inherited by the command — and the notice says so.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "both: exit 0" "0" "$RR_RC"
+assert_eq "both: the command's token is delivered" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_not_contains "both: the static token is not delivered" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "$STATIC_CANARY"
+assert_contains "both: the notice says the static token is ignored" "$RR_ERR" "static REPO_REMOTE_GH_TOKEN is ignored"
+assert_eq "both: the token command never sees the static token in its environment" "0" "$(cat "$MOCK_LOG.minterenv" 2>/dev/null | wc -l | tr -d ' ')"
+assert_canary_absent "both: static token appears nowhere but its config line" "$STATIC_CANARY" config-holds-it
+
+# (h) Layer precedence: per-repo beats shared, and an EMPTY per-repo command
+#     switches a shared one off (falling to that config's static token).
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2" \
+  "REPO_REMOTE_GH_TOKEN_CMD='$MINT_DIR/other.sh'"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "layers: the per-repo command overrides the shared one" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "layers: the shared command did not run" "0" "$(grep -c '^other-ran$' "$MOCK_LOG")"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN_CMD=" "$STATIC_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "layers: an empty per-repo command disables the shared one" "$STATIC_CANARY" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "layers: ... so no command ran at all" "0" "$(( $(grep -c '^other-ran$' "$MOCK_LOG") + $(mint_count) ))"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "layers: a shared command applies when the repo sets none" "ghs_from_the_shared_layer" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+
+# (i) Fail CLOSED on a bad token command: no session, no payload, no
+#     fallback to the static token, and none of the command's output shown.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE"
+for mode in fail empty multiline space; do
+  reset_mint
+  run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true MINT_MODE="$mode" -- attach
+  assert_eq "token command '$mode' -> exit 7" "7" "$RR_RC"
+  assert_eq "token command '$mode': no session was opened" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
+  assert_eq "token command '$mode': nothing was forwarded" "no" "$([[ -f "$MOCK_LOG.payload" ]] && echo yes || echo no)"
+  assert_contains "token command '$mode': says the static token was NOT used" "$RR_ERR" "NOT used instead"
+  assert_not_contains "token command '$mode': no static fallback" "$RR_ERR$RR_OUT" "$STATIC_CANARY"
+  assert_canary_absent "token command '$mode': its token-like output is never shown" "$CANARY_1" config-holds-it
+done
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MINT_MODE=fail -- attach
+assert_contains "failed command: the exit status is reported" "$RR_ERR" "exited 3"
+assert_not_contains "failed command: its stderr is never displayed" "$RR_ERR" "LEAKY-STDERR"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MINT_MODE=empty -- attach
+assert_contains "empty output: named as such" "$RR_ERR" "it is empty"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MINT_MODE=multiline -- attach
+assert_contains "multi-line output: named as such" "$RR_ERR" "more than one line"
+assert_not_contains "multi-line output: the second line is never shown" "$RR_ERR" "second-line"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MINT_MODE=space -- attach
+assert_contains "whitespace in output: named as such" "$RR_ERR" "whitespace"
+assert_not_contains "whitespace in output: the value is never shown" "$RR_ERR" "two words"
+
+# (j) Host identity gates the credential: on a mismatch, an unverifiable host,
+#     or no connection at all, the token command never runs.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0strangersbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "identity MISMATCH -> exit 6" "6" "$RR_RC"
+assert_contains "identity mismatch: the usual unmistakable refusal" "$RR_ERR" "HOST IDENTITY MISMATCH"
+assert_eq "identity mismatch: the token command never ran" "0" "$(mint_count)"
+assert_eq "identity mismatch: no session, no delivery" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
+assert_eq "identity mismatch: the control directory is cleaned up" "no" "$(compgen -G "$SCRATCH/rr-attach.*" >/dev/null && echo yes || echo no)"
+reset_mint
+run_rr MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "identity unverifiable -> exit 6 (fails closed)" "6" "$RR_RC"
+assert_eq "identity unverifiable: the token command never ran" "0" "$(mint_count)"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_SSH_MASTER_FAIL=1 -- attach
+assert_eq "no connection -> exit 6 (identity could not be established)" "6" "$RR_RC"
+assert_contains "no connection: surfaces the ssh error" "$RR_ERR" "Connection refused"
+assert_eq "no connection: the token command never ran" "0" "$(mint_count)"
+assert_eq "no connection: no identity probe either" "0" "$(grep -c 'sh -s' "$MOCK_LOG")"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_SSH_MUX_CHECK_FAIL=1 -- attach
+assert_eq "verified connection lost before delivery -> exit 6" "6" "$RR_RC"
+assert_eq "connection lost: nothing was delivered" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
+
+# (k) An sshd that does not accept LC_* drops the value: the VM side refuses
+#     to start an unauthenticated session silently.
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true MOCK_SSH_DROP_ENV=1 -- attach
+assert_eq "credential dropped in transit -> exit 97 from the VM" "97" "$RR_RC"
+assert_contains "dropped credential: names the sshd requirement" "$RR_ERR" "AcceptEnv LANG LC_*"
+assert_eq "dropped credential: no container session was started" "no" "$([[ -f "$MOCK_VM_LOG.dockerargv" ]] && echo yes || echo no)"
+
+# (l) Existing containers created the OLD way (docker run -e GH_TOKEN) are
+#     flagged, without printing what is stored in them.
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true MOCK_DOCKER_CONFIG_ENV="GH_TOKEN=ghp_old_persisted_value" -- attach
+assert_eq "old-style container: still attaches" "0" "$RR_RC"
+assert_contains "old-style container: warned that a token is stored in its config" "$RR_ERR" "created with GH_TOKEN in its configuration"
+assert_not_contains "old-style container: the stored value is not printed" "$RR_ERR" "ghp_old_persisted_value"
+
+# (m) Read-only and provisioning lifecycle commands NEVER run the token
+#     command or forward a credential: up (dry run and --yes), status, verify,
+#     down (dry run and --yes).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE"
+lifecycle_clean() {  # <label>
+  local leaks=""
+  [[ "$(mint_count)" == 0 ]] || leaks+=" token-command-ran"
+  grep -q '^minter-ran$' "$MOCK_LOG" && leaks+=" minter-in-log"
+  [[ -f "$MOCK_LOG.payload" ]] && leaks+=" payload"
+  grep -qF 'SendEnv=LC_REPO_REMOTE_GH_TOKEN' "$MOCK_LOG" && leaks+=" sendenv"
+  [[ -f "$MOCK_LOG.staticenv" ]] && leaks+=" static-token-in-ssh-env"
+  [[ "$RR_OUT$RR_ERR" == *"$STATIC_CANARY"* ]] && leaks+=" static-token-printed"
+  if [[ -z "$leaks" ]]; then ok "$1"; else no "$1" "leaks:$leaks"; fi
+}
+reset_mint; run_rr -- up
+assert_eq "lifecycle: up (dry run) -> exit 0" "0" "$RR_RC"
+lifecycle_clean "lifecycle: up dry run never runs the token command"
+assert_contains "lifecycle: the dry-run plan reports the credential SOURCE only" "$RR_ERR" "minted per attach by REPO_REMOTE_GH_TOKEN_CMD (not run in a dry run)"
+reset_mint; run_rr -- up --json
+assert_eq "lifecycle: plan JSON names the credential source" "command" "$(json_field "$RR_OUT" gh_credential_source)"
+lifecycle_clean "lifecycle: up --json dry run never runs the token command"
+reset_mint; run_rr MOCK_AWS_STATE=running MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_AWS_PUBLIC_IP=203.0.113.42 -- up --yes --json
+assert_eq "lifecycle: up --yes (reuse) -> exit 0" "0" "$RR_RC"
+lifecycle_clean "lifecycle: up --yes never runs the token command"
+reset_mint; run_rr MOCK_AWS_FIND=$'i-0pinnedbox\trunning\tm5.2xlarge\t203.0.113.42\t2026-01-01' -- status --json
+lifecycle_clean "lifecycle: status never runs the token command"
+reset_mint; run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- verify --json
+assert_eq "lifecycle: verify -> exit 0" "0" "$RR_RC"
+lifecycle_clean "lifecycle: verify never runs the token command"
+reset_mint; run_rr MOCK_AWS_FIND=$'i-0pinnedbox\trunning' -- down
+lifecycle_clean "lifecycle: down (dry run) never runs the token command"
+reset_mint; run_rr MOCK_AWS_FIND=$'i-0pinnedbox\trunning' -- down --yes
+lifecycle_clean "lifecycle: down --yes never runs the token command"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
+reset_mint; run_rr -- up --json
+assert_eq "plan JSON: static source" "static" "$(json_field "$RR_OUT" gh_credential_source)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
+reset_mint; run_rr -- up --json
+assert_eq "plan JSON: no source" "none" "$(json_field "$RR_OUT" gh_credential_source)"
+
+# (n) Tracing: even `bash -x` never prints a token (minted or static).
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE"
+reset_mint
+RR_BASH_X=1 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "bash -x attach: exit 0" "0" "$RR_RC"
+assert_contains "bash -x attach: tracing really was on" "$RR_ERR" "+ "
+assert_eq "bash -x attach: the token was still delivered" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_not_contains "bash -x attach: the minted token is never traced" "$RR_ERR" "$CANARY_1"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
+RR_BASH_X=1 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "bash -x attach (static): exit 0" "0" "$RR_RC"
+assert_not_contains "bash -x attach (static): the static token is never traced" "$RR_ERR" "$STATIC_CANARY"
+
+# (o) Transports and providers: ssm alias, missing plugin, GCP.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "REPO_REMOTE_TRANSPORT=ssm"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "ssm transport: attach -> exit 0" "0" "$RR_RC"
+assert_eq "ssm transport: the token is delivered" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_contains "ssm transport: the session goes through the alias" "$(grep -F 'attach bootstrap' "$MOCK_LOG" | head -n1)" "repo-remote-myrepo"
+assert_canary_absent "ssm transport: token absent from argv, logs, config and VM disk" "$CANARY_1"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox REPO_REMOTE_SSM_PLUGIN=rr-no-such-plugin -- attach
+assert_eq "ssm transport, no plugin -> exit 2 before connecting" "2" "$RR_RC"
+assert_eq "ssm transport, no plugin: the token command never ran" "0" "$(mint_count)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=" "$CMD_ENV_LINE"
+reset_mint
+run_rr MOCK_AWS_FIND=$'i-0tagged\trunning' MOCK_SSH_HOST_ID=i-0tagged -- attach
+assert_eq "unpinned: attach verifies against the tag-discovered instance" "0" "$RR_RC"
+assert_eq "unpinned: tag discovery is read-only" "0" "$(grep -cE 'run-instances|start-instances' "$MOCK_LOG")"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=repo-remote-myrepo -- attach gcp
+assert_eq "gcp: attach -> exit 0 against the derived instance name" "0" "$RR_RC"
+assert_eq "gcp: the token is delivered" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "gcp: no gcloud call is needed" "0" "$(grep -c '^compute ' "$MOCK_LOG")"
+
+# (p) API gateway: an explicit, routing-level contract (not just "GH_HOST is
+#     set"). gh routes `gh api` by GH_HOST and `gh issue/pr` by GH_REPO, and
+#     sends a non-github.com host GH_ENTERPRISE_TOKEN; git keeps its github.com
+#     remote and authenticates there on its own.
+git -C "$REPO" remote add origin https://github.com/acme/widgets.git
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" \
+  "REPO_REMOTE_GH_API_HOST=gateway.invalid"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "gateway: attach -> exit 0" "0" "$RR_RC"
+GWENV="$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)"
+cp "$MOCK_VM_LOG.dockerenv" "$SCRATCH/attach-gw.dockerenv" 2>/dev/null
+assert_contains "gateway: gh api is routed by GH_HOST" "$GWENV" "GH_HOST=gateway.invalid"
+assert_contains "gateway: gh issue/pr are routed by a host-qualified GH_REPO" "$GWENV" "GH_REPO=gateway.invalid/acme/widgets"
+assert_contains "gateway: the token is GH_ENTERPRISE_TOKEN (what gh sends to a non-github.com host)" "$GWENV" "GH_ENTERPRISE_TOKEN=$CANARY_1"
+assert_eq "gateway: GH_TOKEN is emptied so nothing reaches api.github.com directly" "GH_TOKEN=" "$(grep '^GH_TOKEN=' "$MOCK_VM_LOG.dockerenv")"
+argv_has "gateway: an old container's GH_TOKEN is overridden with an empty value" "$MOCK_VM_LOG.dockerargv" "GH_TOKEN="
+assert_contains "gateway: git's helper stays on github.com" "$GWENV" "GIT_CONFIG_KEY_1=credential.https://github.com.helper"
+assert_contains "gateway: git's helper reads the same token by name" "$GWENV" 'password=$GH_ENTERPRISE_TOKEN'
+assert_eq "gateway: git's remote is left exactly as it was" "https://github.com/acme/widgets.git" "$(git -C "$REPO" remote get-url origin)"
+assert_canary_absent "gateway: token absent from argv, logs, config and VM disk" "$CANARY_1"
+git -C "$REPO" remote set-url origin git@github.com:acme/widgets.git
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_contains "gateway: an ssh-form github.com origin is understood too" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_REPO=gateway.invalid/acme/widgets"
+for bad in "https://gateway.invalid" "gateway.invalid:8443" "gateway.invalid/api" "user@gateway.invalid" \
+           "localhost" "github.com" "api.github.com" "GitHub.com" "gw invalid.example"; do
+  write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" \
+    "REPO_REMOTE_GH_API_HOST='$bad'"
+  reset_mint
+  run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+  assert_eq "gateway '$bad' refused -> exit 2" "2" "$RR_RC"
+  assert_eq "gateway '$bad': refused before connecting or minting" "0" "$(( $(mint_count) + $(grep -c 'ControlMaster=yes' "$MOCK_LOG") ))"
+done
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_API_HOST=gateway.invalid"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "gateway without any credential -> exit 2" "2" "$RR_RC"
+git -C "$REPO" remote set-url origin https://gitlab.example/acme/widgets.git
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "REPO_REMOTE_GH_API_HOST=gateway.invalid"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "gateway with a non-github.com origin -> exit 2" "2" "$RR_RC"
+assert_contains "gateway with a non-github.com origin: says why" "$RR_ERR" "github.com repository"
+git -C "$REPO" remote remove origin
+
+# (q) The git half, with REAL git: the helper environment captured from (a)
+#     answers github.com with the session token, is not offered to any other
+#     host, and leaves a configured `store` helper unable to persist it.
+genv() { grep "^$1=" "$SCRATCH/attach-a.dockerenv" | head -n1 | cut -d= -f2-; }
+GK0="$(genv GIT_CONFIG_KEY_0)"; GK1="$(genv GIT_CONFIG_KEY_1)"; GV1="$(genv GIT_CONFIG_VALUE_1)"
+GITCRED_HOME="$SCRATCH/gitcred-home"
+mkdir -p "$GITCRED_HOME"
+printf '[credential]\n\thelper = store\n' >"$GITCRED_HOME/.gitconfig"
+run_git_cred() {
+  env -i HOME="$GITCRED_HOME" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    GH_TOKEN="$CANARY_1" GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0="$GK0" GIT_CONFIG_VALUE_0= \
+    GIT_CONFIG_KEY_1="$GK1" GIT_CONFIG_VALUE_1="$GV1" git "$@"
+}
+FILL="$(printf 'protocol=https\nhost=github.com\n\n' | run_git_cred credential fill 2>/dev/null)"
+assert_contains "git: github.com is answered with the session token" "$FILL" "password=$CANARY_1"
+assert_contains "git: as the x-access-token user" "$FILL" "username=x-access-token"
+printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' "$CANARY_1" | run_git_cred credential approve 2>/dev/null
+assert_eq "git: a configured store helper cannot persist the token" "no" "$([[ -e "$GITCRED_HOME/.git-credentials" ]] && echo yes || echo no)"
+OTHER_FILL="$(printf 'protocol=https\nhost=gitlab.example\n\n' | run_git_cred credential fill 2>/dev/null)"
+assert_not_contains "git: the token is never offered to another host" "$OTHER_FILL" "$CANARY_1"
+# Positive control: WITHOUT the empty reset entry, that same store helper DOES
+# write the token to disk -- so the assertion above is testing the reset.
+printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' "$CANARY_1" \
+  | env -i HOME="$GITCRED_HOME" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GH_TOKEN="$CANARY_1" \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="$GK1" GIT_CONFIG_VALUE_0="$GV1" git credential approve 2>/dev/null
+# (credential-store percent-encodes the password, so test for the file.)
+if [[ -s "$GITCRED_HOME/.git-credentials" ]]; then
+  ok "git control: without the reset, a store helper would persist it"
+else
+  no "git control: without the reset, a store helper would persist it" "control did not reproduce"
+fi
+
+# (r) Usage errors.
+run_rr -- attach --json
+assert_eq "usage: attach has no --json -> 64" "64" "$RR_RC"
+run_rr -- up --host
+assert_eq "usage: --host outside attach -> 64" "64" "$RR_RC"
+run_rr -- attach --command
+assert_eq "usage: --command needs a value -> 64" "64" "$RR_RC"
+run_rr -- attach --container --host
+assert_eq "usage: --container and --host together -> 64" "64" "$RR_RC"
+write_shared "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+run_rr -- attach
+assert_eq "attach without a provider -> exit 2" "2" "$RR_RC"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN='two words'"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "a malformed static token -> exit 2 before connecting" "2" "$RR_RC"
+assert_eq "malformed static token: nothing connected" "0" "$(grep -c 'ControlMaster=yes' "$MOCK_LOG")"
+rm -f "$REPO/.env"
+
+# (s) OPTIONAL evidence against the REAL gh CLI (RR_GH_EVIDENCE=1): the
+#     gateway environment from (p) really routes gh to the gateway, with the
+#     enterprise token, and a gateway whose certificate is not trusted fails
+#     TLS verification instead of being used. Off by default: it resolves an
+#     .invalid name (no traffic can leave) and needs python3 + openssl for the
+#     TLS fixture. GH_CONFIG_DIR is isolated so no stored login is consulted.
+if [[ "${RR_GH_EVIDENCE:-0}" == 1 ]] && command -v gh >/dev/null 2>&1; then
+  EVID="$SCRATCH/gh-evidence"; mkdir -p "$EVID/clone" "$EVID/cfg"
+  git_fixture_init "$EVID/clone"
+  git -C "$EVID/clone" remote add origin https://github.com/acme/widgets.git
+  gwv() { grep "^$1=" "$SCRATCH/attach-gw.dockerenv" | head -n1 | cut -d= -f2-; }
+  run_gh() {
+    (cd "$EVID/clone" && env -u GITHUB_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+      GH_CONFIG_DIR="$EVID/cfg" GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 GH_TELEMETRY=log \
+      GH_TOKEN= GH_HOST="$(gwv GH_HOST)" GH_REPO="$(gwv GH_REPO)" \
+      GH_ENTERPRISE_TOKEN="$(gwv GH_ENTERPRISE_TOKEN)" "$@" 2>&1)
+  }
+  echo "  (gh evidence: $(gh --version | head -n1))"
+  OUT="$(run_gh env GH_DEBUG=api gh api 'repos/{owner}/{repo}')"
+  assert_contains "gh evidence: gh api goes to the gateway's REST prefix" "$OUT" "Request to https://gateway.invalid/api/v3/repos/acme/widgets"
+  assert_contains "gh evidence: with an Authorization header (the enterprise token)" "$OUT" "Authorization: token"
+  OUT="$(run_gh env GH_DEBUG=api gh issue list)"
+  assert_contains "gh evidence: gh issue list goes to the gateway's GraphQL" "$OUT" "Request to https://gateway.invalid/api/graphql"
+  assert_not_contains "gh evidence: nothing goes to api.github.com" "$OUT" "api.github.com"
+  OUT="$(run_gh gh auth status)"
+  assert_contains "gh evidence: gh auth status checks the gateway with GH_ENTERPRISE_TOKEN" "$OUT" "GH_ENTERPRISE_TOKEN"
+  OUT="$(cd "$EVID/clone" && env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$EVID/cfg" GH_NO_UPDATE_NOTIFIER=1 \
+         GH_PROMPT_DISABLED=1 GH_HOST=gateway.invalid GH_ENTERPRISE_TOKEN=x gh issue list 2>&1)"
+  assert_contains "gh evidence: GH_HOST alone does not route a github.com clone" "$OUT" "GH_HOST"
+  if command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=gateway.invalid -days 1 \
+      -keyout "$EVID/key.pem" -out "$EVID/cert.pem" >/dev/null 2>&1
+    cat >"$EVID/connect.py" <<'PY'
+import socket, sys, threading
+tls_port = int(sys.argv[1])
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0)); srv.listen(5)
+print(srv.getsockname()[1], flush=True)
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d: break
+            b.sendall(d)
+    except OSError: pass
+    finally:
+        for s in (a, b):
+            try: s.close()
+            except OSError: pass
+while True:
+    c, _ = srv.accept()
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = c.recv(4096)
+        if not d: break
+        buf += d
+    u = socket.create_connection(("127.0.0.1", tls_port))
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+PY
+    TLS_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+    openssl s_server -quiet -accept "$TLS_PORT" -cert "$EVID/cert.pem" -key "$EVID/key.pem" -www >/dev/null 2>&1 &
+    SSL_PID=$!
+    sleep 1
+    python3 "$EVID/connect.py" "$TLS_PORT" >"$EVID/proxy.port" 2>/dev/null &
+    PROXY_PID=$!
+    sleep 1
+    OUT="$(run_gh env HTTPS_PROXY="http://127.0.0.1:$(cat "$EVID/proxy.port")" gh api 'repos/{owner}/{repo}')"
+    kill "$SSL_PID" "$PROXY_PID" 2>/dev/null
+    assert_matches "gh evidence: an untrusted gateway certificate is a hard TLS failure" "$OUT" "x509|failed to verify certificate"
+    assert_not_contains "gh evidence: ... and no API response is accepted from it" "$OUT" '"full_name"'
+  else
+    skip "gh evidence: TLS-failure fixture" "needs python3 and openssl"
+  fi
+else
+  skip "gh evidence: real gh routing / TLS checks" "set RR_GH_EVIDENCE=1 (and have gh on PATH) to run them"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -3017,6 +3683,31 @@ assert_contains "remote.md documents the additive connect_target field" "$MD" "c
 assert_contains "remote.md: working-tree rsync targets the alias" "$MD" "./ repo-remote-<name>:~/<repo-name>/"
 assert_contains "remote.md: working-tree rsync keeps the provisioning-secret exclusion" "$MD" "--filter=':- .gitignore' --exclude '.git/'"
 assert_contains "remote.md: token rsync targets the alias" "$MD" "repo-remote-<name>:~/<repo-name>/.loom/tokens/"
+
+# repo#565: the credential-aware attach path and its contract.
+assert_contains "remote.md documents the token command" "$MD" "REPO_REMOTE_GH_TOKEN_CMD"
+assert_contains "remote.md calls the minted token the recommended path" "$MD" "the recommended path is a minted token"
+assert_contains "remote.md documents the gateway setting" "$MD" "REPO_REMOTE_GH_API_HOST"
+assert_contains "remote.md documents the attach subcommand" "$MD" "repo-remote attach"
+assert_contains "remote.md documents /repo:remote --attach" "$MD" "/repo:remote --attach"
+assert_contains "remote.md documents exit 7" "$MD" '`7` `attach` could not resolve the GitHub'
+assert_contains "remote.md states there is no static fallback" "$MD" "There is no fallback to"
+assert_contains "remote.md documents the shell interpretation" "$MD" 'run **on your machine** with `bash -c`'
+FMD="$(flatten "$REMOTE_MD")"
+assert_contains "remote.md documents the verify-before-mint order" "$FMD" "**verify the host identity over it**"
+assert_contains "remote.md documents the sshd requirement" "$FMD" "AcceptEnv LANG LC_*"
+assert_contains "remote.md documents the no-disk evidence for docker exec" "$FMD" "the same token passed with \`docker exec -e GH_TOKEN\` appears in neither"
+assert_contains "remote.md documents the refresh limits for running processes" "$MD" "keep the token they were started with"
+assert_contains "remote.md documents the gateway's enterprise token" "$MD" "GH_ENTERPRISE_TOKEN"
+assert_contains "remote.md documents the gateway's GH_REPO routing" "$MD" "GH_REPO=<host>/<owner>/<repo>"
+assert_contains "remote.md documents the GHES API layout requirement" "$MD" "https://<host>/api/v3/"
+assert_contains "remote.md documents what the gateway does not claim" "$MD" "Not claimed:"
+assert_not_contains "remote.md no longer bakes GH_TOKEN into docker run" "$MD" "-e GH_TOKEN -e CLAUDE_CODE_OAUTH_TOKEN"
+assert_not_contains "remote.md no longer runs gh auth setup-git on the VM" "$MD" 'container `gh auth setup-git` and confirm'
+HELP="$(bash "$RR" --help 2>&1)"
+assert_contains "--help documents attach" "$HELP" "repo-remote attach|--attach"
+assert_contains "--help documents exit 7" "$HELP" "7  \`attach\` could not resolve"
+assert_contains "--help documents the gateway contract" "$HELP" "REPO_REMOTE_GH_API_HOST"
 
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"
