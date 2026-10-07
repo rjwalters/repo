@@ -19,13 +19,13 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM
 
 ## PRs Awaiting Review
 
@@ -60,8 +60,8 @@ _None._
 |------|-------|
 | Operator merge-risk holds | 1 |
 | Operator priority | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 2 |
