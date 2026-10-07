@@ -7,9 +7,7 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#433**: fix(guard): a backslash-escaped backtick no longer vetoes span masking
-- **#442**: fix(guard): reach into a quoted single-command $( ) for write-target extraction
-- **#461**: feat(guard): deny a build/scratch dir that resolves onto a tmpfs mount
+- **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
 
 ## Operator Priority
 
@@ -39,17 +37,14 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#433**: fix(guard): a backslash-escaped backtick no longer vetoes span masking
-- **#442**: fix(guard): reach into a quoted single-command $( ) for write-target extraction
-- **#461**: feat(guard): deny a build/scratch dir that resolves onto a tmpfs mount
+- **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#439**: Worktree-write-confinement: a quoted single-command $( ) substitution writes into the main checkout in both guards *(curated)*
-- **#447**: Upstream the repo#443 single-quoted-span inertness fix to Loom's vendored guard *(curated)*
-- **#454**: Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount *(curated)*
+- **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
+- **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,13 +58,13 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 1 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 3 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
