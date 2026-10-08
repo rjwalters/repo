@@ -6813,6 +6813,28 @@ assert_sc deny "#581 literal: empty rebind + suffix denied" "" "" 'd=/tmp/a; d=;
 assert_sc deny "#581 literal: array element rebind denied" "" "" 'd=/tmp/a; d[0]=/opt; rm -rf "$d"'
 assert_sc deny "#581 literal: extra variable in suffix denied" "" "" 'd=/tmp/a; rm -rf "$d/$e"'
 assert_sc deny "#581 literal: in-quote assignment is not a binding" "" "" "echo 'd=/tmp/a'; rm -rf \"\$d\""
+
+# -- the sudo.md rollback shape (commands/repo/tests/test-sudo-rm-guard-contract.sh
+#    section 8): a multi-line `if ! sudo visudo -c; then sudo rm -f "$DROPIN" ...
+#    fi` block. Same-command literal resolution judges the resolved path exactly
+#    like a literal `sudo rm -f <path>`: an in-scope /tmp stand-in is admitted
+#    (as the literal spelling already was), while the real /etc/sudoers.d
+#    target, the doc's own `${USER_NAME}` binding, and the unbound block all
+#    stay denied.
+_SC_ROLLBACK=$'if ! sudo visudo -c; then\n  sudo rm -f "$DROPIN"\n  echo "post-install validation failed — removed ${DROPIN}, no change made" >&2\n  exit 1\nfi'
+assert_sc allow "#581 rollback: same-command /tmp stand-in DROPIN resolves in scope" "" "" \
+    "DROPIN=\"/tmp/guard-sc581/fake-sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
+assert_sc allow "#581 rollback: literal /tmp stand-in spelling is the same verdict" "" "" \
+    'sudo rm -f /tmp/guard-sc581/fake-sudoers.d/alice-nopasswd'
+assert_sc deny "#581 rollback: same-command real /etc/sudoers.d DROPIN still denied" "" "" \
+    "DROPIN=\"/etc/sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
+assert_sc deny "#581 rollback: sudo.md's \${USER_NAME} DROPIN binding not resolvable" "" "" \
+    'DROPIN="/etc/sudoers.d/${USER_NAME}-nopasswd"'$'\n'"$_SC_ROLLBACK"
+assert_sc deny "#581 rollback: unbound DROPIN in the rollback block denied" "" "" "$_SC_ROLLBACK"
+assert_sc deny "#581 rollback: /tmp binding with a .. escape to /etc denied" "" "" \
+    "DROPIN=\"/tmp/a/../../etc/sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
+assert_sc deny "#581 rollback: rebinding DROPIN after the /tmp binding denied" "" "" \
+    "DROPIN=\"/tmp/guard-sc581/x\""$'\n'"DROPIN=\"/etc/sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
 assert_allow_env "#581: rmScope=off keeps unresolved-var rm unchanged" "LOOM_RM_SCOPE=off" 'rm -rf "$d"' "$REPO_ROOT"
 
 rm -rf "$SC_BASE"
