@@ -3,6 +3,10 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-08
+- **PR #592**: Guard: reconcile Loom write confinement and managed worktree rules (#582)
+- **PR #591**: Guard: port cargo clean scope while preserving tmpfs target-dir resolution
+- **Issue #583** (closed): Guard: port cargo clean scope while preserving tmpfs target-dir resolution
+- **Issue #582** (closed): Guard: reconcile Loom write confinement and managed worktree rules
 - **PR #588**: Guard: port rm-scope session scratch and same-command resolution (#581)
 - **PR #587**: Guard: port Loom --search/jq --arg masking and gh body @path denies (#580)
 - **Issue #581** (closed): Guard: reconcile Loom rm scope and session scratch allowances
