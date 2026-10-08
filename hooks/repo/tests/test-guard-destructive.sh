@@ -7061,6 +7061,41 @@ cc_write_cfg "$CC_REPO" config.toml "[build]
 target-dir = \"$CC_SHARED\""
 cc_deny "#583: genuinely external target still denies via symlinked repo path" "cargo clean" "$CC_BASE/repo-link"
 
+# --- reverse direction: repo-local symlink spelling that resolves OUTSIDE ---
+cc_clear
+ln -s "$CC_SHARED" "$CC_REPO/target-link"
+cc_write_cfg "$CC_REPO" config.toml $'[build]\ntarget-dir = "target-link"'
+cc_deny "#583: repo-local symlink to external shared target denies" "cargo clean" "$CC_REPO"
+cc_deny "#583: repo-local symlink to external denies from subdir" "cargo clean" "$CC_REPO/sub/dir"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_REPO/target-link/sub\""
+cc_deny "#583: absolute path under repo-local symlink to external denies" "cargo clean" "$CC_REPO"
+cc_allow "#583: repo-local symlink case still allows -p" "cargo clean -p foo" "$CC_REPO"
+rm -f "$CC_REPO/target-link"
+
+# --- Cargo global options / toolchain selectors before `clean` ---
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: cargo --quiet clean denies shared target" "cargo --quiet clean" "$CC_REPO"
+cc_deny "#583: cargo +stable clean denies shared target" "cargo +stable clean" "$CC_REPO"
+cc_deny "#583: cargo -q clean denies shared target" "cargo -q clean" "$CC_REPO"
+cc_deny "#583: cargo +nightly -v --color never clean denies" "cargo +nightly -v --color never clean" "$CC_REPO"
+cc_deny "#583: cargo --locked --offline clean denies" "cargo --locked --offline clean" "$CC_REPO"
+cc_deny "#583: cargo -Z flag clean denies" "cargo -Z unstable-options clean" "$CC_REPO"
+cc_deny "#583: cargo --config unrelated clean denies" "cargo --config net.offline=true clean" "$CC_REPO"
+cc_deny "#583: later global-option clean not hidden by earlier scoped one" "cargo clean -p foo && cargo +stable clean" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean -p allowed" "cargo --quiet clean -p foo" "$CC_REPO"
+cc_allow "#583: cargo +stable clean -p allowed" "cargo +stable clean -p foo" "$CC_REPO"
+cc_allow "#583: cargo +stable clean --package= allowed" "cargo +stable clean --package=foo" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean --target-dir repo-local allowed" "cargo --quiet clean --target-dir $CC_REPO/target" "$CC_REPO"
+cc_allow "#583: cargo +stable clean --target-dir= repo-local allowed" "cargo +stable clean --target-dir=$CC_REPO/target" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean with CARGO_TARGET_DIR prefix allowed" "CARGO_TARGET_DIR=$CC_REPO/target cargo --quiet clean" "$CC_REPO"
+cc_allow "#583: cargo --config build.target-dir=<repo> clean allowed" "cargo --config build.target-dir=\"$CC_REPO/target\" clean" "$CC_REPO"
+cc_allow "#583: cargo +stable build (not clean) allowed" "cargo +stable build" "$CC_REPO"
+cc_allow "#583: quoted prose with cargo +stable clean allowed" 'echo "try cargo +stable clean"' "$CC_REPO"
+
 # --- helper adapter contract ---
 TOTAL=$((TOTAL + 1))
 _cc_adapt=$(bash -c '

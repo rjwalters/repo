@@ -8239,7 +8239,11 @@ done
 # LOOM_-only read; (4) the walk-up / Cargo-home helpers already emit
 # "<path>\t<config file>" here (for the tmpfs guard), so
 # cargo_clean_effective_target_dir() splits that record rather than taking a
-# bare path.
+# bare path; (5) Cargo global options and `+toolchain` selectors before
+# `clean` are skipped (`cargo --quiet clean`, `cargo +stable clean`), and a
+# `--config build.target-dir=PATH` override counts as an explicit target;
+# (6) containment is decided on the physically resolved target and repo root,
+# so a repo-local symlink pointing at a shared external dir is still refused.
 # =============================================================================
 _CARGO_CLEAN_GUARD_CACHE=""
 cargo_clean_guard_enabled() {
@@ -8284,10 +8288,33 @@ cargo_clean_scope_match() {
             }
             if (j > m || toks[j] != "cargo") continue
             j++
+            # Cargo accepts a rustup toolchain selector and GLOBAL options
+            # before the subcommand (`cargo +stable clean`, `cargo --quiet
+            # clean`, `cargo --color never -v clean`); skip them so they cannot
+            # hide the subcommand. Value-taking globals consume their argument
+            # unless given in `--opt=value` / attached `-Zflag` form. A
+            # `--config build.target-dir=PATH` override is an explicit,
+            # command-local target choice, so it is treated like --target-dir.
+            cli = ""
+            if (j <= m && toks[j] ~ /^\+/) j++
+            while (j <= m && toks[j] ~ /^-/ && toks[j] != "--") {
+                opt = toks[j]
+                val = ""
+                if (opt == "--config" || opt == "--color" || opt == "--explain" || opt == "-Z" || opt == "-C") {
+                    if (j < m) val = toks[j + 1]
+                    j += 2
+                } else {
+                    if (opt ~ /^--config=/) val = substr(opt, index(opt, "=") + 1)
+                    j++
+                }
+                if ((opt == "--config" || opt ~ /^--config=/) && unq(val) ~ /^build\.target-dir=/) {
+                    val = unq(val)
+                    cli = substr(val, index(val, "=") + 1)
+                }
+            }
             if (j > m || toks[j] != "clean") continue
             j++
             scoped = 0
-            cli = ""
             for (k = j; k <= m; k++) {
                 if (toks[k] == "-p" || toks[k] == "--package" || toks[k] ~ /^--package=/) scoped = 1
                 else if (toks[k] == "--target-dir" && k < m) cli = unq(toks[k + 1])
@@ -8345,8 +8372,11 @@ cargo_clean_effective_target_dir() {
     printf '%s\n%s\n%s\n' "$source" "$resolved" "$cfgfile"
 }
 
-if [[ "$COMMAND_ASK_SCAN" == *cargo* ]] && \
-   printf '%s' "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`[:space:]])cargo[[:space:]]+clean'; then
+# Prefilter allows any run of option-like words (`+stable`, `--quiet`,
+# `--color never`) between `cargo` and `clean`; the awk parser above makes the
+# exact decision.
+if [[ "$COMMAND_ASK_SCAN" == *cargo* && "$COMMAND_ASK_SCAN" == *clean* ]] && \
+   printf '%s' "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`[:space:]])cargo([[:space:]]+[^[:space:];&|]+)*[[:space:]]+clean'; then
     _CARGO_CLEAN_MATCH=$(cargo_clean_scope_match "$COMMAND_ASK_SCAN")
     if [[ -n "$_CARGO_CLEAN_MATCH" ]] && [[ -n "$REPO_ROOT" ]] && cargo_clean_guard_enabled; then
         while IFS=$'\t' read -r _cc_env _cc_cli; do
@@ -8357,9 +8387,11 @@ if [[ "$COMMAND_ASK_SCAN" == *cargo* ]] && \
             _CARGO_TD_PATH=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '2p')
             _CARGO_TD_FILE=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '3p')
             [[ "$_CARGO_TD_SOURCE" == "config" && -n "$_CARGO_TD_PATH" ]] || continue
-            [[ "$_CARGO_TD_PATH" != "$REPO_ROOT" && "$_CARGO_TD_PATH" != "$REPO_ROOT"/* ]] || continue
-            # Lexical containment can disagree with git's symlink-resolved
-            # REPO_ROOT; re-test with both sides physically resolved.
+            # Containment is decided on the PHYSICAL (symlink-resolved) target
+            # and root only. A lexical pre-check would wrongly allow a
+            # repo-local symlink (`target-dir = "target-link"` -> external
+            # shared dir), while the physical comparison still allows the
+            # reverse case: an external spelling that resolves into the repo.
             _CARGO_TD_PATH_PHYS=$(physical_abs_path "$_CARGO_TD_PATH")
             _CARGO_REPO_ROOT_PHYS=$(physical_abs_path "$REPO_ROOT")
             [[ "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS" && \
