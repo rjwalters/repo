@@ -2025,10 +2025,18 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
 # BOTH this lexer and qsplit() so the two cannot drift (#113).
 function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
-                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn, sdep) {
+                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn, sdep, segbeg) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     split("", segs)          # clear the caller-supplied out-array
+    # Side channel (repo#588 review): ml_segbeg[k] is the buffer index where
+    # segment k starts and ml_segsep[k] the index of the separator byte that
+    # ENDED it (n + 1 for the final segment). Globals, so existing callers are
+    # unaffected; samecmd_binding_ctx_ok() reads them to prove WHERE a binding
+    # sits (unconditional, top level) relative to the separators around it.
+    split("", ml_segbeg)
+    split("", ml_segsep)
+    segbeg = 1
     split("", acs)           # stack of pending active-span CLOSING quote indexes
     acn = 0
     s = buf
@@ -2350,6 +2358,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 # its terminator, or through end-of-buffer when unterminated) is
                 # inert DATA and contributes no segment at all.
                 segs[++segc] = seg
+                ml_segbeg[segc] = segbeg; ml_segsep[segc] = i; segbeg = k
                 seg = ""
                 incmt = 0
                 i = k
@@ -2359,12 +2368,15 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
         }
         if (c == ";" || c == "&" || c == "|" || c == "\n") {
             if (c == "\n") incmt = 0   # a comment ends at the physical newline
-            segs[++segc] = seg; seg = ""; i++; continue
+            segs[++segc] = seg
+            ml_segbeg[segc] = segbeg; ml_segsep[segc] = i; segbeg = i + 1
+            seg = ""; i++; continue
         }
         seg = seg c
         i++
     }
     segs[++segc] = seg
+    ml_segbeg[segc] = segbeg; ml_segsep[segc] = n + 1
     return segc
 }
 '
@@ -4099,6 +4111,578 @@ _rm_scope_in_scope() {
     esac
 
     return 1
+}
+
+# =============================================================================
+# rm-scope SESSION-OWNED SCRATCH + SAME-COMMAND RESOLUTION (rjwalters/repo#581,
+# part of #579; behavior group ported from Loom's vendored
+# guard-destructive-generic.sh at 2072f82b, #8460 / #6520 / #6676 / #6805 /
+# #7986 / #8221 / #9331).
+#
+# Under guards.rmScope=repo a target outside the repo/worktree/tmp areas is
+# denied (`rm-scope-outside-repo`) and an unexpanded `$VAR` root is denied
+# (`rm-scope-unresolved-var`). Narrow, PROOF-BASED allowances are added; none
+# of them can reach the unconditional catastrophic floor (/, $HOME,
+# /<one-segment>), which always runs first:
+#
+#   1. rm_scope_session_scratch_admits — `<scratch-root>/<this session id>` (and
+#      paths under it) when the directory is a real non-symlink dir holding a
+#      regular `.loom-session-scratch` marker whose `session=` line names this
+#      session. The session id comes from the hook's own STDIN (`session_id`),
+#      which the acting model cannot influence. Anything unprovable fails CLOSED.
+#   2. rm_scope_mktemp_same_command_safe — a bare `$NAME` target whose ONLY
+#      binding in the same command is `NAME=$(mktemp -d)` / `NAME=$(mktemp)`
+#      (optionally followed by the exact `NAME=$(realpath "$NAME")` chain).
+#   3. rm_scope_literal_same_command_resolve — `$NAME[/literal-suffix]` whose
+#      only binding is `NAME=<absolute literal>`; the resolved path is then
+#      judged exactly like a literal `rm -rf` target (never skips the floor).
+#   4. _rm_scope_bare_var_name / _rm_scope_var_ref_split — parsers for 2/3.
+#
+# DIFFERENCES FROM LOOM (intentional):
+#   - REPO_GUARD_SCRATCH_ROOT wins over LOOM_GUARD_SCRATCH_ROOT; config key
+#     guards.scratchRoot is read via guard_cfg() (repo config wins over
+#     legacy .loom). The default root stays $HOME/.cache/loom/session-scratch
+#     so existing recipes keep working.
+#   - The Loom heredoc-substitution-span rescan (#8217 provenance mark) is a
+#     separate behavior group and is NOT ported; this guard's rm scan reads
+#     $COMMAND as before.
+#   - Scans use this file's whole-buffer ml_segment() lexer rather than
+#     Loom's per-record qsplit(), so multi-line quoted text is not mis-split.
+# =============================================================================
+
+# Ownership marker file name. This guard only ever READS it.
+SESSION_SCRATCH_MARKER=".loom-session-scratch"
+
+_SCRATCH_ROOT_DONE=""
+_SCRATCH_ROOT_CACHE=""
+resolve_scratch_root() {
+    if [[ -z "$_SCRATCH_ROOT_DONE" ]]; then
+        _SCRATCH_ROOT_DONE=yes
+        local root="" bad=0 cfgv=""
+        # env (REPO_* beats legacy LOOM_*) -> config -> default.
+        if [[ -n "${REPO_GUARD_SCRATCH_ROOT:-}" ]]; then
+            root="$REPO_GUARD_SCRATCH_ROOT"
+        elif [[ -n "${LOOM_GUARD_SCRATCH_ROOT:-}" ]]; then
+            root="$LOOM_GUARD_SCRATCH_ROOT"
+        else
+            cfgv=$(guard_cfg scratchRoot) || cfgv="unset"
+            [[ "$cfgv" == "unset" ]] || root="$cfgv"
+        fi
+        if [[ -z "$root" && -n "${HOME:-}" ]]; then
+            root="$HOME/.cache/loom/session-scratch"
+        fi
+        # Absolute + lexically normalized; a relative value is dropped.
+        if [[ "$root" == /* ]]; then
+            root=$(normalize_abs_path "$root")
+        else
+            root=""
+        fi
+        # ROOT SANITY SCREEN: a misconfigured root makes the carve-out inert,
+        # never broad (/, $HOME, /<one-segment>, the repo root or an ancestor).
+        if [[ -n "$root" ]]; then
+            if [[ "$root" == "/" ]]; then
+                bad=1
+            elif [[ -n "${HOME:-}" && "$root" == "$HOME" ]]; then
+                bad=1
+            elif [[ "$root" =~ ^/[^/]+$ ]]; then
+                bad=1
+            elif [[ -n "$REPO_ROOT" ]] && \
+                 { [[ "$root" == "$REPO_ROOT" ]] || [[ "$REPO_ROOT" == "$root"/* ]]; }; then
+                bad=1
+            fi
+            if [[ "$bad" == 1 ]]; then
+                log_hook_error "scratch root rejected as unsafe; session-scratch carve-out inert: $root"
+                root=""
+            fi
+        fi
+        _SCRATCH_ROOT_CACHE="$root"
+    fi
+    [[ -n "$_SCRATCH_ROOT_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_ROOT_CACHE"
+}
+
+# The acting session's id, straight off this hook's stdin. Returns 1 (carve-out
+# inert) when absent or not a plausible single path segment.
+_SCRATCH_SID_DONE=""
+_SCRATCH_SID_CACHE=""
+current_session_id() {
+    if [[ -z "$_SCRATCH_SID_DONE" ]]; then
+        _SCRATCH_SID_DONE=yes
+        local sid=""
+        sid=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null) || sid=""
+        if ! [[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]; then
+            sid=""
+        fi
+        _SCRATCH_SID_CACHE="$sid"
+    fi
+    [[ -n "$_SCRATCH_SID_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_SID_CACHE"
+}
+
+# Return 0 ONLY when $1 (a normalized absolute rm target) is this session's own
+# scratch directory or something under it. $2 is the target's RAW absolute
+# spelling (before normalize_abs_path). Every failure path returns 1.
+rm_scope_session_scratch_admits() {
+    local abs="$1" raw="${2-}"
+    local root sid dir marker recorded pdir pabs
+    # (0) No `..` in the raw spelling: normalize_abs_path pops `..` lexically
+    # but the kernel resolves it physically (`<dir>/tunnel/../x`).
+    [[ -n "$raw" ]] || return 1
+    if [[ "/$raw/" == */../* ]]; then
+        return 1
+    fi
+    root=$(resolve_scratch_root) || return 1
+    sid=$(current_session_id) || return 1
+    dir="$root/$sid"
+    # (3) The session dir itself or a descendant; never the root or a sibling.
+    if [[ "$abs" != "$dir" && "$abs" != "$dir"/* ]]; then
+        return 1
+    fi
+    # (4) A real directory, not a symlink planted at <root>/<id>.
+    if [[ ! -d "$dir" ]] || [[ -L "$dir" ]]; then
+        return 1
+    fi
+    # (5) Ownership marker: regular non-symlink file naming THIS session.
+    marker="$dir/$SESSION_SCRATCH_MARKER"
+    if [[ ! -f "$marker" ]] || [[ -L "$marker" ]]; then
+        return 1
+    fi
+    recorded=$(head -c 8192 "$marker" 2>/dev/null | sed -n 's/^session=//p' | head -1) || recorded=""
+    if [[ -z "$recorded" || "$recorded" != "$sid" ]]; then
+        return 1
+    fi
+    # (6) Symlink-traversal defense: re-check containment on physical paths,
+    # using the session dir's own physical form as the base.
+    pdir=$(physical_abs_path "$dir" 2>/dev/null) || pdir=""
+    pabs=$(physical_abs_path "$abs" 2>/dev/null) || pabs=""
+    if [[ -z "$pdir" || -z "$pabs" ]]; then
+        return 1
+    fi
+    if [[ "$pabs" != "$pdir" && "$pabs" != "$pdir"/* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# --- Self-referential canonicalization chain (#7986). -------------------------
+# Masks the EXACT `$(realpath "$NAME")` text into one opaque separator-free
+# token so the segment scan sees `NAME=<token>` as the (single permitted)
+# second assignment. Refuses (fail closed) if the token bytes already occur in
+# the command text. Only `realpath` is admitted -- never `$(cd "$NAME" && pwd
+# -P)`, because `cd ""` succeeds on some shells and would print the cwd.
+_MKTEMP_CANON_TOKEN=$'\001LOOM_MKTEMP_CANON\001'
+_MKTEMP_CANON_MASKED=""
+_mktemp_canon_mask() {
+    local varname="$1" cmdtext="$2" needle_rp masked
+    _MKTEMP_CANON_MASKED=""
+    case "$cmdtext" in
+        *"$_MKTEMP_CANON_TOKEN"*) return 1 ;;
+    esac
+    needle_rp='$(realpath "$'"$varname"'")'
+    masked="$cmdtext"
+    # The needle is pattern-METACHARACTER-FREE by construction (varname is
+    # [A-Za-z_][A-Za-z0-9_]*, and the literal contains no *, ?, [ or \), so it
+    # is spelled UNQUOTED in the pattern position on purpose: a metachar-free
+    # pattern means the same thing to bash 3.2 (macOS stock) and to bash 5,
+    # with no version-dependent question about how the quote characters
+    # inside a QUOTED pattern are handled.
+    masked="${masked//$needle_rp/$_MKTEMP_CANON_TOKEN}"
+    _MKTEMP_CANON_MASKED="$masked"
+    return 0
+}
+
+# --- Same-command REBINDING recognizer (#8221, widened by #9331). ------------
+# A `NAME=` prefix test alone misses `NAME+=`, `NAME[i]=`, an empty `NAME=`,
+# decl-keyword assignments, read/mapfile/readarray/getopts/unset/printf -v/
+# for/select naming NAME, and eval/source (name-agnostic). Each of those
+# poisons the single-binding proof (fail closed): `d=/tmp/a; d+=/../../etc;
+# rm -rf "$d"` must never be allowed. Shared by the two resolvers below.
+_MKTEMP_REBIND_AWK='
+function _mktemp_strip_decl_kw(seg,   out) {
+    out = seg
+    if (out ~ /^(export|readonly|declare|typeset|local)[ \t]/) {
+        sub(/^(export|readonly|declare|typeset|local)[ \t]+/, "", out)
+        while (out ~ /^-/) {
+            if (!sub(/^-[^ \t]*[ \t]*/, "", out)) break
+        }
+    }
+    return out
+}
+function _mktemp_strip_cmd_prefix(seg,   out) {
+    out = seg
+    while (1) {
+        if (sub(/^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^ \t]*[ \t]+/, "", out)) continue
+        if (sub(/^(command|builtin|exec)[ \t]+/, "", out)) continue
+        break
+    }
+    return out
+}
+function _mktemp_is_other_rebind(seg, varname,   n, i, toks, tok, bseg, cseg) {
+    bseg = _mktemp_strip_decl_kw(seg)
+    cseg = _mktemp_strip_cmd_prefix(bseg)
+    if (bseg ~ ("^" varname "(=|\\+=|\\[)")) return 1
+    if (cseg ~ ("^" varname "(=|\\+=|\\[)")) return 1
+    if (cseg ~ /^(eval|source|\.)([ \t]|$)/) return 1
+    if (cseg ~ /^printf([ \t]|$)/ && cseg ~ ("(^|[ \t])-v[ \t]*" varname "([ \t]|$)")) return 1
+    if (cseg ~ ("^(for|select)[ \t]+" varname "[ \t]+in([ \t]|$)")) return 1
+    if (cseg ~ /^(read|mapfile|readarray|getopts|unset)([ \t]|$)/) {
+        n = split(cseg, toks, /[ \t]+/)
+        for (i = 2; i <= n; i++) {
+            # Whitespace splitting alone leaves the bound name GLUED to what
+            # follows it, and both glues are ordinary spellings that hid the
+            # rebinding completely: a redirection (`read d</tmp/list`,
+            # `read -r d<<<"$x"` -- token `d</tmp/list`) and an array
+            # subscript (`unset d[0]` -- token `d[0]`). Reduce each token to
+            # the NAME it binds before comparing. Both subs only ever widen
+            # what counts as a rebinding, so both fail closed.
+            tok = toks[i]
+            sub(/[<>].*$/, "", tok)
+            sub(/\[[^]]*\]$/, "", tok)
+            if (tok == varname) return 1
+        }
+    }
+    return 0
+}
+'
+
+# --- Same-command ORDER + CONTEXT proof (repo#588 review, P1). -----------------
+# Counting bindings across the whole buffer is not enough: a binding proves the
+# rm target only if it is GUARANTEED to have executed, in THIS shell, BEFORE the
+# rm word expands. Both of these were admitted while the inherited value of `d`
+# is what the rm actually receives:
+#     rm -rf "$d"; d=/tmp/safe            (assignment AFTER the rm)
+#     false && d=/tmp/safe; rm -rf "$d"   (assignment SKIPPED)
+# These helpers require, on top of the single-binding count (fail closed on
+# anything unprovable):
+#   1. every reference to NAME sits in a segment AFTER the binding segment;
+#   2. the binding is reached unconditionally: every separator between it and
+#      the previous non-blank segment is `;` or an unescaped newline (never
+#      `&&`, `||`, `|`, `&`), and no control-flow or grouping construct opens
+#      before it (if/then/else/while/until/do/for/select/case/function/coproc,
+#      `(`, `{`, `!`, `NAME()` function definitions);
+#   3. it runs in the current shell: top level (not inside `$( )`/backticks),
+#      and not the left side of a pipeline `|` or backgrounded with `&`;
+#   4. no OTHER assignment-shaped occurrence of NAME exists anywhere (`NAME=`,
+#      `NAME+=`, `NAME[` at a word boundary, `${NAME:=...}`), so a rebinding
+#      buried in `then NAME=...`, `f() { NAME=...; }`, a case arm or a quoted
+#      trap string still poisons the proof.
+# Requires ml_segment() to have just filled ml_segbeg[] / ml_segsep[].
+_SAMECMD_ORDER_AWK='
+function samecmd_trim(t) {
+    sub(/^[ \t\n]+/, "", t)
+    sub(/[ \t\n]+$/, "", t)
+    return t
+}
+function samecmd_assign_like(seg, varname) {
+    if (seg ~ ("(^|[^A-Za-z0-9_$])" varname "(\\+?=|\\[)")) return 1
+    if (seg ~ ("\\$\\{" varname ":?[=?]")) return 1
+    return 0
+}
+function samecmd_refers(seg, varname) {
+    if (seg ~ ("\\$" varname "([^A-Za-z0-9_]|$)")) return 1
+    if (seg ~ ("\\$\\{[#!]?" varname "([^A-Za-z0-9_]|$)")) return 1
+    return 0
+}
+function samecmd_opens_compound(t) {
+    t = samecmd_trim(t)
+    if (t ~ /^[({!]/) return 1
+    if (t ~ /^(if|then|elif|else|fi|while|until|do|done|for|select|case|esac|function|coproc)([ \t;]|$)/) return 1
+    if (t ~ /^[A-Za-z_][A-Za-z0-9_:.-]*[ \t]*\(\)/) return 1
+    return 0
+}
+# 1 when segment k (a NAME=... binding) is unconditional, top level, current
+# shell, and preceded by no control-flow construct. buf is the exact text
+# ml_segment() just segmented into segs[1..n].
+function samecmd_binding_ctx_ok(buf, segs, n, k,   blen, j, p, c, nc, pos, sdep, t) {
+    if (k < 1 || k > n) return 0
+    blen = length(buf)
+    # (3a) top level: not inside a command substitution.
+    subst_depth(buf, sdep)
+    pos = ml_segbeg[k]
+    while (pos <= blen && substr(buf, pos, 1) ~ /[ \t\n]/) pos++
+    if (pos <= blen && (sdep[pos] + 0) > 0) return 0
+    # (2a) nothing before it opens control flow or a grouping/subshell.
+    for (j = 1; j < k; j++) {
+        if (samecmd_opens_compound(segs[j])) return 0
+    }
+    # (2b) separators back to the previous non-blank, non-comment segment.
+    for (j = k - 1; j >= 1; j--) {
+        p = ml_segsep[j]
+        c = substr(buf, p, 1)
+        if (c == "&" || c == "|") return 0
+        if (c == "\n" && bs_escaped(buf, p)) return 0
+        if (c != ";" && c != "\n") return 0
+        t = samecmd_trim(segs[j])
+        # A blank segment (between `&&` and a newline) or a comment-only one
+        # (`false && # note` + newline continues the list) carries the
+        # previous separator forward; keep walking back.
+        if (t != "" && t !~ /^#/) break
+    }
+    # (3b) the separator AFTER it must not pipe or background the binding.
+    p = ml_segsep[k]
+    if (p <= blen) {
+        c = substr(buf, p, 1)
+        nc = (p < blen) ? substr(buf, p + 1, 1) : ""
+        if (c == "|" && nc != "|") return 0
+        if (c == "&" && nc != "&") return 0
+        if (c == ";" && (nc == ";" || nc == "&")) return 0
+        if (c == "\n" && bs_escaped(buf, p)) return 0
+    }
+    return 1
+}
+# Index of the first segment that references NAME, 0 when none does.
+function samecmd_first_ref(segs, n, varname,   i) {
+    for (i = 1; i <= n; i++) {
+        if (samecmd_refers(segs[i], varname)) return i
+    }
+    return 0
+}
+'
+
+# _rm_scope_bare_var_name TOKEN -- print NAME when TOKEN is exactly `$NAME`/`${NAME}`
+# (one optional quote layer), else return 1.
+_rm_scope_bare_var_name() {
+    local tok="$1" t c1 c2
+    t="$tok"
+    if [[ ${#t} -ge 2 ]]; then
+        c1="${t:0:1}"
+        c2="${t: -1}"
+        if [[ ("$c1" == '"' && "$c2" == '"') || ("$c1" == "'" && "$c2" == "'") ]]; then
+            t="${t:1:${#t}-2}"
+        fi
+    fi
+    if [[ "$t" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$t" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# rm_scope_mktemp_same_command_safe TARGET CMDTEXT -- success only when TARGET is
+# a BARE `$NAME`/`${NAME}` (one optional quote layer) and CMDTEXT (heredoc-body
+# masked by the caller) binds NAME exactly once, to the plain `$(mktemp -d)` /
+# `$(mktemp)` forms (optionally followed by the #7986 realpath chain). A custom
+# template/--tmpdir never matches, so it falls through to the fail-closed deny.
+rm_scope_mktemp_same_command_safe() {
+    local target="$1" cmdtext="$2" varname verdict
+    varname=$(_rm_scope_bare_var_name "$target") || return 1
+    [[ -n "$varname" ]] || return 1
+    # #7986: mask the self-referential canonicalization chain (if any) into an
+    # opaque, separator-free token BEFORE the segment scan — see
+    # _mktemp_canon_mask()'s doc comment above. A refusal (the token's bytes
+    # already occur in the command text) fails closed.
+    _mktemp_canon_mask "$varname" "$cmdtext" || return 1
+    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        n = ml_segment(buf, segs)
+        nsegs = n
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/[ \t]+$/, "", seg)
+            # #8221: recognize export/readonly/declare/typeset/local NAME=...
+            # as an assignment too (see _MKTEMP_REBIND_AWK'"'"'s header comment).
+            bseg = _mktemp_strip_decl_kw(seg)
+            prefix = varname "="
+            plen = length(prefix)
+            if (length(bseg) > plen && substr(bseg, 1, plen) == prefix) {
+                rhs = substr(bseg, plen + 1)
+                total++
+                if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
+                    rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
+                    safe++
+                    if (safeat == 0) { safeat = total; safeseg = i }
+                } else if (rhs == canontok || rhs == "\"" canontok "\"") {
+                    canon++
+                    if (canonat == 0) canonat = total
+                }
+            } else if (_mktemp_is_other_rebind(seg, varname) || samecmd_assign_like(seg, varname)) {
+                # #8221 + #9331: every rebinding of NAME that does not produce
+                # a segment beginning `NAME=` -- read/mapfile/readarray/
+                # getopts/unset/printf -v/for/select naming NAME, `NAME+=`,
+                # `NAME[i]=`, an empty `NAME=`, and any eval/source. Poison
+                # the count exactly like a second `NAME=` assignment, never
+                # treated as safe/canon.
+                total++
+            }
+        }
+    }
+    END {
+        # The historic single-assignment proof (#6520), plus the ONE chained
+        # form #7986 admits: EXACTLY two assignments, the mktemp-shaped one
+        # FIRST and the self-referential canonicalization SECOND. A third
+        # assignment, either shape repeated, or the reverse order all leave
+        # this false and fail closed.
+        ok = 0
+        if (total == 1 && safe == 1) ok = 1
+        else if (total == 2 && safe == 1 && canon == 1 && safeat == 1 && canonat == 2) ok = 1
+        # repo#588: the mktemp binding must be PROVEN to run, in this shell,
+        # before any use of NAME (see _SAMECMD_ORDER_AWK). The optional
+        # realpath chain needs no context proof of its own: whether or not it
+        # runs, NAME holds the mktemp path or its canonical spelling.
+        if (ok) {
+            fr = samecmd_first_ref(segs, nsegs, varname)
+            if (fr != 0 && fr <= safeseg) ok = 0
+            else if (!samecmd_binding_ctx_ok(buf, segs, nsegs, safeseg)) ok = 0
+        }
+        print (ok ? "SAFE" : "UNSAFE")
+    }')
+    [[ "$verdict" == "SAFE" ]]
+}
+
+# _rm_scope_var_ref_split TOKEN -- split `$NAME<suffix>` into "NAME<TAB>suffix"; fail
+# closed on any non-literal suffix or a variable that is not the path root.
+# Built on mark_expandable_dollars() so quoting cannot dodge the tests.
+_rm_scope_var_ref_split() {
+    local tok="$1" marked body name rest
+    mark_expandable_dollars "$tok"
+    marked="$_MARKED_TOKEN"
+    [[ "$marked" == $'\001'* ]] || return 1
+    body="${marked:1}"
+    if [[ "$body" =~ ^\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$ ]]; then
+        name="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+    elif [[ "$body" =~ ^([A-Za-z_][A-Za-z0-9_]*)(.*)$ ]]; then
+        name="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    case "$rest" in
+        *$'\001'*|*'`'*|*'$'*) return 1 ;;
+    esac
+    [[ -z "$rest" || "$rest" == /* ]] || return 1
+    printf '%s\t%s' "$name" "$rest"
+}
+
+# rm_scope_literal_same_command_resolve TARGET CMDTEXT -- for `$NAME[/suffix]`
+# whose ONLY same-command binding is a bare `NAME=<absolute literal>`, print the
+# resolved path. The caller judges it like a literal `rm` target (floor +
+# scope), so this never skips a check. Anything else returns 1 (fail closed).
+rm_scope_literal_same_command_resolve() {
+    local target="$1" cmdtext="$2" split varname suffix resolved
+    split=$(_rm_scope_var_ref_split "$target") || return 1
+    varname="${split%%$'\t'*}"
+    suffix="${split#*$'\t'}"
+    [[ -n "$varname" ]] || return 1
+    resolved=$(printf '%s' "$cmdtext" | awk -v varname="$varname" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
+    BEGIN {
+        DQ = sprintf("%c", 34)
+        SQ = sprintf("%c", 39)
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        n = ml_segment(buf, segs)
+        nsegs = n
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/[ \t]+$/, "", seg)
+            prefix = varname "="
+            plen = length(prefix)
+            if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
+                total++
+                val = substr(seg, plen + 1)
+                bindseg = i
+            } else if (_mktemp_is_other_rebind(seg, varname) || samecmd_assign_like(seg, varname)) {
+                # #9331: NAME+= / NAME[i]= / an EMPTY NAME= / a
+                # declaration-keyword assignment / read|mapfile|readarray|
+                # getopts|unset|printf -v|for|select naming NAME / any eval
+                # or source. Each rebinds NAME (or can) without producing a
+                # segment that BEGINS `NAME=`, so each was invisible to the
+                # test above and the resolution below ran on a value the shell
+                # would no longer be holding at the `rm` word. Poison it: this
+                # resolver is a RELAXATION of the catastrophic floor, so
+                # "cannot account for NAME" must reach the fail-closed deny,
+                # never an allow. Counted separately from `total` because the
+                # only resolvable form here stays a BARE `NAME=<literal>`
+                # segment head -- recognizing a decl-keyword assignment as
+                # RESOLVABLE would newly ALLOW `export d=/tmp/x; rm -rf "$d"`,
+                # which is a relaxation this tightening must not smuggle in
+                # (#9601 is where a widening like that belongs).
+                rebind++
+            }
+        }
+    }
+    END {
+        # repo#588: the binding must also be PROVEN to run, in this shell,
+        # before any use of NAME (see _SAMECMD_ORDER_AWK).
+        if (total == 1 && rebind == 0) {
+            fr = samecmd_first_ref(segs, nsegs, varname)
+            if (fr != 0 && fr <= bindseg) total = -1
+            else if (!samecmd_binding_ctx_ok(buf, segs, nsegs, bindseg)) total = -1
+        }
+        if (total == 1 && rebind == 0) {
+            vlen = length(val)
+            quoted = 0
+            if (vlen >= 2) {
+                c1 = substr(val, 1, 1)
+                c2 = substr(val, vlen, 1)
+                if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+                    val = substr(val, 2, vlen - 2)
+                    quoted = 1
+                }
+            }
+            # Any shell metacharacter or stray quote means the segment is not
+            # a plain `NAME=<literal>` (a subshell close, a redirection, a
+            # second word). Unquoted whitespace makes it a PREFIX assignment
+            # (`NAME=/x cmd`) that never persists in the shell. Fail closed.
+            if (val ~ /[;&|<>()\\\n]/ || index(val, DQ) || index(val, SQ)) val = ""
+            if (!quoted && val ~ /[ \t]/) val = ""
+            if (val ~ /^\// && val !~ /[$`]/) print val
+        }
+    }')
+    [[ -n "$resolved" ]] || return 1
+    printf '%s' "${resolved}${suffix}"
+}
+
+# physical_abs_path PATH -- resolve symlinks as far as the filesystem allows,
+# appending not-yet-existing trailing segments lexically (symlink-resolving
+# counterpart of the pure-lexical normalize_abs_path).
+physical_abs_path() {
+    # Resolve an ABSOLUTE path's symlinks as far as the filesystem allows,
+    # keeping any not-yet-existing trailing segments lexically appended.
+    #
+    # This is the symlink-resolving counterpart to normalize_abs_path(), which
+    # is deliberately pure-lexical (see its header) and therefore leaves a
+    # symlinked ancestor intact. Whenever a lexically-built path is compared
+    # against a path that came from git (`rev-parse --show-toplevel` /
+    # `--git-common-dir`, both of which return the symlink-RESOLVED spelling),
+    # the two can describe the same directory in different words and never
+    # string-match. On macOS this is the default state of any $TMPDIR path:
+    # /var is a symlink to /private/var, so `mktemp -d` yields
+    # /var/folders/... while git reports /private/var/folders/... (#6684; the
+    # same divergence the /tmp -> /private/tmp `pwd -P` note at the worktree
+    # containment block below already handles for its own comparisons).
+    #
+    # Walking up to the deepest EXISTING ancestor before `cd`-ing matters:
+    # the paths compared here (e.g. a target-dir cargo has not created yet)
+    # routinely do not exist on disk, and `realpath -m`, which would handle
+    # that, is GNU-only and silently no-ops on macOS.
+    local path="$1" tail="" phys
+    [[ "$path" == /* ]] || { printf '%s' "$path"; return 0; }
+    path=$(normalize_abs_path "$path")
+    while [[ ! -d "$path" && "$path" != "/" ]]; do
+        tail="${path##*/}${tail:+/}$tail"
+        path="${path%/*}"
+        [[ -n "$path" ]] || path="/"
+    done
+    phys=$(cd "$path" 2>/dev/null && pwd -P) || phys=""
+    [[ -n "$phys" ]] || phys="$path"
+    if [[ -n "$tail" ]]; then
+        if [[ "$phys" == "/" ]]; then
+            printf '/%s' "$tail"
+        else
+            printf '%s/%s' "$phys" "$tail"
+        fi
+    else
+        printf '%s' "$phys"
+    fi
 }
 
 # =============================================================================
@@ -6318,19 +6902,47 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
         # stays byte-for-byte unchanged — no new denials appear when the
         # feature is off (the existing CWD-relative fallback still applies).
         # -------------------------------------------------------------
+        _rm_literal_resolved=""
         if [[ "$target" == *'$'* ]] && rm_scope_repo_enabled; then
             mark_expandable_dollars "$target"
             _rmarked="$_MARKED_TOKEN"
             if [[ "$_rmarked" == *$'\001'* ]]; then
                 if [[ "$_rmarked" == $'\001'* || "$_rmarked" == /$'\001'* ]]; then
-                    # Case (1): path root unresolved.
-                    deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime under guards.rmScope=repo — it may point far outside the repo (the #239 regression: an unresolvable target at a repo cwd was silently treated as repo-relative). Unresolvable rm targets fail closed. Spell out the literal path, or unroll the loop so each rm target is a concrete string." "rm-scope-unresolved-var"
+                    # Case (1): path root unresolved. Two narrow SAME-COMMAND
+                    # proofs may still vet the target (#581, ported from Loom
+                    # #6520/#6676/#6805); see rm_scope_mktemp_same_command_safe()
+                    # and rm_scope_literal_same_command_resolve(). Both scan a
+                    # heredoc-body-MASKED copy of the command: a heredoc body is
+                    # never a live top-level assignment of the current shell, so
+                    # masking can only narrow (turn a decoy-inflated SAFE into
+                    # UNSAFE), never widen.
+                    if [[ -z "${COMMAND_RM_MKTEMP_SCAN+x}" ]]; then
+                        COMMAND_RM_MKTEMP_SCAN="$COMMAND_NO_LITERAL_TEXT"
+                        if [[ "$COMMAND_RM_MKTEMP_SCAN" == *"<<"* ]]; then
+                            COMMAND_RM_MKTEMP_SCAN=$(printf '%s' "$COMMAND_RM_MKTEMP_SCAN" | awk "$_MASKHEREDOC_AWK"'
+                            { buf = buf (NR > 1 ? "\n" : "") $0 }
+                            END { printf "%s", mask_heredoc_bodies(buf) }')
+                        fi
+                    fi
+                    # (a) Proven `NAME=$(mktemp -d)` target: fully vetted.
+                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_RM_MKTEMP_SCAN"; then
+                        continue
+                    fi
+                    # (b) Proven literal value: NOT skipped past the checks --
+                    # the resolved path replaces the token and is judged below
+                    # exactly like a literal `rm -rf /that/path`.
+                    _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
+                    if [[ -z "$_rm_literal_resolved" ]]; then
+                        deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime under guards.rmScope=repo — it may point far outside the repo (the #239 regression: an unresolvable target at a repo cwd was silently treated as repo-relative). Unresolvable rm targets fail closed. Spell out the literal path, or unroll the loop so each rm target is a concrete string." "rm-scope-unresolved-var"
+                    fi
                 fi
                 _rdirpart=""
                 case "$_rmarked" in
                     */*) _rdirpart="${_rmarked%/*}" ;;
                 esac
-                if [[ "$_rdirpart" == *$'\001'* ]]; then
+                # A literal-resolved root (case 1b) is judged below as a whole
+                # path, so the known-prefix test (case 2) does not apply.
+                if [[ -z "$_rm_literal_resolved" && "$_rdirpart" == *$'\001'* ]]; then
                     # Case (2): unresolved variable in a directory component,
                     # with a known literal root. Build the effective path the
                     # same way the resolution below does (cwd-joined when
@@ -6359,12 +6971,29 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
         fi
 
         # Resolve path to absolute (raw — normalization happens next).
+        #
+        # Shell-accurate quote removal, for the CLASSIFICATION only (Loom
+        # #4926/#6814, ported with #581): extract_rm_targets() emits tokens
+        # with their quote characters preserved verbatim, so a quoted absolute
+        # target (`'/opt/evil'`, `"/opt/evil"`) would start with a quote
+        # rather than `/`, be misread as RELATIVE, be cwd-prefixed into
+        # `<repo>/'/opt/evil'` and pass the in-repo prefix check -- admitting
+        # an out-of-repo target merely by quoting it. Unquote a COPY; the
+        # allowlist above and the deny messages keep the raw token. An
+        # unterminated quote falls back to the raw token (today's verdict).
+        _rmclassify="$target"
+        strip_target_quoting "$target" && _rmclassify="$_UNQUOTED_TARGET"
         ABS_PATH=""
-        if [[ "$target" = /* ]]; then
-            ABS_PATH="$target"
+        if [[ -n "$_rm_literal_resolved" ]]; then
+            ABS_PATH="$_rm_literal_resolved"
+        elif [[ "$_rmclassify" = /* ]]; then
+            ABS_PATH="$_rmclassify"
         elif [[ -n "$CWD" ]]; then
-            ABS_PATH="$CWD/$target"
+            ABS_PATH="$CWD/$_rmclassify"
         fi
+        # Pre-normalization spelling, for the session-scratch carve-out's
+        # `..`-segment refusal (see rm_scope_session_scratch_admits()).
+        _rm_abs_raw="$ABS_PATH"
 
         # Lexically normalize the absolute target BEFORE the protected-path
         # check. This collapses //, resolves . and .., and strips trailing
@@ -6397,8 +7026,17 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
                 # Repo/worktree areas + the built-in ephemeral allowlist,
                 # via the SAME containment test the unresolved-variable
                 # handling above uses (#239) — one definition of "in scope".
-                if ! _rm_scope_in_scope "$ABS_PATH"; then
-                    deny "BLOCKED: rm target outside repo scope (guards.rmScope=repo; set guards.rmScope:\"off\" in .claude/skills/repo/config.json to opt out): $ABS_PATH" "rm-scope-outside-repo"
+                # THIS SESSION'S OWN proven scratch directory (#581, Loom #8460)
+                # is admitted LAST: the cheaper lexical tests above ran first,
+                # and this one stats the filesystem and reads the marker.
+                if ! _rm_scope_in_scope "$ABS_PATH" && ! rm_scope_session_scratch_admits "$ABS_PATH" "$_rm_abs_raw"; then
+                    _rm_scratch_hint=""
+                    _rm_scratch_root=$(resolve_scratch_root) || _rm_scratch_root=""
+                    if [[ -n "$_rm_scratch_root" ]] && \
+                       { [[ "$ABS_PATH" == "$_rm_scratch_root" ]] || [[ "$ABS_PATH" == "$_rm_scratch_root"/* ]]; }; then
+                        _rm_scratch_hint=" This path is under the session-scratch root ($_rm_scratch_root), but this session cannot prove it owns it. The only removable path there is <root>/<this session's id> -- or something under it -- and that directory must be a real (non-symlink) directory holding a regular file named $SESSION_SCRATCH_MARKER whose 'session=' line names that same id. The root itself is never removable, and another session's directory never is."
+                    fi
+                    deny "BLOCKED: rm target outside repo scope (guards.rmScope=repo; set guards.rmScope:\"off\" in .claude/skills/repo/config.json to opt out): ${ABS_PATH}${_rm_scratch_hint}" "rm-scope-outside-repo"
                 fi
             fi
         fi

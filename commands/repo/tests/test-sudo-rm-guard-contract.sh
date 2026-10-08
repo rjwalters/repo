@@ -589,9 +589,15 @@ install_standin() {
 # Sets GATE_EXECUTED (0/1), GATE_STATUS (the command's status; 1 for a blocked
 # call, as Claude Code reports a blocked tool call as an error) and GATE_OUTPUT
 # (merged stdout+stderr; empty when blocked, since nothing ran).
+#
+# GATE_EXEC_ENV (array of NAME=VAL) is applied to the EXECUTED command only,
+# never to the guard's view of it: it models shell state the call inherits
+# from an earlier, separate call, which the guard cannot see in the command
+# text it classifies.
 GATE_EXECUTED=0
 GATE_STATUS=0
 GATE_OUTPUT=""
+GATE_EXEC_ENV=()
 gate_run() {
     local cwd="$1" cmd="$2"; shift 2
     guard_run "$cwd" "$cmd" "$@"
@@ -602,16 +608,30 @@ gate_run() {
         return 0
     fi
     GATE_EXECUTED=1
-    GATE_OUTPUT="$(cd "$cwd" && PATH="$SHIM_BIN:$PATH" bash -c "$cmd" 2>&1)"
+    GATE_OUTPUT="$(cd "$cwd" && env ${GATE_EXEC_ENV[@]+"${GATE_EXEC_ENV[@]}"} \
+        PATH="$SHIM_BIN:$PATH" bash -c "$cmd" 2>&1)"
     GATE_STATUS=$?
 }
 
-# The real rollback block, with DROPIN bound in the SAME command string — the
-# shape repo#252 already confirmed same-command variable resolution does not
-# rescue. Binding it is what keeps execution confined to the stand-in: the
-# executed `rm` can only ever name this scratch path.
-ROLLBACK_VS_STANDIN="DROPIN=\"$DROPIN_STANDIN\"
-$ROLLBACK_BLOCK"
+# The real rollback block, byte-for-byte, with DROPIN supplied by the
+# EXECUTION environment (GATE_EXEC_ENV), not bound in the command text.
+#
+# Why not bind it in the same command string (the earlier form of this case):
+# since repo#581 the guard ports Loom's rm_scope_literal_same_command_resolve,
+# which resolves `NAME=<absolute literal>; rm "$NAME"` and judges the resolved
+# path exactly like a literal `rm` target. A same-command binding to this
+# scratch stand-in (an in-scope /tmp path) is therefore — correctly — judged
+# like `sudo rm -f /tmp/.../alice-nopasswd`, which rmScope=repo has always
+# allowed; the binding would test the stand-in's location, not the rollback.
+# The note's real situation is the rollback running in a call that does NOT
+# bind DROPIN in its own text (sudo.md's binding is
+# `DROPIN="/etc/sudoers.d/${USER_NAME}-nopasswd"`, which is not a literal and
+# is never resolved; and the real /etc path is outside the repo under any
+# resolution — both pinned below in 8e). Supplying DROPIN through the
+# execution environment reproduces exactly that: the guard classifies the
+# unchanged block, and the executed `rm` can only ever name this stand-in.
+ROLLBACK_VS_STANDIN="$ROLLBACK_BLOCK"
+GATE_EXEC_ENV=("DROPIN=$DROPIN_STANDIN")
 
 if [[ -z "$ROLLBACK_BLOCK" ]]; then
     no "denied rollback strands the stand-in drop-in" \
@@ -695,6 +715,32 @@ if [[ -n "$INSTALL_FENCE" ]]; then
 else
     no "whole step 5 fence as ONE call denies before the cp (rm-scope-unresolved-var)" \
         "could not extract the install fence (the one containing sudo cp \"\$TMP\" \"\$DROPIN\") from $SUDO_MD"
+fi
+
+# 8e. Same-command binding boundary (repo#581). Classified only, never
+# executed. The literal resolver must not rescue the REAL rollback: sudo.md's
+# own `${USER_NAME}` binding is not a literal (stays rm-scope-unresolved-var),
+# and a literal /etc/sudoers.d binding resolves to a path that is outside the
+# repo, so the ordinary out-of-repo rule fires — section 4's "only changes
+# which rule fires, not the outcome". The in-scope stand-in binding is the one
+# shape the resolver admits, and it is pinned as such so a future change to
+# that allowance is a visible decision here rather than a silent drift in 8a.
+if [[ -n "$ROLLBACK_BLOCK" ]]; then
+    assert_deny_tag "rollback with sudo.md's own DROPIN binding still denies (rm-scope-unresolved-var)" \
+        "rm-scope-unresolved-var" "$REPO_ROOT" \
+        "DROPIN=\"/etc/sudoers.d/\${USER_NAME}-nopasswd\"
+$ROLLBACK_BLOCK"
+    assert_deny_tag "rollback with a literal /etc/sudoers.d DROPIN binding denies (rm-scope-outside-repo)" \
+        "rm-scope-outside-repo" "$REPO_ROOT" \
+        "DROPIN=\"/etc/sudoers.d/alice-nopasswd\"
+$ROLLBACK_BLOCK"
+    assert_decision "rollback with an in-scope /tmp stand-in binding is judged like the literal (allow, #581)" \
+        "allow" "$REPO_ROOT" \
+        "DROPIN=\"$DROPIN_STANDIN\"
+$ROLLBACK_BLOCK"
+else
+    no "same-command binding boundary for the rollback block" \
+        "ROLLBACK_BLOCK is empty — could not extract the rollback block from $SUDO_MD"
 fi
 
 # 8d. The prose side of what 8a/8c just established. The note must say the deny
