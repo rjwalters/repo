@@ -62,6 +62,7 @@ for _guard_env_var in \
     REPO_DEFAULT_BRANCH LOOM_DEFAULT_BRANCH \
     REPO_GUARD_TMPFS_SCRATCH LOOM_GUARD_TMPFS_SCRATCH \
     REPO_GUARD_MOUNTS_FILE LOOM_GUARD_MOUNTS_FILE \
+    REPO_GUARD_SCRATCH_ROOT LOOM_GUARD_SCRATCH_ROOT \
     LOOM_WORKTREE_ROOT; do
     unset "$_guard_env_var"
 done
@@ -1484,7 +1485,7 @@ assert_allow "Allow rm -rf on a /var subpath (scoped)" \
 # 7. Crude rm-target extraction: a token from an earlier command must not be
 #    mis-read as an rm target ("outside repository" phantom).
 assert_allow "Allow cat-then-scoped-rm without phantom target" \
-    "cat something.txt && rm -rf ./build"
+    "cat something.txt && rm -rf ./work"
 assert_allow "Allow HOST=cat(...); ssh ... rm -rf remote-path (phantom class)" \
     'HOST=$(cat host-ip.txt); ssh $HOST rm -rf /home/ubuntu/foo'
 
@@ -6678,6 +6679,144 @@ assert_allow "#580: variable assigned an @mention (not path-shaped) is untouched
     'WHO="@reviewer"; gh pr comment 4600 --body "$WHO thanks"'
 assert_allow "#580: @path variable that is NOT passed as --body is untouched" \
     'F="@/tmp/x.md"; gh pr comment 4600 --body-file /tmp/other.md'
+
+# =========================================================================
+# #581 (part of #579): rm-scope session scratch + same-command resolution
+# Ported from Loom's guard (2072f82b): rm_scope_session_scratch_admits,
+# rm_scope_mktemp_same_command_safe, rm_scope_literal_same_command_resolve.
+# =========================================================================
+echo -e "${YELLOW}--- rm-scope session scratch / same-command resolution (#581) ---${NC}"
+
+# Verdict helper: sid + env assignments + command. The scratch root must live
+# OUTSIDE the built-in /tmp allowlist or the carve-out would be vacuous.
+_sc_verdict() {
+    local sid="$1" envs="$2" cmd="$3" out
+    local -a ea=()
+    [[ -n "$envs" ]] && read -r -a ea <<< "$envs"
+    out=$(jq -n --arg cmd "$cmd" --arg cwd "$REPO_ROOT" --arg sid "$sid" '{
+        tool_name: "Bash", tool_input: { command: $cmd }, cwd: $cwd,
+        session_id: (if $sid == "" then null else $sid end) }' \
+        | env ${ea[@]+"${ea[@]}"} "$GUARD" 2>&1) || true
+    if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+        echo deny
+    else
+        echo allow
+    fi
+}
+assert_sc() {  # <allow|deny> <description> <sid> <env-assignments> <command>
+    local want="$1" desc="$2" sid="$3" envs="$4" cmd="$5" got
+    TOTAL=$((TOTAL + 1))
+    got=$(_sc_verdict "$sid" "$envs" "$cmd")
+    if [[ "$got" == "$want" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $desc"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $desc"
+        echo -e "       Command: $cmd (sid: ${sid:-none}, env: ${envs:-none})"
+        echo -e "       Expected: $want, got: $got"
+    fi
+}
+
+mkdir -p "$HOME/.cache" 2>/dev/null || true
+SC_BASE=$(mktemp -d "$HOME/.cache/guard-sc581.XXXXXX")
+SC_ROOT="$SC_BASE/root"
+SC_SID="sess-owned-0001"; SC_OTHER="sess-other-0002"; SC_NOMARK="sess-nomark-0003"; SC_WRONG="sess-wrong-0004"
+mkdir -p "$SC_ROOT/$SC_SID/work" "$SC_ROOT/$SC_OTHER/work" "$SC_ROOT/$SC_NOMARK/work" \
+         "$SC_ROOT/$SC_WRONG/work" "$SC_BASE/outside/inner"
+printf 'session=%s\n' "$SC_SID" > "$SC_ROOT/$SC_SID/.loom-session-scratch"
+printf 'session=%s\n' "$SC_OTHER" > "$SC_ROOT/$SC_OTHER/.loom-session-scratch"
+printf 'session=%s\n' "$SC_SID" > "$SC_ROOT/$SC_WRONG/.loom-session-scratch"   # names a DIFFERENT session
+ln -s "$SC_BASE/outside/inner" "$SC_ROOT/$SC_SID/tunnel"
+ln -s "$SC_BASE/outside" "$SC_ROOT/$SC_SID/escape"
+ln -s "$SC_ROOT/$SC_SID" "$SC_ROOT/sess-link-0005"
+SC_ENV="REPO_GUARD_SCRATCH_ROOT=$SC_ROOT"
+
+# -- session scratch: admitted only when proven --
+assert_sc allow "#581 scratch: own session dir build subdir allowed" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID/work"
+assert_sc allow "#581 scratch: own session dir itself allowed" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID"
+assert_sc allow "#581 scratch: legacy LOOM_GUARD_SCRATCH_ROOT still honored" "$SC_SID" "LOOM_GUARD_SCRATCH_ROOT=$SC_ROOT" "rm -rf $SC_ROOT/$SC_SID/work"
+assert_sc deny "#581 scratch: unrelated scratch dir outside session denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_BASE/other-dir"
+assert_sc deny "#581 scratch: another session's dir denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_OTHER/work"
+assert_sc deny "#581 scratch: scratch root itself denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT"
+assert_sc deny "#581 scratch: own-id dir without marker denied" "$SC_NOMARK" "$SC_ENV" "rm -rf $SC_ROOT/$SC_NOMARK/work"
+assert_sc deny "#581 scratch: marker naming a different session denied" "$SC_WRONG" "$SC_ENV" "rm -rf $SC_ROOT/$SC_WRONG/work"
+assert_sc deny "#581 scratch: no session id on stdin denied" "" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID/work"
+assert_sc deny "#581 scratch: implausible (short) session id denied" "abc" "$SC_ENV" "rm -rf $SC_ROOT/abc/work"
+assert_sc deny "#581 scratch: no scratch root override (default root) denied" "$SC_SID" "" "rm -rf $SC_ROOT/$SC_SID/work"
+assert_sc deny "#581 scratch: symlink escape through session dir denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID/escape/inner"
+assert_sc deny "#581 scratch: symlinked session dir denied" "sess-link-0005" "$SC_ENV" "rm -rf $SC_ROOT/sess-link-0005/work"
+assert_sc deny "#581 scratch: .. through an in-session symlink denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID/tunnel/../x"
+assert_sc deny "#581 scratch: .. back out of session dir denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/$SC_SID/../$SC_OTHER/work"
+assert_sc deny "#581 scratch: sibling sharing the id prefix denied" "$SC_SID" "$SC_ENV" "rm -rf $SC_ROOT/${SC_SID}-evil"
+assert_sc deny "#581 scratch: unresolved variable under scratch denied" "$SC_SID" "$SC_ENV" 'rm -rf "$SCRATCH/work"'
+assert_sc deny "#581 scratch: REPO_ env root wins over legacy LOOM_ root" "$SC_SID" "REPO_GUARD_SCRATCH_ROOT=$SC_BASE/elsewhere LOOM_GUARD_SCRATCH_ROOT=$SC_ROOT" "rm -rf $SC_ROOT/$SC_SID/work"
+assert_sc deny "#581 scratch: unsafe root '/' is inert; floor still denies" "$SC_SID" "REPO_GUARD_SCRATCH_ROOT=/" "rm -rf /$SC_SID"
+assert_sc deny "#581 scratch: one-segment root rejected as unsafe" "$SC_SID" "REPO_GUARD_SCRATCH_ROOT=/opt" "rm -rf /opt/$SC_SID/work"
+assert_sc deny "#581 scratch: \$HOME as root rejected as unsafe" "$SC_SID" "REPO_GUARD_SCRATCH_ROOT=$HOME" "rm -rf $HOME/$SC_SID/work"
+assert_sc allow "#581 scratch: quoted literal text naming a scratch path is not an rm" "$SC_SID" "$SC_ENV" "echo 'rm -rf $SC_ROOT/$SC_OTHER'"
+assert_sc deny "#581 scratch: protected-path refusal intact under a session" "$SC_SID" "$SC_ENV" "rm -rf /usr"
+assert_sc deny "#581 scratch: HOME refusal intact under a session" "$SC_SID" "$SC_ENV" "rm -rf $HOME"
+# config-provided root (guards.scratchRoot)
+SC_CFG_REPO=$(make_sql_repo "{\"guards\":{\"scratchRoot\":\"$SC_ROOT\"}}")
+TOTAL=$((TOTAL + 1))
+_sc_cfg_out=$(jq -n --arg cmd "rm -rf $SC_ROOT/$SC_SID/work" --arg cwd "$SC_CFG_REPO" --arg sid "$SC_SID" \
+    '{tool_name:"Bash",tool_input:{command:$cmd},cwd:$cwd,session_id:$sid}' | "$GUARD" 2>&1) || true
+if ! echo "$_sc_cfg_out" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #581 scratch: guards.scratchRoot config honored"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #581 scratch: guards.scratchRoot config honored"; echo "       Got: $_sc_cfg_out"
+fi
+rm -rf "$SC_CFG_REPO"
+
+# -- quoted targets classify like their unquoted spelling (Loom #6814) --
+assert_sc deny "#581 quoted: single-quoted out-of-repo absolute target denied" "" "" "rm -rf '/opt/some-vendor/important'"
+assert_sc deny "#581 quoted: double-quoted out-of-repo absolute target denied" "" "" 'rm -rf "/opt/some-vendor/important"'
+assert_sc deny "#581 quoted: double-quoted top-level dir refused (floor)" "" "" 'rm -rf "/usr"'
+assert_sc allow "#581 quoted: double-quoted in-repo absolute target allowed" "" "" "rm -rf \"$REPO_ROOT/some-dir\""
+assert_sc allow "#581 quoted: double-quoted own session scratch path allowed" "$SC_SID" "$SC_ENV" "rm -rf \"$SC_ROOT/$SC_SID/work\""
+assert_sc deny "#581 quoted: double-quoted other session scratch path denied" "$SC_SID" "$SC_ENV" "rm -rf \"$SC_ROOT/$SC_OTHER/work\""
+
+# -- same-command mktemp --
+assert_sc allow "#581 mktemp: d=\$(mktemp -d) && rm -rf \"\$d\" allowed" "" "" 'd=$(mktemp -d) && touch "$d/x" && rm -rf "$d"'
+assert_sc allow "#581 mktemp: plain \$(mktemp) with braces allowed" "" "" 'd=$(mktemp); rm -rf ${d}'
+assert_sc allow "#581 mktemp: self-referential realpath chain allowed" "" "" 'd=$(mktemp -d); d=$(realpath "$d"); rm -rf "$d"'
+assert_sc deny "#581 mktemp: no assignment -> unresolved var denied" "" "" 'rm -rf "$d"'
+assert_sc deny "#581 mktemp: custom template root denied" "" "" 'd=$(mktemp -d /opt/x.XXXXXX); rm -rf "$d"'
+assert_sc deny "#581 mktemp: --tmpdir=/opt denied" "" "" 'd=$(mktemp -d --tmpdir=/opt); rm -rf "$d"'
+assert_sc deny "#581 mktemp: second literal assignment poisons proof" "" "" 'd=$(mktemp -d); d=/opt/x; rm -rf "$d"'
+assert_sc deny "#581 mktemp: append rebind (d+=) denied" "" "" 'd=$(mktemp -d); d+=/../../etc; rm -rf "$d"'
+assert_sc deny "#581 mktemp: export rebind denied" "" "" 'd=$(mktemp -d); export d=/opt/x; rm -rf "$d"'
+assert_sc deny "#581 mktemp: read rebind denied" "" "" 'd=$(mktemp -d); read -r d < /etc/hostname; rm -rf "$d"'
+assert_sc deny "#581 mktemp: eval rebind denied" "" "" 'd=$(mktemp -d); eval d=/opt/x; rm -rf "$d"'
+assert_sc deny "#581 mktemp: unset then suffix denied" "" "" 'd=$(mktemp -d); unset d; rm -rf "$d/etc"'
+assert_sc deny "#581 mktemp: suffix with .. on mktemp var denied" "" "" 'd=$(mktemp -d); rm -rf "$d/../../opt"'
+assert_sc deny "#581 mktemp: other var's mktemp does not prove this var" "" "" 'e=$(mktemp -d); rm -rf "$d"'
+assert_sc deny "#581 mktemp: assignment only inside quoted literal text denied" "" "" 'echo "d=$(mktemp -d)"; rm -rf "$d"'
+assert_sc deny "#581 mktemp: decoy assignment inside heredoc body denied" "" "" $'export d=$(cat /etc/hostname); rm -rf "$d"; cat <<\'EOF\'\nd=$(mktemp -d)\nEOF'
+assert_sc deny "#581 mktemp: cd-pwd canonicalization not admitted" "" "" 'd=$(mktemp -d); d=$(cd "$d" && pwd -P); rm -rf "$d"'
+assert_sc deny "#581 mktemp: protected path still refused alongside mktemp" "" "" 'd=$(mktemp -d); rm -rf "$d" /usr'
+
+# -- same-command literal resolution (judged like a literal target) --
+assert_sc allow "#581 literal: d=<repo path>; rm -rf \"\$d/sub\" allowed (in scope)" "" "" "d=$REPO_ROOT/build-out; rm -rf \"\$d/sub\""
+assert_sc allow "#581 literal: d=/tmp/x; rm -rf \$d allowed (ephemeral)" "" "" 'd=/tmp/some-scratch; rm -rf $d'
+assert_sc allow "#581 literal: single-quoted literal value allowed" "" "" "d='/tmp/some-scratch'; rm -rf \"\$d\""
+assert_sc deny "#581 literal: resolved path outside scope denied" "" "" 'd=/opt/vendor; rm -rf "$d"'
+assert_sc deny "#581 literal: resolved top-level dir denied (floor)" "" "" 'd=/tmp; rm -rf "$d"'
+assert_sc deny "#581 literal: resolved root denied (floor)" "" "" 'd=/; rm -rf "$d"'
+assert_sc deny "#581 literal: resolved suffix reaching /etc via .. denied" "" "" 'd=/tmp/a; rm -rf "$d/../../etc"'
+assert_sc deny "#581 literal: suffix not starting with / not admitted" "" "" 'd=/tmp/a; rm -rf "$d.bak"'
+assert_sc deny "#581 literal: relative value not admitted" "" "" 'd=build; rm -rf "$d"'
+assert_sc deny "#581 literal: value with command substitution not admitted" "" "" 'd=$(cat /tmp/p); rm -rf "$d"'
+assert_sc deny "#581 literal: two assignments denied" "" "" 'd=/tmp/a; d=/opt/b; rm -rf "$d"'
+assert_sc deny "#581 literal: append rebind denied" "" "" 'd=/tmp/a; d+=/../../etc; rm -rf "$d"'
+assert_sc deny "#581 literal: unset + suffix denied" "" "" 'd=/tmp/a; unset d; rm -rf "$d/etc"'
+assert_sc deny "#581 literal: empty rebind + suffix denied" "" "" 'd=/tmp/a; d=; rm -rf "$d/etc"'
+assert_sc deny "#581 literal: array element rebind denied" "" "" 'd=/tmp/a; d[0]=/opt; rm -rf "$d"'
+assert_sc deny "#581 literal: extra variable in suffix denied" "" "" 'd=/tmp/a; rm -rf "$d/$e"'
+assert_sc deny "#581 literal: in-quote assignment is not a binding" "" "" "echo 'd=/tmp/a'; rm -rf \"\$d\""
+assert_allow_env "#581: rmScope=off keeps unresolved-var rm unchanged" "LOOM_RM_SCOPE=off" 'rm -rf "$d"' "$REPO_ROOT"
+
+rm -rf "$SC_BASE"
+echo ""
 
 # --- existing tmpfs coverage is retained (guard against accidental removal) ---
 _tmpfs_cases=$(grep -c 'assert_tmpfs_deny\|assert_tmpfs_allow' "$SCRIPT_DIR/test-guard-destructive.sh")
