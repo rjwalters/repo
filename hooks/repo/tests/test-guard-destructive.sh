@@ -6888,6 +6888,228 @@ fi
 echo ""
 
 # =========================================================================
+# repo#583: cargo clean scope guard (port of the cargo-clean family from
+# rjwalters/loom tests/hooks/test-guard-destructive-cargo-and-perf.sh @
+# 2072f82b). Intentional differences from the Loom suite:
+#   - shared config target-dir expectation is DENY (as in Loom after #7795),
+#     and the diagnostics must name the target and the scoped alternatives;
+#   - `--target-dir PATH` / `--target-dir=PATH` cases are new (Loom's resolver
+#     ignores the flag);
+#   - toggle cases use REPO_GUARD_CARGO_CLEAN / legacy LOOM_GUARD_CARGO_CLEAN
+#     precedence and the repo config location (canonical guard_toggle_enabled);
+#   - the manual config fallback is forced with a PATH shim `cargo` that fails
+#     `config get`, instead of depending on the installed cargo;
+#   - multi-segment, substitution and quoted-prose cases are new.
+# =========================================================================
+echo -e "\n${YELLOW}repo#583: cargo clean scope${NC}"
+
+CC_BASE="$(mktemp -d)"
+CC_REPO="$CC_BASE/repo"; CC_SHARED="$CC_BASE/shared-target"
+mkdir -p "$CC_REPO/sub/dir" "$CC_BASE/cargo-shim" "$CC_BASE/emptyhome" "$CC_BASE/homecfg" "$CC_SHARED"
+git -C "$CC_REPO" init -q >/dev/null 2>&1
+printf '#!/bin/sh\nexit 1\n' > "$CC_BASE/cargo-shim/cargo"; chmod +x "$CC_BASE/cargo-shim/cargo"
+printf '/dev/sda1 / ext4 rw 0 0\n' > "$CC_BASE/mounts"
+printf '/dev/sda1 / ext4 rw 0 0\ntmpfs /dev/shm tmpfs rw 0 0\n' > "$CC_BASE/mounts-shm"
+CC_ENVV=(REPO_GUARD_MOUNTS_FILE="$CC_BASE/mounts" PATH="$CC_BASE/cargo-shim:$PATH" CARGO_HOME="$CC_BASE/emptyhome")
+
+cc_write_cfg() {  # <dir> <filename> <body>
+    mkdir -p "$1/.cargo"; printf '%s\n' "$3" > "$1/.cargo/$2"
+}
+cc_clear() { rm -rf "$CC_REPO/.cargo" "$CC_BASE/.cargo" "$CC_BASE/homecfg"/config* "$CC_REPO/.loom" "$CC_REPO/.claude"; }
+cc_run() {  # <cmd> <cwd> [env...]
+    local cmd="$1" cwd="$2"; shift 2
+    make_input "$cmd" "$cwd" | env "${CC_ENVV[@]}" "$@" "$GUARD" 2>&1 || true
+}
+cc_deny() {  # <desc> <cmd> <cwd> [env...]
+    local d="$1" cmd="$2" cwd="$3"; shift 3
+    TOTAL=$((TOTAL + 1)); local out; out=$(cc_run "$cmd" "$cwd" "$@")
+    if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $d"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $d"; echo "       Command: $cmd"; echo "       Got: $out"
+    fi
+}
+cc_allow() {
+    local d="$1" cmd="$2" cwd="$3"; shift 3
+    TOTAL=$((TOTAL + 1)); local out; out=$(cc_run "$cmd" "$cwd" "$@")
+    if ! echo "$out" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $d"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $d"; echo "       Command: $cmd"; echo "       Got: $out"
+    fi
+}
+CC_MSG_ENV=()
+cc_msg() {  # <desc> <cmd> <cwd> <grep -F needle>...
+    local d="$1" cmd="$2" cwd="$3"; shift 3
+    TOTAL=$((TOTAL + 1)); local out reason ok=1 n
+    out=$(cc_run "$cmd" "$cwd" "${CC_MSG_ENV[@]}"); reason=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
+    for n in "$@"; do grep -qF -- "$n" <<<"$reason" || ok=0; done
+    if [[ $ok -eq 1 && -n "$reason" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $d"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $d"; echo "       Got: $out"
+    fi
+}
+
+# --- no config / repo-local config: allowed ---
+cc_clear
+cc_allow "#583: bare cargo clean, no config, allowed" "cargo clean" "$CC_REPO"
+cc_write_cfg "$CC_REPO" config.toml $'[build]\ntarget-dir = "target-local"'
+cc_allow "#583: repo-relative config target-dir allowed" "cargo clean" "$CC_REPO"
+cc_allow "#583: repo-relative config allowed from subdir" "cargo clean" "$CC_REPO/sub/dir"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml $'[net]\ntarget-dir = "/elsewhere"'
+cc_allow "#583: target-dir under an unrelated TOML table ignored" "cargo clean" "$CC_REPO"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml $'[build.foo]\ntarget-dir = "/elsewhere"'
+cc_allow "#583: [build.foo] sub-table target-dir ignored" "cargo clean" "$CC_REPO"
+
+# --- shared config: denied, both filenames and every source ---
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: repo config.toml shared target-dir denies" "cargo clean" "$CC_REPO"
+cc_msg "#583: diagnostic names target and scoped alternatives" "cargo clean" "$CC_REPO" \
+    "$CC_SHARED" "cargo clean -p <pkg>" "CARGO_TARGET_DIR=<repo>/target" "$CC_REPO/.cargo/config.toml"
+cc_deny "#583: shared config denies from a subdirectory" "cargo clean" "$CC_REPO/sub/dir"
+cc_clear
+cc_write_cfg "$CC_REPO" config "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: legacy extensionless .cargo/config denies" "cargo clean" "$CC_REPO"
+cc_clear
+cc_write_cfg "$CC_BASE" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: ancestor (outside repo) config shared target-dir denies" "cargo clean" "$CC_REPO"
+cc_clear
+printf '[build]\ntarget-dir = "%s"\n' "$CC_SHARED" > "$CC_BASE/homecfg/config.toml"
+cc_deny "#583: Cargo-home fallback config.toml denies" "cargo clean" "$CC_REPO" CARGO_HOME="$CC_BASE/homecfg"
+rm -f "$CC_BASE/homecfg/config.toml"
+printf '[build]\ntarget-dir = "%s"\n' "$CC_SHARED" > "$CC_BASE/homecfg/config"
+cc_deny "#583: Cargo-home fallback extensionless config denies" "cargo clean" "$CC_REPO" CARGO_HOME="$CC_BASE/homecfg"
+CC_MSG_ENV=(CARGO_HOME="$CC_BASE/homecfg")
+cc_msg "#583: Cargo-home provenance names the home config file" "cargo clean" "$CC_REPO" "$CC_BASE/homecfg/config"
+CC_MSG_ENV=()
+rm -f "$CC_BASE/homecfg/config"
+printf '[build]\ntarget-dir = "target-home"\n' > "$CC_BASE/homecfg/config.toml"
+cc_deny "#583: Cargo-home relative target-dir resolves outside repo" "cargo clean" "$CC_REPO" CARGO_HOME="$CC_BASE/homecfg"
+rm -f "$CC_BASE/homecfg/config.toml"
+
+# --- scoping forms ---
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_allow "#583: -p <pkg> allowed" "cargo clean -p foo" "$CC_REPO"
+cc_allow "#583: --package <pkg> allowed" "cargo clean --package foo" "$CC_REPO"
+cc_allow "#583: --package=<pkg> allowed" "cargo clean --package=foo" "$CC_REPO"
+cc_allow "#583: command-local CARGO_TARGET_DIR allowed" "CARGO_TARGET_DIR=$CC_REPO/target cargo clean" "$CC_REPO"
+cc_allow "#583: env-wrapper CARGO_TARGET_DIR allowed" "env CARGO_TARGET_DIR=$CC_REPO/target cargo clean" "$CC_REPO"
+cc_allow "#583: inherited CARGO_TARGET_DIR allowed" "cargo clean" "$CC_REPO" CARGO_TARGET_DIR="$CC_REPO/target"
+cc_allow "#583: --target-dir PATH (repo-local) overrides shared config" "cargo clean --target-dir $CC_REPO/target" "$CC_REPO"
+cc_allow "#583: --target-dir=PATH (repo-local) overrides shared config" "cargo clean --target-dir=$CC_REPO/target" "$CC_REPO"
+cc_allow "#583: --target-dir relative repo-local overrides shared config" "cargo clean --target-dir target" "$CC_REPO"
+
+# --- multi-segment, substitution, prose ---
+cc_deny "#583: later shared clean not hidden by earlier scoped clean" "cargo clean -p foo && cargo clean" "$CC_REPO"
+cc_deny "#583: later shared clean not hidden by earlier safe clean (;)" "cargo clean --target-dir $CC_REPO/target; cargo clean" "$CC_REPO"
+cc_deny "#583: cargo clean in pipeline segment denies" "echo hi | cargo clean" "$CC_REPO"
+cc_deny "#583: executable substitution denies" 'echo "$(cargo clean)"' "$CC_REPO"
+cc_allow "#583: quoted prose mentioning cargo clean allowed" 'echo "run cargo clean to reset"' "$CC_REPO"
+cc_allow "#583: git commit message mentioning cargo clean allowed" 'git commit -m "docs: explain cargo clean"' "$CC_REPO"
+
+# --- tmpfs guard stays independent ---
+TOTAL=$((TOTAL + 1))
+_cc_out=$(make_input "CARGO_TARGET_DIR=/dev/shm/x cargo clean" "$CC_REPO" | env "${CC_ENVV[@]}" REPO_GUARD_MOUNTS_FILE="$CC_BASE/mounts-shm" "$GUARD" 2>&1 || true)
+if echo "$_cc_out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #583: explicit-env exemption does not bypass tmpfs guard"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #583: tmpfs guard bypassed by explicit CARGO_TARGET_DIR"; echo "       Got: $_cc_out"
+fi
+TOTAL=$((TOTAL + 1))
+_cc_out=$(make_input "cargo clean --target-dir /dev/shm/x" "$CC_REPO" | env "${CC_ENVV[@]}" REPO_GUARD_MOUNTS_FILE="$CC_BASE/mounts-shm" "$GUARD" 2>&1 || true)
+if echo "$_cc_out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #583: --target-dir exemption does not bypass tmpfs guard"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #583: tmpfs guard bypassed by --target-dir"; echo "       Got: $_cc_out"
+fi
+
+# --- toggles ---
+cc_deny "#583: shared clean denies with no overrides (baseline)" "cargo clean" "$CC_REPO"
+cc_allow "#583: REPO_GUARD_CARGO_CLEAN=0 in process env allows" "cargo clean" "$CC_REPO" REPO_GUARD_CARGO_CLEAN=0
+cc_allow "#583: legacy LOOM_GUARD_CARGO_CLEAN=0 in process env allows" "cargo clean" "$CC_REPO" LOOM_GUARD_CARGO_CLEAN=0
+cc_deny "#583: REPO=1 beats legacy LOOM=0" "cargo clean" "$CC_REPO" REPO_GUARD_CARGO_CLEAN=1 LOOM_GUARD_CARGO_CLEAN=0
+cc_allow "#583: REPO=0 beats legacy LOOM=1" "cargo clean" "$CC_REPO" REPO_GUARD_CARGO_CLEAN=0 LOOM_GUARD_CARGO_CLEAN=1
+cc_deny "#583: inline command-text opt-out does not reach the hook" "REPO_GUARD_CARGO_CLEAN=0 cargo clean" "$CC_REPO"
+cc_deny "#583: inline legacy command-text opt-out does not reach the hook" "LOOM_GUARD_CARGO_CLEAN=0 cargo clean" "$CC_REPO"
+mkdir -p "$CC_REPO/.loom"; printf '{"guards":{"cargoCleanScope":false}}' > "$CC_REPO/.loom/config.json"
+cc_allow "#583: legacy .loom config cargoCleanScope:false allows" "cargo clean" "$CC_REPO"
+cc_deny "#583: env REPO=1 beats config disable" "cargo clean" "$CC_REPO" REPO_GUARD_CARGO_CLEAN=1
+rm -rf "$CC_REPO/.loom"
+mkdir -p "$CC_REPO/.claude/skills/repo"; printf '{"guards":{"cargoCleanScope":false}}' > "$CC_REPO/.claude/skills/repo/config.json"
+cc_allow "#583: repo config cargoCleanScope:false allows" "cargo clean" "$CC_REPO"
+rm -rf "$CC_REPO/.claude"
+
+# --- symlinked repository path ---
+ln -s "$CC_REPO" "$CC_BASE/repo-link"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml $'[build]\ntarget-dir = "target-local"'
+cc_allow "#583: repo-local target allowed via symlinked repo path" "cargo clean" "$CC_BASE/repo-link"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_BASE/repo-link/target\""
+cc_allow "#583: target spelled through symlink to repo allowed" "cargo clean" "$CC_REPO"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: genuinely external target still denies via symlinked repo path" "cargo clean" "$CC_BASE/repo-link"
+
+# --- reverse direction: repo-local symlink spelling that resolves OUTSIDE ---
+cc_clear
+ln -s "$CC_SHARED" "$CC_REPO/target-link"
+cc_write_cfg "$CC_REPO" config.toml $'[build]\ntarget-dir = "target-link"'
+cc_deny "#583: repo-local symlink to external shared target denies" "cargo clean" "$CC_REPO"
+cc_deny "#583: repo-local symlink to external denies from subdir" "cargo clean" "$CC_REPO/sub/dir"
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_REPO/target-link/sub\""
+cc_deny "#583: absolute path under repo-local symlink to external denies" "cargo clean" "$CC_REPO"
+cc_allow "#583: repo-local symlink case still allows -p" "cargo clean -p foo" "$CC_REPO"
+rm -f "$CC_REPO/target-link"
+
+# --- Cargo global options / toolchain selectors before `clean` ---
+cc_clear
+cc_write_cfg "$CC_REPO" config.toml "[build]
+target-dir = \"$CC_SHARED\""
+cc_deny "#583: cargo --quiet clean denies shared target" "cargo --quiet clean" "$CC_REPO"
+cc_deny "#583: cargo +stable clean denies shared target" "cargo +stable clean" "$CC_REPO"
+cc_deny "#583: cargo -q clean denies shared target" "cargo -q clean" "$CC_REPO"
+cc_deny "#583: cargo +nightly -v --color never clean denies" "cargo +nightly -v --color never clean" "$CC_REPO"
+cc_deny "#583: cargo --locked --offline clean denies" "cargo --locked --offline clean" "$CC_REPO"
+cc_deny "#583: cargo -Z flag clean denies" "cargo -Z unstable-options clean" "$CC_REPO"
+cc_deny "#583: cargo --config unrelated clean denies" "cargo --config net.offline=true clean" "$CC_REPO"
+cc_deny "#583: later global-option clean not hidden by earlier scoped one" "cargo clean -p foo && cargo +stable clean" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean -p allowed" "cargo --quiet clean -p foo" "$CC_REPO"
+cc_allow "#583: cargo +stable clean -p allowed" "cargo +stable clean -p foo" "$CC_REPO"
+cc_allow "#583: cargo +stable clean --package= allowed" "cargo +stable clean --package=foo" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean --target-dir repo-local allowed" "cargo --quiet clean --target-dir $CC_REPO/target" "$CC_REPO"
+cc_allow "#583: cargo +stable clean --target-dir= repo-local allowed" "cargo +stable clean --target-dir=$CC_REPO/target" "$CC_REPO"
+cc_allow "#583: cargo --quiet clean with CARGO_TARGET_DIR prefix allowed" "CARGO_TARGET_DIR=$CC_REPO/target cargo --quiet clean" "$CC_REPO"
+cc_allow "#583: cargo --config build.target-dir=<repo> clean allowed" "cargo --config build.target-dir=\"$CC_REPO/target\" clean" "$CC_REPO"
+cc_allow "#583: cargo +stable build (not clean) allowed" "cargo +stable build" "$CC_REPO"
+cc_allow "#583: quoted prose with cargo +stable clean allowed" 'echo "try cargo +stable clean"' "$CC_REPO"
+
+# --- helper adapter contract ---
+TOTAL=$((TOTAL + 1))
+_cc_adapt=$(bash -c '
+    source <(sed -n "/^_cargo_toml_target_dir_value()/,/^# tmpfs_ambient_target_dir()/p" "$1" | sed "\$d")
+    _cargo_config_walk_up_target_dir "$2"' _ "$GUARD" "$CC_REPO" 2>/dev/null || true)
+if [[ "$_cc_adapt" == "$CC_SHARED"$'\t'"$CC_REPO/.cargo/config.toml" ]]; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #583: walk-up helper keeps <path>TAB<file> contract"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #583: walk-up helper contract changed"; echo "       Got: $_cc_adapt"
+fi
+cc_clear
+rm -rf "$CC_BASE"
+
+# =========================================================================
 # Summary
 # =========================================================================
 

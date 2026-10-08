@@ -8214,6 +8214,192 @@ for pattern in "${ASK_PATTERNS[@]}"; do
     fi
 done
 
+
+# =============================================================================
+# CARGO CLEAN SCOPE DENY — an unscoped `cargo clean` that would clear a
+# config-derived build.target-dir SHARED outside this repo (rjwalters/repo#583,
+# ported from rjwalters/loom guard-destructive-generic.sh at 2072f82b, #6684 /
+# #7795). Gated by cargo_clean_guard_enabled() (guards.cargoCleanScope;
+# REPO_GUARD_CARGO_CLEAN wins over legacy LOOM_GUARD_CARGO_CLEAN, then config,
+# then default ON).
+#
+# `cargo clean -p <pkg>` and any repo-local/default target dir are untouched.
+# An EXPLICIT target dir — command-local or inherited CARGO_TARGET_DIR, or
+# `--target-dir PATH` / `--target-dir=PATH` — is a deliberate scoping decision
+# and is never refused here (it remains subject to the independent tmpfs-scratch
+# guard above, which this block neither replaces nor bypasses). Only the
+# CONFIG-derived resolution (`cargo config get`, then a manual ancestor
+# `.cargo/config{,.toml}` walk-up, then $CARGO_HOME) is compared to the repo.
+#
+# Differences from the Loom source: (1) the `--target-dir` CLI forms are
+# honored (Loom's resolver ignores them); (2) every unscoped clean segment is
+# examined, not just the first, so a safe earlier clean cannot hide a later
+# shared one; (3) the toggle uses the canonical guard_toggle_enabled()
+# resolver (REPO_* > LOOM_* > repo config > default) instead of Loom's
+# LOOM_-only read; (4) the walk-up / Cargo-home helpers already emit
+# "<path>\t<config file>" here (for the tmpfs guard), so
+# cargo_clean_effective_target_dir() splits that record rather than taking a
+# bare path; (5) Cargo global options and `+toolchain` selectors before
+# `clean` are skipped (`cargo --quiet clean`, `cargo +stable clean`), and a
+# `--config build.target-dir=PATH` override counts as an explicit target;
+# (6) containment is decided on the physically resolved target and repo root,
+# so a repo-local symlink pointing at a shared external dir is still refused.
+# =============================================================================
+_CARGO_CLEAN_GUARD_CACHE=""
+cargo_clean_guard_enabled() {
+    guard_toggle_enabled _CARGO_CLEAN_GUARD_CACHE cargoCleanScope true \
+        LOOM_GUARD_CARGO_CLEAN REPO_GUARD_CARGO_CLEAN
+}
+
+# Prints one line per UNSCOPED `cargo clean` segment: "x<same-command
+# CARGO_TARGET_DIR>\tx<--target-dir value>" (the "x" sentinels keep empty
+# fields from collapsing under tab IFS splitting). Prints nothing when there
+# is no candidate.
+cargo_clean_scope_match() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    function unq(v) { gsub(/[\047\042]/, "", v); return v }
+    {
+        orig = $0
+        # qsplit() re-emits only commands after a separator INSIDE a
+        # substitution; subst_heads() adds the first command of each
+        # `$( ... )`/backtick span, which the shell also executes.
+        $0 = qsplit(orig) "\n" subst_heads(orig, "\n")
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            j = 1
+            envval = ""
+            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                if (toks[j] ~ /^CARGO_TARGET_DIR=/)
+                    envval = unq(substr(toks[j], index(toks[j], "=") + 1))
+                j++
+            }
+            if (j <= m && toks[j] == "sudo") j++
+            if (j <= m && toks[j] == "env") {
+                j++
+                while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                    if (toks[j] ~ /^CARGO_TARGET_DIR=/)
+                        envval = unq(substr(toks[j], index(toks[j], "=") + 1))
+                    j++
+                }
+            }
+            if (j > m || toks[j] != "cargo") continue
+            j++
+            # Cargo accepts a rustup toolchain selector and GLOBAL options
+            # before the subcommand (`cargo +stable clean`, `cargo --quiet
+            # clean`, `cargo --color never -v clean`); skip them so they cannot
+            # hide the subcommand. Value-taking globals consume their argument
+            # unless given in `--opt=value` / attached `-Zflag` form. A
+            # `--config build.target-dir=PATH` override is an explicit,
+            # command-local target choice, so it is treated like --target-dir.
+            cli = ""
+            if (j <= m && toks[j] ~ /^\+/) j++
+            while (j <= m && toks[j] ~ /^-/ && toks[j] != "--") {
+                opt = toks[j]
+                val = ""
+                if (opt == "--config" || opt == "--color" || opt == "--explain" || opt == "-Z" || opt == "-C") {
+                    if (j < m) val = toks[j + 1]
+                    j += 2
+                } else {
+                    if (opt ~ /^--config=/) val = substr(opt, index(opt, "=") + 1)
+                    j++
+                }
+                if ((opt == "--config" || opt ~ /^--config=/) && unq(val) ~ /^build\.target-dir=/) {
+                    val = unq(val)
+                    cli = substr(val, index(val, "=") + 1)
+                }
+            }
+            if (j > m || toks[j] != "clean") continue
+            j++
+            scoped = 0
+            for (k = j; k <= m; k++) {
+                if (toks[k] == "-p" || toks[k] == "--package" || toks[k] ~ /^--package=/) scoped = 1
+                else if (toks[k] == "--target-dir" && k < m) cli = unq(toks[k + 1])
+                else if (toks[k] ~ /^--target-dir=/) cli = unq(substr(toks[k], index(toks[k], "=") + 1))
+            }
+            if (scoped) continue
+            printf "x%s\tx%s\n", envval, cli
+        }
+    }'
+}
+
+# Resolves the effective target dir for one candidate clean. Prints three
+# lines: SOURCE (env|cli|config|default), the absolute path, and the config
+# file the path came from (empty unless SOURCE=config). Precedence: --target-dir
+# CLI flag, command-local CARGO_TARGET_DIR, inherited CARGO_TARGET_DIR, cargo's
+# own config query, ancestor config, Cargo-home config, default <repo>/target.
+cargo_clean_effective_target_dir() {
+    local repo_root="$1" cwd="$2" same_cmd_env="$3" cli_dir="${4:-}"
+    local base_cwd="${cwd:-$repo_root}"
+    local resolved="" source="" cfgfile="" hit=""
+    if [[ -n "$cli_dir" ]]; then
+        resolved="$cli_dir"; source="cli"
+    elif [[ -n "$same_cmd_env" ]]; then
+        resolved="$same_cmd_env"; source="env"
+    elif [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        resolved="$CARGO_TARGET_DIR"; source="env"
+    else
+        source="config"
+        if command -v cargo >/dev/null 2>&1; then
+            local cg
+            cg=$(cd "$base_cwd" 2>/dev/null && cargo config get build.target-dir 2>/dev/null) || cg=""
+            if [[ -n "$cg" ]]; then
+                resolved=$(printf '%s' "$cg" | sed -e 's/^build\.target-dir[[:space:]]*=[[:space:]]*//' -e 's/^"//' -e 's/"$//')
+                cfgfile="cargo config get build.target-dir"
+            fi
+        fi
+        if [[ -z "$resolved" ]]; then
+            # Adapter: both helpers print "<path>\t<config file>".
+            hit=$(_cargo_config_walk_up_target_dir "$base_cwd") || hit=""
+            [[ -n "$hit" ]] || { hit=$(_cargo_home_config_target_dir) || hit=""; }
+            if [[ -n "$hit" ]]; then
+                resolved="${hit%%$'\t'*}"
+                cfgfile="${hit#*$'\t'}"
+            fi
+        fi
+        if [[ -z "$resolved" ]]; then
+            resolved="${repo_root}/target"
+            source="default"
+        fi
+    fi
+    if [[ -n "$resolved" && "$resolved" != /* ]]; then
+        resolved="$base_cwd/$resolved"
+    fi
+    [[ "$resolved" = /* ]] && resolved=$(normalize_abs_path "$resolved")
+    printf '%s\n%s\n%s\n' "$source" "$resolved" "$cfgfile"
+}
+
+# Prefilter allows any run of option-like words (`+stable`, `--quiet`,
+# `--color never`) between `cargo` and `clean`; the awk parser above makes the
+# exact decision.
+if [[ "$COMMAND_ASK_SCAN" == *cargo* && "$COMMAND_ASK_SCAN" == *clean* ]] && \
+   printf '%s' "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`[:space:]])cargo([[:space:]]+[^[:space:];&|]+)*[[:space:]]+clean'; then
+    _CARGO_CLEAN_MATCH=$(cargo_clean_scope_match "$COMMAND_ASK_SCAN")
+    if [[ -n "$_CARGO_CLEAN_MATCH" ]] && [[ -n "$REPO_ROOT" ]] && cargo_clean_guard_enabled; then
+        while IFS=$'\t' read -r _cc_env _cc_cli; do
+            [[ -n "$_cc_env$_cc_cli" ]] || continue
+            _cc_env="${_cc_env#x}"; _cc_cli="${_cc_cli#x}"
+            _CARGO_TD_INFO=$(cargo_clean_effective_target_dir "$REPO_ROOT" "$CWD" "$_cc_env" "$_cc_cli")
+            _CARGO_TD_SOURCE=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '1p')
+            _CARGO_TD_PATH=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '2p')
+            _CARGO_TD_FILE=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '3p')
+            [[ "$_CARGO_TD_SOURCE" == "config" && -n "$_CARGO_TD_PATH" ]] || continue
+            # Containment is decided on the PHYSICAL (symlink-resolved) target
+            # and root only. A lexical pre-check would wrongly allow a
+            # repo-local symlink (`target-dir = "target-link"` -> external
+            # shared dir), while the physical comparison still allows the
+            # reverse case: an external spelling that resolves into the repo.
+            _CARGO_TD_PATH_PHYS=$(physical_abs_path "$_CARGO_TD_PATH")
+            _CARGO_REPO_ROOT_PHYS=$(physical_abs_path "$REPO_ROOT")
+            [[ "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS" && \
+               "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS"/* ]] || continue
+            deny "Blocked: $COMMAND (cargo's target-dir is shared at '$_CARGO_TD_PATH'${_CARGO_TD_FILE:+ (from $_CARGO_TD_FILE)} — OUTSIDE this repo — so this clears the build output of every project on this host, including whatever sweep is compiling right now. Nothing has been deleted: just rerun with a scoped form. Package-scoped: 'cargo clean -p <pkg>'. Repo-scoped: 'cargo clean --target-dir <repo>/target' or prefix with CARGO_TARGET_DIR=<repo>/target. To opt out repo-wide set guards.cargoCleanScope:false in the repo config, or export REPO_GUARD_CARGO_CLEAN=0 in the agent's OWN environment before the session — an inline 'REPO_GUARD_CARGO_CLEAN=0 cargo clean' prefix does not reach this hook, which runs as a separate process)" "cargo-clean-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN
+        done <<< "$_CARGO_CLEAN_MATCH"
+    fi
+fi
 # =============================================================================
 # REVERSIBLE-GITHUB ASK patterns — gated by the reversible-gh guard toggle (#3757)
 #
