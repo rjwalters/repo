@@ -45,6 +45,7 @@ Issues carrying `loom:curated`.
 
 - **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
+- **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -52,7 +53,7 @@ _None._
 
 ## Epics
 
-_None._
+- **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal
 
 ## Backlog Balance
 
@@ -64,7 +65,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 2 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
-| Active epics | 0 |
+| Active epics | 1 |
 <!-- guide:plan-body:end -->
