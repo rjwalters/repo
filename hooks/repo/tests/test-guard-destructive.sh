@@ -63,7 +63,8 @@ for _guard_env_var in \
     REPO_GUARD_TMPFS_SCRATCH LOOM_GUARD_TMPFS_SCRATCH \
     REPO_GUARD_MOUNTS_FILE LOOM_GUARD_MOUNTS_FILE \
     REPO_GUARD_SCRATCH_ROOT LOOM_GUARD_SCRATCH_ROOT \
-    LOOM_WORKTREE_ROOT; do
+    REPO_GUARD_WORKTREE_ISOLATION LOOM_GUARD_WORKTREE_ISOLATION \
+    LOOM_WORKTREE_ROOT LOOM_WORKTREE_PATH LOOM_ROLE; do
     unset "$_guard_env_var"
 done
 unset _guard_env_var
@@ -4116,7 +4117,10 @@ assert_deny_tag() {
     out=$(make_input "$cmd" "$cwd" | \
         env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$log" "$GUARD" 2>&1) || true
     decision=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // ""' 2>/dev/null)
-    got_tag=$(tail -1 "$log" 2>/dev/null | jq -r '.pattern' 2>/dev/null)
+    # `|| got_tag=""`: an allow verdict writes no decision log, and under
+    # `set -euo pipefail` the failed `tail` would abort the whole suite
+    # instead of recording this one FAIL.
+    got_tag=$(tail -1 "$log" 2>/dev/null | jq -r '.pattern' 2>/dev/null) || got_tag=""
     rm -rf "$logdir"
     if [[ "$decision" == "deny" && "$got_tag" == "$want_tag" ]]; then
         PASS=$((PASS + 1))
@@ -4177,14 +4181,19 @@ assert_deny_tag 'write-confinement (#293): conflicting reassignment poisons the 
 assert_deny_tag 'write-confinement (#293): ${VAR:-default} is not a bare reference, stays unresolvable' \
     "cp /tmp/src.txt \"\${V:-$WTC_MAIN}/evil.sh\"" "$WTC_WT" "worktree-write-confinement-unresolved-var"
 # The issue body's SECOND example. `tmp=$(mktemp -d)` is command
-# substitution, which Acceptance Criterion 3 (and the #4921 header comment's
-# invariants) explicitly require to keep failing closed: no static literal
-# exists to resolve, so the destination is genuinely unknowable. Pinned as a
-# DENY on purpose — resolving it would be the rejected "general shell
-# evaluator" option, not this change.
-assert_deny_tag 'write-confinement (#293): $(mktemp -d)-derived target stays unresolvable' \
+# substitution, so the #293 literal resolver still never RESOLVES it (that
+# would be the rejected "general shell evaluator" option). #582 (ported from
+# Loom #6949) later added a separate, narrower PROOF: a target whose only
+# binding is a plain, unconditionally-run `NAME=$(mktemp -d)` lands in a fresh
+# scratch directory outside every worktree, so it is admitted without being
+# resolved. Any shape the proof cannot establish -- here, a rebinding after
+# the mktemp -- still fails closed exactly as #293 pinned it.
+assert_allow 'write-confinement (#293/#582): proven same-command $(mktemp -d) target allows' \
     "cd $WTC_WT
-tmp=\$(mktemp -d); cp rtl/generated.v \"\$tmp/\"" "$WTC_WT" \
+tmp=\$(mktemp -d); cp rtl/generated.v \"\$tmp/\"" "$WTC_WT"
+assert_deny_tag 'write-confinement (#293/#582): $(mktemp -d) target rebound afterwards stays unresolvable' \
+    "cd $WTC_WT
+tmp=\$(mktemp -d); tmp=\"\$(pwd)\"; cp rtl/generated.v \"\$tmp/\"" "$WTC_WT" \
     "worktree-write-confinement-unresolved-var"
 
 # ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
@@ -6872,6 +6881,271 @@ assert_sc allow "#588 literal: quoted value with a space still resolves" "" "$SC
 assert_allow_env "#581: rmScope=off keeps unresolved-var rm unchanged" "LOOM_RM_SCOPE=off" 'rm -rf "$d"' "$REPO_ROOT"
 
 rm -rf "$SC_BASE"
+echo ""
+
+# =========================================================================
+# #582 (part of #579): write confinement + managed worktree rules
+# Ported from Loom's guard (2072f82b): registered/env-selected worktrees,
+# read-only-role dist/ scratch, same-command mktemp write outputs, managed
+# branch recognition for detached recovery resets, configured-root hints.
+# =========================================================================
+echo -e "${YELLOW}--- write confinement / managed worktree rules (#582) ---${NC}"
+
+# Verdict helper: cwd + space-separated env assignments + command. Prints
+# deny / ask / allow (anything that is neither a deny nor an ask is an allow).
+_wc_verdict() {
+    local cwd="$1" envs="$2" cmd="$3" out
+    local -a ea=()
+    [[ -n "$envs" ]] && read -r -a ea <<< "$envs"
+    out=$(make_input "$cmd" "$cwd" | env ${ea[@]+"${ea[@]}"} "$GUARD" 2>&1) || true
+    case "$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // ""' 2>/dev/null)" in
+        deny) echo deny ;;
+        ask) echo ask ;;
+        *) echo allow ;;
+    esac
+}
+assert_wc() {  # <allow|deny|ask> <description> <cwd> <env-assignments> <command>
+    local want="$1" desc="$2" cwd="$3" envs="$4" cmd="$5" got
+    TOTAL=$((TOTAL + 1))
+    got=$(_wc_verdict "$cwd" "$envs" "$cmd")
+    if [[ "$got" == "$want" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $desc"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $desc"
+        echo -e "       Command: $cmd (cwd: $cwd, env: ${envs:-none})"
+        echo -e "       Expected: $want, got: $got"
+    fi
+}
+# Deny reason (or decision-log tag) must contain a fixed string.
+assert_wc_reason() {  # <description> <cwd> <env-assignments> <command> <needle>
+    local desc="$1" cwd="$2" envs="$3" cmd="$4" needle="$5" out reason
+    local -a ea=()
+    [[ -n "$envs" ]] && read -r -a ea <<< "$envs"
+    TOTAL=$((TOTAL + 1))
+    out=$(make_input "$cmd" "$cwd" | env ${ea[@]+"${ea[@]}"} "$GUARD" 2>&1) || true
+    reason=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null)
+    if [[ "$reason" == *"$needle"* ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $desc"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $desc"
+        echo -e "       Wanted: $needle"
+        echo -e "       Reason: ${reason:-<none>}"
+    fi
+}
+
+_wc_git() { git -c user.email=test@example.com -c user.name=test "$@"; }
+
+# Fixture: a main checkout (physical spelling) with
+#   .loom/worktrees/issue-1   managed linked worktree, `# Branch:` sentinel
+#   .loom/worktrees/issue-2   managed linked worktree, sentinel WITHOUT Branch
+#   .loom/worktrees/issue-3   managed linked worktree, MALFORMED Branch line
+#   .claude/worktrees/x       registered, UNMANAGED nested worktree
+#   .claude/worktrees/gone    registered but its directory was deleted (stale)
+#   .claude/worktrees/x-other, not-a-wt   plain directories
+#   dist/, src/               plain main-checkout directories
+WC_BASE=$(mktemp -d 2>/dev/null)
+WC_BASE=$(cd "$WC_BASE" && pwd -P)
+WC_MAIN="$WC_BASE/main"
+mkdir -p "$WC_MAIN"
+git -C "$WC_MAIN" init -q >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" commit -q --allow-empty -m init >/dev/null 2>&1
+git -C "$WC_MAIN" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1
+mkdir -p "$WC_MAIN/.loom/worktrees" "$WC_MAIN/.claude/worktrees/x-other" \
+         "$WC_MAIN/.claude/worktrees/not-a-wt" "$WC_MAIN/dist" "$WC_MAIN/src/deep"
+WC_WT="$WC_MAIN/.loom/worktrees/issue-1"
+WC_WT2="$WC_MAIN/.loom/worktrees/issue-2"
+WC_WT3="$WC_MAIN/.loom/worktrees/issue-3"
+WC_NEST="$WC_MAIN/.claude/worktrees/x"
+_wc_git -C "$WC_MAIN" worktree add -q -b feature/issue-1 "$WC_WT" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b feature/issue-2 "$WC_WT2" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b feature/issue-3 "$WC_WT3" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b nested/x "$WC_NEST" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b nested/gone "$WC_MAIN/.claude/worktrees/gone" >/dev/null 2>&1
+rm -rf "$WC_MAIN/.claude/worktrees/gone"
+printf '# Loom-managed worktree marker\n# Issue: 1\n# Branch: feature/issue-1\n' > "$WC_WT/.loom-managed"
+printf '# Loom-managed worktree marker\n# Issue: 2\n' > "$WC_WT2/.loom-managed"
+printf '# Loom-managed worktree marker\n# Branch: ../feature/issue-3\n' > "$WC_WT3/.loom-managed"
+git -C "$WC_MAIN" update-ref refs/remotes/origin/feature/issue-1 HEAD >/dev/null 2>&1
+git -C "$WC_MAIN" update-ref refs/remotes/origin/feature/issue-2 HEAD >/dev/null 2>&1
+ln -s "$WC_MAIN" "$WC_BASE/main-link"
+WC_LINK="$WC_BASE/main-link"
+ln -s "$WC_MAIN/src/deep" "$WC_MAIN/dist/tunnel"
+ln -s "$WC_MAIN/src" "$WC_MAIN/dist-link-src"
+
+# -- control: the existing confinement still denies main-checkout writes --
+assert_wc deny "#582 control: cp into a plain main-checkout dir denies" "$WC_WT" "" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc allow "#582 control: cp into the managed worktree allows" "$WC_WT" "" "cp /tmp/a $WC_WT/f"
+
+# -- registered (unmanaged) worktrees --
+assert_wc allow "#582 registered: cp into a nested unmanaged worktree allows" "$WC_WT" "" "cp /tmp/a $WC_NEST/src/f"
+assert_wc allow "#582 registered: relative cp from the nested worktree's own cwd allows" "$WC_NEST" "" "cp /tmp/a src/f"
+assert_wc allow "#582 registered: cd <nested> && redirect from main cwd allows" "$WC_MAIN" "" "cd $WC_NEST && echo x > f.txt"
+assert_wc allow "#582 registered: tee into the nested worktree allows" "$WC_MAIN" "" "echo x | tee $WC_NEST/f.txt"
+assert_wc allow "#582 registered: symlinked main spelling into the nested worktree allows" "$WC_WT" "" "cp /tmp/a $WC_LINK/.claude/worktrees/x/f"
+assert_wc deny "#582 registered: symlinked main spelling into the main checkout denies" "$WC_WT" "" "cp /tmp/a $WC_LINK/src/f"
+assert_wc deny "#582 registered: main checkout itself stays denied from the nested cwd" "$WC_NEST" "" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 registered: path-component boundary (x-other) denies" "$WC_MAIN" "" "cp /tmp/a $WC_MAIN/.claude/worktrees/x-other/f"
+assert_wc deny "#582 registered: plain look-alike directory denies" "$WC_MAIN" "" "cp /tmp/a $WC_MAIN/.claude/worktrees/not-a-wt/f"
+assert_wc deny "#582 registered: the nested worktree's parent dir denies" "$WC_MAIN" "" "echo x > $WC_MAIN/.claude/worktrees/stray.txt"
+assert_wc deny "#582 registered: a stale (deleted) registered entry denies" "$WC_MAIN" "" "cp /tmp/a $WC_MAIN/.claude/worktrees/gone/f"
+assert_wc deny "#582 registered: .. out of the nested worktree denies" "$WC_MAIN" "" "cp /tmp/a $WC_NEST/../../src/f"
+assert_wc deny "#582 registered: quoted literal text naming the path is not a bypass" "$WC_MAIN" "" "echo 'cp /tmp/a $WC_NEST/f' > $WC_MAIN/src/notes.txt"
+
+# -- environment-selected worktree pin (the hook's OWN inherited env) --
+WC_PIN="$WC_MAIN/pinned-session"
+mkdir -p "$WC_PIN/sub"
+assert_wc deny "#582 pin: absent pin, plain main-checkout dir denies" "$WC_MAIN" "" "cp /tmp/a $WC_PIN/f"
+assert_wc allow "#582 pin: valid pin allows a write under it" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_PIN" "cp /tmp/a $WC_PIN/sub/f"
+assert_wc allow "#582 pin: valid pin given via symlinked spelling allows" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_LINK/pinned-session" "cp /tmp/a $WC_PIN/f"
+assert_wc deny "#582 pin: valid pin does not widen to the rest of the main checkout" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_PIN" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 pin: path-component boundary (pinned-session-x) denies" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_PIN" "cp /tmp/a ${WC_PIN}-x/f"
+assert_wc deny "#582 pin: pin AT the main checkout root is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_MAIN" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 pin: pin at the main root via symlinked spelling is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_LINK" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 pin: pin at an ANCESTOR of the main root is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_BASE" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 pin: pin at / is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=/" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 pin: invalid (nonexistent) pin is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_MAIN/no-such-dir" "cp /tmp/a $WC_MAIN/no-such-dir/f"
+assert_wc deny "#582 pin: relative pin is ignored" "$WC_MAIN" "LOOM_WORKTREE_PATH=pinned-session" "cp /tmp/a $WC_PIN/f"
+assert_wc deny "#582 pin: .. out of the pinned dir denies" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_PIN" "cp /tmp/a $WC_PIN/../src/f"
+assert_wc deny "#582 pin: an inline LOOM_WORKTREE_PATH= assignment in the command does not pin" "$WC_MAIN" "" "LOOM_WORKTREE_PATH=$WC_PIN cp /tmp/a $WC_PIN/f"
+assert_wc deny "#582 pin: an exported LOOM_WORKTREE_PATH in the command does not pin" "$WC_MAIN" "" "export LOOM_WORKTREE_PATH=$WC_PIN; cp /tmp/a $WC_PIN/f"
+
+# -- read-only-role dist/ scratch exemption --
+assert_wc allow "#582 role: auditor cp into <main>/dist allows" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/dist/loom-daemon-x86"
+assert_wc allow "#582 role: case-normalized AUDITOR allows" "$WC_MAIN" "LOOM_ROLE=AUDITOR" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc allow "#582 role: judge relative dist/ target from main cwd allows" "$WC_MAIN" "LOOM_ROLE=judge" "cp /tmp/a dist/f"
+assert_wc allow "#582 role: auditor through the symlinked main spelling allows" "$WC_WT" "LOOM_ROLE=auditor" "cp /tmp/a $WC_LINK/dist/f"
+assert_wc deny "#582 role: builder into dist/ denies" "$WC_MAIN" "LOOM_ROLE=builder" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc deny "#582 role: doctor into dist/ denies" "$WC_MAIN" "LOOM_ROLE=Doctor" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc deny "#582 role: unset role into dist/ denies" "$WC_MAIN" "" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc deny "#582 role: unknown role into dist/ denies" "$WC_MAIN" "LOOM_ROLE=sweep-lifecycle" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc deny "#582 role: role name with a suffix (auditor2) denies" "$WC_MAIN" "LOOM_ROLE=auditor2" "cp /tmp/a $WC_MAIN/dist/f"
+assert_wc deny "#582 role: auditor into dist-other/ denies (component boundary)" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/dist-other/f"
+assert_wc deny "#582 role: auditor outside dist/ denies" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 role: auditor through a dist/ symlink into src denies" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/dist/tunnel/f"
+assert_wc deny "#582 role: auditor .. through a dist/ symlink denies" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/dist/tunnel/../x"
+assert_wc deny "#582 role: an inline LOOM_ROLE= prefix does not grant the exemption" "$WC_MAIN" "" "LOOM_ROLE=auditor cp /tmp/a $WC_MAIN/dist/f"
+assert_wc allow "#582 role: isolation toggle off (REPO_) still allows any main write" "$WC_MAIN" "REPO_GUARD_WORKTREE_ISOLATION=0" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc deny "#582 role: REPO_GUARD_WORKTREE_ISOLATION=1 beats legacy LOOM_=0" "$WC_MAIN" "REPO_GUARD_WORKTREE_ISOLATION=1 LOOM_GUARD_WORKTREE_ISOLATION=0" "cp /tmp/a $WC_MAIN/src/f"
+
+# -- same-command mktemp write outputs --
+for _wc_cwd in "$WC_WT" "$WC_MAIN"; do
+    _wc_where=worktree-cwd; [[ "$_wc_cwd" == "$WC_MAIN" ]] && _wc_where=main-cwd
+    assert_wc allow "#582 mktemp ($_wc_where): > \"\$tmp/out\" under mktemp -d allows" "$_wc_cwd" "" 'tmp=$(mktemp -d); echo x > "$tmp/out.txt"'
+    assert_wc allow "#582 mktemp ($_wc_where): \${tmp} brace form allows" "$_wc_cwd" "" 'tmp=$(mktemp -d) && echo x > "${tmp}/out.txt"'
+    assert_wc allow "#582 mktemp ($_wc_where): bare mktemp file target allows" "$_wc_cwd" "" 'f=$(mktemp); echo x > "$f"'
+    assert_wc allow "#582 mktemp ($_wc_where): tee / cp / sed -i under mktemp -d allow" "$_wc_cwd" "" 'tmp=$(mktemp -d); echo x | tee "$tmp/a"; cp /tmp/a "$tmp/b"; sed -i s/a/b/ "$tmp/b"'
+    assert_wc allow "#582 mktemp ($_wc_where): heredoc into mktemp dir allows" "$_wc_cwd" "" $'tmp=$(mktemp -d)\ncat > "$tmp/out.txt" <<EOF\nhello\nEOF'
+    assert_wc allow "#582 mktemp ($_wc_where): realpath canonicalization chain allows" "$_wc_cwd" "" 'tmp=$(mktemp -d); tmp=$(realpath "$tmp"); echo x > "$tmp/o"'
+    assert_wc allow "#582 mktemp ($_wc_where): declaration-prefixed (export) binding allows" "$_wc_cwd" "" 'export tmp=$(mktemp -d); echo x > "$tmp/o"'
+    assert_wc allow "#582 mktemp ($_wc_where): double-quoted RHS allows" "$_wc_cwd" "" 'tmp="$(mktemp -d)"; echo x > "$tmp/o"'
+    assert_wc allow "#582 mktemp ($_wc_where): TMPDIR itself bound by mktemp allows" "$_wc_cwd" "" 'TMPDIR=$(mktemp -d); echo x > "$TMPDIR/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): reassignment poisons the proof" "$_wc_cwd" "" 'tmp=$(mktemp -d); tmp=/x; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): append rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); tmp+=/../..; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): export rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); export tmp=/x; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): declare rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); declare tmp=/; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): read rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); read -r tmp < /etc/hosts; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): unset poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); unset tmp; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): printf -v rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); printf -v tmp %s /; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): for-loop rebind poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); for tmp in /; do :; done; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): eval poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); eval tmp=/x; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): source poisons" "$_wc_cwd" "" 'tmp=$(mktemp -d); source ./env.sh; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): suffix containing .. denies" "$_wc_cwd" "" 'tmp=$(mktemp -d); cp /tmp/a "$tmp/../../evil.sh"'
+    assert_wc deny "#582 mktemp ($_wc_where): suffix ending in /.. denies" "$_wc_cwd" "" 'tmp=$(mktemp -d); echo x > "$tmp/a/.."'
+    assert_wc deny "#582 mktemp ($_wc_where): suffix with a second variable denies" "$_wc_cwd" "" 'tmp=$(mktemp -d); echo x > "$tmp/$sub"'
+    assert_wc deny "#582 mktemp ($_wc_where): suffix with a command substitution denies" "$_wc_cwd" "" 'tmp=$(mktemp -d); echo x > "$tmp/$(id -u)"'
+    assert_wc deny "#582 mktemp ($_wc_where): conditional binding (false &&) denies" "$_wc_cwd" "" 'false && tmp=$(mktemp -d); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): binding after the write denies" "$_wc_cwd" "" 'echo x > "$tmp/o"; tmp=$(mktemp -d)'
+    assert_wc deny "#582 mktemp ($_wc_where): binding inside a subshell denies" "$_wc_cwd" "" '(tmp=$(mktemp -d)); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): custom template denies" "$_wc_cwd" "" 'tmp=$(mktemp -d /opt/x.XXXXXX); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): --tmpdir denies" "$_wc_cwd" "" 'tmp=$(mktemp -d --tmpdir=/opt); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): cd/pwd -P chain is not admitted" "$_wc_cwd" "" 'tmp=$(mktemp -d); tmp=$(cd "$tmp" && pwd -P); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): another variable's mktemp proves nothing" "$_wc_cwd" "" 'e=$(mktemp -d); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): assignment only inside quoted text proves nothing" "$_wc_cwd" "" 'echo "tmp=$(mktemp -d)"; echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): decoy binding in a heredoc body proves nothing" "$_wc_cwd" "" $'echo x > "$tmp/o"; cat <<\'EOF\'\ntmp=$(mktemp -d)\nEOF'
+    assert_wc deny "#582 mktemp ($_wc_where): TMPDIR rebound before mktemp denies" "$_wc_cwd" "" "export TMPDIR=$WC_MAIN/src; tmp=\$(mktemp -d); echo x > \"\$tmp/o\""
+    assert_wc deny "#582 mktemp ($_wc_where): \${TMPDIR:=...} default-assignment denies" "$_wc_cwd" "" ": \${TMPDIR:=$WC_MAIN/src}; tmp=\$(mktemp -d); echo x > \"\$tmp/o\""
+    assert_wc deny "#582 mktemp ($_wc_where): inherited TMPDIR inside the main checkout denies" "$_wc_cwd" "TMPDIR=$WC_MAIN/src" 'tmp=$(mktemp -d); echo x > "$tmp/o"'
+    assert_wc deny "#582 mktemp ($_wc_where): empty-expansion spelling landing in main denies" "$_wc_cwd" "" "tmp=\$(mktemp -d); echo x > \"\$tmp$WC_MAIN/src/f\""
+    assert_wc deny "#582 mktemp ($_wc_where): cd into a mktemp dir then a relative write is not admitted" "$_wc_cwd" "" 'tmp=$(mktemp -d); cd "$tmp"; echo x > f.txt'
+    assert_wc deny "#582 mktemp ($_wc_where): a proven chain lends nothing to an absolute main target" "$_wc_cwd" "" "tmp=\$(mktemp -d); echo x > \"\$tmp/o\"; echo y > $WC_MAIN/src/f"
+done
+assert_wc deny "#582 mktemp: single-quoted '\$tmp/x' is a literal main path, not a mktemp target" "$WC_MAIN" "" "tmp=\$(mktemp -d); echo x > '\$tmp/x'"
+assert_wc allow "#582 mktemp: single-quoted literal under the worktree cwd still allows" "$WC_WT" "" "echo x > '\$tmp/x'"
+# cd FRESH-ROOT classification: a `$VAR` cd argument supplies its own root.
+assert_wc deny "#582 cd: cd /tmp && cd \"\$X\" && relative write fails closed" "$WC_WT" "" 'cd /tmp && cd "$X" && echo x > f.txt'
+assert_wc allow "#582 cd: single-quoted literal cd '\$X' under /tmp keeps the relative join" "$WC_WT" "" "cd /tmp && cd '\$X' && echo x > f.txt"
+assert_wc allow "#582 cd: absolute literal cd into /tmp then relative write allows" "$WC_WT" "" 'cd /tmp && echo x > f.txt'
+# Regression for a pre-#582 BYPASS: from a /tmp cwd, `cd "$V"` was joined as
+# /tmp/$V, so a write through a V that holds the main checkout was allowed.
+assert_wc deny "#582 cd: cd /tmp; V=<main>/src; cd \"\$V\"; write denies (was a join bypass)" "$WC_WT" "" "cd /tmp; V=$WC_MAIN/src; cd \"\$V\"; echo pwned > evil.sh"
+assert_wc deny "#582 cd: exported V=<main> then cd \"\$V\" and write denies" "$WC_WT" "" "cd /tmp; export V=$WC_MAIN; cd \"\$V\"; echo x > f.txt"
+# Same-command LITERAL resolution of the cd argument (Loom #7294).
+assert_wc allow "#582 cd: literal V=/tmp/x; cd \"\$V/repo\"; relative write allows (from main cwd)" "$WC_MAIN" "" $'TMP=/tmp/x582\ncd "$TMP/repo"\necho hi > README.md'
+assert_wc allow "#582 cd: literal \${V}/sub cd argument allows" "$WC_WT" "" 'cd /tmp; V=/tmp/a; cd "${V}/b"; echo hi > f.txt'
+assert_wc allow "#582 cd: unquoted literal cd \$V && write allows" "$WC_MAIN" "" 'TMP=/tmp/x582; cd $TMP && echo hi > README.md'
+assert_wc deny "#582 cd: literal V resolving into the main checkout, cd + relative write denies" "$WC_WT" "" $'SNEAK='"$WC_MAIN"$'/src\ncd "$SNEAK/deep"\necho pwned > evil.sh'
+assert_wc deny "#582 cd: conflicting reassignment of the cd variable denies" "$WC_WT" "" "cd /tmp; V=/tmp/a; V=$WC_MAIN; cd \"\$V\"; echo x > f.txt"
+assert_wc deny "#582 cd: inline prefix V=/x cd \"\$V\" is not resolved (bash expands \$V first)" "$WC_WT" "" 'cd /tmp; V=/tmp/ok cd "$V"; echo x > f.txt'
+assert_wc deny "#582 cd: tilde value V=~/x is not resolved (bash would expand it)" "$WC_WT" "" 'cd /tmp; V=~/x; cd "$V"; echo x > f.txt'
+assert_wc deny "#582 cd: backtick in the cd variable value denies" "$WC_WT" "" 'cd /tmp; V="/tmp/a`id`"; cd "$V"; echo x > f.txt'
+assert_wc deny "#582 cd: a second unresolved cd after a resolved one denies" "$WC_WT" "" 'cd /tmp; V=/tmp/a; cd "$V"; cd "$W"; echo x > f.txt'
+assert_wc deny "#582 cd: mktemp-valued cd then relative write is not admitted" "$WC_MAIN" "" $'tmp=$(mktemp -d)\ncd "$tmp/repo"\necho hi > README.md'
+
+# -- managed branch recognition (detached recovery reset, protected scope) --
+git -C "$WC_WT" checkout -q --detach >/dev/null 2>&1
+git -C "$WC_WT2" checkout -q --detach >/dev/null 2>&1
+git -C "$WC_WT3" checkout -q --detach >/dev/null 2>&1
+git -C "$WC_NEST" checkout -q --detach >/dev/null 2>&1
+WC_P="LOOM_FORCE_SCOPE=protected"
+assert_wc allow "#582 branch: detached managed worktree, reset to origin/<own sentinel branch> allows" "$WC_WT" "$WC_P" 'git reset --hard origin/feature/issue-1'
+assert_wc allow "#582 branch: same via git -C from the main cwd allows" "$WC_MAIN" "$WC_P" "git -C $WC_WT reset --hard origin/feature/issue-1"
+assert_wc allow "#582 branch: same via cd <wt> && from the main cwd allows" "$WC_MAIN" "$WC_P" "cd $WC_WT && git reset --hard origin/feature/issue-1"
+assert_wc allow "#582 branch: detached managed worktree, reset to origin/main allows" "$WC_WT" "$WC_P" 'git reset --hard origin/main'
+assert_wc allow "#582 branch: detached managed worktree, bare reset --hard (HEAD) allows" "$WC_WT" "$WC_P" 'git reset --hard'
+assert_wc ask "#582 branch: sibling branch target still asks" "$WC_WT" "$WC_P" 'git reset --hard origin/feature/issue-2'
+assert_wc ask "#582 branch: prefix-extended own branch name still asks" "$WC_WT" "$WC_P" 'git reset --hard origin/feature/issue-10'
+assert_wc ask "#582 branch: sentinel without a Branch line still asks" "$WC_WT2" "$WC_P" 'git reset --hard origin/feature/issue-2'
+assert_wc ask "#582 branch: malformed Branch line still asks" "$WC_WT3" "$WC_P" 'git reset --hard origin/../feature/issue-3'
+assert_wc ask "#582 branch: unmanaged (registered) worktree still asks" "$WC_NEST" "$WC_P" 'git reset --hard origin/nested/x'
+assert_wc ask "#582 branch: unmanaged worktree reset to origin/main still asks" "$WC_NEST" "$WC_P" 'git reset --hard origin/main'
+assert_wc ask "#582 branch: quoted reset target is not recognized, asks" "$WC_WT" "$WC_P" 'git reset --hard "origin/feature/issue-1"'
+assert_wc ask "#582 branch: reset with -- is not recognized, asks" "$WC_WT" "$WC_P" 'git reset --hard -- origin/feature/issue-1'
+assert_wc ask "#582 branch: force push from the detached managed worktree still asks" "$WC_WT" "$WC_P" 'git push --force origin HEAD'
+assert_wc ask "#582 branch: default force-scope mode (all) still asks" "$WC_WT" "" 'git reset --hard origin/feature/issue-1'
+assert_wc ask "#582 branch: REPO_FORCE_SCOPE=all beats legacy LOOM_FORCE_SCOPE=protected" "$WC_WT" "REPO_FORCE_SCOPE=all $WC_P" 'git reset --hard origin/feature/issue-1'
+git -C "$WC_MAIN" checkout -q --detach >/dev/null 2>&1
+mkdir -p "$WC_MAIN/sub"
+printf '# Branch: feature/issue-1\n' > "$WC_MAIN/sub/.loom-managed"
+assert_wc ask "#582 branch: detached MAIN checkout reset to origin/main still asks" "$WC_MAIN" "$WC_P" 'git reset --hard origin/main'
+assert_wc ask "#582 branch: a sentinel planted in a main-checkout subdir does not qualify" "$WC_MAIN/sub" "$WC_P" 'git reset --hard origin/feature/issue-1'
+git -C "$WC_MAIN" checkout -q - >/dev/null 2>&1 || true
+
+# -- diagnostics --
+assert_wc_reason "#582 hint: default deny names the in-repo worktree root" "$WC_WT" "" "cp /tmp/a $WC_MAIN/src/f" "$WC_MAIN/.loom/worktrees/issue-<N>"
+assert_wc_reason "#582 hint: deny names the config opt-out" "$WC_WT" "" "cp /tmp/a $WC_MAIN/src/f" "guards.worktreeIsolation:false"
+assert_wc_reason "#582 hint: deny warns that an inline env prefix does NOT work" "$WC_WT" "" "cp /tmp/a $WC_MAIN/src/f" "prefix does NOT work"
+assert_wc_reason "#582 hint: unresolved-var deny names the worktree root too" "$WC_WT" "" 'echo x > "$DEST/f"' "$WC_MAIN/.loom/worktrees/issue-<N>"
+WCR_BASE=$(mktemp -d 2>/dev/null); WCR_BASE=$(cd "$WCR_BASE" && pwd -P)
+WCR_MAIN="$WCR_BASE/proj"
+WCR_ROOT="$WCR_BASE/wt-root"
+mkdir -p "$WCR_MAIN/.claude/skills/repo" "$WCR_ROOT/proj/issue-7"
+git -C "$WCR_MAIN" init -q >/dev/null 2>&1
+printf '{"worktree":{"root":"%s"}}' "$WCR_ROOT" > "$WCR_MAIN/.claude/skills/repo/config.json"
+: > "$WCR_ROOT/proj/issue-7/.loom-managed"
+assert_wc deny "#582 hint: configured worktree root puts isolation in play" "$WCR_MAIN" "" "cp /tmp/a $WCR_MAIN/f"
+assert_wc_reason "#582 hint: deny names the CONFIGURED worktree-root destination" "$WCR_MAIN" "" "cp /tmp/a $WCR_MAIN/f" "$WCR_ROOT/proj/issue-<N>"
+assert_wc allow "#582 hint: write into the configured-root worktree allows" "$WCR_MAIN" "" "cp /tmp/a $WCR_ROOT/proj/issue-7/f"
+WCN_MAIN=$(mktemp -d 2>/dev/null); git -C "$WCN_MAIN" init -q >/dev/null 2>&1
+assert_wc allow "#582 no-isolation: a repo with no managed worktree stays unconfined" "$WCN_MAIN" "" "cp /tmp/a $WCN_MAIN/f"
+# The `worktree-write-confinement` marker (Loom dispatcher probe) is retained.
+TOTAL=$((TOTAL + 1))
+if grep -q 'worktree-write-confinement' "$GUARD"; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #582: worktree-write-confinement marker retained"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #582: worktree-write-confinement marker missing"
+fi
+
+rm -rf "$WC_BASE" "$WCR_BASE" "$WCN_MAIN"
 echo ""
 
 # --- existing tmpfs coverage is retained (guard against accidental removal) ---

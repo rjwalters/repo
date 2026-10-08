@@ -2510,8 +2510,29 @@ parse_force_ops() {
                 }
             } else if (subcmd == "reset") {
                 hard = 0
-                for (j = k+1; j <= m; j++) if (toks[j] == "--hard") hard = 1
-                if (hard) print cpath SEP "@HEAD@"
+                rt = ""
+                # Capture the first positional (non-flag) token as the reset
+                # TARGET literal (Loom #5772), e.g. "origin/main" -- emitted as
+                # a THIRD field so the caller can recognize a known recovery
+                # target when branch identity resolves to a detached HEAD. A
+                # bare `git reset --hard` defaults to the literal "HEAD", so
+                # the field is never empty on a reset line; a push line never
+                # carries one, which is how the caller tells them apart. The
+                # token is raw (quotes intact): a quoted target simply fails
+                # the exact-string tests in the caller and keeps asking.
+                for (j = k+1; j <= m; j++) {
+                    t = toks[j]
+                    if (t == "--hard") { hard = 1; continue }
+                    # `--` ends options; whatever follows is not a plain
+                    # recovery target, so mark the line unrecognized.
+                    if (t == "--") { if (rt == "") rt = "--"; break }
+                    if (t ~ /^-/) continue
+                    if (rt == "") rt = t
+                }
+                if (hard) {
+                    if (rt == "") rt = "HEAD"
+                    print cpath SEP "@HEAD@" SEP rt
+                }
             }
         }
     }'
@@ -4468,9 +4489,24 @@ _rm_scope_bare_var_name() {
 # `$(mktemp)` forms (optionally followed by the #7986 realpath chain). A custom
 # template/--tmpdir never matches, so it falls through to the fail-closed deny.
 rm_scope_mktemp_same_command_safe() {
-    local target="$1" cmdtext="$2" varname verdict
+    local target="$1" cmdtext="$2" varname
     varname=$(_rm_scope_bare_var_name "$target") || return 1
     [[ -n "$varname" ]] || return 1
+    mktemp_same_command_bound "$varname" "$cmdtext"
+}
+
+# mktemp_same_command_bound VARNAME CMDTEXT -- the shared same-command mktemp
+# PROOF behind both fast paths (rm scope above, #581; write confinement below,
+# #582 / Loom #6949). Success only when CMDTEXT (heredoc-body masked by the
+# caller) binds VARNAME exactly once, to the plain `$(mktemp -d)` / `$(mktemp)`
+# forms (optionally followed by the exact #7986 realpath chain), with no other
+# rebinding of any kind (#8221/#9331), and that binding is PROVEN to run, in
+# this shell, before any reference to VARNAME (repo#588). One definition, so the
+# rm and write consumers can never drift apart on the shape they admit. Every
+# failure path returns 1; callers invoke it only in a condition context.
+mktemp_same_command_bound() {
+    local varname="$1" cmdtext="$2" verdict
+    [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
     # #7986: mask the self-referential canonicalization chain (if any) into an
     # opaque, separator-free token BEFORE the segment scan — see
     # _mktemp_canon_mask()'s doc comment above. A refusal (the token's bytes
@@ -4531,8 +4567,99 @@ rm_scope_mktemp_same_command_safe() {
             else if (!samecmd_binding_ctx_ok(buf, segs, nsegs, safeseg)) ok = 0
         }
         print (ok ? "SAFE" : "UNSAFE")
-    }')
+    }') || verdict=""
     [[ "$verdict" == "SAFE" ]]
+}
+
+# Lazily built, heredoc-body-masked scan text shared by BOTH same-command mktemp
+# fast paths (rm scope and write confinement): a heredoc body is never a live
+# top-level assignment of the current shell, so masking can only narrow (a
+# decoy `NAME=$(mktemp -d)` inside an inert body cannot launder a live
+# binding, Loom #6549). A masking failure leaves the text EMPTY, which no proof
+# can pass (fail closed), instead of reaching the ERR trap's allow path.
+_MKTEMP_SCAN_DONE=""
+COMMAND_MKTEMP_SCAN=""
+mktemp_scan_text_ensure() {
+    [[ -n "$_MKTEMP_SCAN_DONE" ]] && return 0
+    _MKTEMP_SCAN_DONE=1
+    COMMAND_MKTEMP_SCAN="$COMMAND_NO_LITERAL_TEXT"
+    if [[ "$COMMAND_MKTEMP_SCAN" == *"<<"* ]]; then
+        COMMAND_MKTEMP_SCAN=$(printf '%s' "$COMMAND_MKTEMP_SCAN" | awk "$_MASKHEREDOC_AWK"'
+        { buf = buf (NR > 1 ? "\n" : "") $0 }
+        END { printf "%s", mask_heredoc_bodies(buf) }') || COMMAND_MKTEMP_SCAN=""
+    fi
+    return 0
+}
+
+# --- Write-confinement same-command mktemp outputs (#582, Loom #6949). -------
+# _wt_write_mktemp_leading_var TOKEN -- succeed only when TOKEN (one optional
+# surrounding quote layer) is exactly `$NAME` / `${NAME}`, optionally followed
+# by a `/`-prefixed suffix. Publishes NAME in _WT_WRITE_VARNAME and the
+# (possibly empty) suffix in _WT_WRITE_SUFFIX (out-parameters, so the bytes
+# survive without a command-substitution round trip).
+_WT_WRITE_VARNAME=""
+_WT_WRITE_SUFFIX=""
+_wt_write_mktemp_leading_var() {
+    local tok="$1" t c1 c2
+    _WT_WRITE_VARNAME=""
+    _WT_WRITE_SUFFIX=""
+    t="$tok"
+    if [[ ${#t} -ge 2 ]]; then
+        c1="${t:0:1}"
+        c2="${t: -1}"
+        if [[ ("$c1" == '"' && "$c2" == '"') || ("$c1" == "'" && "$c2" == "'") ]]; then
+            # A single-quoted `$` is literal data, never an expansion: not a
+            # variable reference at all, so it can prove nothing.
+            [[ "$c1" == "'" ]] && return 1
+            t="${t:1:${#t}-2}"
+        fi
+    fi
+    if [[ "$t" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}(/.*)?$ ]] || \
+       [[ "$t" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)(/.*)?$ ]]; then
+        _WT_WRITE_VARNAME="${BASH_REMATCH[1]}"
+        _WT_WRITE_SUFFIX="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# wt_write_mktemp_same_command_safe TARGET CMDTEXT -- success only when TARGET
+# is `$NAME[/suffix]` (see above) and NAME is proven by
+# mktemp_same_command_bound(). On top of that shared proof, a write target
+# needs conditions the bare-`$NAME` rm consumer never does:
+#   1. The suffix is a plain literal path: no further expansion, quoting,
+#      glob or backslash, and no `..` component (the mktemp directory's
+#      depth is unknown, so `..` could walk back into a protected area).
+#   2. TMPDIR is not rebound anywhere in the command (unless NAME *is*
+#      TMPDIR, whose single binding the proof itself pins): `mktemp`
+#      honours TMPDIR, so `export TMPDIR=<main>/x; t=$(mktemp -d)` would put
+#      the "fresh" directory inside the main checkout. Fail closed.
+# The caller additionally applies the protected-area checks that need the
+# write-confinement block's roots (inherited TMPDIR, empty-expansion
+# spelling) — see wt_write_mktemp_target_admitted() in that block.
+wt_write_mktemp_same_command_safe() {
+    local target="$1" cmdtext="$2" varname suffix scrubbed
+    _wt_write_mktemp_leading_var "$target" || return 1
+    varname="$_WT_WRITE_VARNAME"
+    suffix="$_WT_WRITE_SUFFIX"
+    [[ -n "$varname" ]] || return 1
+    if [[ -n "$suffix" ]]; then
+        case "$suffix" in
+            *'$'*|*'`'*|*'"'*|*"'"*|*'\'*|*'*'*|*'?'*|*'['*) return 1 ;;
+        esac
+        case "$suffix/" in
+            */../*|*/./*) return 1 ;;
+        esac
+    fi
+    if [[ "$varname" != "TMPDIR" ]]; then
+        # Only plain READS are scrubbed (`$TMPDIR`, `${TMPDIR}`); anything else
+        # naming it -- an assignment, export/declare/read/unset, or a
+        # `${TMPDIR:=...}` default-assignment -- survives and refuses.
+        scrubbed="${cmdtext//\$\{TMPDIR\}/}"
+        scrubbed="${scrubbed//\$TMPDIR/}"
+        [[ "$scrubbed" == *TMPDIR* ]] && return 1
+    fi
+    mktemp_same_command_bound "$varname" "$cmdtext"
 }
 
 # _rm_scope_var_ref_split TOKEN -- split `$NAME<suffix>` into "NAME<TAB>suffix"; fail
@@ -4739,6 +4866,45 @@ _in_any_managed_worktree() {
         i=$((i + 1))
     done
     return 1
+}
+
+# Reads the `# Branch: <name>` line worktree.sh records into a managed
+# worktree's `.loom-managed` sentinel at creation time (Loom #7530; this repo's
+# vendored .loom/scripts/worktree.sh writes the same line). Authoritative
+# because it is recorded once at creation, so it survives the worktree later
+# going detached -- exactly the ambiguous case it resolves. Walks up from $1
+# like _in_any_managed_worktree() (same 64-hop cap) and echoes the recorded
+# branch for the NEAREST sentinel, or nothing when that sentinel has no
+# well-formed `# Branch:` line. A value that is not a plausible branch name
+# (empty, whitespace, a leading `-`, `..`, or characters git forbids in a
+# ref) is treated as absent. ALWAYS returns 0: this hook's ERR trap
+# fail-opens, so the ordinary "nothing found" case must never be a non-zero
+# exit from a helper used in an assignment.
+_managed_worktree_branch() {
+    local dir="$1" line="" br=""
+    [[ -n "$dir" ]] || return 0
+    if [[ ! -d "$dir" ]]; then
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+    fi
+    local i=0
+    while [[ $i -lt 64 ]]; do
+        if [[ -f "$dir/.loom-managed" ]]; then
+            line=$(grep -m1 '^# Branch: ' "$dir/.loom-managed" 2>/dev/null) || line=""
+            br="${line#\# Branch: }"
+            if [[ -n "$line" && -n "$br" ]] && \
+               [[ "$br" =~ ^[A-Za-z0-9._/-]+$ ]] && \
+               [[ "$br" != -* && "$br" != */ && "$br" != /* && "$br" != *..* && "$br" != *//* ]]; then
+                printf '%s' "$br"
+            fi
+            return 0
+        fi
+        [[ "$dir" == "/" ]] && break
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+        i=$((i + 1))
+    done
+    return 0
 }
 
 # True if at least one managed worktree currently exists under $1
@@ -6441,11 +6607,13 @@ extract_write_targets() {
                     if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
                 }
             }
+            segprefix = 0
             while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
                 assignword = substr(seg, 1, RLENGTH)
                 seg = substr(seg, RLENGTH + 1)
                 sub(/[ \t]+$/, "", assignword)
                 record_assign(assignword)
+                segprefix = 1
             }
             # A segment that was NOTHING but assignments writes nothing.
             # Anything left over keeps flowing into the command scan below
@@ -6492,6 +6660,32 @@ extract_write_targets() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    # SAME-COMMAND LITERAL RESOLUTION OF THE cd ARGUMENT
+                    # (#582, Loom #7294): `TMP=/tmp/x; cd "$TMP/repo"; echo
+                    # hi > README.md` left curcwd carrying the unexpanded
+                    # `$TMP`, so the later RELATIVE write failed closed even
+                    # though the identical `$TMP/...` shape already resolves
+                    # as a DIRECT write target (#4881/repo#293). resolve_var()
+                    # is the same quote-aware, static-literal-only resolver
+                    # (single quotes, backslashes, backticks, chained or
+                    # conflicting values all refuse), and the resolved cwd is
+                    # then judged by the SAME containment rule as a literal
+                    # `cd /that/path`, so it can never grant more than spelling
+                    # that path outright. Two extra refusals, both stricter
+                    # than Loom:
+                    #   - the resolved value must be ABSOLUTE. record_assign()
+                    #     stores `V=~/x` verbatim while bash tilde-expands it,
+                    #     so a non-absolute value is not what bash would cd to;
+                    #   - no resolution when THIS segment carries its own
+                    #     `NAME=value` prefix: bash expands `$V` in `V=/x cd
+                    #     "$V"` BEFORE the prefix applies, so the recorded
+                    #     value is not the one cd receives.
+                    # Anything refused keeps the pre-existing path below
+                    # (fresh-root classification => fail closed).
+                    if (!segprefix) {
+                        cdres = resolve_var(toks[2])
+                        if (cdres != toks[2] && substr(cdres, 1, 1) == "/") cdarg = cdres
+                    }
                     # Quote-aware absolute/relative CLASSIFICATION only
                     # (#4933, widened to a PARTIALLY quoted argument by
                     # #5363 -- see the strip_cd_quoting() header comment
@@ -6534,7 +6728,27 @@ extract_write_targets() {
                     # widen a deny into an allow (same fallback contract as
                     # #4926).
                     cdclass = strip_cd_quoting(cdarg)
-                    if (cdclass ~ /^\//) {
+                    # FRESH-ROOT classification (#582, Loom #7294): a bare
+                    # `$NAME`/`${NAME}` argument (optionally `/suffix`)
+                    # supplies its OWN root at runtime -- `cd "$X"` never
+                    # lands under the prior cwd -- so it starts a new curcwd
+                    # exactly like an absolute path, instead of being joined
+                    # onto the prior cwd as if relative. Joining it fabricated
+                    # a REAL known prefix: from a cwd outside the repo
+                    # (`/tmp`), `cd "$X"; echo x > f` was judged as
+                    # `/tmp/$X/f` and ALLOWED even though $X may hold the main
+                    # checkout. As a fresh root, the shell layer below sees an
+                    # unknown first path component and fails closed under the
+                    # isolation gate. Only ever turns an allow into a deny.
+                    # Restricted to an EXPANDABLE `$` (unquoted or
+                    # double-quoted, no single quote / backslash anywhere): a
+                    # single-quoted `cd '"'"'$X'"'"'` names a directory literally called
+                    # `$X` under the prior cwd and must keep the relative join.
+                    cdfresh = 0
+                    if (index(cdarg, SQ) == 0 && index(cdarg, "\\") == 0 && \
+                        (cdclass ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*\}(\/.*)?$/ || \
+                         cdclass ~ /^\$[A-Za-z_][A-Za-z0-9_]*(\/.*)?$/)) cdfresh = 1
+                    if (cdclass ~ /^\// || cdfresh) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -6916,22 +7130,15 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]|[)`][[:space:]]+-[a-
                     # never a live top-level assignment of the current shell, so
                     # masking can only narrow (turn a decoy-inflated SAFE into
                     # UNSAFE), never widen.
-                    if [[ -z "${COMMAND_RM_MKTEMP_SCAN+x}" ]]; then
-                        COMMAND_RM_MKTEMP_SCAN="$COMMAND_NO_LITERAL_TEXT"
-                        if [[ "$COMMAND_RM_MKTEMP_SCAN" == *"<<"* ]]; then
-                            COMMAND_RM_MKTEMP_SCAN=$(printf '%s' "$COMMAND_RM_MKTEMP_SCAN" | awk "$_MASKHEREDOC_AWK"'
-                            { buf = buf (NR > 1 ? "\n" : "") $0 }
-                            END { printf "%s", mask_heredoc_bodies(buf) }')
-                        fi
-                    fi
+                    mktemp_scan_text_ensure
                     # (a) Proven `NAME=$(mktemp -d)` target: fully vetted.
-                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_RM_MKTEMP_SCAN"; then
+                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_MKTEMP_SCAN"; then
                         continue
                     fi
                     # (b) Proven literal value: NOT skipped past the checks --
                     # the resolved path replaces the token and is judged below
                     # exactly like a literal `rm -rf /that/path`.
-                    _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
+                    _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_MKTEMP_SCAN") || true
                     if [[ -z "$_rm_literal_resolved" ]]; then
                         deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime under guards.rmScope=repo — it may point far outside the repo (the #239 regression: an unresolvable target at a repo cwd was silently treated as repo-relative). Unresolvable rm targets fail closed. Spell out the literal path, or unroll the loop so each rm target is a concrete string." "rm-scope-unresolved-var"
                     fi
@@ -7075,7 +7282,71 @@ fi
 # deny"), not merely a missed optimization. Heredocs are rare enough in
 # practice that this stays a cheap, narrow widening of the pre-check, not a
 # reintroduction of the hot-path cost this comment describes avoiding.
+#
+# NARROW ALLOWANCES (#582, reconciled from Loom's vendored copy). Each is an
+# allow condition with its own proof, checked only for a target that already
+# resolved inside the main checkout; none is a general worktree opt-out, and
+# none applies when the configured isolation toggle is off (nothing is denied
+# then anyway):
+#   - registered worktree (Loom #7415): inside a git-registered, non-main
+#     worktree that really exists (a directory carrying its own `.git` file),
+#     e.g. `<main>/.claude/worktrees/x` made by a plain `git worktree add`.
+#   - env-selected worktree (Loom #7415): under the hook process's OWN
+#     inherited LOOM_WORKTREE_PATH pin. A pin at (or above) the main checkout
+#     root is ignored, so one env var cannot switch confinement off; an inline
+#     `LOOM_WORKTREE_PATH=... <cmd>` prefix never reaches this process.
+#   - read-only-role scratch (Loom #6021): LOOM_ROLE names a role with no
+#     Write/Edit tool AND the target is under `<main>/dist/`.
+#   - same-command mktemp output (Loom #6949/#7986/#8221): `$NAME[/suffix]`
+#     whose only binding is a proven `NAME=$(mktemp -d)` / `$(mktemp)`.
+# DIFFERENCES FROM LOOM (intentional, all stricter): an allowance is judged on
+# the target's PHYSICAL spelling when it differs from the lexical one; a raw
+# target or cwd containing a `..` component never earns one (the kernel resolves `..`
+# physically, normalize_abs_path() lexically); a registered root must exist as
+# a real linked worktree and must not be the main root or an ancestor of it;
+# the mktemp proof keeps repo#588's ordering/context rule, refuses a suffix
+# with further expansion or `..`, refuses when TMPDIR is rebound (or the
+# inherited TMPDIR is protected) and when the suffix's empty-expansion spelling
+# (`mktemp` failed, NAME empty) lands in the protected area; a `cd "$NAME"`
+# cwd is never admitted through the mktemp proof (a failed or no-op `cd`
+# leaves the write in the prior cwd).
 # =============================================================================
+
+# Roles whose agent definitions grant no Write/Edit tool (Loom #6021). Builder
+# and Doctor are deliberately absent; an unset or unknown LOOM_ROLE fails
+# closed. LOOM_ROLE is set by Loom's own dispatcher -- it is a Loom concept with
+# no REPO_* counterpart, the same treatment as LOOM_WORKTREE_ROOT above.
+_WT_READONLY_ROLES=" architect auditor champion curator guide hermit judge "
+
+# True if the CURRENT LOOM_ROLE identifies a role with no Write/Edit tool.
+# Case-insensitive; empty/unset never matches.
+_wt_readonly_role_active() {
+    [[ -n "${LOOM_ROLE:-}" ]] || return 1
+    local _role_lc
+    _role_lc=$(printf '%s' "$LOOM_ROLE" | tr '[:upper:]' '[:lower:]') || return 1
+    [[ "$_role_lc" =~ ^[a-z]+$ ]] || return 1
+    [[ "$_WT_READONLY_ROLES" == *" ${_role_lc} "* ]]
+}
+
+# True if $1 (an absolute, normalized path) sits inside the well-known `dist/`
+# scratch directory at the main-checkout root (either root spelling). A
+# path-component boundary: `<main>/dist-other` never matches.
+_wt_dist_scratch_path() {
+    local _p="$1"
+    [[ -n "$_p" ]] || return 1
+    if [[ -n "${_WT_MAIN_ROOT:-}" ]]; then
+        case "$_p" in
+            "$_WT_MAIN_ROOT/dist"|"$_WT_MAIN_ROOT/dist"/*) return 0 ;;
+        esac
+    fi
+    if [[ -n "${_WT_MAIN_ROOT_LOGICAL:-}" ]]; then
+        case "$_p" in
+            "$_WT_MAIN_ROOT_LOGICAL/dist"|"$_WT_MAIN_ROOT_LOGICAL/dist"/*) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 if worktree_isolation_guard_enabled && \
    { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
      [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
@@ -7228,6 +7499,186 @@ if worktree_isolation_guard_enabled && \
         _wt_in_protected_area_spelling "$_pp"
     }
 
+    # The worktree location to point a denied write at (Loom #7415): the
+    # ACTUALLY configured worktree root (LOOM_WORKTREE_ROOT env > worktree.root
+    # config, repo config over legacy .loom > in-repo default, i.e.
+    # resolve_worktree_root()) instead of a hardcoded `.loom/worktrees`, which
+    # is wrong for any repo that relocates its worktree root.
+    _wt_worktree_hint() {
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT") || _WT_WRITE_BASE=""
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if [[ -n "$_WT_WRITE_BASE" ]]; then
+            printf '%s/issue-<N>' "$_WT_WRITE_BASE"
+        else
+            printf '.loom/worktrees/issue-<N>'
+        fi
+    }
+
+    # Shared tail of every deny in this block (Loom #6110): the reliable
+    # opt-out is the config toggle; an inline env prefix never reaches this
+    # hook, which runs as a separate process with its own environment.
+    _WT_OPTOUT_HINT="Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json (or in .claude/skills/repo/config.json, which takes precedence) for the session -- an inline 'REPO_GUARD_WORKTREE_ISOLATION=0 <command>' or 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process)."
+    _WT_RESOLVE_HINT="Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the same-command resolver substitutes it before this check runs, and the resolved path is still judged by this same containment rule, so a declaration can never grant more than writing that literal path outright."
+
+    # True if $1 is a single raw path spelling with no `..` component. The
+    # kernel resolves `..` PHYSICALLY (through any symlink before it) while
+    # normalize_abs_path() pops it LEXICALLY, so a target spelled with `..`
+    # can land somewhere other than its normalized form claims. The narrow
+    # allowances below never trust such a spelling.
+    _wt_no_dotdot() {
+        [[ "/$1/" != */../* ]]
+    }
+
+    # ---------------------------------------------------------------------
+    # Env-selected worktree -- LOOM_WORKTREE_PATH (Loom #7415). ALLOW-ONLY:
+    # the hook's OWN inherited pin (set by a launcher that owns one process
+    # per worktree) admits a write under it, matching guard-worktree-paths.sh.
+    # Ignored when absent, when it does not resolve to a directory, and when
+    # it resolves to the main checkout root OR ANY ANCESTOR of it (stricter
+    # than Loom, which drops only the exact root): a pin there would switch
+    # the whole confinement off.
+    # ---------------------------------------------------------------------
+    _WT_ENV_WT=""
+    _WT_ENV_WT_LEX=""
+    _WT_ENV_WT_DONE=""
+    _wt_env_pin_resolve() {
+        local _phys _lex _r
+        [[ -n "$_WT_ENV_WT_DONE" ]] && return 0
+        _WT_ENV_WT_DONE=1
+        [[ -n "${LOOM_WORKTREE_PATH:-}" && "$LOOM_WORKTREE_PATH" == /* ]] || return 0
+        _phys=$(cd "$LOOM_WORKTREE_PATH" 2>/dev/null && pwd -P 2>/dev/null) || _phys=""
+        _phys="${_phys%/}"
+        [[ -n "$_phys" ]] || return 0
+        _lex=$(normalize_abs_path "$LOOM_WORKTREE_PATH") || _lex=""
+        _lex="${_lex%/}"
+        for _r in "$_WT_MAIN_ROOT" "$_WT_MAIN_ROOT_LOGICAL"; do
+            [[ -n "$_r" ]] || continue
+            # The pin equals, or contains, the main checkout: not a pin.
+            if [[ "$_r" == "$_phys" || "$_r" == "$_phys"/* ]]; then
+                return 0
+            fi
+            if [[ -n "$_lex" ]] && [[ "$_r" == "$_lex" || "$_r" == "$_lex"/* ]]; then
+                return 0
+            fi
+        done
+        _WT_ENV_WT="$_phys"
+        [[ -n "$_lex" && "$_lex" != "$_phys" ]] && _WT_ENV_WT_LEX="$_lex"
+        return 0
+    }
+    _wt_under_env_worktree() {
+        local _p="$1"
+        [[ -n "$_p" ]] || return 1
+        _wt_env_pin_resolve
+        [[ -n "$_WT_ENV_WT" ]] || return 1
+        case "$_p" in
+            "$_WT_ENV_WT"|"$_WT_ENV_WT"/*) return 0 ;;
+        esac
+        if [[ -n "$_WT_ENV_WT_LEX" ]]; then
+            case "$_p" in
+                "$_WT_ENV_WT_LEX"|"$_WT_ENV_WT_LEX"/*) return 0 ;;
+            esac
+        fi
+        return 1
+    }
+
+    # ---------------------------------------------------------------------
+    # Registered-but-unmanaged git worktrees (Loom #7415). A worktree made by a
+    # plain `git worktree add` nested under the main checkout carries no
+    # `.loom-managed` sentinel, so the main-root prefix test denied it even
+    # though git treats it as a separate working tree. Consult
+    # `git worktree list --porcelain` and accept any registered entry OTHER
+    # than the main one, in both root spellings.
+    #
+    # TRUST BOUNDARY (#4245): this widens recognition from "worktrees Loom
+    # created" to "worktrees git knows about" -- the sentinel was never an
+    # authentication boundary either. What is NOT widened: the main checkout's
+    # own working tree. Stricter than Loom: an entry must currently exist as a
+    # real linked worktree (a directory holding its own `.git` file -- a stale
+    # or prunable entry would otherwise let a write CREATE files in the main
+    # checkout), and an entry equal to, or an ancestor of, either main-root
+    # spelling is skipped. Resolved lazily and cached; builtins only per entry.
+    # ---------------------------------------------------------------------
+    _WT_REG_ROOTS=""
+    _WT_REG_ROOTS_DONE=""
+    # Populates _WT_REG_ROOTS (newline-separated) once per hook run. Called
+    # directly -- never through `$(...)` -- so the cache survives into the
+    # caller's shell. Always returns 0.
+    _wt_registered_worktree_roots() {
+        local _line _wtp _alt _r _skip
+        if [[ -z "$_WT_REG_ROOTS_DONE" ]]; then
+            _WT_REG_ROOTS_DONE=1
+            if [[ -n "$_WT_MAIN_ROOT" && -d "$_WT_MAIN_ROOT" ]]; then
+                while IFS= read -r _line; do
+                    [[ "$_line" == "worktree "* ]] || continue
+                    _wtp="${_line#worktree }"
+                    [[ "$_wtp" == /* ]] || continue
+                    _wtp="${_wtp%/}"
+                    [[ -n "$_wtp" ]] || continue
+                    _skip=""
+                    for _r in "$_WT_MAIN_ROOT" "$_WT_MAIN_ROOT_LOGICAL"; do
+                        [[ -n "$_r" ]] || continue
+                        if [[ "$_r" == "$_wtp" || "$_r" == "$_wtp"/* ]]; then
+                            _skip=1
+                        fi
+                    done
+                    [[ -z "$_skip" ]] || continue
+                    [[ -d "$_wtp" && -f "$_wtp/.git" ]] || continue
+                    _WT_REG_ROOTS+="${_wtp}"$'\n'
+                    _alt=""
+                    if [[ -n "$_WT_MAIN_ROOT_LOGICAL" && "$_WT_MAIN_ROOT_LOGICAL" != "$_WT_MAIN_ROOT" ]]; then
+                        case "$_wtp" in
+                            "$_WT_MAIN_ROOT"/*) _alt="${_WT_MAIN_ROOT_LOGICAL}/${_wtp#"$_WT_MAIN_ROOT"/}" ;;
+                            "$_WT_MAIN_ROOT_LOGICAL"/*) _alt="${_WT_MAIN_ROOT}/${_wtp#"$_WT_MAIN_ROOT_LOGICAL"/}" ;;
+                        esac
+                    fi
+                    [[ -n "$_alt" ]] && _WT_REG_ROOTS+="${_alt}"$'\n'
+                done < <(git -C "$_WT_MAIN_ROOT" worktree list --porcelain 2>/dev/null || true)
+            fi
+        fi
+        return 0
+    }
+
+    # True if $1 (absolute, normalized) sits inside a registered worktree that
+    # is not the main checkout.
+    _wt_in_registered_worktree() {
+        local _p="$1" _root
+        [[ -n "$_p" ]] || return 1
+        _wt_registered_worktree_roots
+        [[ -n "$_WT_REG_ROOTS" ]] || return 1
+        while IFS= read -r _root; do
+            [[ -n "$_root" ]] || continue
+            if [[ "$_p" == "$_root" || "$_p" == "$_root"/* ]]; then
+                return 0
+            fi
+        done <<< "$_WT_REG_ROOTS"
+        return 1
+    }
+
+    # Same-command mktemp output admission for a root-unknown write target.
+    # wt_write_mktemp_same_command_safe() supplies the shared proof; this adds
+    # the two checks that need this block's protected-area roots:
+    #   - the INHERITED TMPDIR (what `mktemp` will use) must be absolute and
+    #     outside the protected area;
+    #   - the EMPTY-EXPANSION spelling of the target (`mktemp` or the realpath
+    #     chain failed, NAME is empty, the write goes to `/<suffix>`) must be
+    #     outside the protected area too.
+    _wt_mktemp_target_admitted() {
+        local _t="$1" _td _empty
+        mktemp_scan_text_ensure
+        wt_write_mktemp_same_command_safe "$_t" "$COMMAND_MKTEMP_SCAN" || return 1
+        _empty="${_WT_WRITE_SUFFIX:-/}"
+        _empty=$(normalize_abs_path "$_empty") || return 1
+        _wt_in_protected_area "$_empty" && return 1
+        if [[ -n "${TMPDIR:-}" ]]; then
+            [[ "$TMPDIR" == /* ]] || return 1
+            _td=$(normalize_abs_path "$TMPDIR") || return 1
+            _wt_in_protected_area "$_td" && return 1
+        fi
+        return 0
+    }
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -7331,7 +7782,17 @@ if worktree_isolation_guard_enabled && \
                 # directory — the main checkout's own included).
                 if [[ "$_wmarked" == $'\001'* || "$_wmarked" == /$'\001'* ]]; then
                     if _wt_isolation_in_play; then
-                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
+                        # Same-command mktemp output (#582, Loom #6949/#7986/
+                        # #8221): `$NAME[/suffix]` whose only binding is a
+                        # proven `NAME=$(mktemp -d)` / `$(mktemp)` lands in a
+                        # fresh scratch path outside every worktree -- see
+                        # wt_write_mktemp_same_command_safe() and
+                        # _wt_mktemp_target_admitted() for the exact proof.
+                        # Anything it cannot prove falls through to the deny.
+                        if _wt_mktemp_target_admitted "$_wtarget"; then
+                            continue
+                        fi
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). ${_WT_RESOLVE_HINT} Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
                     fi
                     continue
                 fi
@@ -7362,11 +7823,11 @@ if worktree_isolation_guard_enabled && \
                         # value picks a top-level directory, the main
                         # checkout's own included. Same verdict as (1).
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). ${_WT_RESOLVE_HINT} Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wtarget")"
                         fi
                     elif _wt_in_protected_area "$_wknown"; then
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wknown")"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). ${_WT_RESOLVE_HINT} Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement-unresolved-var" "$(_wt_confinement_context "$_wknown")"
                         fi
                     fi
                     continue
@@ -7415,6 +7876,9 @@ if worktree_isolation_guard_enabled && \
         else
             continue
         fi
+        # Raw (pre-normalization) spelling, kept for the narrow allowances'
+        # `..` refusal below (_wt_no_dotdot).
+        _wraw="$_wabs"
         _wabs=$(normalize_abs_path "$_wabs")
 
         # Second spelling of the same target: physical, symlink-resolved.
@@ -7465,6 +7929,34 @@ if worktree_isolation_guard_enabled && \
         fi
         [[ -n "$_wt_root_hit" ]] || continue
 
+        # NARROW ALLOWANCES (#582; see the block header). Each is judged on
+        # the PHYSICAL spelling of the target whenever it differs from the
+        # lexical one -- that is where the kernel actually writes, so a
+        # symlinked ancestor can neither earn nor dodge an allowance -- and a
+        # raw spelling containing `..` never qualifies (the kernel resolves
+        # `..` physically, normalize_abs_path() lexically). None of them
+        # consults anything the acting command controls.
+        _wjudge="$_wabs"
+        [[ -n "$_wabsp" ]] && _wjudge="$_wabsp"
+        if _wt_no_dotdot "$_wraw"; then
+            # (b) The worktree this hook process is pinned to via its OWN
+            # inherited LOOM_WORKTREE_PATH (Loom #7415).
+            if _wt_under_env_worktree "$_wjudge"; then
+                continue
+            fi
+            # (c) A read-only-by-role session staging a scratch artifact under
+            # `<main>/dist/` (Loom #6021) -- never any other main-checkout path,
+            # never Builder/Doctor, never an unset/unknown role.
+            if _wt_dist_scratch_path "$_wjudge" && _wt_readonly_role_active; then
+                continue
+            fi
+            # (d) Inside a git-registered, non-main worktree nested under the
+            # main checkout, sentinel or not (Loom #7415).
+            if _wt_in_registered_worktree "$_wjudge"; then
+                continue
+            fi
+        fi
+
         # Target resolves inside the main checkout and outside every
         # worktree. Deny only if worktree isolation is actually in play for
         # this repo/session (a managed worktree exists somewhere); otherwise
@@ -7473,7 +7965,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
         fi
     done <<< "$WRITE_TARGETS"
 fi
@@ -7511,6 +8003,43 @@ fi
 # the ~99% of commands with no force flag at all.
 # =============================================================================
 
+# _force_detached_reset_recovery_ok CWD RESET_TARGET -- succeed only for the
+# "resync my own Loom-managed worktree" recovery shape (#582, ported from Loom
+# #5772 / #7530): a `git reset --hard` line (RESET_TARGET non-empty -- a push
+# line never carries one) whose CWD is a linked git worktree, NOT the main
+# checkout, with a `.loom-managed` sentinel at that worktree's own toplevel,
+# and whose target is exactly one of:
+#   HEAD | origin/main | origin/master | origin/<repo default branch>
+#   | origin/<the branch recorded in the sentinel's `# Branch:` line>
+# A detached worktree reset to any of those names no protected branch and no
+# other agent's work (it moves only this worktree's detached HEAD). A sibling
+# branch, an absent/malformed sentinel, an unmanaged location, the main
+# checkout, a quoted/unrecognized target and every push all fail and keep the
+# existing ask. Stricter than Loom, which accepts a sentinel on ANY ancestor of
+# the cwd: here the sentinel must sit at the cwd's own git toplevel and that
+# toplevel must not be the main checkout. Every failure returns 1.
+_force_detached_reset_recovery_ok() {
+    local fcwd="$1" rtarget="$2" top common main def own
+    [[ -n "$rtarget" && -n "$fcwd" && "$fcwd" == /* && -d "$fcwd" ]] || return 1
+    top=$(git -C "$fcwd" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [[ -n "$top" && -d "$top" ]] || return 1
+    top=$(cd "$top" 2>/dev/null && pwd -P) || return 1
+    common=$(git -C "$fcwd" rev-parse --git-common-dir 2>/dev/null) || return 1
+    [[ -n "$common" ]] || return 1
+    main=$(cd "$fcwd" 2>/dev/null && cd "$common/.." 2>/dev/null && pwd -P) || return 1
+    [[ -n "$main" && "$top" != "$main" ]] || return 1
+    [[ -f "$top/.loom-managed" && ! -L "$top/.loom-managed" ]] || return 1
+    case "$rtarget" in
+        HEAD|origin/main|origin/master) return 0 ;;
+    esac
+    def=$(resolve_default_branch "$fcwd") || def=""
+    if [[ -n "$def" && "$rtarget" == "origin/$def" ]]; then
+        return 0
+    fi
+    own=$(_managed_worktree_branch "$top") || own=""
+    [[ -n "$own" && "$rtarget" == "origin/$own" ]]
+}
+
 # Pre-check and parse both read COMMAND_ASK_SCAN, not the raw
 # COMMAND_NO_COMMENT (repo#188 parity fix) — a `--force` mentioned inside a
 # quoted `--body`/`-m` value is prose, and asking on it stalls ordinary issue
@@ -7529,7 +8058,7 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
             # "protected" mode: ask only for protected-branch or ambiguous
             # targets; allow own working branches. resolve_default_branch() plus
             # the main/master literals form the protected set.
-            while IFS=$'\037' read -r _fcpath _ftarget; do
+            while IFS=$'\037' read -r _fcpath _ftarget _fresettarget; do
                 [[ -z "$_ftarget" ]] && _ftarget="@HEAD@"
                 _fcwd="$_fcpath"
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
@@ -7537,6 +8066,14 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                     _fbranch=""
                     if [[ -n "$_fcwd" ]]; then
                         _fbranch=$(git -C "$_fcwd" symbolic-ref --short HEAD 2>/dev/null || true)
+                    fi
+                    if [[ -z "$_fbranch" ]] && \
+                       _force_detached_reset_recovery_ok "$_fcwd" "$_fresettarget"; then
+                        # Managed-worktree recovery reset (#582, Loom #5772 /
+                        # #7530) -- see _force_detached_reset_recovery_ok().
+                        # Only a detached RESET line can reach here; it names
+                        # no branch, so nothing below has a target to judge.
+                        continue
                     fi
                     if [[ -z "$_fbranch" ]]; then
                         # Detached HEAD / unresolved identity is ambiguous — ask,
