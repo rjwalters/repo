@@ -6835,6 +6835,40 @@ assert_sc deny "#581 rollback: /tmp binding with a .. escape to /etc denied" "" 
     "DROPIN=\"/tmp/a/../../etc/sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
 assert_sc deny "#581 rollback: rebinding DROPIN after the /tmp binding denied" "" "" \
     "DROPIN=\"/tmp/guard-sc581/x\""$'\n'"DROPIN=\"/etc/sudoers.d/alice-nopasswd\""$'\n'"$_SC_ROLLBACK"
+
+# -- repo#588 review (P1): a same-command binding proves the rm target ONLY when
+#    it is guaranteed to have run, in this shell, BEFORE the rm word expands.
+#    Each case below previously ALLOWED while the shell would hand rm the
+#    INHERITED value of `d`. The guard runs with an inherited out-of-scope `d`
+#    in its environment to mirror the Judge's reproduction; it is only ever fed
+#    JSON, so no rm runs.
+SC_INH="d=/opt/vendor/important"
+for _sc_bind in 'd=/tmp/safe' 'd=$(mktemp -d)'; do
+    _sc_kind=literal; [[ "$_sc_bind" == *mktemp* ]] && _sc_kind=mktemp
+    assert_sc deny "#588 $_sc_kind: assignment AFTER the rm does not prove it" "" "$SC_INH" "rm -rf \"\$d\"; $_sc_bind"
+    assert_sc deny "#588 $_sc_kind: skipped assignment (false &&) does not prove it" "" "$SC_INH" "false && $_sc_bind; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: skipped assignment (true ||) does not prove it" "" "$SC_INH" "true || $_sc_bind; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: && continued over a newline is still conditional" "" "$SC_INH" "false &&"$'\n'"$_sc_bind"$'\n'"rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: && continued past a comment line is still conditional" "" "$SC_INH" "false && # note"$'\n'"$_sc_bind"$'\n'"rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: && continued by backslash-newline is still conditional" "" "$SC_INH" "false && \\"$'\n'"$_sc_bind; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment inside if/then does not prove it" "" "$SC_INH" "if false; then $_sc_bind; fi; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment inside a subshell does not persist" "" "$SC_INH" "($_sc_bind); rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment inside a brace group after && denied" "" "$SC_INH" "false && { $_sc_bind; }; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment in a pipeline runs in a subshell" "" "$SC_INH" "$_sc_bind | cat; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment as a pipeline's right side runs in a subshell" "" "$SC_INH" "true | $_sc_bind; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: backgrounded assignment does not persist" "" "$SC_INH" "$_sc_bind & rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: assignment inside \$( ) does not persist" "" "$SC_INH" "x=\$(true; $_sc_bind); rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: a use of \$d before the binding denied" "" "$SC_INH" "echo \$d; $_sc_bind; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: rebinding hidden in a function body denied" "" "$SC_INH" "$_sc_bind; f() { d=/etc; }; f; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: rebinding hidden in a then-branch denied" "" "$SC_INH" "$_sc_bind; if c; then d=/etc; fi; rm -rf \"\$d\""
+    assert_sc deny "#588 $_sc_kind: \${d:=...} rebinding denied" "" "$SC_INH" "$_sc_bind; : \${d:=/etc}; rm -rf \"\$d\""
+    # The intended safe shapes stay allowed with the same inherited value.
+    assert_sc allow "#588 $_sc_kind: unconditional binding before the rm allowed" "" "$SC_INH" "$_sc_bind; rm -rf \"\$d\""
+    assert_sc allow "#588 $_sc_kind: binding followed by && chain allowed" "" "$SC_INH" "$_sc_bind && true && rm -rf \"\$d\""
+    assert_sc allow "#588 $_sc_kind: binding then rm inside a later if allowed" "" "$SC_INH" "$_sc_bind"$'\n'"if true; then rm -rf \"\$d\"; fi"
+done
+assert_sc deny "#588 literal: prefix assignment (d=/tmp/x rm ...) does not persist" "" "$SC_INH" 'd=/tmp/safe rm -rf "$d"'
+assert_sc allow "#588 literal: quoted value with a space still resolves" "" "$SC_INH" "d='/tmp/my dir'; rm -rf \"\$d\""
 assert_allow_env "#581: rmScope=off keeps unresolved-var rm unchanged" "LOOM_RM_SCOPE=off" 'rm -rf "$d"' "$REPO_ROOT"
 
 rm -rf "$SC_BASE"

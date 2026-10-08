@@ -2025,10 +2025,18 @@ function hd_opener(s, n, i, out,   j, c, q, w, SQ, DQ) {
 # BOTH this lexer and qsplit() so the two cannot drift (#113).
 function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, inner,
                     hdc, hddelim, hdstrip, hdquoted, hdo, hdnext, h, k, unsafe,
-                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn, sdep) {
+                    arO, arC, eol, nexti, line, t, incmt, pc, acs, acn, sdep, segbeg) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     split("", segs)          # clear the caller-supplied out-array
+    # Side channel (repo#588 review): ml_segbeg[k] is the buffer index where
+    # segment k starts and ml_segsep[k] the index of the separator byte that
+    # ENDED it (n + 1 for the final segment). Globals, so existing callers are
+    # unaffected; samecmd_binding_ctx_ok() reads them to prove WHERE a binding
+    # sits (unconditional, top level) relative to the separators around it.
+    split("", ml_segbeg)
+    split("", ml_segsep)
+    segbeg = 1
     split("", acs)           # stack of pending active-span CLOSING quote indexes
     acn = 0
     s = buf
@@ -2350,6 +2358,7 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
                 # its terminator, or through end-of-buffer when unterminated) is
                 # inert DATA and contributes no segment at all.
                 segs[++segc] = seg
+                ml_segbeg[segc] = segbeg; ml_segsep[segc] = i; segbeg = k
                 seg = ""
                 incmt = 0
                 i = k
@@ -2359,12 +2368,15 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
         }
         if (c == ";" || c == "&" || c == "|" || c == "\n") {
             if (c == "\n") incmt = 0   # a comment ends at the physical newline
-            segs[++segc] = seg; seg = ""; i++; continue
+            segs[++segc] = seg
+            ml_segbeg[segc] = segbeg; ml_segsep[segc] = i; segbeg = i + 1
+            seg = ""; i++; continue
         }
         seg = seg c
         i++
     }
     segs[++segc] = seg
+    ml_segbeg[segc] = segbeg; ml_segsep[segc] = n + 1
     return segc
 }
 '
@@ -4333,6 +4345,100 @@ function _mktemp_is_other_rebind(seg, varname,   n, i, toks, tok, bseg, cseg) {
 }
 '
 
+# --- Same-command ORDER + CONTEXT proof (repo#588 review, P1). -----------------
+# Counting bindings across the whole buffer is not enough: a binding proves the
+# rm target only if it is GUARANTEED to have executed, in THIS shell, BEFORE the
+# rm word expands. Both of these were admitted while the inherited value of `d`
+# is what the rm actually receives:
+#     rm -rf "$d"; d=/tmp/safe            (assignment AFTER the rm)
+#     false && d=/tmp/safe; rm -rf "$d"   (assignment SKIPPED)
+# These helpers require, on top of the single-binding count (fail closed on
+# anything unprovable):
+#   1. every reference to NAME sits in a segment AFTER the binding segment;
+#   2. the binding is reached unconditionally: every separator between it and
+#      the previous non-blank segment is `;` or an unescaped newline (never
+#      `&&`, `||`, `|`, `&`), and no control-flow or grouping construct opens
+#      before it (if/then/else/while/until/do/for/select/case/function/coproc,
+#      `(`, `{`, `!`, `NAME()` function definitions);
+#   3. it runs in the current shell: top level (not inside `$( )`/backticks),
+#      and not the left side of a pipeline `|` or backgrounded with `&`;
+#   4. no OTHER assignment-shaped occurrence of NAME exists anywhere (`NAME=`,
+#      `NAME+=`, `NAME[` at a word boundary, `${NAME:=...}`), so a rebinding
+#      buried in `then NAME=...`, `f() { NAME=...; }`, a case arm or a quoted
+#      trap string still poisons the proof.
+# Requires ml_segment() to have just filled ml_segbeg[] / ml_segsep[].
+_SAMECMD_ORDER_AWK='
+function samecmd_trim(t) {
+    sub(/^[ \t\n]+/, "", t)
+    sub(/[ \t\n]+$/, "", t)
+    return t
+}
+function samecmd_assign_like(seg, varname) {
+    if (seg ~ ("(^|[^A-Za-z0-9_$])" varname "(\\+?=|\\[)")) return 1
+    if (seg ~ ("\\$\\{" varname ":?[=?]")) return 1
+    return 0
+}
+function samecmd_refers(seg, varname) {
+    if (seg ~ ("\\$" varname "([^A-Za-z0-9_]|$)")) return 1
+    if (seg ~ ("\\$\\{[#!]?" varname "([^A-Za-z0-9_]|$)")) return 1
+    return 0
+}
+function samecmd_opens_compound(t) {
+    t = samecmd_trim(t)
+    if (t ~ /^[({!]/) return 1
+    if (t ~ /^(if|then|elif|else|fi|while|until|do|done|for|select|case|esac|function|coproc)([ \t;]|$)/) return 1
+    if (t ~ /^[A-Za-z_][A-Za-z0-9_:.-]*[ \t]*\(\)/) return 1
+    return 0
+}
+# 1 when segment k (a NAME=... binding) is unconditional, top level, current
+# shell, and preceded by no control-flow construct. buf is the exact text
+# ml_segment() just segmented into segs[1..n].
+function samecmd_binding_ctx_ok(buf, segs, n, k,   blen, j, p, c, nc, pos, sdep, t) {
+    if (k < 1 || k > n) return 0
+    blen = length(buf)
+    # (3a) top level: not inside a command substitution.
+    subst_depth(buf, sdep)
+    pos = ml_segbeg[k]
+    while (pos <= blen && substr(buf, pos, 1) ~ /[ \t\n]/) pos++
+    if (pos <= blen && (sdep[pos] + 0) > 0) return 0
+    # (2a) nothing before it opens control flow or a grouping/subshell.
+    for (j = 1; j < k; j++) {
+        if (samecmd_opens_compound(segs[j])) return 0
+    }
+    # (2b) separators back to the previous non-blank, non-comment segment.
+    for (j = k - 1; j >= 1; j--) {
+        p = ml_segsep[j]
+        c = substr(buf, p, 1)
+        if (c == "&" || c == "|") return 0
+        if (c == "\n" && bs_escaped(buf, p)) return 0
+        if (c != ";" && c != "\n") return 0
+        t = samecmd_trim(segs[j])
+        # A blank segment (between `&&` and a newline) or a comment-only one
+        # (`false && # note` + newline continues the list) carries the
+        # previous separator forward; keep walking back.
+        if (t != "" && t !~ /^#/) break
+    }
+    # (3b) the separator AFTER it must not pipe or background the binding.
+    p = ml_segsep[k]
+    if (p <= blen) {
+        c = substr(buf, p, 1)
+        nc = (p < blen) ? substr(buf, p + 1, 1) : ""
+        if (c == "|" && nc != "|") return 0
+        if (c == "&" && nc != "&") return 0
+        if (c == ";" && (nc == ";" || nc == "&")) return 0
+        if (c == "\n" && bs_escaped(buf, p)) return 0
+    }
+    return 1
+}
+# Index of the first segment that references NAME, 0 when none does.
+function samecmd_first_ref(segs, n, varname,   i) {
+    for (i = 1; i <= n; i++) {
+        if (samecmd_refers(segs[i], varname)) return i
+    }
+    return 0
+}
+'
+
 # _rm_scope_bare_var_name TOKEN -- print NAME when TOKEN is exactly `$NAME`/`${NAME}`
 # (one optional quote layer), else return 1.
 _rm_scope_bare_var_name() {
@@ -4370,10 +4476,11 @@ rm_scope_mktemp_same_command_safe() {
     # _mktemp_canon_mask()'s doc comment above. A refusal (the token's bytes
     # already occur in the command text) fails closed.
     _mktemp_canon_mask "$varname" "$cmdtext" || return 1
-    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK"'
+    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         n = ml_segment(buf, segs)
+        nsegs = n
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
@@ -4389,12 +4496,12 @@ rm_scope_mktemp_same_command_safe() {
                 if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
                     rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
                     safe++
-                    if (safeat == 0) safeat = total
+                    if (safeat == 0) { safeat = total; safeseg = i }
                 } else if (rhs == canontok || rhs == "\"" canontok "\"") {
                     canon++
                     if (canonat == 0) canonat = total
                 }
-            } else if (_mktemp_is_other_rebind(seg, varname)) {
+            } else if (_mktemp_is_other_rebind(seg, varname) || samecmd_assign_like(seg, varname)) {
                 # #8221 + #9331: every rebinding of NAME that does not produce
                 # a segment beginning `NAME=` -- read/mapfile/readarray/
                 # getopts/unset/printf -v/for/select naming NAME, `NAME+=`,
@@ -4411,9 +4518,19 @@ rm_scope_mktemp_same_command_safe() {
         # FIRST and the self-referential canonicalization SECOND. A third
         # assignment, either shape repeated, or the reverse order all leave
         # this false and fail closed.
-        if (total == 1 && safe == 1) print "SAFE"
-        else if (total == 2 && safe == 1 && canon == 1 && safeat == 1 && canonat == 2) print "SAFE"
-        else print "UNSAFE"
+        ok = 0
+        if (total == 1 && safe == 1) ok = 1
+        else if (total == 2 && safe == 1 && canon == 1 && safeat == 1 && canonat == 2) ok = 1
+        # repo#588: the mktemp binding must be PROVEN to run, in this shell,
+        # before any use of NAME (see _SAMECMD_ORDER_AWK). The optional
+        # realpath chain needs no context proof of its own: whether or not it
+        # runs, NAME holds the mktemp path or its canonical spelling.
+        if (ok) {
+            fr = samecmd_first_ref(segs, nsegs, varname)
+            if (fr != 0 && fr <= safeseg) ok = 0
+            else if (!samecmd_binding_ctx_ok(buf, segs, nsegs, safeseg)) ok = 0
+        }
+        print (ok ? "SAFE" : "UNSAFE")
     }')
     [[ "$verdict" == "SAFE" ]]
 }
@@ -4453,7 +4570,7 @@ rm_scope_literal_same_command_resolve() {
     varname="${split%%$'\t'*}"
     suffix="${split#*$'\t'}"
     [[ -n "$varname" ]] || return 1
-    resolved=$(printf '%s' "$cmdtext" | awk -v varname="$varname" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK"'
+    resolved=$(printf '%s' "$cmdtext" | awk -v varname="$varname" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
     BEGIN {
         DQ = sprintf("%c", 34)
         SQ = sprintf("%c", 39)
@@ -4461,6 +4578,7 @@ rm_scope_literal_same_command_resolve() {
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         n = ml_segment(buf, segs)
+        nsegs = n
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
@@ -4470,7 +4588,8 @@ rm_scope_literal_same_command_resolve() {
             if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
                 total++
                 val = substr(seg, plen + 1)
-            } else if (_mktemp_is_other_rebind(seg, varname)) {
+                bindseg = i
+            } else if (_mktemp_is_other_rebind(seg, varname) || samecmd_assign_like(seg, varname)) {
                 # #9331: NAME+= / NAME[i]= / an EMPTY NAME= / a
                 # declaration-keyword assignment / read|mapfile|readarray|
                 # getopts|unset|printf -v|for|select naming NAME / any eval
@@ -4491,15 +4610,30 @@ rm_scope_literal_same_command_resolve() {
         }
     }
     END {
+        # repo#588: the binding must also be PROVEN to run, in this shell,
+        # before any use of NAME (see _SAMECMD_ORDER_AWK).
+        if (total == 1 && rebind == 0) {
+            fr = samecmd_first_ref(segs, nsegs, varname)
+            if (fr != 0 && fr <= bindseg) total = -1
+            else if (!samecmd_binding_ctx_ok(buf, segs, nsegs, bindseg)) total = -1
+        }
         if (total == 1 && rebind == 0) {
             vlen = length(val)
+            quoted = 0
             if (vlen >= 2) {
                 c1 = substr(val, 1, 1)
                 c2 = substr(val, vlen, 1)
                 if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
                     val = substr(val, 2, vlen - 2)
+                    quoted = 1
                 }
             }
+            # Any shell metacharacter or stray quote means the segment is not
+            # a plain `NAME=<literal>` (a subshell close, a redirection, a
+            # second word). Unquoted whitespace makes it a PREFIX assignment
+            # (`NAME=/x cmd`) that never persists in the shell. Fail closed.
+            if (val ~ /[;&|<>()\\\n]/ || index(val, DQ) || index(val, SQ)) val = ""
+            if (!quoted && val ~ /[ \t]/) val = ""
             if (val ~ /^\// && val !~ /[$`]/) print val
         }
     }')
