@@ -6583,6 +6583,116 @@ fi
 echo ""
 
 # =========================================================================
+# repo#580: Loom literal masking (--search / jq --arg|--argjson) and the
+# gh pr/issue comment|edit --body @path literal-@ rules (+ variable variants)
+# =========================================================================
+echo -e "${YELLOW}repo#580: --search / jq --arg|--argjson masking + gh body @path${NC}"
+
+# --- quoted inert text is masked (safe commands stay allowed) ---
+assert_allow "#580: gh issue list --search \"<catastrophic phrase>\" is inert query text" \
+    'gh issue list --search "docker system prune" --limit 5'
+assert_allow "#580: gh --search phrase followed by a --jq pipe filter (Loom #5916 shape)" \
+    "gh issue list --search \"docker system prune\" --jq '.[] | .number'"
+assert_allow "#580: single-quoted --search value is inert" \
+    "gh pr list --search 'docker system prune' --limit 5"
+# Intentional difference from Loom (#5783 masks single-quoted spans even when
+# they carry a backtick): this repo keeps its stricter floor for every quoted
+# flag value, so a backtick-bearing single-quoted --search stays visible.
+assert_deny "#580: single-quoted --search value carrying a backtick stays visible (stricter than Loom #5783)" \
+    "gh pr list --search 'docker system prune \`x\`' --limit 5"
+assert_allow "#580: escaped-quote exact-phrase --search value is fully masked (Loom #7095 shape)" \
+    'gh issue list --search "\"docker system prune\" label:bug" --limit 5'
+assert_allow "#580: jq --arg binds a quoted catastrophic phrase as data" \
+    "jq -n --arg t 'docker system prune' '\$t'"
+assert_allow "#580: jq --argjson binds a quoted catastrophic phrase as data" \
+    'jq -n --argjson t "\"docker system prune\"" "\$t"'
+assert_allow "#580: gh --comment value quoting a catastrophic phrase stays inert" \
+    'gh pr review 5 --comment "docker system prune is dangerous"'
+
+# --- executable substitutions are NEVER masked ---
+assert_deny "#580: double-quoted --search value with a live command substitution still denies" \
+    'gh issue list --search "$(docker system prune -af)" --limit 5'
+assert_deny "#580: double-quoted --search value with a live backtick still denies" \
+    'gh issue list --search "`docker system prune -af`" --limit 5'
+assert_deny "#580: jq --arg value with a live command substitution still denies" \
+    'jq -n --arg t "$(docker system prune -af)" "\$t"'
+assert_deny "#580: jq --argjson value with a live backtick still denies" \
+    'jq -n --argjson t "`docker system prune -af`" "\$t"'
+assert_deny "#580: unquoted phrase after a masked --search value still denies" \
+    'gh issue list --search "ok" --limit 5; docker system prune -af'
+assert_deny "#580: unquoted phrase after a masked jq --arg value still denies" \
+    'jq -n --arg t "ok" "\$t"; docker system prune -af'
+assert_deny "#580: --arg without a NAME token is not masked (phrase stays visible)" \
+    'somecmd --arg "docker system prune -af"'
+
+# --- ask tier: masking applies to the ask-word copy too ---
+assert_allow "#580: ask-tier phrase quoted in a gh --search value does not false-ask" \
+    'gh issue list --search "git reset --hard" --limit 5'
+assert_ask "#580: ask-tier phrase outside the masked --search value still asks" \
+    'gh issue list --search "x" --limit 5; git reset --hard'
+
+# --- gh pr/issue comment|edit --body @path (literal-@ data loss) ---
+assert_deny_tag "#580: gh pr comment --body @path (unquoted)" \
+    'gh pr comment 123 --body @/tmp/review.md' "$REPO_ROOT" "gh-comment-body-literal-at"
+assert_deny "#580: gh pr comment --body \"@path\" (double-quoted)" \
+    'gh pr comment 123 --body "@/tmp/review.md"'
+assert_deny "#580: gh pr comment --body '@path' (single-quoted)" \
+    "gh pr comment 123 --body '@/tmp/review.md'"
+assert_deny "#580: gh issue comment -b @path (short flag)" \
+    'gh issue comment 42 -b @./relative/review.md'
+assert_deny "#580: gh issue comment --body=@path (equals form)" \
+    'gh issue comment 42 --body=@~/review.md'
+assert_deny_tag "#580: gh issue edit --body @path" \
+    'gh issue edit 4608 --body @/tmp/body.txt' "$REPO_ROOT" "gh-edit-body-literal-at"
+assert_deny "#580: gh pr edit --body \"@path\" (double-quoted)" \
+    'gh pr edit 123 --body "@/tmp/review.md"'
+assert_deny "#580: gh issue edit --body '@path' (single-quoted)" \
+    "gh issue edit 4608 --body '@/tmp/body.txt'"
+assert_deny "#580: chained command still reaches the comment @path rule" \
+    'cd /tmp && gh pr comment 123 --body @/tmp/review.md'
+assert_allow "#580: gh pr comment --body-file path is the correct spelling" \
+    'gh pr comment 123 --body-file /tmp/review.md'
+assert_allow "#580: gh pr comment @mention prose is not an @path (Loom #4577)" \
+    'gh pr comment 123 --body "@reviewer could you clarify this?"'
+assert_allow "#580: gh pr edit @mention prose is not an @path" \
+    'gh pr edit 123 --body "@reviewer please re-check"'
+assert_allow "#580: gh pr comment --body \$(cat <<'EOF') spelling is allowed" \
+    "$(printf 'gh pr comment 123 --body "$(cat <<'"'"'EOF'"'"'\nreview text\nEOF\n)"')"
+assert_allow "#580: gh api -F body=@path is the correct file-reading spelling" \
+    'gh api repos/o/r/issues/1/comments -F body=@/tmp/review.md'
+assert_allow "#580: gh issue view is unaffected" \
+    'gh issue view 123 --json body'
+
+# --- variable variants ---
+assert_deny_tag "#580: variable assigned @path then passed as comment --body \"\$V\"" \
+    'REVIEW_FILE="@/tmp/review.md"; gh pr comment 4600 --body "$REVIEW_FILE"' "$REPO_ROOT" "gh-comment-body-literal-at-var"
+assert_deny "#580: variable variant, \${V} braces, extension-only path" \
+    'F=@review.md; gh issue comment 9 --body ${F}'
+assert_deny_tag "#580: variable assigned @path then passed to gh pr edit --body" \
+    'B="@/tmp/b.md"; gh pr edit 7 --body "$B"' "$REPO_ROOT" "gh-edit-body-literal-at-var"
+assert_deny "#580: variable variant, gh issue edit -b \$V" \
+    "B='@./b.md'; gh issue edit 7 -b \$B"
+assert_allow "#580: variable carrying prose passed as --body is untouched" \
+    'SUMMARY="all checks pass"; gh pr comment 4600 --body "$SUMMARY"'
+assert_allow "#580: variable assigned an @mention (not path-shaped) is untouched" \
+    'WHO="@reviewer"; gh pr comment 4600 --body "$WHO thanks"'
+assert_allow "#580: @path variable that is NOT passed as --body is untouched" \
+    'F="@/tmp/x.md"; gh pr comment 4600 --body-file /tmp/other.md'
+
+# --- existing tmpfs coverage is retained (guard against accidental removal) ---
+_tmpfs_cases=$(grep -c 'assert_tmpfs_deny\|assert_tmpfs_allow' "$SCRIPT_DIR/test-guard-destructive.sh")
+TOTAL=$((TOTAL + 1))
+if [[ "$_tmpfs_cases" -ge 10 ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #580: tmpfs build-dir case family still present ($_tmpfs_cases references)"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #580: tmpfs build-dir case family went missing ($_tmpfs_cases references)"
+fi
+
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
