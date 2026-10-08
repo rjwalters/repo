@@ -2753,7 +2753,21 @@ strip_literal_text() {
         # a continuation line is still recognized; the quoted-span classes
         # ([^"]* / [^'"'"']*) already match a newline, so a MULTI-LINE quoted
         # value is captured as one span once the whole command is slurped below.
-        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
+        #
+        # `--search` (gh issue/pr list --search "<text>") and `--comment|--search`
+        # both carry free text GitHub matches against, never executes.
+        # Second alternative (Loom #5797): `jq --arg NAME "<value>"` /
+        # `jq --argjson NAME "<value>"` — a bare identifier token (NAME) sits
+        # between the flag and the quoted value, which the first alternative
+        # does not anticipate, so it gets its own alternative. jq binds the
+        # value as DATA; it is never executed. The same ESCAPED CLOSE
+        # extension below applies to both alternatives (qpos is the first quote
+        # byte, and NAME cannot contain one). The has_live_subst() floor below
+        # is unchanged, so a double-quoted value carrying a live command
+        # substitution stays visible and still denies.
+        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|--search|-m)[ \t]*=?[ \t]*(" \
+             DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")" \
+             "|(^|[ \t\n])(--arg|--argjson)[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+(" \
              DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
         buf = ""
     }
@@ -3567,7 +3581,8 @@ fi
 # either — it just finds nothing left to redact there.
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
-      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
+      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* || \
+      "$COMMAND" == *"--search"* || "$COMMAND" == *"--arg"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
 fi
 
@@ -3611,6 +3626,61 @@ for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# `gh pr/issue comment|edit --body @path` — literal-@ silent data loss
+# (Loom #4523 comment, #4685 edit, #4601 shell-variable indirection; ported
+# for repo#580).
+#
+# `gh ... --body @path` does NOT expand `@path` to the file's contents (unlike
+# `gh api -F body=@path` or `--body-file path`): it posts the literal string
+# `@path` as the comment / issue body. Never intentional, so this is an ungated
+# hard deny, like the catastrophic tier above.
+#
+# DELIBERATELY scans the RAW $COMMAND, NOT COMMAND_NO_LITERAL_TEXT: the regex
+# only inspects the character right after the --body/-b flag's opening quote,
+# and strip_literal_text() would have blanked a quoted `"@/tmp/x"` to X's —
+# silently disabling the quoted shape. The `@` must be followed by a
+# path-shaped character (`/`, `.`, `~`); a bare `@reviewer ...` mention is
+# prose and must not match (Loom #4577). `comment` and `edit` are separate
+# regexes on purpose (Loom #4577/#4685 additive-not-widened precedent).
+# =============================================================================
+GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' does NOT expand the file — it posts the literal string '@path' as the comment. Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"
+fi
+GH_EDIT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+if echo "$COMMAND" | grep -qiE "$GH_EDIT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr edit'/'gh issue edit --body @path' does NOT expand the file — it writes the literal string '@path' as the issue/PR body. Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-edit-body-literal-at"
+fi
+
+# Same loss through SHELL-VARIABLE INDIRECTION (Loom #4601): a variable
+# assigned a path-shaped at-sign value, then passed as the body value.
+# An unconditional deny on `--body "$VAR"` would be far too broad, so this
+# CORRELATES: it denies only when the SAME command both assigns a path-shaped
+# `@…` value to a variable and passes that variable as the --body/-b value.
+# GH_AT_PATHISH requires real path shape (explicit `/`, `~/`, `./`, `../`
+# prefix, or a text-file extension) so `@mention` / `@org/team` prose never
+# matches. A variable assigned in an EARLIER Bash call is invisible to a single
+# PreToolUse payload (known limit, by construction).
+GH_AT_PATHISH="@((/|~/|\.\.?/)[^[:space:]\"';&|]*|[^[:space:]\"';&|]*\.(md|markdown|txt|text|log|json|ya?ml|diff|patch|out))"
+# Both variable rules need a literal `@`; this bash-builtin prefilter keeps
+# them off the hot path for nearly every command.
+if [[ "$COMMAND" == *"@"* ]]; then
+    for _gh_at_sub in comment edit; do
+        if echo "$COMMAND" | grep -qiE "(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+${_gh_at_sub}"; then
+            _gh_at_path_vars=$(printf '%s\n' "$COMMAND" \
+                | grep -oE "(^|[;&|(){}[:space:]])[A-Za-z_][A-Za-z0-9_]*=[\"']?$GH_AT_PATHISH" 2>/dev/null \
+                | grep -oE "[A-Za-z_][A-Za-z0-9_]*=" 2>/dev/null \
+                | tr -d '=' | sort -u)
+            for _gh_at_var in $_gh_at_path_vars; do
+                if echo "$COMMAND" | grep -qiE "(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?[\$]\{?${_gh_at_var}(\}|[^A-Za-z0-9_]|\$)"; then
+                    deny "BLOCKED: '\$${_gh_at_var}' is assigned a path-shaped '@<path>' value and passed as --body — 'gh ${_gh_at_sub}' does NOT expand '@path' from a variable either; it posts the literal string instead. Use --body-file <path>, 'gh api ... -F body=@<path>', or --body \"\$(cat <<'EOF' ... EOF)\"." "gh-${_gh_at_sub}-body-literal-at-var"
+                fi
+            done
+        fi
+    done
+fi
+
+# =============================================================================
 # COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
 # matches below, never for the catastrophic ALWAYS_BLOCK scan.
 #
@@ -3647,7 +3717,8 @@ fi
 COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
 if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
       "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
-      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
+      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* || \
+      "$COMMAND_NO_COMMENT" == *"--search"* || "$COMMAND_NO_COMMENT" == *"--arg"* ]]; then
     COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_NO_COMMENT")
 fi
 # Mirror the catastrophic tier's data-sink redaction (#53): an ask-phrase quoted
