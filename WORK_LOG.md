@@ -2,6 +2,12 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-08
+- **PR #588**: Guard: port rm-scope session scratch and same-command resolution (#581)
+- **PR #587**: Guard: port Loom --search/jq --arg masking and gh body @path denies (#580)
+- **Issue #581** (closed): Guard: reconcile Loom rm scope and session scratch allowances
+- **Issue #580** (closed): Guard: port Loom literal masking and gh body-file misuse checks
+
 ### 2026-10-07
 - **PR #576**: fix(optimize-ci): cache false positives for version keys and shared matrix caches
 - **Issue #574** (closed): optimize-ci: false positives for version-keyed caches and matrix legs that share one cache
