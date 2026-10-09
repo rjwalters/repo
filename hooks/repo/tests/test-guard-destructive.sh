@@ -7610,6 +7610,58 @@ assert_allow "#585 wrap: sudo -nu root printenv LOOM_TOKEN_NAME allowed" "sudo -
 assert_allow "#585 wrap: sudo -u root cat ssh known_hosts allowed" "sudo -u root cat /root/.ssh/known_hosts"
 assert_allow "#585 wrap: sudo -u root echo of systemctl restart text allowed" "sudo -u root echo 'systemctl restart nginx'"
 
+# --- quoted wrapper option values (PR #595 re-review, finding 1): a quoted or
+# escaped value containing a space is mis-split by the whitespace tokenizer, so
+# the resolver must fail closed rather than land on a fragment of the value.
+assert_ask "#585 wrap: sudo -p \"x y\" printenv asks" 'sudo -p "x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo -p 'x y' systemctl restart asks" "sudo -p 'x y' systemctl restart x"
+assert_ask "#585 wrap: sudo -p 'x y' cat ssh key asks" "sudo -p 'x y' cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo --prompt \"x y\" printenv asks" 'sudo --prompt "x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo --prompt=\"x y\" printenv asks" 'sudo --prompt="x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo -u \"a b\" printenv asks" 'sudo -u "a b" printenv API_KEY'
+assert_ask "#585 wrap: env -u \"A B\" printenv asks" 'env -u "A B" printenv API_KEY'
+assert_ask "#585 wrap: piped sudo -p \"a b\" printenv asks" 'echo hi | sudo -p "a b" printenv API_KEY'
+assert_ask "#585 wrap: sudo -p escaped-space printenv asks" 'sudo -p x\ y printenv API_KEY'
+assert_ask "#585 wrap: quoted assignment prefix printenv asks" 'FOO="a b" printenv API_KEY'
+assert_ask "#585 wrap: env quoted assignment systemctl restart asks" 'env FOO="a b" systemctl restart nginx'
+assert_ask "#585 wrap: sudo -p 'x y' -u root systemctl stop asks" "sudo -p 'x y' -u root systemctl stop nginx"
+assert_allow "#585 wrap: sudo -p \"x y\" ls allowed" 'sudo -p "x y" ls'
+assert_allow "#585 wrap: sudo -p 'x y' systemctl status allowed" "sudo -p 'x y' systemctl status nginx"
+assert_allow "#585 wrap: env -u \"A B\" make allowed" 'env -u "A B" make'
+assert_allow "#585 wrap: quoted assignment prefix make allowed" 'FOO="a b" make'
+assert_allow "#585 wrap: sudo -u \"a b\" printenv HOME allowed" 'sudo -u "a b" printenv HOME'
+assert_allow "#585 wrap: sudo -p 'x y' cat ssh known_hosts allowed" "sudo -p 'x y' cat /root/.ssh/known_hosts"
+
+# --- unmodelled launchers (PR #595 re-review, finding 2): the replaced
+# substring checks asked through these, so the resolver fails closed on them
+# (every token is a candidate command word) instead of newly allowing.
+assert_ask "#585 wrap: eval printenv asks" "eval printenv API_KEY"
+assert_ask "#585 wrap: sudo eval printenv asks" "sudo eval printenv API_KEY"
+assert_ask "#585 wrap: find -exec printenv asks" "find . -exec printenv API_KEY ;"
+assert_ask "#585 wrap: find -exec cat ssh key asks" "find . -exec cat /root/.ssh/id_rsa ;"
+assert_ask "#585 wrap: watch printenv asks" "watch printenv API_KEY"
+assert_ask "#585 wrap: sudo watch printenv asks" "sudo watch printenv API_KEY"
+assert_ask "#585 wrap: flock printenv asks" "flock /tmp/l printenv API_KEY"
+assert_ask "#585 wrap: chroot printenv asks" "chroot / printenv API_KEY"
+assert_ask "#585 wrap: nsenter printenv asks" "nsenter -t 1 printenv API_KEY"
+assert_ask "#585 wrap: busybox printenv asks" "busybox printenv API_KEY"
+assert_ask "#585 wrap: ssh host systemctl restart asks" "ssh host systemctl restart nginx"
+assert_ask "#585 wrap: ssh host quoted sudo systemctl restart asks" 'ssh host "sudo systemctl restart nginx"'
+assert_ask "#585 wrap: bash -c sudo -u root printenv asks" 'bash -c "sudo -u root printenv API_KEY"'
+assert_ask "#585 wrap: sh -c printenv secret asks" "sh -c 'printenv MY_SECRET'"
+assert_ask "#585 wrap: ssh host cat ssh key asks" "ssh host cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo -u root chroot / systemctl stop asks" "sudo -u root chroot / systemctl stop nginx"
+assert_allow "#585 wrap: eval printenv HOME allowed" "eval printenv HOME"
+assert_allow "#585 wrap: find -exec ls allowed" "find . -name x -exec ls {} ;"
+assert_allow "#585 wrap: watch -n 1 date allowed" "watch -n 1 date"
+assert_allow "#585 wrap: flock make allowed" "flock /tmp/l make"
+assert_allow "#585 wrap: ssh host systemctl status allowed" "ssh host systemctl status nginx"
+assert_allow "#585 wrap: ssh host cat ssh known_hosts allowed" "ssh host cat /root/.ssh/known_hosts"
+assert_allow "#585 wrap: bash -c echo hi allowed" "bash -c 'echo hi'"
+assert_allow "#585 wrap: env FOO=1 make allowed" "env FOO=1 make"
+assert_allow "#585 wrap: timeout 5 curl allowed" "timeout 5 curl https://example.com"
+assert_allow "#585 wrap: sudo -l allowed" "sudo -l"
+
 # --- git read-tree: executable + unisolated asks; isolated/inert text does not
 assert_ask "#585 read-tree: bare asks" "git read-tree"
 assert_ask "#585 read-tree: via bash -c asks" "bash -c 'git read-tree HEAD'"

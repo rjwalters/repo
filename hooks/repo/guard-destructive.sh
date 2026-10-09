@@ -8952,7 +8952,11 @@ done
 #     >0  index of the resolved command word
 #      0  no command word in the segment
 #     -1  AMBIGUOUS: a wrapper option this grammar does not model (`sudo -h`,
-#         `env -S "..."`, `ionice -p`, an unknown flag, ...)
+#         `env -S "..."`, `ionice -p`, an unknown flag, ...), an unmodelled
+#         launcher (eval, find -exec, watch, flock, chroot, nsenter, busybox,
+#         ssh, sh/bash -c, ... — cw_ambiguous_launcher), or a token before
+#         the command word carrying a quote/backslash/`$` (a quoted value
+#         with a space, e.g. `sudo -p "x y"`, mis-splits — cw_tok_unsafe)
 # Callers FAIL CLOSED on -1 by checking EVERY token position of the segment
 # as a candidate command word, so an unmodelled wrapper form can only ever
 # add asks, never hide one.
@@ -8997,7 +9001,29 @@ function cw_skip_opts(toks, m, j, sflag, sarg, lflag, larg,   t, k, c, n, name, 
     }
     return j
 }
-function cw_resolve(toks, m,   j, t, b, nj) {
+# Launchers whose own argument grammar this resolver does NOT model — they
+# run a command found somewhere later in their arguments (eval, find -exec,
+# watch, flock, chroot, nsenter, busybox, ssh <host> <cmd>, sh/bash -c, ...).
+# Reaching one of these makes the segment AMBIGUOUS (-1), so callers check
+# every token: the replaced substring checks asked on all of these shapes,
+# and failing closed keeps that (repo#585 review).
+function cw_ambiguous_launcher(b) {
+    return (b ~ /^(eval|find|watch|flock|chroot|nsenter|busybox|ssh|mosh|sh|bash|zsh|dash|ksh|mksh|fish|csh|tcsh|su|runuser|pkexec|script|strace|ltrace|unshare|taskset|chrt|numactl|prlimit|systemd-run|setpriv|sg|fakeroot|firejail|parallel|unbuffer|caffeinate|gtimeout|gnice|builtin|coproc|docker|podman|kubectl|lxc|vagrant|gdb|valgrind|perf|catchsegv|arch|torsocks|proxychains|proxychains4|dbus-run-session|xvfb-run|nix-shell|direnv|tmux|screen|expect)$/)
+}
+# The resolver splits on whitespace, so a quoted/escaped value with a space
+# (`sudo -p "x y" ...`, `env -u "A B" ...`, `FOO="a b" ...`, `-p x\ y`) is
+# broken across tokens and the walk lands on a fragment. Any token BEFORE the
+# resolved command word that carries a quote, backslash or `$` therefore makes
+# the segment ambiguous (-1) instead of trusting the split.
+function cw_tok_unsafe(t) { return (t ~ /[\047\042\\$]/) }
+function cw_resolve(toks, m,   j, k) {
+    j = cw_resolve_raw(toks, m)
+    if (j <= 0) return j
+    for (k = 1; k < j; k++)
+        if (cw_tok_unsafe(toks[k])) return -1
+    return j
+}
+function cw_resolve_raw(toks, m,   j, t, b, nj) {
     j = 1
     while (j <= m) {
         t = toks[j]
@@ -9008,6 +9034,7 @@ function cw_resolve(toks, m,   j, t, b, nj) {
             b == "else" || b == "elif" || b == "while" || b == "until" || b == "do") {
             j++; continue
         }
+        if (cw_ambiguous_launcher(b)) return -1
         if (b == "sudo") {
             nj = cw_skip_opts(toks, m, j + 1, "ABbEeHiKklNnPSsVv", "aCcDgpRrTtUu",
                 " --askpass --background --bell --edit --set-home --login --remove-timestamp --reset-timestamp --list --no-update --non-interactive --preserve-groups --stdin --shell --version --validate --preserve-env --help ",
