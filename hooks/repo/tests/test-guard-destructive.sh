@@ -2552,8 +2552,8 @@ assert_deny "Fast path security: 'git status \$(rm -rf /)' takes full path and d
 # Pipe: observable — same read-only grep, but the pipe disqualifies the fast
 # path so the full-path SQL-DDL check fires (deny), proving the excluded-char
 # guard truly routes to the full path rather than admitting.
-assert_deny "Fast path security: 'grep <ddl> | cat' pipe disqualifies fast path (SQL-DDL denies)" \
-    "grep '$_FP_DDL' x.sql | cat"
+assert_deny "Fast path security: 'grep <ddl> | sort' non-sink pipe disqualifies fast path (SQL-DDL denies; repo#584: '| cat' is now an admitted sink)" \
+    "grep '$_FP_DDL' x.sql | sort"
 # Wrapper: first token is bash (not an allowlist word) → not admitted. Observable
 # via the SQL grep the wrapper carries (full path denies).
 assert_deny "Fast path security: 'bash -c \"grep <ddl>\"' wrapper not admitted (SQL-DDL denies)" \
@@ -7382,6 +7382,139 @@ else
 fi
 cc_clear
 rm -rf "$CC_BASE"
+
+# =========================================================================
+echo -e "${YELLOW}--- Fast path: grep pipelines, reserved extras, tiered config (repo#584) ---${NC}"
+# =========================================================================
+#
+# Ports Loom's _fastpath_count_real_pipes / fastpath_grep_pipe_admits /
+# _fastpath_extra_reserved / _fastpath_tiered_get[_array] / fastpath_config_root
+# behaviour (loom 2072f82b, #5263 #5673 #4791 #4262) onto this guard's
+# two-tier config (.claude/skills/repo/config.json over legacy .loom/config.json).
+#
+# Intentional differences from the Loom suite (rationale in the guard source):
+#   * Loom's second tier is .loom-project/project.json; here the tiers are
+#     .claude/skills/repo/config.json then .loom/config.json (guard_cfg order).
+#   * less/more sinks are NOT admitted (Loom admits them as stdin-only) because
+#     less -o / --log-file and pager shell escapes are write/exec surfaces.
+#   * REPO_GUARD_READONLY_FASTPATH wins over legacy LOOM_GUARD_READONLY_FASTPATH
+#     in both the disable pre-check and fastpath_enabled().
+#   * Loom's 'grep <ddl> | cat' full-path-deny case is now an admission case;
+#     the disqualifying-pipe case uses a non-sink (sort) instead.
+
+# make_dual_repo <repo-skills-config-or-empty> <legacy-config-or-empty>
+make_dual_repo() {
+    local dir; dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    if [[ -n "$1" ]]; then
+        mkdir -p "$dir/.claude/skills/repo"; printf '%s' "$1" > "$dir/.claude/skills/repo/config.json"
+    fi
+    if [[ -n "$2" ]]; then
+        mkdir -p "$dir/.loom"; printf '%s' "$2" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    # --- allowed grep pipelines (silent: fast path decided) ---
+    assert_allow_silent "#584: grep <ddl> | head admits silently" "grep '$_FP_DDL' x.sql | head -5"
+    assert_allow_silent "#584: grep | wc -l admits silently" "grep '$_FP_DDL' x.sql | wc -l"
+    assert_allow_silent "#584: rg | tail admits silently" "rg '$_FP_DDL' src | tail -n 3"
+    assert_allow_silent "#584: egrep | head admits silently" "egrep '$_FP_DDL' x.sql | head"
+    assert_allow_silent "#584: grep <ddl> | cat (stdin-only) admits silently" "grep '$_FP_DDL' x.sql | cat"
+    assert_allow_silent "#584: grep | cat -n (flag only) admits silently" "grep '$_FP_DDL' x.sql | cat -n"
+    # Quoted BRE alternation: the quoted | is data, the trailing | is the one real pipe.
+    assert_allow_silent "#584: quoted alternation + one real pipe admits" "grep \"$_FP_DDL\\|foo\" x.sql | head"
+    assert_allow_silent "#584: single-quoted alternation + one real pipe admits" "grep '$_FP_DDL|foo' x.sql | head"
+fi
+
+# --- pipeline admission never skips downstream destructive checks ---
+assert_deny "#584: grep <ddl> | sort (non-sink) takes full path and denies" "grep '$_FP_DDL' x.sql | sort"
+assert_deny "#584: grep <ddl> | sh (shell sink) denies" "grep '$_FP_DDL' x.sql | sh"
+assert_deny "#584: grep <ddl> | tee (writing sink) denies" "grep '$_FP_DDL' x.sql | tee out.txt"
+assert_deny "#584: grep <ddl> | less (pager not admitted) denies" "grep '$_FP_DDL' x.sql | less"
+assert_deny "#584: grep <ddl> | head | sh (two real pipes) denies" "grep '$_FP_DDL' x.sql | head | sh"
+assert_deny "#584: mysql <ddl> | head (non-search upstream) denies" "mysql -e '$_FP_DDL' | head"
+assert_deny "#584: grep <ddl> | head ; force-push denies" "grep '$_FP_DDL' x.sql | head ; $_FP_MAIN"
+assert_deny "#584: grep <ddl> | head && force-push denies" "grep '$_FP_DDL' x.sql | head && $_FP_MAIN"
+assert_deny "#584: grep <ddl> | head \$(catastrophic rm) denies" "grep '$_FP_DDL' x.sql | head \$(rm -rf $_FP_ROOT)"
+assert_deny "#584: grep <ddl> | head \`catastrophic rm\` denies" "grep '$_FP_DDL' x.sql | head \`rm -rf $_FP_ROOT\`"
+assert_deny "#584: grep <ddl> | head > file (redirect) denies" "grep '$_FP_DDL' x.sql | head > out.txt"
+assert_deny "#584: grep <ddl> | head newline-chained force-push denies" "grep '$_FP_DDL' x.sql | head
+$_FP_MAIN"
+assert_deny "#584: unterminated quote never admits (denies)" "grep '$_FP_DDL|x f | head"
+assert_ask "#584: grep | cat ~/.ssh/id_rsa keeps the cat ASK (positional operand declines)" \
+    "grep x notes.txt | cat ~/.ssh/id_rsa"
+assert_deny "#584: quoted prose pipe does not mask a real downstream sh" "grep \"a|b\" x.sql | sh -c '$_FP_DDL'"
+# Quoted literal text containing a pipe and a pipeline word stays harmless.
+assert_allow "#584: echo with quoted pipe prose still allowed (full path)" 'echo "run grep x | head later"'
+
+# --- reserved extra-command names are ignored ---
+RES_REPO=$(make_dual_repo '{"guards":{"readOnlyFastPathExtra":["rm","bash","git","sudo","xargs"]}}' "")
+assert_deny "#584: extra [rm] cannot fast-path a catastrophic rm" "rm -rf $_FP_ROOT" "$RES_REPO"
+assert_deny "#584: extra [bash] cannot fast-path a wrapped payload" "bash -c \"grep '$_FP_DDL' x.sql\"" "$RES_REPO"
+assert_deny "#584: extra [git] cannot fast-path a force-push" "$_FP_MAIN" "$RES_REPO"
+assert_deny "#584: extra [sudo] cannot fast-path a wrapped payload" "sudo rm -rf $_FP_ROOT" "$RES_REPO"
+assert_deny "#584: extra [xargs] cannot fast-path a wrapped payload" "xargs rm -rf $_FP_ROOT" "$RES_REPO"
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    NONRES_REPO=$(make_dual_repo '{"guards":{"readOnlyFastPathExtra":["rm","psql"]}}' "")
+    assert_allow "#584: non-reserved extra [psql] still admitted alongside reserved [rm]" \
+        "psql -c '$_FP_DDL'" "$NONRES_REPO"
+    rm -rf "$NONRES_REPO"
+fi
+
+# --- malformed configuration fails safe ---
+BAD_REPO=$(make_dual_repo '{not json' "")
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "#584: malformed config leaves fast path ON (default)" "grep '$_FP_DDL' x.sql" "$BAD_REPO"
+fi
+assert_deny "#584: malformed config grants no extras (psql <ddl> denies)" "psql -c '$_FP_DDL'" "$BAD_REPO"
+BADX_REPO=$(make_dual_repo '{"guards":{"readOnlyFastPathExtra":"psql"}}' "")
+assert_deny "#584: non-array extras grant nothing (psql <ddl> denies)" "psql -c '$_FP_DDL'" "$BADX_REPO"
+BADT_REPO=$(make_dual_repo '{"guards":{"readOnlyFastPath":"nope"}}' "")
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "#584: non-false toggle value stays ON" "grep '$_FP_DDL' x.sql" "$BADT_REPO"
+fi
+# Malformed Repo Skills config falls through to the legacy tier for the toggle.
+BADFALL_REPO=$(make_dual_repo '{not json' '{"guards":{"readOnlyFastPath":false}}')
+assert_deny "#584: malformed repo config falls through to legacy toggle=false" "grep '$_FP_DDL' x.sql" "$BADFALL_REPO"
+
+# --- tiered config precedence: Repo Skills config over legacy .loom ---
+T1=$(make_dual_repo '{"guards":{"readOnlyFastPath":false}}' '{"guards":{"readOnlyFastPath":true}}')
+assert_deny "#584: repo-config toggle=false wins over legacy true" "grep '$_FP_DDL' x.sql" "$T1"
+T2=$(make_dual_repo '{"guards":{"readOnlyFastPath":true}}' '{"guards":{"readOnlyFastPath":false}}')
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "#584: repo-config toggle=true wins over legacy false" "grep '$_FP_DDL' x.sql" "$T2"
+fi
+T3=$(make_dual_repo '{"guards":{"sqlDdl":true}}' '{"guards":{"readOnlyFastPath":false}}')
+assert_deny "#584: key absent from repo config falls through to legacy false" "grep '$_FP_DDL' x.sql" "$T3"
+T4=$(make_dual_repo '{"guards":{"readOnlyFastPathExtra":[]}}' '{"guards":{"readOnlyFastPathExtra":["psql"]}}')
+assert_deny "#584: repo-config extras [] overrides legacy extras wholesale" "psql -c '$_FP_DDL'" "$T4"
+T5=$(make_dual_repo '{"guards":{"sqlDdl":true}}' '{"guards":{"readOnlyFastPathExtra":["psql"]}}')
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow "#584: extras absent from repo config fall through to legacy list" "psql -c '$_FP_DDL'" "$T5"
+fi
+# Config root walk: a subdirectory of a configured dir still finds the config.
+mkdir -p "$T1/sub/deeper"
+assert_deny "#584: config root found by walking up from a subdirectory" "grep '$_FP_DDL' x.sql" "$T1/sub/deeper"
+# Legacy-only repo still works (config root walk finds .loom/config.json alone).
+T6=$(make_dual_repo "" '{"guards":{"readOnlyFastPath":false}}')
+assert_deny "#584: legacy-only config root honoured" "grep '$_FP_DDL' x.sql" "$T6"
+
+# --- REPO_* versus legacy LOOM_* precedence for the toggle ---
+LOOM_GUARD_READONLY_FASTPATH=0 assert_allow_env "#584: REPO=1 beats LOOM=0 (fast path on)" \
+    "REPO_GUARD_READONLY_FASTPATH=1" "grep '$_FP_DDL' x.sql"
+LOOM_GUARD_READONLY_FASTPATH=1 assert_deny_env "#584: REPO=0 beats LOOM=1 (fast path off)" \
+    "REPO_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' x.sql"
+assert_allow_env "#584: REPO=1 overrides repo-config false" "REPO_GUARD_READONLY_FASTPATH=1" "grep '$_FP_DDL' x.sql" "$T1"
+assert_deny_env "#584: REPO=0 disables the grep pipeline admission" \
+    "REPO_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' x.sql | head"
+
+for _d in "$RES_REPO" "$BAD_REPO" "$BADX_REPO" "$BADT_REPO" "$BADFALL_REPO" "$T1" "$T2" "$T3" "$T4" "$T5" "$T6"; do
+    [[ -n "$_d" && "$_d" != "/" && -d "$_d/.git" ]] && rm -rf "$_d"
+done
+
+echo ""
 
 # =========================================================================
 # Summary

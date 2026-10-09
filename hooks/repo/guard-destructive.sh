@@ -321,7 +321,7 @@ fi
 # is resolved LAZILY (only after structural admission already passed) by walking
 # up from CWD to the nearest guard config (.claude/skills/repo/config.json or
 # legacy .loom/config.json) WITHOUT forking git
-# (fastpath_config_file). So a fast-pathed command pays: 1 bash-builtin test +
+# (fastpath_config_root). So a fast-pathed command pays: 1 bash-builtin test +
 # (only if eligible) 1 stat-walk + 1 jq read — never the git rev-parse, never a
 # deny/ask array, never a log write.
 #
@@ -331,24 +331,26 @@ fi
 # commands (each entry is a full-generality bypass for that command word).
 # =============================================================================
 
-# Locate the nearest guard config by walking up from CWD, fork-free (no git
-# rev-parse). At each level Repo Skills' own config
-# (.claude/skills/repo/config.json) wins over the legacy .loom/config.json.
-# Cached. Best-effort: empty when none is found.
-_FASTPATH_CFG_FILE=""
-_FASTPATH_CFG_FILE_DONE=""
-fastpath_config_file() {
-    if [[ -z "$_FASTPATH_CFG_FILE_DONE" ]]; then
-        _FASTPATH_CFG_FILE_DONE=1
+# Locate the nearest guard config ROOT by walking up from CWD, fork-free (no git
+# rev-parse): a directory holding EITHER Repo Skills' own config
+# (.claude/skills/repo/config.json) OR the legacy .loom/config.json. Cached.
+# Best-effort: empty when neither is found.
+#
+# Why the fast path does NOT call guard_cfg()/guard_cfg_array() below: those
+# need REPO_ROOT (a `git rev-parse` fork) and this block can `exit 0` before
+# REPO_ROOT is resolved. The readers here are the same two-tier contract
+# (repo config wins, per-key, over legacy .loom) with the root found by a
+# fork-free walk instead; they cost at most 2 file-scoped jq reads.
+_FASTPATH_CFG_ROOT=""
+_FASTPATH_CFG_ROOT_DONE=""
+fastpath_config_root() {
+    if [[ -z "$_FASTPATH_CFG_ROOT_DONE" ]]; then
+        _FASTPATH_CFG_ROOT_DONE=1
         local d="$CWD"
         if [[ -n "$d" && "$d" == /* ]]; then
             while :; do
-                if [[ -f "$d/.claude/skills/repo/config.json" ]]; then
-                    _FASTPATH_CFG_FILE="$d/.claude/skills/repo/config.json"
-                    break
-                fi
-                if [[ -f "$d/.loom/config.json" ]]; then
-                    _FASTPATH_CFG_FILE="$d/.loom/config.json"
+                if [[ -f "$d/.claude/skills/repo/config.json" || -f "$d/.loom/config.json" ]]; then
+                    _FASTPATH_CFG_ROOT="$d"
                     break
                 fi
                 [[ "$d" == "/" ]] && break
@@ -358,7 +360,47 @@ fastpath_config_file() {
             done
         fi
     fi
-    printf '%s' "$_FASTPATH_CFG_FILE"
+    printf '%s' "$_FASTPATH_CFG_ROOT"
+}
+
+# Read guards.<key> as a scalar (jq tostring) from the tiered fast-path config:
+# Repo Skills' config first, falling back to the legacy .loom/config.json ONLY
+# when the key is absent from (or unreadable in) the first tier -- a tier that
+# defines the key wins outright. Malformed JSON reads as absent. Echoes the
+# value, or nothing when the key is absent from both tiers.
+_fastpath_tiered_get() {
+    local key="$1" root cfg value
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || return 0
+    for cfg in "$root/.claude/skills/repo/config.json" "$root/.loom/config.json"; do
+        [[ -f "$cfg" ]] || continue
+        value=$(jq -r --arg k "$key" '((.guards? // {}) | if has($k) and .[$k] != null then (.[$k] | tostring) else empty end)' "$cfg" 2>/dev/null) || value=""
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Array-valued sibling: echoes the elements of guards.<key> one per line from
+# whichever tier DEFINES the key first (Repo Skills, else legacy). A defined
+# array is a whole-value override, never merged element-wise with the lower
+# tier (matches guard_cfg_array()). A non-array / malformed value yields
+# nothing. Nothing when the key is absent from both tiers.
+_fastpath_tiered_get_array() {
+    local key="$1" root cfg has
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || return 0
+    for cfg in "$root/.claude/skills/repo/config.json" "$root/.loom/config.json"; do
+        [[ -f "$cfg" ]] || continue
+        has=$(jq -r --arg k "$key" '((.guards? // {}) | has($k) and .[$k] != null)' "$cfg" 2>/dev/null) || has="false"
+        if [[ "$has" == "true" ]]; then
+            jq -r --arg k "$key" '(.guards[$k] | if type == "array" then .[] | strings else empty end)' "$cfg" 2>/dev/null || true
+            return 0
+        fi
+    done
+    return 0
 }
 
 # Resolve the fast-path toggle (config + env), cached. Default true. Only ever
@@ -367,14 +409,11 @@ fastpath_config_file() {
 _FASTPATH_ENABLED_CACHE=""
 fastpath_enabled() {
     if [[ -z "$_FASTPATH_ENABLED_CACHE" ]]; then
-        local enabled=true cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            # Only an explicit `false` disables; a missing key or malformed JSON
-            # (jq non-zero, caught by ||) stays ON — mirrors sql_guard_enabled().
-            enabled=$(jq -r 'if .guards.readOnlyFastPath == false then "false" else "true" end' "$cfg" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
-        fi
+        local enabled=true raw
+        # Only an explicit `false` disables; an absent key on both tiers, or
+        # malformed JSON, stays ON -- mirrors sql_guard_enabled().
+        raw=$(_fastpath_tiered_get "readOnlyFastPath")
+        [[ "$raw" == "false" ]] && enabled=false
         # Env override wins over config; REPO_* wins over the legacy LOOM_* name.
         case "${LOOM_GUARD_READONLY_FASTPATH:-}" in
             0|false|no)  enabled=false ;;
@@ -462,6 +501,115 @@ fastpath_builtin_admits() {
     return 1
 }
 
+# -----------------------------------------------------------------------------
+# Read-only search piped to a read-only sink (Loom #5263/#5673). A deliberately
+# NARROW carve-out, not a general "pipes are OK" relaxation. Admits ONLY
+#     <grep|egrep|fgrep|rg ...> | <read-only-sink ...>
+# with exactly ONE real pipe and NO other shell metacharacter (; & < > ` $(
+# newline) anywhere -- so wrappers, substitutions, redirections, and compounds
+# keep taking the full deny/ask path. The sink allowlist is fixed:
+#   head|tail|wc  -- pure read-only filters, any args (already fully admitted
+#                    by fastpath_builtin_admits()).
+#   cat           -- stdin only: any positional operand declines, so
+#                    `grep x | cat ~/.ssh/id_rsa` still reaches the cat ASK.
+# Intentional difference from Loom: less/more are NOT admitted (less -o /
+# --log-file and the pager's shell escapes are write/exec surfaces).
+# Downstream destructive commands cannot be skipped: any sink word outside the
+# list (sh, tee, xargs, mysql, ...) declines and takes the full path.
+# False negatives are safe; only false positives are dangerous.
+# -----------------------------------------------------------------------------
+_FASTPATH_PIPE_SINKS_ANYARG=" head tail wc "
+_FASTPATH_PIPE_SINKS_STDIN=" cat "
+
+# Quote/escape-aware pipe count, pure bash. A `|` inside quotes or after an
+# unquoted backslash is data. Sets _FASTPATH_REAL_PIPE_COUNT (-1 on an
+# unterminated quote -- never trust a partial scan) and _FASTPATH_REAL_PIPE_POS
+# (offset of the first real pipe; meaningful only when the count is 1).
+_fastpath_count_real_pipes() {
+    local s="$1"
+    local -i i=0 n=${#s} count=0 pos=-1
+    local mode=0 c   # 0=unquoted 1=single-quoted 2=double-quoted
+    while (( i < n )); do
+        c="${s:i:1}"
+        case "$mode" in
+            0)
+                case "$c" in
+                    "'") mode=1 ;;
+                    '"') mode=2 ;;
+                    '\') i=$(( i + 1 )) ;;
+                    '|') count=$(( count + 1 )); if (( pos == -1 )); then pos=$i; fi ;;
+                esac
+                ;;
+            1)
+                if [[ "$c" == "'" ]]; then mode=0; fi
+                ;;
+            2)
+                case "$c" in
+                    '"') mode=0 ;;
+                    '\') i=$(( i + 1 )) ;;
+                esac
+                ;;
+        esac
+        i=$(( i + 1 ))
+    done
+    if (( mode != 0 )); then
+        count=-1
+    fi
+    _FASTPATH_REAL_PIPE_COUNT=$count
+    _FASTPATH_REAL_PIPE_POS=$pos
+}
+
+fastpath_grep_pipe_admits() {
+    local cmd="$1"
+    case "$cmd" in
+        *';'*|*'&'*|*'<'*|*'>'*|*'`'*|*'$('*) return 1 ;;
+    esac
+    [[ "$cmd" == *$'\n'* ]] && return 1
+    [[ "$cmd" == *'|'* ]] || return 1
+    _fastpath_count_real_pipes "$cmd"
+    (( _FASTPATH_REAL_PIPE_COUNT == 1 )) || return 1
+    local left="${cmd:0:_FASTPATH_REAL_PIPE_POS}"
+    local right="${cmd:_FASTPATH_REAL_PIPE_POS+1}"
+    local -a lt rt
+    read -ra lt <<< "$left"
+    read -ra rt <<< "$right"
+    (( ${#lt[@]} >= 1 && ${#rt[@]} >= 1 )) || return 1
+    case "${lt[0]}" in
+        grep|egrep|fgrep|rg) ;;
+        *) return 1 ;;
+    esac
+    local sink="${rt[0]}"
+    if [[ "$_FASTPATH_PIPE_SINKS_ANYARG" == *" $sink "* ]]; then
+        return 0
+    fi
+    if [[ "$_FASTPATH_PIPE_SINKS_STDIN" == *" $sink "* ]]; then
+        local i
+        for (( i = 1; i < ${#rt[@]}; i++ )); do
+            case "${rt[i]}" in
+                -*) ;;
+                *) return 1 ;;
+            esac
+        done
+        return 0
+    fi
+    return 1
+}
+
+# Words the extend-only escape hatch may NOT claim (Loom #4791): denial-floor
+# command words and shell/exec wrappers. A configured entry naming one is
+# IGNORED so the command takes the full deny/ask path -- a config file can never
+# fast-path past the floor. Checked BEFORE the config read. Rejecting can only
+# add work, never remove protection.
+_fastpath_extra_reserved() {
+    case "$1" in
+        rm|git|gh|aws|docker|curl|wget|halt|reboot|poweroff|shutdown|init)
+            return 0 ;;
+        sudo|doas|env|eval|exec|xargs|nohup|timeout|ssh|bash|sh|zsh|ksh|dash|fish|python|python3|perl|ruby|node)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # Optional extend-only escape hatch: guards.readOnlyFastPathExtra is an array of
 # literal first-word commands. Read lazily (only when the built-in list did not
 # admit) and cached. Each entry is a full-generality bypass for that word.
@@ -474,13 +622,10 @@ fastpath_extra_admits() {
     read -ra t <<< "$cmd"
     (( ${#t[@]} >= 1 )) || return 1
     local first="${t[0]}"
+    _fastpath_extra_reserved "$first" && return 1
     if [[ -z "$_FASTPATH_EXTRA_DONE" ]]; then
         _FASTPATH_EXTRA_DONE=1
-        local cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            _FASTPATH_EXTRA_CACHE=$(jq -r '(.guards.readOnlyFastPathExtra // []) | .[]' "$cfg" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
-        fi
+        _FASTPATH_EXTRA_CACHE=$(_fastpath_tiered_get_array "readOnlyFastPathExtra" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
     fi
     [[ -n "$_FASTPATH_EXTRA_CACHE" ]] || return 1
     local w
@@ -498,6 +643,9 @@ _fastpath_env="${REPO_GUARD_READONLY_FASTPATH:-${LOOM_GUARD_READONLY_FASTPATH:-}
 if [[ "$_fastpath_env" != "0" && "$_fastpath_env" != "false" && "$_fastpath_env" != "no" ]]; then
     if fastpath_builtin_admits "$COMMAND"; then
         # Silent allow: no stdout/stderr, no log_hook_error, before REPO_ROOT.
+        fastpath_enabled && exit 0
+    elif fastpath_grep_pipe_admits "$COMMAND"; then
+        # Read-only search piped to a read-only sink -- same silent allow.
         fastpath_enabled && exit 0
     elif fastpath_extra_admits "$COMMAND"; then
         fastpath_enabled && exit 0
