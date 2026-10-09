@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#582**: Guard: reconcile Loom write confinement and managed worktree rules
+_None._
 
 ## PRs Awaiting Review
 
@@ -46,7 +46,6 @@ Issues carrying `loom:curated`.
 - **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
-- **#582**: Guard: reconcile Loom write confinement and managed worktree rules *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,10 +62,10 @@ _None._
 | Operator merge-risk holds | 1 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 4 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
