@@ -2,6 +2,12 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-09
+- **PR #595**: Guard: reconcile Loom environment, service, stash and index rules (#585)
+- **Issue #585** (closed): Guard: reconcile Loom environment service stash and index rules
+- **PR #594**: guard: port Loom read-only fast path pipelines, reserved extras, tiered config (#584)
+- **Issue #584** (closed): Guard: reconcile Loom read-only fast path and configuration precedence
+
 ### 2026-10-08
 - **PR #592**: Guard: reconcile Loom write confinement and managed worktree rules (#582)
 - **PR #591**: Guard: port cargo clean scope while preserving tmpfs target-dir resolution
