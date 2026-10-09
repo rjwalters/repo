@@ -7517,6 +7517,237 @@ done
 echo ""
 
 # =========================================================================
+# repo#585 (part of #579): environment/service/stash/index reconciliation with
+# rjwalters/loom guard-destructive-generic.sh @ 2072f82b. Ported by behavior:
+# printenv_ask_reason, ssh_cat_ask_reason, systemctl_ask_reason,
+# stash_create_invoked, index_mutation_unisolated, toggle_hint_for_tag.
+# =========================================================================
+echo -e "${YELLOW}--- #585 env / service / stash / index reconciliation ---${NC}"
+
+# --- printenv: credential-shaped names ask; allowlisted pointers and quoted text do not
+assert_ask "#585 printenv GITHUB_TOKEN asks" "printenv GITHUB_TOKEN"
+assert_ask "#585 printenv AWS_SECRET_ACCESS_KEY asks" "printenv AWS_SECRET_ACCESS_KEY"
+assert_ask "#585 printenv API_KEY after && asks" "true && printenv API_KEY"
+assert_ask "#585 sudo printenv TOKEN asks" "sudo printenv MY_TOKEN"
+assert_ask "#585 env-wrapped printenv asks" "env FOO=bar printenv GITHUB_TOKEN"
+assert_ask "#585 printenv with quoted name asks" "printenv 'GITHUB_TOKEN'"
+assert_ask "#585 printenv flag then secret name asks" "printenv -0 GITHUB_TOKEN"
+assert_ask "#585 printenv allowlisted name followed by secret name asks" "printenv LOOM_TOKEN_NAME GITHUB_TOKEN"
+assert_ask "#585 allowlist is exact: LOOM_TOKEN_NAME_BACKUP asks" "printenv LOOM_TOKEN_NAME_BACKUP"
+assert_ask "#585 allowlist is exact: XLOOM_TOKEN_MODE asks" "printenv XLOOM_TOKEN_MODE"
+assert_allow "#585 printenv LOOM_TOKEN_NAME (documented non-secret pointer) allowed" "printenv LOOM_TOKEN_NAME"
+assert_allow "#585 printenv LOOM_TOKEN_MODE (documented non-secret pointer) allowed" "printenv LOOM_TOKEN_MODE"
+assert_allow "#585 printenv HOME (non-credential name) allowed" "printenv HOME"
+assert_allow "#585 grep for the phrase 'printenv TOKEN' in a file is not an invocation" 'grep -n "printenv TOKEN" notes.md'
+assert_allow "#585 echo of the phrase 'printenv SECRET' is inert text" "echo 'run printenv SECRET to see it'"
+
+# --- ssh: cat of key material asks; routine non-secret files do not
+assert_ask "#585 cat ~/.ssh/id_ed25519 asks" "cat ~/.ssh/id_ed25519"
+assert_ask "#585 cat of an unknown .ssh file name asks" "cat /home/u/.ssh/deploy_key"
+assert_ask "#585 sudo cat .ssh key asks" "sudo cat /root/.ssh/id_rsa"
+assert_ask "#585 env-wrapped cat .ssh key asks" "env X=1 cat ~/.ssh/id_rsa"
+assert_ask "#585 cat of bare .ssh/ directory operand asks (fail closed)" "cat ~/.ssh/"
+assert_ask "#585 cat config AND key together asks" "cat ~/.ssh/config ~/.ssh/id_rsa"
+assert_ask "#585 quoted .ssh key operand asks" 'cat "$HOME/.ssh/id_rsa"'
+assert_ask "#585 cat piped from search still asks on the cat segment" "grep x f | cat ~/.ssh/id_rsa"
+assert_ask "#585 cat .ssh/config.bak (lookalike of an allowlisted name) asks" "cat ~/.ssh/config.bak"
+assert_allow "#585 cat ~/.ssh/config allowed (host aliases only)" "cat ~/.ssh/config"
+assert_allow "#585 cat ~/.ssh/known_hosts allowed" "cat ~/.ssh/known_hosts"
+assert_allow "#585 cat ~/.ssh/known_hosts.old allowed" "cat ~/.ssh/known_hosts.old"
+assert_allow "#585 cat ~/.ssh/authorized_keys allowed" "cat ~/.ssh/authorized_keys"
+assert_allow "#585 grep for 'cat ~/.ssh/id_rsa' text is not an invocation" "grep -n 'cat ~/.ssh/id_rsa' README.md"
+assert_ask "#585 cat .aws/credentials still asks (substring entry retained)" "cat ~/.aws/credentials"
+
+# --- systemctl: mutating verbs at the command word ask; quoted text and reads do not
+assert_ask "#585 systemctl restart asks" "systemctl restart nginx"
+assert_ask "#585 sudo systemctl stop asks" "sudo systemctl stop nginx"
+assert_ask "#585 systemctl disable after && asks" "cd /tmp && systemctl disable sshd"
+assert_ask "#585 env-wrapped systemctl restart asks" "env FOO=bar systemctl restart x"
+assert_ask "#585 systemctl restart with a quoted unit asks" 'systemctl restart "my service"'
+assert_ask "#585 systemctl restart behind a pipe asks" "echo y | systemctl restart nginx"
+assert_allow "#585 systemctl status allowed" "systemctl status nginx"
+assert_allow "#585 systemctl is-active allowed" "systemctl is-active nginx"
+assert_allow "#585 systemctl list-units allowed" "systemctl list-units"
+assert_allow "#585 grep with 'systemctl restart' inside an alternation is inert" 'grep -n "idle\|systemctl restart\|systemd" f.sh'
+assert_allow "#585 jq filter containing 'systemctl' is inert" "jq -c 'select(.pattern | contains(\"systemctl\"))' log.jsonl"
+
+# --- wrapper options (PR #595 review): sudo/env/... options and their operands
+# must not hide the command word from the three parsers above; unmodelled
+# wrapper forms fail closed (ask) while lookalike safe commands still allow.
+assert_ask "#585 wrap: sudo -u root systemctl restart asks" "sudo -u root systemctl restart nginx"
+assert_ask "#585 wrap: sudo -- systemctl restart asks" "sudo -- systemctl restart nginx"
+assert_ask "#585 wrap: sudo --user=root systemctl stop asks" "sudo --user=root systemctl stop nginx"
+assert_ask "#585 wrap: sudo --user root systemctl stop asks" "sudo --user root systemctl stop nginx"
+assert_ask "#585 wrap: sudo -nu root systemctl disable asks" "sudo -nu root systemctl disable sshd"
+assert_ask "#585 wrap: sudo -uroot (attached) systemctl restart asks" "sudo -uroot systemctl restart nginx"
+assert_ask "#585 wrap: sudo -E -H -g wheel -- systemctl restart asks" "sudo -E -H -g wheel -- systemctl restart nginx"
+assert_ask "#585 wrap: sudo -u root env FOO=1 systemctl restart asks" "sudo -u root env FOO=1 systemctl restart nginx"
+assert_ask "#585 wrap: nohup systemctl restart asks" "nohup systemctl restart nginx"
+assert_ask "#585 wrap: timeout 5 systemctl stop asks" "timeout 5 systemctl stop nginx"
+assert_ask "#585 wrap: nice -n 5 systemctl restart asks" "nice -n 5 systemctl restart nginx"
+assert_ask "#585 wrap: /usr/bin/systemctl restart asks" "/usr/bin/systemctl restart nginx"
+assert_ask "#585 wrap: systemctl --user restart asks" "systemctl --user restart foo"
+assert_ask "#585 wrap: ambiguous sudo -h form fails closed (systemctl)" "sudo -h systemctl restart nginx"
+assert_ask "#585 wrap: unknown sudo flag fails closed (systemctl)" "sudo -Z systemctl restart nginx"
+assert_ask "#585 wrap: env -S split-string fails closed (systemctl)" "env -S systemctl restart nginx"
+assert_ask "#585 wrap: sudo -u root printenv GITHUB_TOKEN asks" "sudo -u root printenv GITHUB_TOKEN"
+assert_ask "#585 wrap: sudo -- printenv GITHUB_TOKEN asks" "sudo -- printenv GITHUB_TOKEN"
+assert_ask "#585 wrap: sudo --user=root printenv API_KEY asks" "sudo --user=root printenv API_KEY"
+assert_ask "#585 wrap: sudo -nu root printenv MY_SECRET asks" "sudo -nu root printenv MY_SECRET"
+assert_ask "#585 wrap: env -i -u HOME printenv GITHUB_TOKEN asks" "env -i -u HOME printenv GITHUB_TOKEN"
+assert_ask "#585 wrap: unknown sudo flag fails closed (printenv)" "sudo -Z printenv GITHUB_TOKEN"
+assert_ask "#585 wrap: sudo -u root cat ssh key asks" "sudo -u root cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo -- cat ssh key asks" "sudo -- cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo --user=root cat ssh key asks" "sudo --user=root cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo -nu root cat ssh key asks" "sudo -nu root cat /root/.ssh/id_ed25519"
+assert_ask "#585 wrap: doas -u root cat ssh key asks" "doas -u root cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: unknown sudo flag fails closed (cat .ssh)" "sudo -Z cat /root/.ssh/id_rsa"
+assert_allow "#585 wrap: sudo -u root ls allowed" "sudo -u root ls"
+assert_allow "#585 wrap: sudo -- echo hi allowed" "sudo -- echo hi"
+assert_allow "#585 wrap: sudo -u root systemctl status allowed" "sudo -u root systemctl status nginx"
+assert_allow "#585 wrap: sudo --user=root printenv HOME allowed" "sudo --user=root printenv HOME"
+assert_allow "#585 wrap: sudo -nu root printenv LOOM_TOKEN_NAME allowed" "sudo -nu root printenv LOOM_TOKEN_NAME"
+assert_allow "#585 wrap: sudo -u root cat ssh known_hosts allowed" "sudo -u root cat /root/.ssh/known_hosts"
+assert_allow "#585 wrap: sudo -u root echo of systemctl restart text allowed" "sudo -u root echo 'systemctl restart nginx'"
+
+# --- quoted wrapper option values (PR #595 re-review, finding 1): a quoted or
+# escaped value containing a space is mis-split by the whitespace tokenizer, so
+# the resolver must fail closed rather than land on a fragment of the value.
+assert_ask "#585 wrap: sudo -p \"x y\" printenv asks" 'sudo -p "x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo -p 'x y' systemctl restart asks" "sudo -p 'x y' systemctl restart x"
+assert_ask "#585 wrap: sudo -p 'x y' cat ssh key asks" "sudo -p 'x y' cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo --prompt \"x y\" printenv asks" 'sudo --prompt "x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo --prompt=\"x y\" printenv asks" 'sudo --prompt="x y" printenv API_KEY'
+assert_ask "#585 wrap: sudo -u \"a b\" printenv asks" 'sudo -u "a b" printenv API_KEY'
+assert_ask "#585 wrap: env -u \"A B\" printenv asks" 'env -u "A B" printenv API_KEY'
+assert_ask "#585 wrap: piped sudo -p \"a b\" printenv asks" 'echo hi | sudo -p "a b" printenv API_KEY'
+assert_ask "#585 wrap: sudo -p escaped-space printenv asks" 'sudo -p x\ y printenv API_KEY'
+assert_ask "#585 wrap: quoted assignment prefix printenv asks" 'FOO="a b" printenv API_KEY'
+assert_ask "#585 wrap: env quoted assignment systemctl restart asks" 'env FOO="a b" systemctl restart nginx'
+assert_ask "#585 wrap: sudo -p 'x y' -u root systemctl stop asks" "sudo -p 'x y' -u root systemctl stop nginx"
+assert_allow "#585 wrap: sudo -p \"x y\" ls allowed" 'sudo -p "x y" ls'
+assert_allow "#585 wrap: sudo -p 'x y' systemctl status allowed" "sudo -p 'x y' systemctl status nginx"
+assert_allow "#585 wrap: env -u \"A B\" make allowed" 'env -u "A B" make'
+assert_allow "#585 wrap: quoted assignment prefix make allowed" 'FOO="a b" make'
+assert_allow "#585 wrap: sudo -u \"a b\" printenv HOME allowed" 'sudo -u "a b" printenv HOME'
+assert_allow "#585 wrap: sudo -p 'x y' cat ssh known_hosts allowed" "sudo -p 'x y' cat /root/.ssh/known_hosts"
+
+# --- unmodelled launchers (PR #595 re-review, finding 2): the replaced
+# substring checks asked through these, so the resolver fails closed on them
+# (every token is a candidate command word) instead of newly allowing.
+assert_ask "#585 wrap: eval printenv asks" "eval printenv API_KEY"
+assert_ask "#585 wrap: sudo eval printenv asks" "sudo eval printenv API_KEY"
+assert_ask "#585 wrap: find -exec printenv asks" "find . -exec printenv API_KEY ;"
+assert_ask "#585 wrap: find -exec cat ssh key asks" "find . -exec cat /root/.ssh/id_rsa ;"
+assert_ask "#585 wrap: watch printenv asks" "watch printenv API_KEY"
+assert_ask "#585 wrap: sudo watch printenv asks" "sudo watch printenv API_KEY"
+assert_ask "#585 wrap: flock printenv asks" "flock /tmp/l printenv API_KEY"
+assert_ask "#585 wrap: chroot printenv asks" "chroot / printenv API_KEY"
+assert_ask "#585 wrap: nsenter printenv asks" "nsenter -t 1 printenv API_KEY"
+assert_ask "#585 wrap: busybox printenv asks" "busybox printenv API_KEY"
+assert_ask "#585 wrap: ssh host systemctl restart asks" "ssh host systemctl restart nginx"
+assert_ask "#585 wrap: ssh host quoted sudo systemctl restart asks" 'ssh host "sudo systemctl restart nginx"'
+assert_ask "#585 wrap: bash -c sudo -u root printenv asks" 'bash -c "sudo -u root printenv API_KEY"'
+assert_ask "#585 wrap: sh -c printenv secret asks" "sh -c 'printenv MY_SECRET'"
+assert_ask "#585 wrap: ssh host cat ssh key asks" "ssh host cat /root/.ssh/id_rsa"
+assert_ask "#585 wrap: sudo -u root chroot / systemctl stop asks" "sudo -u root chroot / systemctl stop nginx"
+assert_allow "#585 wrap: eval printenv HOME allowed" "eval printenv HOME"
+assert_allow "#585 wrap: find -exec ls allowed" "find . -name x -exec ls {} ;"
+assert_allow "#585 wrap: watch -n 1 date allowed" "watch -n 1 date"
+assert_allow "#585 wrap: flock make allowed" "flock /tmp/l make"
+assert_allow "#585 wrap: ssh host systemctl status allowed" "ssh host systemctl status nginx"
+assert_allow "#585 wrap: ssh host cat ssh known_hosts allowed" "ssh host cat /root/.ssh/known_hosts"
+assert_allow "#585 wrap: bash -c echo hi allowed" "bash -c 'echo hi'"
+assert_allow "#585 wrap: env FOO=1 make allowed" "env FOO=1 make"
+assert_allow "#585 wrap: timeout 5 curl allowed" "timeout 5 curl https://example.com"
+assert_allow "#585 wrap: sudo -l allowed" "sudo -l"
+
+# --- git read-tree: executable + unisolated asks; isolated/inert text does not
+assert_ask "#585 read-tree: bare asks" "git read-tree"
+assert_ask "#585 read-tree: via bash -c asks" "bash -c 'git read-tree HEAD'"
+assert_ask "#585 read-tree: via sh -c asks" 'sh -c "git read-tree HEAD"'
+assert_ask "#585 read-tree: via eval asks" "eval 'git read-tree HEAD'"
+assert_ask "#585 read-tree: inside \$(...) asks" 'x=$(git read-tree HEAD)'
+assert_ask "#585 read-tree: inside backticks asks" 'x=`git read-tree HEAD`'
+assert_ask "#585 read-tree: git -c option before subcommand asks" "git -c core.quotepath=false read-tree HEAD"
+assert_ask "#585 read-tree: git -C option before subcommand asks" "git -C . read-tree HEAD"
+assert_ask "#585 read-tree: full-path git asks" "/usr/bin/git read-tree HEAD"
+assert_ask "#585 read-tree: quoted subcommand asks" "git 'read-tree' HEAD"
+assert_ask "#585 read-tree: unrelated GIT_INDEX_FILE echo does not isolate" "echo 'GIT_INDEX_FILE=' ; git read-tree HEAD"
+assert_ask "#585 read-tree: assignment scoped to a different command does not isolate" "GIT_INDEX_FILE=/tmp/i git status; git read-tree HEAD"
+assert_allow "#585 read-tree: assignment prefix isolates" "GIT_INDEX_FILE=/tmp/i git read-tree HEAD"
+assert_allow "#585 read-tree: env-carried assignment isolates" "env GIT_INDEX_FILE=/tmp/i git read-tree HEAD"
+assert_allow "#585 read-tree: persistent export before the call isolates" "export GIT_INDEX_FILE=/tmp/i; git read-tree HEAD"
+assert_allow "#585 read-tree: isolated inside bash -c payload" "bash -c 'GIT_INDEX_FILE=/tmp/i git read-tree HEAD'"
+assert_allow "#585 read-tree: quoted --body mention is inert text" "gh issue create --title t --body 'the guard blocks git read-tree HEAD in main'"
+assert_allow "#585 read-tree: literal heredoc body mention is inert text" "cat > notes.md <<'EOF'
+run git read-tree HEAD to reset
+EOF"
+assert_allow "#585 read-tree: merge-tree preview (no index) allowed" "git merge-tree --write-tree main feature"
+
+# --- stash: create vs destructive operations
+read -r S585_MAIN S585_WT1 <<< "$(make_wt_confinement_repo)"
+# second managed linked worktree + the redirect target script
+git -C "$S585_MAIN" worktree add -q -b "s585-b-$$" "$S585_MAIN/.loom/worktrees/issue-2" >/dev/null 2>&1
+touch "$S585_MAIN/.loom/worktrees/issue-2/.loom-managed"
+mkdir -p "$S585_MAIN/.loom/scripts"; : > "$S585_MAIN/.loom/scripts/worktree.sh"
+# two linked worktrees but NO worktree.sh (no named alternative)
+read -r S585N_MAIN S585N_WT1 <<< "$(make_wt_confinement_repo)"
+git -C "$S585N_MAIN" worktree add -q -b "s585n-b-$$" "$S585N_MAIN/.loom/worktrees/issue-2" >/dev/null 2>&1
+# a single linked worktree (no one to collide with)
+read -r S585S_MAIN S585S_WT1 <<< "$(make_wt_confinement_repo)"
+mkdir -p "$S585S_MAIN/.loom/scripts"; : > "$S585S_MAIN/.loom/scripts/worktree.sh"
+
+assert_deny "#585 stash: raw create in a managed worktree with a sibling is denied (redirect)" "git stash" "$S585_WT1"
+assert_deny "#585 stash: 'git stash push -m wip' is denied (redirect)" "git stash push -m wip" "$S585_WT1"
+assert_deny "#585 stash: 'git stash save wip' is denied (redirect)" "git stash save wip" "$S585_WT1"
+assert_deny "#585 stash: 'git stash -u' (option-prefixed create) is denied" "git stash -u" "$S585_WT1"
+assert_deny "#585 stash: create chained before a pop is denied at the front" "git stash && make check; git stash pop" "$S585_WT1"
+assert_deny "#585 stash: create inside backticks is denied" 'x=`git stash push`' "$S585_WT1"
+assert_deny "#585 stash: create after cd into the worktree from main is denied" "cd $S585_WT1 && git stash push" "$S585_MAIN"
+assert_ask "#585 stash: pop in a managed worktree with a sibling still asks (recovery stays an ask)" "git stash pop" "$S585_WT1"
+assert_ask "#585 stash: pop inside \$(...) in the main checkout asks" 'echo $(git stash pop)' "$S585_MAIN"
+assert_ask "#585 stash: pop inside backticks in the main checkout asks" 'echo `git stash pop`' "$S585_MAIN"
+assert_ask "#585 stash: drop in the main checkout asks" "git stash drop" "$S585_MAIN"
+assert_allow "#585 stash: create in the main checkout stays allowed" "git stash push -m wip" "$S585_MAIN"
+assert_allow "#585 stash: bare create in the main checkout stays allowed" "git stash" "$S585_MAIN"
+assert_allow "#585 stash: create with no worktree.sh to name stays allowed" "git stash push" "$S585N_WT1"
+assert_allow "#585 stash: create in a solo linked worktree stays allowed" "git stash push" "$S585S_WT1"
+assert_allow "#585 stash: plumbing 'git stash create' is not a raw create" "git stash create" "$S585_WT1"
+assert_allow "#585 stash: 'git stash store' is plumbing, not a raw create" "git stash store abc123" "$S585_WT1"
+assert_allow "#585 stash: 'git stash list' is read-only" "git stash list" "$S585_WT1"
+assert_allow "#585 stash: 'git stash show' is read-only" "git stash show -p" "$S585_WT1"
+assert_allow "#585 stash: 'git stash apply' keeps the entry" "git stash apply" "$S585_WT1"
+assert_allow "#585 stash: 'git stash branch' is not a raw create" "git stash branch nb" "$S585_WT1"
+assert_allow "#585 stash: 'git stash --help' is not an operation" "git stash --help" "$S585_WT1"
+assert_allow "#585 stash: 'git stashx' is not git stash" "git stashx push" "$S585_WT1"
+assert_allow "#585 stash: grep for a test-case name containing 'git stash pop' is inert" 'grep -n "git stash pop in main" tests.sh' "$S585_MAIN"
+assert_allow "#585 stash: awk program mentioning 'git stash pop' is inert" "awk '/git stash pop/ {print}' tests.sh" "$S585_MAIN"
+assert_allow "#585 stash: grep for a create phrase in a managed worktree is inert" 'grep -n "x git stash push y" t.sh' "$S585_WT1"
+assert_allow_env "#585 stash: REPO_GUARD_STASH_SCOPE=0 disables the create redirect" "REPO_GUARD_STASH_SCOPE=0" "git stash push" "$S585_WT1"
+assert_allow_env "#585 stash: legacy LOOM_GUARD_STASH_SCOPE=0 disables the create redirect" "LOOM_GUARD_STASH_SCOPE=0" "git stash push" "$S585_WT1"
+assert_ask "#585 stash: single-quoted --body citing a backticked stash-pop stays visible (intentionally stricter than loom#5783, see #580)" "gh issue comment 1 --body 'quoting \`git stash pop\` as an example'" "$S585_MAIN"
+assert_ask "#585 stash: double-quoted --body with a LIVE backtick stash pop still asks" 'gh issue comment 1 --body "run: `git stash pop`"' "$S585_MAIN"
+rm -rf "$S585_MAIN" "$S585N_MAIN" "$S585S_MAIN"
+
+# --- toggle hints: toggleable tags carry a REPO_* hint; non-toggleable tags do not
+_h585_force=$(make_input "git push --force origin feature-585" "$REPO_ROOT" | env REPO_FORCE_SCOPE=all "$GUARD" 2>&1 || true)
+_h585_env=$(make_input "printenv GITHUB_TOKEN" "$REPO_ROOT" | "$GUARD" 2>&1 || true)
+TOTAL=$((TOTAL + 1))
+if echo "$_h585_force" | jq -e '.hookSpecificOutput.permissionDecision == "ask" and (.hookSpecificOutput.permissionDecisionReason | contains("Toggle: set REPO_FORCE_SCOPE=off"))' >/dev/null 2>&1; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #585 hint: force-op ask carries the REPO_FORCE_SCOPE toggle hint"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #585 hint: force-op ask carries the REPO_FORCE_SCOPE toggle hint"; echo "       Got: $_h585_force"
+fi
+TOTAL=$((TOTAL + 1))
+if echo "$_h585_env" | jq -e '.hookSpecificOutput.permissionDecision == "ask" and (.hookSpecificOutput.permissionDecisionReason | contains("Toggle:") | not)' >/dev/null 2>&1; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: #585 hint: printenv ask (no toggle) carries no hint"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: #585 hint: printenv ask (no toggle) carries no hint"; echo "       Got: $_h585_env"
+fi
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
