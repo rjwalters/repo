@@ -578,6 +578,11 @@ fastpath_grep_pipe_admits() {
         grep|egrep|fgrep|rg) ;;
         *) return 1 ;;
     esac
+    # rg --pre / --hostname-bin run an arbitrary program; decline (full path)
+    # if the search side mentions either anywhere, even inside quotes.
+    case "$left" in
+        *--pre*|*--hostname-bin*) return 1 ;;
+    esac
     local sink="${rt[0]}"
     if [[ "$_FASTPATH_PIPE_SINKS_ANYARG" == *" $sink "* ]]; then
         return 0
