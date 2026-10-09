@@ -3552,6 +3552,33 @@ command_has_shell_segment() {
     }'
 }
 
+# Toggle hint (loom#10434, ported in repo#585): one line naming the REPO_* env
+# var (set in the agent's OWN environment — the hook is a separate process, so an
+# inline `VAR=x cmd` prefix never reaches it and is never suggested) and the
+# config key for a TOGGLEABLE category. Tags that no toggle can disable
+# (catastrophic*, rm-protected-path, lifecycle-or-cloud-delete, git-read-tree,
+# printenv/ssh/systemctl asks, ...) match no arm and get no hint. Env names and
+# config path follow THIS guard's model (REPO_* wins over legacy LOOM_*;
+# .claude/skills/repo/config.json), not Loom's LOOM_*/.loom/config.json. Callers
+# skip the hint when the message already names a guards.* key, so existing
+# inline hints are not duplicated.
+toggle_hint_for_tag() {
+    local env="" key=""
+    case "$1" in
+        sql-ddl|sql-delete-no-where)  env="REPO_GUARD_SQL=0";                key='"guards.sqlDdl": false' ;;
+        cloud-cli:*)                  env="REPO_GUARD_CLOUD=0";              key='"guards.cloudCli": false' ;;
+        reversible-gh:*)              env="REPO_GUARD_REVERSIBLE_GH=1";      key='"guards.reversibleGh": true' ;;
+        cargo-clean-scope-outside-repo) env="REPO_GUARD_CARGO_CLEAN=0";      key='"guards.cargoCleanScope": false' ;;
+        rm-scope-unresolved-var|rm-scope-outside-repo) env="REPO_RM_SCOPE=off"; key='"guards.rmScope": "off"' ;;
+        force-op:*)                   env="REPO_FORCE_SCOPE=off";            key='"guards.forceScope": "off"' ;;
+        stash-scope:*)                env="REPO_GUARD_STASH_SCOPE=0";        key='"guards.stashScope": false' ;;
+        worktree-write-confinement*)  env="REPO_GUARD_WORKTREE_ISOLATION=0"; key='"guards.worktreeIsolation": false' ;;
+        tmpfs-scratch-dir:*)          env="REPO_GUARD_TMPFS_SCRATCH=0";      key='"guards.tmpfsScratch": false' ;;
+        *) return 0 ;;
+    esac
+    printf '\nToggle: set %s in the agent environment, or %s in .claude/skills/repo/config.json' "$env" "$key"
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -3568,6 +3595,7 @@ deny() {
     local tag="${2:-deny}"
     local context="${3:-}"
     log_guard_decision "deny" "catastrophic" "$tag" "$context" || true
+    [[ "$reason" == *"guards."* ]] || reason="${reason}$(toggle_hint_for_tag "$tag")"
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -3595,6 +3623,7 @@ ask() {
     local tag="${2:-ask}"
     local context="${3:-}"
     log_guard_decision "ask" "ask" "$tag" "$context" || true
+    [[ "$reason" == *"guards."* ]] || reason="${reason}$(toggle_hint_for_tag "$tag")"
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -8876,10 +8905,9 @@ ASK_PATTERNS=(
     # They live in CLOUD_ASK_PATTERNS below, gated by cloud_guard_enabled() so
     # cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 / guards.cloudCli:false).
 
-    # Service management
-    '(^|[;&|[:space:]])systemctl restart'
-    '(^|[;&|[:space:]])systemctl stop'
-    '(^|[;&|[:space:]])systemctl disable'
+    # NOTE: `systemctl restart|stop|disable` is NOT a plain substring entry here.
+    # It is handled by the segment-parsed, command-word-anchored
+    # systemctl_ask_reason() check after this loop (loom#5214, repo#585).
 
     # Kubernetes operations
     '(^|[;&|[:space:]])kubectl delete'
@@ -8890,11 +8918,11 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])sky down'
     '(^|[;&|[:space:]])sky stop'
 
-    # Credential exposure
-    '(^|[;&|[:space:]])printenv.*SECRET'
-    '(^|[;&|[:space:]])printenv.*TOKEN'
-    '(^|[;&|[:space:]])printenv.*KEY'
-    '(^|[;&|[:space:]])cat.*/\.ssh/'
+    # Credential exposure. `printenv ... SECRET|TOKEN|KEY` and `cat .../.ssh/<f>`
+    # are NOT plain substring entries any more: they are the segment-parsed
+    # printenv_ask_reason() / ssh_cat_ask_reason() checks after this loop
+    # (loom#6245 / loom#5824, repo#585). `.aws/credentials` has no safe
+    # sibling file to allowlist, so it stays a substring entry.
     '(^|[;&|[:space:]])cat.*/\.aws/credentials'
 )
 
@@ -8903,6 +8931,227 @@ for pattern in "${ASK_PATTERNS[@]}"; do
         ask "Command requires confirmation: $COMMAND" "ask:$pattern"
     fi
 done
+
+# Ported from rjwalters/loom guard-destructive-generic.sh at 2072f82b
+# (rjwalters/repo#585, part of #579): the three checks below replace the plain
+# substring ASK_PATTERNS entries that false-asked on quoted search text.
+# =============================================================================
+# SERVICE-MANAGEMENT ASK — systemctl restart/stop/disable, segment-parsed,
+# command-word anchored (#5214)
+#
+# These three verbs used to live in ASK_PATTERNS above as plain substring
+# patterns anchored only by '(^|[;&|[:space:]])' (#3756) — a boundary that
+# cannot distinguish a real shell separator from a whitespace character sitting
+# INSIDE a quoted string literal. So a phrase like `systemctl restart` merely
+# being quoted as SEARCH TEXT (a grep pattern, a jq filter, prose) still matched
+# on its leading space, even though no such command was ever invoked:
+#   grep -n "idle\|systemctl restart\|systemd\|relaunch\|--idle-shutdown" f.sh
+#   jq -c 'select(.pattern | contains("systemctl"))' guard-decisions.log
+#
+# Mirrors lifecycle_or_cloud_reason()'s fix for the analogous halt/reboot/
+# az-delete false positive: segment-parse the command with qsplit() (quote-aware,
+# #3755) instead of scanning raw substrings, strip a leading sudo/env wrapper
+# per segment, and ask ONLY when a segment's actual command word is `systemctl`
+# AND its very next token is restart/stop/disable. A quoted `|` inside
+# `grep`/`jq` arguments (no `$(`/backtick) is inert to qsplit(), so both example
+# commands above stay a single `grep`/`jq` segment — command word never
+# resolves to `systemctl` — and no longer false-ask. A genuine invocation
+# (bare, after `;`/`&&`/`|`, or with a later quoted argument such as
+# `systemctl restart "my service"`) still asks, since toks[1]/toks[2] are
+# unaffected by trailing quoted content.
+#
+# Scoped narrowly to this one "Service management" ASK_PATTERNS block per
+# #5214 — #5157/#5158 describe the same false-positive CLASS for other
+# patterns but were judged too broad a fix to land autonomously; this is not
+# an attempt at a general-purpose fix for the whole ASK_PATTERNS family.
+# =============================================================================
+systemctl_ask_reason() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # lifecycle_or_cloud_reason() (#3586), so `env FOO=bar systemctl
+            # restart x` still resolves its command word to `systemctl`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] == "systemctl" && (toks[2] == "restart" || toks[2] == "stop" || toks[2] == "disable")) {
+                print "systemctl " toks[2]
+            }
+        }
+    }'
+}
+_SYSTEMCTL_ASK=$(systemctl_ask_reason "$COMMAND_NO_COMMENT" | head -1)
+if [[ -n "$_SYSTEMCTL_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_SYSTEMCTL_ASK"
+fi
+
+# =============================================================================
+# SSH-DIRECTORY READ ASK — cat under .ssh/, basename-allowlisted (#5824)
+#
+# The plain-substring ASK_PATTERNS entry this replaced —
+# '(^|[;&|[:space:]])cat.*/\.ssh/' — matched the whole `.ssh/` directory, so
+# reading a routine, non-secret file (`config`, `known_hosts`,
+# `known_hosts.old`, `authorized_keys` — at most host aliases / key
+# fingerprints, never key material) asked identically to reading an actual
+# private key. `grep -E` substring matching cannot capture the matched
+# operand to inspect its basename, so — mirroring systemctl_ask_reason()
+# above — this segment-parses the command with qsplit() (quote-aware,
+# #3755), strips a leading sudo/env wrapper per segment, and only inspects
+# segments whose command word is literally `cat`.
+#
+# ALLOWLIST, NOT DENYLIST (deliberate, per the issue's acceptance criteria):
+# a `cat` operand under `.ssh/` still asks unless its basename is one of the
+# four known-safe filenames below. Any unrecognized/unlisted filename —
+# including a bare `.ssh/` with no filename at all — falls through to the
+# safer default (ask), so a new key-naming convention or an unforeseen file
+# is never silently allowed. Private key material (`id_rsa`, `id_ed25519`,
+# anything else) always misses the allowlist and keeps asking.
+# =============================================================================
+ssh_cat_ask_reason() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # systemctl_ask_reason() above (#3586), so `env FOO=bar cat
+            # ~/.ssh/id_rsa` still resolves its command word to `cat`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] != "cat") continue
+            for (j = 2; j <= m; j++) {
+                tok = toks[j]
+                if (tok !~ /\/\.ssh\//) continue
+                # Operand after the LAST /.ssh/ in this token (greedy .*
+                # backtracks to the rightmost occurrence).
+                if (!match(tok, /.*\/\.ssh\//)) continue
+                rest = substr(tok, RLENGTH + 1)
+                # basename: strip any further path components after /.ssh/
+                if (match(rest, /.*\//)) {
+                    base = substr(rest, RLENGTH + 1)
+                } else {
+                    base = rest
+                }
+                # Strip stray quote characters a quoted operand (copied
+                # verbatim by qsplit) may leave attached to the basename.
+                gsub(/[\047\042]/, "", base)
+                if (base != "config" && base != "known_hosts" && base != "known_hosts.old" && base != "authorized_keys") {
+                    print "cat .ssh/" base
+                    exit
+                }
+            }
+        }
+    }'
+}
+_SSH_CAT_ASK=$(ssh_cat_ask_reason "$COMMAND_ASK_SCAN" | head -1)
+if [[ -n "$_SSH_CAT_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_SSH_CAT_ASK"
+fi
+
+# =============================================================================
+# PRINTENV CREDENTIAL-NAME ASK — segment-parsed, name-allowlisted (#6245)
+#
+# The plain-substring ASK_PATTERNS entries this replaced — three separate
+# '(^|[;&|[:space:]])printenv.*SECRET' / '...TOKEN' / '...KEY' patterns —
+# matched ANY printenv invocation whose command text contained one of those
+# three substrings anywhere after "printenv", with no way to distinguish a
+# genuinely secret-bearing read (`printenv GITHUB_TOKEN`) from a non-secret
+# pointer/identity variable that merely has one of those words in its name
+# (`printenv LOOM_TOKEN_NAME` — an account-label string identifying which
+# OAuth token slot is active, not a credential value; see
+# docs/token-pool.md — spawn-claude.sh already logs it in plaintext).
+#
+# DENYLIST substring check, ALLOWLIST override (deliberate): mirroring
+# systemctl_ask_reason()/ssh_cat_ask_reason() above, this segment-parses the
+# command with qsplit() (quote-aware, #3755), strips a leading sudo/env
+# wrapper per segment, and only inspects segments whose command word is
+# literally `printenv`. Each remaining operand (the variable name being
+# read) still asks if its name contains SECRET/TOKEN/KEY as a substring —
+# the same narrowing the old patterns used — UNLESS the operand is an
+# EXACT match for a documented non-secret var (LOOM_TOKEN_NAME,
+# LOOM_TOKEN_MODE). The allowlist match is exact-string, not substring, so
+# a lookalike name that merely CONTAINS an allowlisted name (e.g.
+# LOOM_TOKEN_NAME_BACKUP) still asks — guards against a suffix/prefix-match
+# bypass. Any unrecognized/unlisted credential-shaped name falls through to
+# the safer default (ask), so a new var-naming convention is never silently
+# allowed.
+# =============================================================================
+printenv_ask_reason() {
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # systemctl_ask_reason()/ssh_cat_ask_reason() above (#3586), so
+            # `env FOO=bar printenv LOOM_TOKEN_NAME` still resolves its
+            # command word to `printenv`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] != "printenv") continue
+            for (j = 2; j <= m; j++) {
+                var = toks[j]
+                gsub(/[\047\042]/, "", var)
+                if (var ~ /^-/) continue
+                if (var !~ /SECRET|TOKEN|KEY/) continue
+                if (var == "LOOM_TOKEN_NAME" || var == "LOOM_TOKEN_MODE") continue
+                print "printenv " var
+                exit
+            }
+        }
+    }'
+}
+_PRINTENV_ASK=$(printenv_ask_reason "$COMMAND_ASK_SCAN" | head -1)
+if [[ -n "$_PRINTENV_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_PRINTENV_ASK"
+fi
 
 
 # =============================================================================
@@ -9120,6 +9369,658 @@ for pattern in "${REVERSIBLE_GH_ASK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# INDEX-MUTATION ANALYZER (#7923) — the executable-context / per-segment
+# isolation engine behind the `git-read-tree` deny site below.
+#
+# WHY A STRUCTURED PASS AND NOT A REGEX
+#
+# The deny site used to ask two independent substring questions of
+# COMMAND_NO_COMMENT:
+#
+#   1. does `(^|[;&|(`]|[[:space:]])git[[:space:]]+read-tree` appear anywhere?
+#   2. does `GIT_INDEX_FILE=` appear anywhere?
+#
+# Neither question is about EXECUTION, so both were wrong in both directions:
+#
+#   * FALSE DENY — COMMAND_NO_COMMENT strips only `#` comments, so a quoted
+#     `--body` value or a `cat > file <<QUOTED` heredoc body that merely
+#     MENTIONS the phrase matched (1) and was hard-denied. That blocked
+#     filing/commenting on any issue about this guard, including #7923 itself.
+#   * FALSE ALLOW — the boundary class has no quote characters, so
+#     `bash -c <SQ>git read-tree HEAD<SQ>`, `sh -c "…"` and `eval <SQ>…<SQ>`
+#     -- which DO mutate the real index -- never matched (1) at all. And (2)
+#     accepted a `GIT_INDEX_FILE=` occurrence from ANYWHERE in the string, so
+#     `echo <SQ>GIT_INDEX_FILE=<SQ> ; git read-tree HEAD` and
+#     `GIT_INDEX_FILE=/tmp/i git status; git read-tree HEAD` (assignment scoped
+#     to a DIFFERENT simple command) both authorized an unrelated invocation.
+#
+# No lossier scan COPY fixes this: #7923 measured the obvious
+# COMMAND_ASK_SCAN swap and it flipped `printf <SQ>%s\n<SQ> <SQ>git read-tree
+# HEAD<SQ> > /tmp/notes.txt` to a deny (a quoted POSITIONAL of a non-executing
+# command is inert, and no copy in the chain masks those generally) while
+# leaving both isolation-scoping holes open. The questions this site actually
+# needs answered are structural, so it gets a structural pass.
+#
+# WHAT IT ANSWERS
+#
+# For each SIMPLE COMMAND in the command text: is its command word `git` with
+# subcommand `read-tree`, and is a `GIT_INDEX_FILE=` assignment in force FOR
+# THAT SIMPLE COMMAND? Quoted text is inert DATA unless the segment that
+# carries it actually re-executes it — the wrapper vocabulary is exactly the
+# one mask_ask_positional_args() already names as the reason it excludes
+# wrappers from its allowlist (`sh|bash|zsh|dash -c`, `eval`, `source`/`.`),
+# plus the `$(…)` / backtick substitutions qsplit()/has_live_subst() already
+# treat as live and a pipeline whose sink is a stdin-reading shell.
+#
+# MONOTONE ON THE DENY SET (the security floor, argued not asserted)
+#
+# For any text that is actually EXECUTED, this pass is a strict superset of
+# the old regex:
+#   * The old regex required a separator/whitespace boundary then the literal
+#     bytes `git` + whitespace + `read-tree`. That is exactly an ADJACENT
+#     `git` / `read-tree` word pair inside one segment, which im_segments()
+#     re-checks verbatim as its "lenient net" AFTER the precise command-word
+#     walk — so nothing the old matcher caught in executable text is lost,
+#     even when a prefix this pass does not model (`timeout 5 …`, `sudo -u x
+#     …`) sits in front of it.
+#   * The precise walk ADDS shapes the old regex structurally could not see:
+#     `git -c core.quotepath=false read-tree` (git accepts `-c`/`-C`/
+#     `--git-dir` config overrides BEFORE the subcommand, so the two words are
+#     not adjacent), a quoted subcommand, and every interpreter-wrapped body.
+#   * Isolation only ever gets STRICTER: a bare `GIT_INDEX_FILE=` substring no
+#     longer authorizes anything; the assignment must be an assignment PREFIX
+#     of the same simple command, an `env`/`sudo`-carried assignment for it, or
+#     a genuinely persistent earlier `export GIT_INDEX_FILE=` / standalone
+#     assignment segment (the shapes where the real shell would in fact export
+#     it to the later segment).
+# The ONLY direction it narrows is the intended one: a `git read-tree` phrase
+# that no shell would ever execute — quoted data handed to a non-executing
+# command, or a LITERAL heredoc body fed to something that is not an
+# interpreter. "Literal" is load-bearing there: only a QUOTED delimiter
+# (`<<'EOF'` / `<<"EOF"`) makes a body literal. A bare `<<EOF` body is
+# expanded BY THE SHELL before the sink reads a byte of it, so its `$( … )` /
+# backtick spans are scanned as executable text (im_hd_expand()) even when the
+# owning command is a known inert sink.
+#
+# Fail-closed by construction: an unterminated quote, an unbalanced `$(`, an
+# unclosed heredoc and a recursion beyond the depth bound all leave the text
+# VISIBLE/treated as executable rather than inert, and index_mutation_unisolated()
+# falls back to the legacy regex pair if awk itself fails.
+#
+# MEASURED, not asserted. A differential sweep of a 148-shape corpus against
+# the merge-base hook (`origin/main` at 44e9ab48), each version built into its
+# OWN isolated tree and fed PreToolUse JSON exactly as
+# tests/hooks/lib/guard-destructive-harness.sh make_input() builds it (throwaway
+# git cwd, no .loom/config.json, every LOOM_* unset):
+#
+#     36 shapes  allow -> deny    wrapper escapes, both isolation-scoping
+#                                 holes, git -c/-C/--git-dir/--work-tree
+#     27 shapes  deny  -> allow
+#     85 shapes  unchanged
+#
+# Of the 27 deny -> allow, 22 are PROVABLY inert: each was probed by replacing
+# the index subcommand with a marker program and RUNNING the shape — the marker
+# never fired, so no shell ever executed that text. They are quoted
+# `--body`/`--comment` values and heredoc bodies owned by a known inert sink
+# (`cat > file`, `tee`, `git commit -F -`, `grep`, `jq`, the
+# `--body "$(cat <<QUOTED … )"` filing idiom), either with a QUOTED delimiter or
+# with no substitution in the body at all. The other 5 are the write-then-execute
+# shapes recorded as limitation 4 below: their marker DOES fire, and they are
+# accepted with reasons, not claimed inert.
+#
+# KNOWN LIMITATIONS (unchanged from the old matcher — recorded, not introduced)
+#
+#   1. A phrase QUOTED inside a non-shell interpreter body — `python - <<EOF` /
+#      `os.system("git read-tree HEAD")` — is not seen. The old regex missed it
+#      for the same reason (no quote character in its boundary class), and this
+#      pass does not parse Python/Perl/Ruby syntax. Bodies of such commands keep
+#      the old regex verbatim (im_legacy()) rather than the structural pass, so
+#      the coverage is identical to before, not narrower.
+#   2. A payload ASSEMBLED at runtime — `bash -c "$(printf 'git read-tree')"`,
+#      an `eval` of a variable — is not resolvable without executing it. Also
+#      unchanged: the old matcher missed every one of these too.
+#   3. `git` reached through an alias/variable command word (`$G read-tree`) is
+#      not resolved, matching every other command-word-anchored check in this
+#      file (see the printenv/systemctl/ssh-cat segment parsers).
+#
+# ACCEPTED LIMITATIONS INTRODUCED BY THIS PASS (measured, with reasons)
+#
+#   4. WRITE-THEN-EXECUTE inside ONE command string —
+#      `cat > /tmp/x.sh <<QUOTED … EOF` followed by `bash /tmp/x.sh` (also the
+#      `tee`, `source` and `cat <<QUOTED > file && bash file` variants). The
+#      heredoc body genuinely IS literal to `cat`, so this pass treats it as
+#      file content; the same string then executes the file it just wrote. The
+#      old regex denied these only by accident — it matched the raw bytes
+#      wherever they sat — and the shape was never actually covered: no guard
+#      can follow a file across `bash /tmp/x.sh`, and splitting the write and
+#      the run into two tool calls escaped the old matcher exactly as it escapes
+#      this one. 5 shapes in the sweep; accepted as out of remit, recorded here
+#      rather than omitted from the deny -> allow table.
+#   5. PROCESS SUBSTITUTION as an interpreter payload —
+#      `source <(echo 'git read-tree HEAD')`, `. <(…)`, `bash <(…)`.
+#      ALLOW on both sides (no regression, so not a deny -> allow move), but it
+#      is the same class of escape this pass set out to close: the phrase is a
+#      quoted argument of a non-executing producer whose output the interpreter
+#      then runs through a /dev/fd path. Recorded so this inventory stays
+#      honest rather than silently short. (A process substitution whose own
+#      text is unquoted — `diff <(git read-tree HEAD) f` — is still denied by
+#      the lenient net, which sees the adjacent word pair.)
+#
+# Hot path: gated behind a `read-tree` substring test at the call site, so the
+# awk fork only happens for a command that mentions the phrase at all.
+# =============================================================================
+_INDEXMUT_AWK="$_HASLIVESUBST_AWK"'
+# Basename of a command word (so /usr/bin/git is still git).
+function im_base(w,   p, k) {
+    p = w
+    k = index(p, "/")
+    while (k > 0) { p = substr(p, k + 1); k = index(p, "/") }
+    return p
+}
+
+# Interpreters whose ARGUMENTS are shell source text. Deliberately the same
+# vocabulary mask_ask_positional_args() names in its own header as the set it
+# refuses to allowlist ("a command that WRAPS the phrase and then executes it").
+function im_is_interp(b) {
+    return (b == "sh" || b == "bash" || b == "zsh" || b == "dash" ||
+            b == "ksh" || b == "mksh" || b == "ash" || b == "busybox" ||
+            b == "eval" || b == "source" || b == ".")
+}
+
+# Shells that execute their STANDARD INPUT when given no -c payload -- the
+# sink shape of `echo <SQ>…<SQ> | sh`.
+function im_is_stdin_shell(b) {
+    return (b == "sh" || b == "bash" || b == "zsh" || b == "dash" ||
+            b == "ksh" || b == "mksh" || b == "ash")
+}
+
+# Commands that can own a heredoc without EXECUTING its body: the body is file
+# content, message text or search input. DELIBERATELY NARROW, the same
+# convention mask_ask_positional_args() states for its own allowlist -- this is
+# the ONLY list that lets a heredoc body stop being scanned, so anything not on
+# it (an interpreter, a language runtime, an unknown command) keeps the
+# pre-#7923 treatment via im_legacy() below. Adding an entry here is a claim
+# that the command cannot run its stdin as code.
+function im_is_inert_sink(b) {
+    return (b == "cat" || b == "tee" || b == "grep" || b == "egrep" ||
+            b == "fgrep" || b == "rg" || b == "head" || b == "tail" ||
+            b == "wc" || b == "sort" || b == "uniq" || b == "diff" ||
+            b == "cmp" || b == "jq" || b == "yq" || b == "gh" || b == "git" ||
+            b == "base64" || b == "tr" || b == "column" || b == "cut" ||
+            b == "md5sum" || b == "shasum" || b == "sha1sum" || b == "sha256sum")
+}
+
+# The PRE-#7923 matcher, verbatim, over a raw string. Applied to a heredoc body
+# whose owning command is neither a shell (re-scanned structurally) nor a known
+# inert sink (ignored) -- a `python - <<EOF` / `perl <<EOF` body can call out to
+# the shell in its own syntax, which this pass does not parse, so those bodies
+# keep exactly the treatment they had before this change rather than silently
+# becoming allow. Monotonicity over cleverness.
+function im_legacy(s) {
+    if (index(s, "read-tree") == 0) return
+    if (s ~ /GIT_INDEX_FILE=/) return
+    if (s ~ /(^|[;&|(`]|[ \t\n])git[ \t]+read-tree/) IMHIT = 1
+}
+
+# Words that may PRECEDE the real command word without being it: shell
+# grammar keywords/openers and env-preserving launcher prefixes.
+function im_is_prefix(b) {
+    return (b == "{" || b == "!" || b == "if" || b == "then" || b == "else" ||
+            b == "elif" || b == "while" || b == "until" || b == "do" ||
+            b == "time" || b == "command" || b == "builtin" || b == "exec" ||
+            b == "nohup" || b == "sudo" || b == "doas" || b == "env" ||
+            b == "stdbuf" || b == "nice" || b == "ionice" || b == "setsid" ||
+            b == "xargs")
+}
+
+# git GLOBAL options that consume the NEXT word as their value, so the
+# subcommand walk does not mistake the value for the subcommand. This is what
+# makes `git -c core.quotepath=false read-tree` visible.
+function im_git_opt_takes_value(u) {
+    return (u == "-c" || u == "-C" || u == "--git-dir" || u == "--work-tree" ||
+            u == "--namespace" || u == "--exec-path" || u == "--super-prefix" ||
+            u == "--config-env")
+}
+
+# NAME of a shell assignment token, or "" when the token is not one. Tested on
+# the RAW token on purpose: `"GIT_INDEX_FILE=/tmp/i"` (quote BEFORE the name)
+# is a command word to the shell, not an assignment, and must not isolate.
+function im_assign_name(rawtok) {
+    if (match(rawtok, /^[A-Za-z_][A-Za-z0-9_]*=/)) return substr(rawtok, 1, RLENGTH - 1)
+    return ""
+}
+
+# An assignment/export only reaches a LATER segment across a separator that
+# keeps the same shell: `;`, `&&` and a newline. Never across a pipe.
+function im_persist_sep(sep) {
+    return (sep == ";" || sep == "&&" || sep == "\n" || sep == "")
+}
+
+function im_hd_index(u) {
+    if (match(u, /^IMHD[0-9]+IM$/)) return substr(u, 5, length(u) - 6) + 0
+    return 0
+}
+
+# Remove ONE quoting layer, shell-accurately: quotes at the outer level are
+# removed, quotes nested inside the other kind are preserved, so recursing into
+# `bash -c <SQ>echo "hi"<SQ>` still sees the inner double quotes.
+function im_unquote(tok,   out, i, n, c, q) {
+    out = ""; n = length(tok); i = 1; q = ""
+    while (i <= n) {
+        c = substr(tok, i, 1)
+        if (q == SQ) {
+            if (c == SQ) q = ""; else out = out c
+            i++; continue
+        }
+        if (q == DQ) {
+            if (c == "\\") { i++; if (i <= n) out = out substr(tok, i, 1); i++; continue }
+            if (c == DQ) { q = ""; i++; continue }
+            out = out c; i++; continue
+        }
+        if (c == SQ) { q = SQ; i++; continue }
+        if (c == DQ) { q = DQ; i++; continue }
+        if (c == "\\") { i++; if (i <= n) out = out substr(tok, i, 1); i++; continue }
+        out = out c; i++
+    }
+    return out
+}
+
+# Replace each heredoc BODY with a marker word on the opener line, remembering
+# the body in the GLOBAL IMHD[] (global, and keyed by a global counter, so a
+# marker still resolves when the opener line is later re-scanned one recursion
+# level down -- e.g. the `cat` inside `--body "$(cat <<QUOTED … )"`). What
+# happens to a body is decided by its OWNING command in im_segments(), not
+# here: a `bash <<QUOTED` body executes, a `cat > file <<QUOTED` body is file
+# content, and anything else keeps the pre-#7923 regex treatment.
+# An UNCLOSED heredoc is left untouched (body stays visible => fail-closed).
+function im_mask_heredocs(s,   lines, nl, i, j, line, delim, closeat, trimmed,
+                          dashform, k, out, skip, rs, rl, body, any, hdquoted) {
+    if (index(s, "<<") == 0) return s
+    nl = split(s, lines, "\n")
+    for (i = 1; i <= nl; i++) skip[i] = 0
+    any = 0
+    for (i = 1; i <= nl; i++) {
+        if (skip[i]) continue
+        line = lines[i]
+        if (!match(line, HDRE)) continue
+        rs = RSTART; rl = RLENGTH
+        delim = substr(line, rs, rl)
+        dashform = (substr(delim, 3, 1) == "-")
+        sub(/^<<-?[ \t]*/, "", delim)
+        # QUOTEDNESS of the delimiter is security-relevant, so it is RECORDED
+        # here, not merely stripped: a quoted delimiter makes the body literal,
+        # but a bare `<<EOF` does NOT -- the shell performs parameter expansion
+        # and command substitution on such a body BEFORE the owning command
+        # reads a single byte of it. See im_hd_expand().
+        # (No apostrophes in this awk program: it is a single-quoted string.)
+        hdquoted = (substr(delim, 1, 1) == SQ || substr(delim, 1, 1) == DQ)
+        if (hdquoted) {
+            delim = substr(delim, 2, length(delim) - 2)
+        }
+        if (delim == "") continue
+        closeat = 0
+        for (j = i + 1; j <= nl; j++) {
+            trimmed = lines[j]
+            if (dashform) sub(/^\t+/, "", trimmed)
+            sub(/[ \t]+$/, "", trimmed)
+            if (trimmed == delim) { closeat = j; break }
+        }
+        if (closeat == 0) continue
+        IMHDN++
+        k = IMHDN
+        any = 1
+        body = ""
+        for (j = i + 1; j < closeat; j++) {
+            body = body (body == "" ? "" : "\n") lines[j]
+            skip[j] = 1
+        }
+        skip[closeat] = 1
+        IMHD[k] = body
+        IMHDQ[k] = hdquoted
+        lines[i] = substr(line, 1, rs - 1) " IMHD" k "IM " substr(line, rs + rl)
+    }
+    if (!any) return s
+    out = ""
+    for (i = 1; i <= nl; i++) {
+        if (skip[i]) continue
+        out = out (out == "" ? "" : "\n") lines[i]
+    }
+    return out
+}
+
+# Recurse into every LIVE command substitution -- `$( … )` and backticks,
+# including inside double quotes -- and replace the span with an inert
+# placeholder so the outer lex is not confused by its separators. A span inside
+# SINGLE quotes is skipped: bash performs no expansion there at all, the same
+# floor strip_literal_text() records for its own single-quote carve-out.
+# Unbalanced/unterminated spans are left verbatim (fail-closed).
+function im_extract_subst(s, depth,   out, n, i, c, q, dep, j, inner) {
+    out = ""; n = length(s); i = 1; q = ""
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (q == SQ) { out = out c; if (c == SQ) q = ""; i++; continue }
+        if (q == DQ) {
+            if (c == "\\") { out = out c; i++; if (i <= n) { out = out substr(s, i, 1); i++ }; continue }
+            if (c == DQ) { out = out c; q = ""; i++; continue }
+        } else {
+            if (c == SQ) { q = SQ; out = out c; i++; continue }
+            if (c == DQ) { q = DQ; out = out c; i++; continue }
+            if (c == "\\") { out = out c; i++; if (i <= n) { out = out substr(s, i, 1); i++ }; continue }
+        }
+        if (c == "$" && substr(s, i + 1, 1) == "(") {
+            dep = 1; j = i + 2
+            while (j <= n) {
+                if (substr(s, j, 1) == "(") dep++
+                else if (substr(s, j, 1) == ")") { dep--; if (dep == 0) break }
+                j++
+            }
+            if (dep != 0) { out = out c; i++; continue }
+            inner = substr(s, i + 2, j - i - 2)
+            im_scan(inner, depth + 1)
+            out = out "IMSUB"
+            i = j + 1
+            continue
+        }
+        if (c == "`") {
+            j = i + 1
+            while (j <= n && substr(s, j, 1) != "`") j++
+            if (j > n) { out = out c; i++; continue }
+            inner = substr(s, i + 1, j - i - 1)
+            im_scan(inner, depth + 1)
+            out = out "IMSUB"
+            i = j + 1
+            continue
+        }
+        out = out c; i++
+    }
+    return out
+}
+
+# LIVE expansions inside an UNQUOTED-delimiter heredoc body.
+#
+# `cat > f <<QUOTED` is genuinely literal, but a bare `cat > f <<EOF` is NOT:
+# the SHELL performs parameter expansion and command substitution on the body
+# and hands the RESULT to the sink, so a `$( ... )` / backtick span in such a
+# body executes against the real index even though cat/tee/gh/jq/grep never run
+# a byte of it as code. Only the SPANS are live -- the surrounding text really
+# is data -- so this scans the spans and nothing else, which is why a plain
+# `cat > f <<EOF` body naming the index command stays allow.
+#
+# DELIBERATELY QUOTE-BLIND, unlike im_extract_subst(): quote characters carry
+# no quoting meaning inside a heredoc body, so a span wrapped in single quotes
+# there is expanded exactly like a bare one. A BACKSLASH is the one suppressor
+# the shell honours, so it is honoured here too. An unbalanced/unterminated
+# span is not resolvable -- fail closed by handing the whole body to the
+# pre-#7923 regex rather than ignoring it.
+function im_hd_expand(s, depth,   n, i, c, j, dep) {
+    n = length(s); i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\\") { i += 2; continue }
+        if (c == "$" && substr(s, i + 1, 1) == "(") {
+            dep = 1; j = i + 2
+            while (j <= n) {
+                if (substr(s, j, 1) == "(") dep++
+                else if (substr(s, j, 1) == ")") { dep--; if (dep == 0) break }
+                j++
+            }
+            if (dep != 0) { im_legacy(s); return }
+            im_scan(substr(s, i + 2, j - i - 2), depth + 1)
+            i = j + 1
+            continue
+        }
+        if (c == "`") {
+            j = i + 1
+            while (j <= n && substr(s, j, 1) != "`") j++
+            if (j > n) { im_legacy(s); return }
+            im_scan(substr(s, i + 1, j - i - 1), depth + 1)
+            i = j + 1
+            continue
+        }
+        i++
+    }
+}
+
+# Quote-aware lexer. tok[]/typ[] hold words ("w", quote characters PRESERVED so
+# im_assign_name() can tell an assignment from a quoted look-alike) and
+# separators ("s": ; && || | & newline ( ) ).
+function im_lex(s, tok, typ,   n, i, c, cur, q, cnt) {
+    n = length(s); i = 1; cur = ""; q = ""; cnt = 0
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (q != "") {
+            cur = cur c
+            if (q == DQ && c == "\\") { i++; if (i <= n) cur = cur substr(s, i, 1); i++; continue }
+            if (c == q) q = ""
+            i++; continue
+        }
+        if (c == SQ || c == DQ) { q = c; cur = cur c; i++; continue }
+        if (c == "\\") {
+            # Backslash-newline is a LINE CONTINUATION: both bytes vanish and
+            # the word continues, so `git \<newline>  read-tree` is the same
+            # adjacent word pair as `git read-tree`.
+            if (substr(s, i + 1, 1) == "\n") { i += 2; continue }
+            cur = cur c; i++; if (i <= n) { cur = cur substr(s, i, 1); i++ }
+            continue
+        }
+        if (c == " " || c == "\t") {
+            if (cur != "") { cnt++; tok[cnt] = cur; typ[cnt] = "w"; cur = "" }
+            i++; continue
+        }
+        if (c == "\n" || c == ";" || c == "&" || c == "|" || c == "(" || c == ")") {
+            if (cur != "") { cnt++; tok[cnt] = cur; typ[cnt] = "w"; cur = "" }
+            cnt++
+            if (c == "&" && substr(s, i + 1, 1) == "&") { tok[cnt] = "&&"; i += 2 }
+            else if (c == "|" && substr(s, i + 1, 1) == "|") { tok[cnt] = "||"; i += 2 }
+            else { tok[cnt] = c; i++ }
+            typ[cnt] = "s"
+            continue
+        }
+        cur = cur c; i++
+    }
+    if (cur != "") { cnt++; tok[cnt] = cur; typ[cnt] = "w" }
+    return cnt
+}
+
+# Index of the command word in tok[lo..hi] (assignments and launcher prefixes
+# skipped), or 0 when the segment has none.
+function im_cmdidx(tok, typ, lo, hi,   i, b) {
+    i = lo
+    while (i <= hi) {
+        if (typ[i] != "w") { i++; continue }
+        if (im_assign_name(tok[i]) != "") { i++; continue }
+        b = im_base(im_unquote(tok[i]))
+        if (b == "" || im_is_prefix(b)) { i++; continue }
+        return i
+    }
+    return 0
+}
+
+# Does tok[lo..hi] name a shell that will EXECUTE ITS STDIN (no -c payload)?
+function im_seg_is_stdin_shell(tok, typ, lo, hi,   ci, j) {
+    ci = im_cmdidx(tok, typ, lo, hi)
+    if (ci == 0) return 0
+    if (!im_is_stdin_shell(im_base(im_unquote(tok[ci])))) return 0
+    for (j = ci + 1; j <= hi; j++) {
+        if (typ[j] == "w" && im_unquote(tok[j]) == "-c") return 0
+    }
+    return 1
+}
+
+function im_segments(tok, typ, n, depth,
+                     ns, sstart, send, ssep, feeds, k, i, hi, j, b, u,
+                     seg_iso, env_iso, assigned, payload, hdk) {
+    ns = 1; sstart[1] = 1
+    for (i = 1; i <= n; i++) {
+        if (typ[i] != "s") continue
+        send[ns] = i - 1
+        ssep[ns] = tok[i]
+        ns++
+        sstart[ns] = i + 1
+    }
+    send[ns] = n
+    ssep[ns] = ""
+
+    # A segment whose pipeline SINK is a stdin-reading shell has its own data
+    # words executed, so they are source text, not inert arguments.
+    for (k = 1; k <= ns; k++) feeds[k] = 0
+    for (k = ns - 1; k >= 1; k--) {
+        if (ssep[k] != "|") continue
+        if (feeds[k + 1] || im_seg_is_stdin_shell(tok, typ, sstart[k + 1], send[k + 1])) feeds[k] = 1
+    }
+
+    env_iso = 0
+    for (k = 1; k <= ns; k++) {
+        i = sstart[k]; hi = send[k]
+        if (i > hi) continue
+        seg_iso = env_iso
+        assigned = 0
+        # Assignment PREFIX of this simple command.
+        while (i <= hi && typ[i] == "w" && im_assign_name(tok[i]) != "") {
+            if (im_assign_name(tok[i]) == "GIT_INDEX_FILE") { seg_iso = 1; assigned = 1 }
+            i++
+        }
+        if (i > hi) {
+            # Assignments only: these DO persist into the following segments.
+            if (assigned && im_persist_sep(ssep[k])) env_iso = 1
+            continue
+        }
+        # Launcher prefixes (env/sudo/…) may carry further assignments.
+        while (i <= hi && typ[i] == "w") {
+            if (im_assign_name(tok[i]) != "") {
+                if (im_assign_name(tok[i]) == "GIT_INDEX_FILE") seg_iso = 1
+                i++; continue
+            }
+            b = im_base(im_unquote(tok[i]))
+            if (b == "" || im_is_prefix(b)) { i++; continue }
+            break
+        }
+        if (i > hi) continue
+        b = im_base(im_unquote(tok[i]))
+
+        # Heredoc bodies OWNED by this segment, routed by what the owning
+        # command does with its stdin. Done before the branches below so every
+        # command word reaches it, including `git` and `export`.
+        for (j = sstart[k]; j <= hi; j++) {
+            if (typ[j] != "w") continue
+            hdk = im_hd_index(im_unquote(tok[j]))
+            if (hdk == 0) continue
+            if (im_is_interp(b) || feeds[k]) im_scan(IMHD[hdk], depth + 1)
+            else if (!im_is_inert_sink(b)) im_legacy(IMHD[hdk])
+            else if (!IMHDQ[hdk]) im_hd_expand(IMHD[hdk], depth)
+        }
+
+        if (b == "export") {
+            for (j = i + 1; j <= hi; j++) {
+                if (typ[j] != "w") continue
+                if (im_assign_name(tok[j]) == "GIT_INDEX_FILE" && im_persist_sep(ssep[k])) env_iso = 1
+            }
+            continue
+        }
+
+        if (im_is_interp(b)) {
+            # Every argument of an interpreter is shell SOURCE: scan each one
+            # on its own AND the joined non-option run, so both
+            # `bash -c <SQ>git read-tree HEAD<SQ>` and `eval git read-tree HEAD`
+            # are seen. Its heredoc body was already scanned above.
+            payload = ""
+            for (j = i + 1; j <= hi; j++) {
+                if (typ[j] != "w") continue
+                u = im_unquote(tok[j])
+                if (im_hd_index(u) > 0) continue
+                if (substr(u, 1, 1) == "-") continue
+                payload = payload (payload == "" ? "" : " ") u
+                im_scan(u, depth + 1)
+            }
+            if (payload != "") im_scan(payload, depth + 1)
+            continue
+        }
+
+        if (b == "git") {
+            j = i + 1
+            while (j <= hi && typ[j] == "w") {
+                u = im_unquote(tok[j])
+                if (length(u) > 1 && substr(u, 1, 1) == "-") {
+                    if (im_git_opt_takes_value(u)) j += 2; else j++
+                    continue
+                }
+                break
+            }
+            if (j <= hi && typ[j] == "w" && im_unquote(tok[j]) == "read-tree") {
+                if (!seg_iso) IMHIT = 1
+                continue
+            }
+        }
+
+        # LENIENT NET -- the old regex, re-expressed per segment: an ADJACENT
+        # `git` / `read-tree` word pair in executable text. Keeps every shape
+        # the previous matcher denied denied, including behind a prefix this
+        # pass does not model (`timeout 5 git read-tree`).
+        for (j = i; j < hi; j++) {
+            if (typ[j] != "w" || typ[j + 1] != "w") continue
+            if (im_base(im_unquote(tok[j])) == "git" && im_unquote(tok[j + 1]) == "read-tree") {
+                if (!seg_iso) IMHIT = 1
+            }
+        }
+
+        if (feeds[k]) {
+            for (j = i + 1; j <= hi; j++) {
+                if (typ[j] != "w") continue
+                u = im_unquote(tok[j])
+                if (im_hd_index(u) > 0) continue
+                im_scan(u, depth + 1)
+            }
+        }
+    }
+}
+
+function im_scan(s, depth,   tok, typ, n) {
+    if (index(s, "read-tree") == 0 && index(s, "IMHD") == 0) return
+    if (depth > 5) { IMHIT = 1; return }
+    s = im_mask_heredocs(s)
+    s = im_extract_subst(s, depth)
+    n = im_lex(s, tok, typ)
+    im_segments(tok, typ, n, depth)
+}
+
+BEGIN {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    HDRE = "<<-?[ \t]*(" SQ "[A-Za-z_][A-Za-z0-9_]*" SQ "|" DQ "[A-Za-z_][A-Za-z0-9_]*" DQ "|[A-Za-z_][A-Za-z0-9_]*)"
+    IMHIT = 0
+    IMHDN = 0
+    buf = ""
+}
+{ buf = buf (NR > 1 ? "\n" : "") $0 }
+END {
+    im_scan(buf, 0)
+    printf "%d", IMHIT
+}
+'
+
+
+# Returns 0 (true) when $1 contains a `git read-tree` that would mutate the
+# REAL staging index without an isolating GIT_INDEX_FILE assignment in force
+# for that invocation. Falls back to the pre-#7923 regex pair if awk itself
+# fails, so a broken analyzer can only ever be as permissive as the old check
+# (never more) — the ERR trap`s fail-open must not reach this deny floor.
+index_mutation_unisolated() {
+    local verdict
+    verdict=$(printf '%s' "$1" | awk "$_INDEXMUT_AWK" 2>/dev/null) || verdict="awk-failed"
+    if [[ "$verdict" == "1" ]]; then
+        return 0
+    elif [[ "$verdict" == "0" ]]; then
+        return 1
+    fi
+    log_hook_error "index_mutation_unisolated: analyzer failed, falling back to legacy matcher"
+    if echo "$1" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+read-tree' &&
+        ! echo "$1" | grep -qE 'GIT_INDEX_FILE='; then
+        return 0
+    fi
+    return 1
+}
+
+# =============================================================================
 # git read-tree WITHOUT an isolating GIT_INDEX_FILE assignment
 #
 # A bare `git read-tree` (no tree-ish, no isolated index) is equivalent to
@@ -9138,13 +10039,150 @@ done
 #
 # `git commit-tree` is intentionally NOT guarded here — it writes a commit
 # object from an existing tree and does not mutate the index.
+#
+# EXECUTABLE vs. INERT (loom#7923, ported in repo#585): the two substring tests
+# this site used to make were context-blind. index_mutation_unisolated() above
+# asks the structural question instead: is a `git read-tree` simple command
+# actually going to run (command word, `git -c/-C/--git-dir` options, quoted
+# subcommand, `bash -c`/`eval`/`source` payloads, `$(..)`/backticks, unquoted
+# heredocs), and is an isolating GIT_INDEX_FILE= assignment in force FOR THAT
+# invocation (assignment prefix, env/sudo-carried, or a persistent earlier
+# export/standalone assignment). A quoted `--body` value or literal heredoc
+# body that merely MENTIONS the phrase no longer asks. TIER: stays ASK here
+# (Loom escalated this to deny in loom#7795; the canonical guard keeps its
+# documented ask contract — see the PR body for the rationale).
 # =============================================================================
-if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+read-tree'; then
-    # Isolated form (GIT_INDEX_FILE=... git read-tree ...) is allowed.
-    if ! echo "$COMMAND_NO_COMMENT" | grep -qE 'GIT_INDEX_FILE='; then
-        ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))" "git-read-tree"
-    fi
+if [[ "$COMMAND_NO_COMMENT" == *"read-tree"* ]] && index_mutation_unisolated "$COMMAND_NO_COMMENT"; then
+    ask "Command requires confirmation: $COMMAND (this 'git read-tree' targets the REAL staging index — a bare form empties it outright with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp) on THAT invocation)" "git-read-tree"
 fi
+
+# True if $1 (the ask-scan form of a command) contains at least one stash
+# CREATE invocation: bare `git stash`, `git stash push …`, `git stash save …`,
+# or an option-prefixed create (`git stash -u`, `git stash --include-untracked`,
+# `git stash -m wip`).
+#
+# Deliberately NOT treated as a create (#5754):
+#   - `pop` / `drop` / `clear` — the RECOVERY half, handled by its own ask
+#     below. Never escalate those: once WIP is on `refs/stash`, `pop` is the
+#     only way to get it back (worktree.sh's stash-pop reads a per-issue ref,
+#     not `refs/stash`), so blocking them strands work with no recovery path.
+#   - `apply` / `list` / `show` / `branch` — do not remove entries from the
+#     shared stack.
+#   - `create` / `store` — plumbing. `git stash create` is exactly what
+#     worktree.sh's own `stash-push` runs, so matching it would deny the
+#     sanctioned replacement path itself.
+#   - `-h` / `--help` — not an operation at all.
+#
+# ERE has no lookahead, and one command can chain several `git stash`
+# invocations of different kinds (`git stash && <check>; git stash pop` is the
+# exact shape this fires on), so the subcommand token is extracted per
+# occurrence and classified in shell rather than encoded in a single pattern.
+# The trailing `([[:space:]]|[;&|)]|$)` on the match is what makes `stash` a
+# whole token — without it `git stashx` would match the `git stash` prefix and
+# be misread as a bare create.
+#
+# BACKTICK BOUNDARY (#5783): the leading class, the subcommand token's
+# excluded-character class, and the trailing class all now also admit a
+# backtick — `` `git stash push` `` used to be invisible to the leading
+# anchor entirely, and even after that half is fixed, an unfixed subcommand
+# class would swallow the closing backtick into the token itself (`push\``)
+# and fail the `push` case match below. All three sites need the same
+# widening together for a backtick-wrapped create to classify correctly.
+stash_create_invoked() {
+    local scan="$1" occurrence subcmd
+    local -a parts
+    while IFS= read -r occurrence; do
+        [[ -n "$occurrence" ]] || continue
+        IFS=$' \t' read -r -a parts <<< "$occurrence"
+        subcmd="${parts[2]:-}"
+        # The match may swallow a trailing separator (`git stash push;`), so
+        # keep only the token up to the first shell delimiter.
+        subcmd="${subcmd%%[;&|)\`]*}"
+        case "$subcmd" in
+            -h|--help)        ;;
+            ""|push|save|-*)  return 0 ;;
+            *)                ;;
+        esac
+    done < <(printf '%s\n' "$scan" \
+        | grep -oE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash([[:space:]]+[^[:space:];&|)`]+)?([[:space:]]|[;&|)`]|$)' \
+        | sed -E 's/^.*(git[[:space:]]+stash)/\1/')
+    return 1
+}
+
+# Mask quoted POSITIONAL arguments to grep/egrep/fgrep/rg/awk (loom#7363) —
+# used ONLY to build COMMAND_STASH_SCAN for the stash detectors below, never
+# fed back into COMMAND_ASK_SCAN (whose SQL-DDL consumer must keep seeing
+# grep's own quoted argument). Escape-aware for double quotes.
+mask_stash_scan_positional_args() {
+    printf '%s' "$1" | awk "$_HASLIVESUBST_AWK"'
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        BS = sprintf("%c", 92)
+        # Command-name allowlist: read-only search commands whose quoted
+        # pattern/program argument is inert search text, never a live shell
+        # invocation. Safe to include grep/rg AND awk here — see the function
+        # header comment for why this copy has no SQL-DDL (or other raw-text)
+        # consumer to protect, unlike COMMAND_ASK_SCAN.
+        cmdre = "(grep|egrep|fgrep|rg|awk)"
+        flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
+        anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            out = out pre matched
+            # Mask every consecutive quoted positional argument immediately
+            # following the anchor (whitespace-separated), same boundary
+            # convention as mask_catastrophic_positional_args() above.
+            while (1) {
+                qc = substr(rest, 1, 1)
+                if (qc != DQ && qc != SQ) break
+                endpos = 0
+                if (qc == DQ) {
+                    # Escape-aware: a backslash swallows the NEXT character as
+                    # one atomic unit, so an escaped `\"` can never be misread
+                    # as the closing quote.
+                    i = 2
+                    rlen = length(rest)
+                    while (i <= rlen) {
+                        c = substr(rest, i, 1)
+                        if (c == BS) { i += 2; continue }
+                        if (c == DQ) { endpos = i; break }
+                        i++
+                    }
+                } else {
+                    # Single-quoted: bash gives backslash no special meaning
+                    # inside real single quotes, so a plain same-character
+                    # scan is correct here.
+                    for (i = 2; i <= length(rest); i++) {
+                        if (substr(rest, i, 1) == qc) { endpos = i; break }
+                    }
+                }
+                if (endpos == 0) break
+                inner = substr(rest, 2, endpos - 2)
+                if (!has_live_subst(inner)) {
+                    gsub(/./, "X", inner)
+                }
+                out = out qc inner qc
+                rest = substr(rest, endpos + 1)
+                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
+                    out = out substr(rest, 1, 1)
+                    rest = substr(rest, 2)
+                }
+            }
+            s = rest
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
 
 # =============================================================================
 # GIT STASH SCOPE ASK — gated by the stash-scope guard toggle
@@ -9206,7 +10244,29 @@ fi
 # tolerates zero or more such assignments (any name, not just GIT_DIR/
 # GIT_WORK_TREE — resolve_stash_cwd only ACTS on the two it recognises, so
 # being permissive here again only costs a parser call, never a wrong verdict).
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0-9_]*=[^;&|[:space:]]*[[:space:]]+)*git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+# COMMAND_STASH_SCAN (loom#7363): a branched copy of COMMAND_ASK_SCAN with the
+# quoted positional pattern/program of grep/egrep/fgrep/rg/awk masked, read ONLY
+# by the stash detectors below. A read-only `grep -n "...git stash pop..." f`
+# searching for a literal test-case name is not a stash invocation.
+COMMAND_STASH_SCAN="$COMMAND_ASK_SCAN"
+if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"awk"* || "$COMMAND" == *"rg "* ]]; then
+    COMMAND_STASH_SCAN=$(mask_stash_scan_positional_args "$COMMAND_STASH_SCAN")
+fi
+# BACKTICK BOUNDARY (loom#5783): a backtick is admitted as a leading and
+# trailing boundary alongside `(`/`)`, so `` `git stash pop` `` and
+# `$(git stash pop)` are visible to the scan.
+_stash_is_recover=false
+_stash_is_create=false
+if echo "$COMMAND_STASH_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])([A-Za-z_][A-Za-z0-9_]*=[^;&|[:space:]]*[[:space:]]+)*git[[:space:]]+([^;&|]*[[:space:]]+)?stash[[:space:]]+(pop|drop|clear)([[:space:]]|[;&|)`]|$)'; then
+    _stash_is_recover=true
+fi
+# CREATE detection (stash_create_invoked, loom#5754): `git stash`, `push`,
+# `save`, or an option-prefixed create. Used ONLY by the create-side redirect
+# deny inside the linked-worktree branch below; creates elsewhere stay allowed.
+if [[ "$COMMAND_STASH_SCAN" == *"stash"* ]] && stash_create_invoked "$COMMAND_STASH_SCAN"; then
+    _stash_is_create=true
+fi
+if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
     _stash_effective_gitdir=""
@@ -9290,7 +10350,11 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0
     fi
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
+        # MAIN CHECKOUT. Only the RECOVERY half is gated; a stash create here
+        # stays allowed (the create-side deny below is linked-worktree only).
+        if [[ "$_stash_is_recover" == true ]]; then
         ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
+        fi
     elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
         # cwd is a linked worktree, not the main checkout. Count the repo's
         # linked worktrees as git reports them — a collision needs at least one
@@ -9306,9 +10370,26 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])([A-Za-z_][A-Za-z0
         # >=3 entries = the main checkout plus two or more linked worktrees, so
         # some OTHER worktree exists besides this one to collide with.
         if [[ "$_stash_worktree_count" -ge 3 ]]; then
+            # CREATE-SIDE REDIRECT (loom#5754), evaluated BEFORE the recovery
+            # ask. Denies a raw stash CREATE only where a named, lossless
+            # replacement provably exists: cwd is a linked worktree carrying
+            # the `.loom-managed` sentinel, its directory name is `issue-<N>`,
+            # and `<main>/.loom/scripts/worktree.sh` exists. Anywhere else (no
+            # Loom tooling, solo worktree, main checkout) a create stays
+            # ALLOWED: this never blocks a caller with no alternative.
+            if [[ "$_stash_is_create" == true && -f "$_stash_toplevel/.loom-managed" \
+                  && -f "$_stash_common_parent/.loom/scripts/worktree.sh" ]]; then
+                _stash_wt_base="${_stash_toplevel##*/}"
+                if [[ "$_stash_wt_base" =~ ^issue-([0-9]+)$ ]]; then
+                    _stash_issue_num="${BASH_REMATCH[1]}"
+                    deny "Blocked: $COMMAND (raw 'git stash' puts WIP on refs/stash — a SINGLE stack SHARED across every linked worktree of this repo, not per-worktree — where any of the $((_stash_worktree_count - 1)) currently-active linked worktrees can pop or drop it, and where the recovery step ('git stash pop') is itself gated. Nothing has been run: your working tree is untouched, so just rerun with the per-issue equivalent, which never touches refs/stash. Shelve WIP as a patch: './.loom/scripts/worktree.sh snapshot $_stash_issue_num'. Clean baseline vs. diff: './.loom/scripts/worktree.sh stash-push $_stash_issue_num' ... './.loom/scripts/worktree.sh stash-pop $_stash_issue_num'. To opt out set guards.stashScope:false in .claude/skills/repo/config.json, or export REPO_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline prefix does not reach this hook, which runs as a separate process)" "stash-scope:create-redirect"
+                fi
+            fi
+        fi
+        if [[ "$_stash_is_recover" == true && "$_stash_worktree_count" -ge 3 ]]; then
             ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER agent's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $((_stash_worktree_count - 1)) linked worktrees are currently active. Use a per-worktree WIP ref instead of the shared stash stack; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
         fi
-    elif [[ "$_stash_effective_cwd" != "$CWD" || -n "$_stash_effective_gitdir" ]]; then
+    elif [[ "$_stash_is_recover" == true && ( "$_stash_effective_cwd" != "$CWD" || -n "$_stash_effective_gitdir" ) ]]; then
         # A `cd <dir>` prefix, or a --git-dir/GIT_DIR override, resolved to a
         # target that does not exist or is not inside any git checkout —
         # ambiguous. Fail toward asking rather than guessing (mirrors
