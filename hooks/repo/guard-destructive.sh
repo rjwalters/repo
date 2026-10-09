@@ -8932,6 +8932,127 @@ for pattern in "${ASK_PATTERNS[@]}"; do
     fi
 done
 
+# =============================================================================
+# COMMAND-WORD RESOLUTION through launcher wrappers (repo#585 review fix)
+#
+# Shared by systemctl_ask_reason(), ssh_cat_ask_reason() and
+# printenv_ask_reason() below. Those parsers originally stripped only a bare
+# leading `sudo ` and a narrow `env` form before treating the next token as
+# the command word, so `sudo -u root systemctl restart x` or `sudo --
+# printenv TOKEN` resolved the command word to `-u` / `--` and silently
+# ALLOWED — a regression versus the substring patterns they replaced, which
+# found the invocation after any wrapper options.
+#
+# cw_resolve(toks, m) walks toks[1..m] (one qsplit() segment, whitespace
+# split) past leading NAME=value assignments, shell grammar openers, and the
+# launcher wrappers sudo / doas / env / command / exec / nohup / nice / time /
+# timeout / stdbuf / ionice / setsid / xargs — each with its OWN option
+# grammar (flag clusters such as `-nu root`, attached `-uroot`, `--user=root`,
+# `--user root`, and the `--` terminator) — and returns:
+#     >0  index of the resolved command word
+#      0  no command word in the segment
+#     -1  AMBIGUOUS: a wrapper option this grammar does not model (`sudo -h`,
+#         `env -S "..."`, `ionice -p`, an unknown flag, ...)
+# Callers FAIL CLOSED on -1 by checking EVERY token position of the segment
+# as a candidate command word, so an unmodelled wrapper form can only ever
+# add asks, never hide one.
+# =============================================================================
+_CMDWORD_AWK='
+function cw_unq(t) { gsub(/[\047\042]/, "", t); return t }
+function cw_base(w,   k) {
+    k = index(w, "/")
+    while (k > 0) { w = substr(w, k + 1); k = index(w, "/") }
+    return w
+}
+# Skip the options of a wrapper starting at toks[j]. sflag/sarg: short flag
+# letters without / with a required argument. lflag/larg: space-delimited
+# (" --a --b ") long options without / with a required argument. Returns the
+# index of the first non-option token, or -1 on an unmodelled option.
+function cw_skip_opts(toks, m, j, sflag, sarg, lflag, larg,   t, k, c, n, name, eq) {
+    while (j <= m) {
+        t = cw_unq(toks[j])
+        if (t == "--") return j + 1
+        if (t == "-") { j++; continue }
+        if (substr(t, 1, 1) != "-") return j
+        if (substr(t, 1, 2) == "--") {
+            eq = index(t, "=")
+            name = (eq > 0) ? substr(t, 1, eq - 1) : t
+            if (eq > 0 && (index(larg, " " name " ") || index(lflag, " " name " "))) { j++; continue }
+            if (index(lflag, " " name " ")) { j++; continue }
+            if (index(larg, " " name " ")) { j += 2; continue }
+            return -1
+        }
+        n = length(t)
+        for (k = 2; k <= n; k++) {
+            c = substr(t, k, 1)
+            if (index(sflag, c)) continue
+            if (index(sarg, c)) {
+                # Argument is the rest of this token, or the next token.
+                if (k == n) j++
+                break
+            }
+            return -1
+        }
+        j++
+    }
+    return j
+}
+function cw_resolve(toks, m,   j, t, b, nj) {
+    j = 1
+    while (j <= m) {
+        t = toks[j]
+        if (t == "") { j++; continue }
+        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { j++; continue }
+        b = cw_base(cw_unq(t))
+        if (b == "!" || b == "{" || b == "(" || b == "if" || b == "then" ||
+            b == "else" || b == "elif" || b == "while" || b == "until" || b == "do") {
+            j++; continue
+        }
+        if (b == "sudo") {
+            nj = cw_skip_opts(toks, m, j + 1, "ABbEeHiKklNnPSsVv", "aCcDgpRrTtUu",
+                " --askpass --background --bell --edit --set-home --login --remove-timestamp --reset-timestamp --list --no-update --non-interactive --preserve-groups --stdin --shell --version --validate --preserve-env --help ",
+                " --auth-type --close-from --login-class --chdir --group --host --prompt --chroot --role --type --command-timeout --other-user --user ")
+        } else if (b == "doas") {
+            nj = cw_skip_opts(toks, m, j + 1, "nsL", "uC", "", "")
+        } else if (b == "env") {
+            nj = cw_skip_opts(toks, m, j + 1, "0iv", "uCP",
+                " --ignore-environment --null --debug --default-signal --ignore-signal --block-signal --list-signal-handling ",
+                " --unset --chdir ")
+        } else if (b == "command") {
+            nj = cw_skip_opts(toks, m, j + 1, "pvV", "", "", "")
+        } else if (b == "exec") {
+            nj = cw_skip_opts(toks, m, j + 1, "cl", "a", "", "")
+        } else if (b == "nohup") {
+            nj = cw_skip_opts(toks, m, j + 1, "", "", "", "")
+        } else if (b == "nice") {
+            nj = cw_skip_opts(toks, m, j + 1, "0123456789", "n", "", " --adjustment ")
+        } else if (b == "time") {
+            nj = cw_skip_opts(toks, m, j + 1, "apqvV", "fo",
+                " --append --portability --quiet --verbose ", " --format --output ")
+        } else if (b == "timeout") {
+            nj = cw_skip_opts(toks, m, j + 1, "v", "ks",
+                " --preserve-status --foreground --verbose ", " --kill-after --signal ")
+            if (nj > 0 && nj <= m) nj++    # the DURATION operand
+        } else if (b == "stdbuf") {
+            nj = cw_skip_opts(toks, m, j + 1, "", "eio", "", " --input --output --error ")
+        } else if (b == "ionice") {
+            nj = cw_skip_opts(toks, m, j + 1, "t", "cn", " --ignore ", " --class --classdata ")
+        } else if (b == "setsid") {
+            nj = cw_skip_opts(toks, m, j + 1, "cfw", "", " --ctty --fork --wait ", "")
+        } else if (b == "xargs") {
+            nj = cw_skip_opts(toks, m, j + 1, "0prtx", "adEILnPs",
+                " --null --interactive --no-run-if-empty --verbose --exit ",
+                " --arg-file --delimiter --max-lines --max-args --max-procs --max-chars --process-slot-var ")
+        } else {
+            return j
+        }
+        if (nj < 0) return -1
+        j = nj
+    }
+    return 0
+}
+'
+
 # Ported from rjwalters/loom guard-destructive-generic.sh at 2072f82b
 # (rjwalters/repo#585, part of #579): the three checks below replace the plain
 # substring ASK_PATTERNS entries that false-asked on quoted search text.
@@ -8950,8 +9071,9 @@ done
 #
 # Mirrors lifecycle_or_cloud_reason()'s fix for the analogous halt/reboot/
 # az-delete false positive: segment-parse the command with qsplit() (quote-aware,
-# #3755) instead of scanning raw substrings, strip a leading sudo/env wrapper
-# per segment, and ask ONLY when a segment's actual command word is `systemctl`
+# #3755) instead of scanning raw substrings, resolve the command word through
+# sudo/env/... wrappers and their options (cw_resolve, _CMDWORD_AWK; fails
+# closed on unmodelled forms), and ask ONLY when a segment's actual command word is `systemctl`
 # AND its very next token is restart/stop/disable. A quoted `|` inside
 # `grep`/`jq` arguments (no `$(`/backtick) is inert to qsplit(), so both example
 # commands above stay a single `grep`/`jq` segment — command word never
@@ -8966,33 +9088,56 @@ done
 # an attempt at a general-purpose fix for the whole ASK_PATTERNS family.
 # =============================================================================
 systemctl_ask_reason() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK$_CMDWORD_AWK"'
+    # Is toks[c] a `systemctl` whose verb is restart/stop/disable? Leading
+    # systemctl options are skipped (value-taking ones consume their operand)
+    # so `systemctl --user restart x` / `systemctl -H h stop x` still match.
+    function sc_check(toks, m, c,   j, t) {
+        if (cw_base(cw_unq(toks[c])) != "systemctl") return ""
+        j = c + 1
+        while (j <= m) {
+            t = cw_unq(toks[j])
+            if (t == "--") { j++; break }
+            if (t ~ /^-/) {
+                if (t ~ /^(-[HMtpnosP]|--(host|machine|type|property|lines|output|signal|kill-whom|root|state|job-mode|what|kill-value|image|preset-mode|message|timestamp|check-inhibitors|drop-in|when))$/) {
+                    # Fail closed if the consumed operand is itself a
+                    # mutating verb (an option misjudged as value-taking).
+                    if (j + 1 <= m) {
+                        t = cw_unq(toks[j + 1])
+                        if (t == "restart" || t == "stop" || t == "disable") return "systemctl " t
+                    }
+                    j += 2
+                }
+                else j++
+                continue
+            }
+            break
+        }
+        if (j > m) return ""
+        t = cw_unq(toks[j])
+        if (t == "restart" || t == "stop" || t == "disable") return "systemctl " t
+        return ""
+    }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
-            # Strip a leading `env` wrapper + its flags/assignments, mirroring
-            # lifecycle_or_cloud_reason() (#3586), so `env FOO=bar systemctl
-            # restart x` still resolves its command word to `systemctl`.
-            if (sub(/^env([ \t]+|$)/, "", seg)) {
-                sub(/^[ \t]+/, "", seg)
-                stripped = 1
-                while (stripped) {
-                    stripped = 0
-                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
-                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
-                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                }
-            }
-            sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m < 2) continue
-            if (toks[1] == "systemctl" && (toks[2] == "restart" || toks[2] == "stop" || toks[2] == "disable")) {
-                print "systemctl " toks[2]
+            # Resolve the command word through sudo/env/... wrappers and
+            # their options (cw_resolve, see _CMDWORD_AWK). On an ambiguous
+            # wrapper form, FAIL CLOSED: every token is a candidate.
+            c = cw_resolve(toks, m)
+            if (c > 0) {
+                r = sc_check(toks, m, c)
+                if (r != "") print r
+            } else if (c < 0) {
+                for (c = 1; c <= m; c++) {
+                    r = sc_check(toks, m, c)
+                    if (r != "") { print r; break }
+                }
             }
         }
     }'
@@ -9013,8 +9158,9 @@ fi
 # private key. `grep -E` substring matching cannot capture the matched
 # operand to inspect its basename, so — mirroring systemctl_ask_reason()
 # above — this segment-parses the command with qsplit() (quote-aware,
-# #3755), strips a leading sudo/env wrapper per segment, and only inspects
-# segments whose command word is literally `cat`.
+# #3755), resolves the command word through sudo/env/... wrappers and their
+# options (cw_resolve, _CMDWORD_AWK; fails closed on unmodelled forms), and
+# only inspects segments whose command word is `cat`.
 #
 # ALLOWLIST, NOT DENYLIST (deliberate, per the issue's acceptance criteria):
 # a `cat` operand under `.ssh/` still asks unless its basename is one of the
@@ -9025,51 +9171,52 @@ fi
 # anything else) always misses the allowlist and keeps asking.
 # =============================================================================
 ssh_cat_ask_reason() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK$_CMDWORD_AWK"'
+    # Is toks[c] a `cat` reading a non-allowlisted file under .ssh/? Returns
+    # the ask reason, or "".
+    function ssh_check(toks, m, c,   j, tok, rest, base) {
+        if (cw_base(cw_unq(toks[c])) != "cat") return ""
+        for (j = c + 1; j <= m; j++) {
+            tok = toks[j]
+            if (tok !~ /\/\.ssh\//) continue
+            # Operand after the LAST /.ssh/ in this token (greedy .*
+            # backtracks to the rightmost occurrence).
+            if (!match(tok, /.*\/\.ssh\//)) continue
+            rest = substr(tok, RLENGTH + 1)
+            # basename: strip any further path components after /.ssh/
+            if (match(rest, /.*\//)) {
+                base = substr(rest, RLENGTH + 1)
+            } else {
+                base = rest
+            }
+            # Strip stray quote characters a quoted operand (copied
+            # verbatim by qsplit) may leave attached to the basename.
+            gsub(/[\047\042]/, "", base)
+            if (base != "config" && base != "known_hosts" && base != "known_hosts.old" && base != "authorized_keys") {
+                return "cat .ssh/" base
+            }
+        }
+        return ""
+    }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
-            # Strip a leading `env` wrapper + its flags/assignments, mirroring
-            # systemctl_ask_reason() above (#3586), so `env FOO=bar cat
-            # ~/.ssh/id_rsa` still resolves its command word to `cat`.
-            if (sub(/^env([ \t]+|$)/, "", seg)) {
-                sub(/^[ \t]+/, "", seg)
-                stripped = 1
-                while (stripped) {
-                    stripped = 0
-                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
-                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
-                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                }
-            }
-            sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m < 2) continue
-            if (toks[1] != "cat") continue
-            for (j = 2; j <= m; j++) {
-                tok = toks[j]
-                if (tok !~ /\/\.ssh\//) continue
-                # Operand after the LAST /.ssh/ in this token (greedy .*
-                # backtracks to the rightmost occurrence).
-                if (!match(tok, /.*\/\.ssh\//)) continue
-                rest = substr(tok, RLENGTH + 1)
-                # basename: strip any further path components after /.ssh/
-                if (match(rest, /.*\//)) {
-                    base = substr(rest, RLENGTH + 1)
-                } else {
-                    base = rest
-                }
-                # Strip stray quote characters a quoted operand (copied
-                # verbatim by qsplit) may leave attached to the basename.
-                gsub(/[\047\042]/, "", base)
-                if (base != "config" && base != "known_hosts" && base != "known_hosts.old" && base != "authorized_keys") {
-                    print "cat .ssh/" base
-                    exit
+            # Resolve the command word through sudo/env/... wrappers and
+            # their options (cw_resolve, see _CMDWORD_AWK). On an ambiguous
+            # wrapper form, FAIL CLOSED: every token is a candidate.
+            c = cw_resolve(toks, m)
+            if (c > 0) {
+                r = ssh_check(toks, m, c)
+                if (r != "") { print r; exit }
+            } else if (c < 0) {
+                for (c = 1; c <= m; c++) {
+                    r = ssh_check(toks, m, c)
+                    if (r != "") { print r; exit }
                 }
             }
         }
@@ -9095,9 +9242,10 @@ fi
 #
 # DENYLIST substring check, ALLOWLIST override (deliberate): mirroring
 # systemctl_ask_reason()/ssh_cat_ask_reason() above, this segment-parses the
-# command with qsplit() (quote-aware, #3755), strips a leading sudo/env
-# wrapper per segment, and only inspects segments whose command word is
-# literally `printenv`. Each remaining operand (the variable name being
+# command with qsplit() (quote-aware, #3755), resolves the command word
+# through sudo/env/... wrappers and their options (cw_resolve, _CMDWORD_AWK;
+# fails closed on unmodelled forms), and only inspects segments whose command
+# word is `printenv`. Each remaining operand (the variable name being
 # read) still asks if its name contains SECRET/TOKEN/KEY as a substring —
 # the same narrowing the old patterns used — UNLESS the operand is an
 # EXACT match for a documented non-secret var (LOOM_TOKEN_NAME,
@@ -9109,41 +9257,41 @@ fi
 # allowed.
 # =============================================================================
 printenv_ask_reason() {
-    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_QSPLIT_AWK$_CMDWORD_AWK"'
+    # Is toks[c] a `printenv` reading a credential-shaped, non-allowlisted
+    # name? Returns the ask reason, or "".
+    function pe_check(toks, m, c,   j, var) {
+        if (cw_base(cw_unq(toks[c])) != "printenv") return ""
+        for (j = c + 1; j <= m; j++) {
+            var = toks[j]
+            gsub(/[\047\042]/, "", var)
+            if (var ~ /^-/) continue
+            if (var !~ /SECRET|TOKEN|KEY/) continue
+            if (var == "LOOM_TOKEN_NAME" || var == "LOOM_TOKEN_MODE") continue
+            return "printenv " var
+        }
+        return ""
+    }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
-            # Strip a leading `env` wrapper + its flags/assignments, mirroring
-            # systemctl_ask_reason()/ssh_cat_ask_reason() above (#3586), so
-            # `env FOO=bar printenv LOOM_TOKEN_NAME` still resolves its
-            # command word to `printenv`.
-            if (sub(/^env([ \t]+|$)/, "", seg)) {
-                sub(/^[ \t]+/, "", seg)
-                stripped = 1
-                while (stripped) {
-                    stripped = 0
-                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
-                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
-                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                }
-            }
-            sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m < 2) continue
-            if (toks[1] != "printenv") continue
-            for (j = 2; j <= m; j++) {
-                var = toks[j]
-                gsub(/[\047\042]/, "", var)
-                if (var ~ /^-/) continue
-                if (var !~ /SECRET|TOKEN|KEY/) continue
-                if (var == "LOOM_TOKEN_NAME" || var == "LOOM_TOKEN_MODE") continue
-                print "printenv " var
-                exit
+            # Resolve the command word through sudo/env/... wrappers and
+            # their options (cw_resolve, see _CMDWORD_AWK). On an ambiguous
+            # wrapper form, FAIL CLOSED: every token is a candidate.
+            c = cw_resolve(toks, m)
+            if (c > 0) {
+                r = pe_check(toks, m, c)
+                if (r != "") { print r; exit }
+            } else if (c < 0) {
+                for (c = 1; c <= m; c++) {
+                    r = pe_check(toks, m, c)
+                    if (r != "") { print r; exit }
+                }
             }
         }
     }'
