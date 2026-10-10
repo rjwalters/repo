@@ -270,3 +270,19 @@ wt:echo "`id > {{MAIN}}/e.sh`"
 # would actually break a builder.
 wt:echo "$(id > {{WT}}/ok.sh)"
 wt:echo "$(id > /tmp/loom-439-scratch.txt)"
+
+# ── disguised cd spellings (repo#600) ─────────────────────────────────────
+# Bash runs c''d, c\d, "c"d, c$()d and ${C:-c}d as the cd builtin. The cwd
+# tracker used to recognise only the literal word, so the relative write was
+# judged against /tmp while it really lands in the main checkout. Canonical
+# now tracks the statically provable spellings and fails closed on the ones
+# that need runtime expansion; the vendored copy still allows all three
+# (measured 2026-10-10) — see DECLARED_DIVERGENCES.
+wt:cd /tmp; c''d {{MAIN}}; echo hi > out.log
+wt:cd /tmp; c$()d {{MAIN}}; echo hi > out.log
+wt:cd /tmp; ${C:-c}d {{MAIN}}; echo hi > out.log
+# The repo#597 mktemp cd-chain with a disguised second cd: deny in both
+# (vendored has no cd-chain admission at all).
+wt:D=$(mktemp -d /tmp/p.XXXX); cd $D; c''d {{MAIN}}; echo hi > out.log
+# Control: the same text as inert echo DATA must stay allowed by both.
+wt:cd /tmp; echo "c''d {{MAIN}}"; echo hi > out.log
