@@ -4,12 +4,14 @@
       "description": [
         "2AMLogic organization overrides (2AMLogic/2am#3687, infra/renovate/README.md amendment of 2026-10-08).",
         "Merged over rjwalters/repo policies/default.json and deployed to 2AMLogic/.github:renovate-config by /repo:org-policy --install.",
-        "Update delays (minimumReleaseAge) come from default.json and are not restated here: one definition."
+        "Update delays (minimumReleaseAge) come from default.json and are not restated here: one definition.",
+        "dependencyDashboard false: every 2AMLogic fleet repo runs Loom, whose Curator treats the unlabelled dashboard issue as work (rjwalters/loom#9418). A repo that wants one extends :dependencyDashboard after this preset."
       ],
       "extends": [
         "config:recommended",
         "helpers:pinGitHubActionDigests"
       ],
+      "dependencyDashboard": false,
       "timezone": "America/Los_Angeles",
       "schedule": ["* 6-9 * * 1"],
       "labels": ["dependencies", "loom:review-requested"],
