@@ -25,7 +25,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#601**: guard: cwd trackers ignore control flow (short-circuit cd, pushd, eval, functions, case arms)
+- **#604**: guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X)
 
 ## PRs Awaiting Review
 
@@ -46,7 +47,8 @@ Issues carrying `loom:curated`.
 - **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
-- **#597**: Write-confinement: treat same-command NAME=$(mktemp -d /tmp/<prefix>.XXXX) as proven /tmp-rooted *(curated)*
+- **#601**: guard: cwd trackers ignore control flow (short-circuit cd, pushd, eval, functions, case arms) *(curated)*
+- **#604**: guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,10 +65,10 @@ _None._
 | Operator merge-risk holds | 1 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 4 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
