@@ -4301,6 +4301,122 @@ for _c597 in "$WTC_MAIN" "$WTC_WT"; do
         'D=$(mktemp -d -t p.XXXX) && cd ${D} && make 2>&1 | tee out.log' "$_c597"
 done
 
+# repo#600: the cwd trackers recognised `cd` only as the literal word, so
+# c''d, c\d, "c"d, c$()d and ${C:-c}d -- all of which bash runs as the cd
+# builtin -- left the tracked cwd stale and a later RELATIVE write was judged
+# against /tmp (or a proven mktemp directory) while it really landed in the
+# main checkout. Statically provable spellings (quotes / backslash) are now
+# tracked like the literal word, so the write resolves into the main checkout
+# and hits the ordinary containment deny; spellings whose value needs runtime
+# expansion make the cwd UNKNOWN, and a relative write after that fails closed
+# under its own tag. Every command below only ever reaches the hook as JSON;
+# nothing is executed.
+_U600="worktree-write-confinement-unknown-cwd"
+_C600="worktree-write-confinement"
+_S600=("c''d" 'c\d' '"c"d' 'c$()d' '${C:-c}d')
+_T600=("$_C600" "$_C600" "$_C600" "$_U600" "$_U600")
+_SEPN600=$'\n'
+for _c600 in "$WTC_MAIN" "$WTC_WT"; do
+    _w600="main"; [[ "$_c600" == "$WTC_WT" ]] && _w600="worktree"
+    for _i600 in 0 1 2 3 4; do
+        _sp="${_S600[$_i600]}"; _tg="${_T600[$_i600]}"
+        # Five spellings x three separators, relative redirection.
+        for _sep in '; ' "$_SEPN600" ' && '; do
+            _sn="${_sep//$'\n'/<newline>}"
+            assert_deny_tag "write-confinement (#600, cwd=$_w600): cd /tmp${_sn}${_sp} <main>${_sn}redirect" \
+                "cd /tmp${_sep}${_sp} $WTC_MAIN${_sep}echo hi > out.log" "$_c600" "$_tg"
+        done
+        # tee and cp destinations.
+        assert_deny_tag "write-confinement (#600, cwd=$_w600): cd /tmp; ${_sp} <main>; tee" \
+            "cd /tmp; ${_sp} $WTC_MAIN; echo hi | tee out.log" "$_c600" "$_tg"
+        assert_deny_tag "write-confinement (#600, cwd=$_w600): cd /tmp; ${_sp} <main>; cp" \
+            "cd /tmp; ${_sp} $WTC_MAIN; cp /tmp/src.txt out.log" "$_c600" "$_tg"
+        # The repo#597 single-cd mktemp proof: a disguised SECOND cd after
+        # `cd \$D` must not inherit the proven scratch cwd.
+        assert_deny_tag "write-confinement (#600, cwd=$_w600): mktemp -d; cd \$D; ${_sp} <main>; redirect" \
+            "D=\$(mktemp -d /tmp/p.XXXX); cd \$D; ${_sp} $WTC_MAIN; echo hi > out.log" "$_c600" "$_tg"
+        assert_deny "write-confinement (#600, cwd=$_w600): mktemp -d && cd \$D && ${_sp} <main> && redirect" \
+            "D=\$(mktemp -d /tmp/p.XXXX) && cd \$D && ${_sp} $WTC_MAIN && echo hi > out.log" "$_c600"
+    done
+    # Parameter expansion, explicitly unset and explicitly bound: either way
+    # the guard must not guess the value.
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): unset C; \${C:-c}d <main>" \
+        "unset C; cd /tmp; \${C:-c}d $WTC_MAIN; echo hi > out.log" "$_c600" "$_U600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): C=c; \${C}d <main>" \
+        "C=c; cd /tmp; \${C}d $WTC_MAIN; echo hi > out.log" "$_c600" "$_U600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): C=c \$C\"d\" <main> (bound, partially quoted)" \
+        "C=c; cd /tmp; \$C\"d\" $WTC_MAIN; echo hi > out.log" "$_c600" "$_U600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): backtick command word" \
+        "cd /tmp; \`echo cd\` $WTC_MAIN; echo hi > out.log" "$_c600" "$_U600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): ANSI-C quoted \$'c\\x64'" \
+        "cd /tmp; \$'c\\x64' $WTC_MAIN; echo hi > out.log" "$_c600" "$_U600"
+    # Controls: literal safe chains, worktree writes, inert data.
+    assert_allow "write-confinement (#600, cwd=$_w600): literal cd /tmp chain still allowed" \
+        'cd /tmp; echo hi > out.log' "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): literal cd /tmp && tee still allowed" \
+        'cd /tmp && echo hi | tee out.log' "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): disguised cd quoted as echo DATA is inert" \
+        "cd /tmp; echo \"c''d $WTC_MAIN\"; echo hi > out.log" "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): disguised cd spellings as printf DATA are inert" \
+        "cd /tmp; printf '%s\\n' 'c\$()d $WTC_MAIN' '\${C:-c}d' 'c\\d'; echo hi > out.log" "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): disguised cd in a comment is inert" \
+        "cd /tmp # then c''d $WTC_MAIN"$'\n'"echo hi > out.log" "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): unknown cwd is reset by a later absolute cd" \
+        "c\$()d $WTC_MAIN; cd /tmp; echo hi > out.log" "$_c600"
+    assert_allow "write-confinement (#600, cwd=$_w600): absolute write into the worktree after an unknown cwd" \
+        "c\$()d $WTC_MAIN; echo hi > $WTC_WT/ok.log" "$_c600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): absolute write into main after an unknown cwd" \
+        "c\$()d /tmp; echo hi > $WTC_MAIN/evil.sh" "$_c600" "$_C600"
+    assert_deny_tag "write-confinement (#600, cwd=$_w600): relative cd from an unknown cwd stays unknown" \
+        "c\$()d /tmp; cd sub; echo hi > out.log" "$_c600" "$_U600"
+done
+
+# Statically provable spellings are tracked exactly like the literal word, in
+# BOTH directions: into the worktree they allow, and the quote/backslash
+# counterexamples a naive "strip every quote and backslash" normaliser would
+# get wrong (each names the command `c\d`, not cd, so the cwd stays put) keep
+# the write where it really lands.
+assert_allow 'write-confinement (#600): \cd <wt> && redirect from main is a worktree write' \
+    "\\cd $WTC_WT && echo hi > out.log" "$WTC_MAIN"
+assert_allow "write-confinement (#600): c''d <wt>; redirect from main is a worktree write" \
+    "c''d $WTC_WT; echo hi > out.log" "$WTC_MAIN"
+assert_allow 'write-confinement (#600): c\\d (escaped backslash) is not cd' \
+    "cd $WTC_WT; c\\\\d $WTC_MAIN; echo hi > out.log" "$WTC_MAIN"
+assert_allow "write-confinement (#600): 'c\\d' (single-quoted backslash) is not cd" \
+    "cd $WTC_WT; 'c\\d' $WTC_MAIN; echo hi > out.log" "$WTC_MAIN"
+assert_allow 'write-confinement (#600): "c\d" (double-quoted backslash) is not cd' \
+    "cd $WTC_WT; \"c\\d\" $WTC_MAIN; echo hi > out.log" "$WTC_MAIN"
+assert_allow 'write-confinement (#600): an unknown word only affects LATER segments' \
+    '"$X" > out.log' "$WTC_WT"
+assert_allow 'write-confinement (#600): assignment with a spaced substitution is not a command word' \
+    'X=$(basename $F); echo hi > out.log' "$WTC_WT"
+assert_allow 'write-confinement (#600): command -v cd does not change directory' \
+    'command -v cd >/dev/null; echo hi > out.log' "$WTC_WT"
+assert_deny_tag 'write-confinement (#600): cd after an assignment holding a spaced ${A:-a b}' \
+    "X=\${A:-a b} c''d $WTC_MAIN; echo hi > out.log" "$WTC_WT" "$_C600"
+assert_deny_tag 'write-confinement (#600): command word from a variable makes the cwd unknown' \
+    "\"\$EDITOR\" x; echo hi > out.log" "$WTC_WT" "$_U600"
+# A cd behind a group or conditional prefix runs in a scope (or only on a
+# branch) this control-flow-insensitive scan cannot follow: unknown.
+assert_deny_tag 'write-confinement (#600): if cd <main>; then redirect' \
+    "if cd $WTC_MAIN; then echo hi > out.log; fi" "$WTC_WT" "$_U600"
+assert_deny_tag 'write-confinement (#600): { cd <main>; redirect; }' \
+    "{ cd $WTC_MAIN; echo hi > out.log; }" "$WTC_WT" "$_U600"
+assert_deny_tag 'write-confinement (#600): (cd <main> && redirect)' \
+    "(cd $WTC_MAIN && echo hi > out.log)" "$WTC_WT" "$_U600"
+
+# The other two cwd consumers fail closed on the same spellings: force ops
+# and stash recovery ask instead of judging the stale cwd.
+assert_ask_env 'force-op (#600): cd <wt>; c$()d <main>; reset --hard asks (protected mode)' \
+    "LOOM_FORCE_SCOPE=protected" "cd $WTC_WT; c\$()d $WTC_MAIN; git reset --hard" "$WTC_WT"
+assert_ask_env 'force-op (#600): ${C:-c}d <main>; push --force asks (protected mode)' \
+    "LOOM_FORCE_SCOPE=protected" "\${C:-c}d $WTC_MAIN; git push --force origin HEAD" "$WTC_WT"
+assert_ask 'stash-scope (#600): cd <wt>; ${C:-c}d <main>; git stash pop asks' \
+    "cd $WTC_WT; \${C:-c}d $WTC_MAIN; git stash pop" "$WTC_WT"
+assert_ask "stash-scope (#600): cd <wt>; c''d <main>; git stash pop resolves to the main checkout" \
+    "cd $WTC_WT; c''d $WTC_MAIN; git stash pop" "$WTC_MAIN"
+unset _U600 _C600 _S600 _T600 _SEPN600 _c600 _w600 _i600 _sp _tg _sep _sn
+
 # ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
 # ---- where bash would NOT expand the `$`, or where a backtick hides a
 # ---- component the guard cannot see. ----

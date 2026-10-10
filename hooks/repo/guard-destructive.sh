@@ -2565,12 +2565,13 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 # identical to the pre-#350 empty-cpath fallback (`_fcwd="$CWD"` at the call
 # site), just made explicit so a LATER `cd` in the same command can override it.
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK$_CDWORD_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
                                  # read does not trim an empty cpath.
         buf = ""
         curcwd = startcwd
+        UNK = unknown_cwd()
     }
     # Slurp the whole (possibly multi-line) command, then segment ONCE with the
     # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
@@ -2598,13 +2599,22 @@ parse_force_ops() {
             # to its OWN raw hook $CWD (typically the main checkout) instead of
             # the scratch directory the reset actually runs in — defeating the
             # #320/#330 out-of-tree exemption for exactly the idiom it targets.
-            if (toks[1] == "cd") {
-                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)
+            #
+            # The command word goes through the shared static recognizer
+            # (repo#600, _CDWORD_AWK): c\d / "c"d are the cd builtin too, and
+            # a word this scan cannot resolve (c$()d, ${C:-c}d, a cd behind a
+            # group or conditional) makes the cwd UNKNOWN, which the caller
+            # turns into an ask instead of judging a stale cwd.
+            cdk = cd_seg_class(seg)
+            if (cdk == "unknown") { curcwd = UNK; continue }
+            if (cdk == "cd") {
+                ci = CDW_IDX; cdtok = CT[ci + 1]
+                if (cdtok != "" && cdtok != "-") {
+                    cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
-                    } else if (curcwd != "") {
+                    } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
                 }
@@ -2627,6 +2637,10 @@ parse_force_ops() {
             # when no `cd` has run yet in this command, preserving the
             # pre-#350 fallback exactly.
             if (cpath == "") cpath = curcwd
+            # A RELATIVE -C is resolved by git against the process cwd, so
+            # from an unknown cwd it is unknown too (repo#600).
+            if (curcwd == UNK && cpath != UNK && \
+                strip_cd_quoting(expand_cd_arg(cpath, home)) !~ /^\//) cpath = UNK
             subcmd = toks[k]
             if (subcmd == "push") {
                 force = 0
@@ -4918,7 +4932,10 @@ wt_write_mktemp_same_command_safe() {
 #     around the steps before the cd; no `)`/`}` after it closing a group
 #     opened earlier; and none of trap/eval/source/`.`/exec/builtin/alias/
 #     function/enable (each can run a hidden cd before the write);
-#   - anywhere in the command: no `cd -`, `pushd`, `popd`, `OLDPWD`, `CDPATH`.
+#   - anywhere in the command: no `cd -`, `pushd`, `popd`, `OLDPWD`, `CDPATH`,
+#     and (repo#600) no command position that cmd_has_unproven_cwd_change()
+#     flags -- a disguised cd spelling, an unresolvable command word, or a cd
+#     behind a group/conditional prefix.
 # Publishes _WT_CD_CHAIN_LOOSE=1 when a `;`/newline separator was involved.
 _WT_CD_CHAIN_LOOSE=0
 wt_write_mktemp_cd_chain_ok() {
@@ -4955,6 +4972,12 @@ wt_write_mktemp_cd_chain_ok() {
         esac
     done
     [[ "$ncd" -eq 1 ]] || return 1
+    # repo#600: the count above only sees the literal word `cd` (punctuation
+    # becomes spaces, so c''d / c\d / "c"d read as `c d`). Inspect every real
+    # command position with the shared static recognizer instead: a disguised
+    # cd, an unresolvable command word (c$()d, ${C:-c}d, $X), or a cd behind a
+    # group/conditional prefix anywhere in the command refuses the proof.
+    cmd_has_unproven_cwd_change "$cmd" && return 1
     # Walk the steps up to (and including the separator after) the cd.
     t="${rest//$nl/;}"
     while :; do
@@ -5380,8 +5403,8 @@ mark_expandable_dollars() {
 # with no -C at all -- is fixed in the pre-check block below.)
 # =============================================================================
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
-    BEGIN { curcwd = startcwd; found = 0 }
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_CDWORD_AWK""$_MASKWS_AWK"'
+    BEGIN { curcwd = startcwd; found = 0; UNK = unknown_cwd() }
     {
         $0 = qsplit($0)   # quote-aware segmentation
         n = split($0, segs, "\n")
@@ -5421,13 +5444,22 @@ resolve_stash_cwd() {
                 idx++
             }
             if (idx > m) continue   # nothing left but assignments
-            if (toks[idx] == "cd") {
-                if (idx + 1 <= m && toks[idx + 1] != "" && toks[idx + 1] != "-") {
-                    cdarg = expand_cd_arg(unmask_ws(toks[idx + 1]), home)
+            # Shared static command-word recognizer (repo#600, _CDWORD_AWK):
+            # a disguised spelling of cd is still cd, and an unresolvable
+            # command word (or a cd behind a group/conditional) leaves the
+            # cwd UNKNOWN -- the caller then asks rather than judging a stale
+            # cwd. Relative cd / -C / --git-dir from UNKNOWN stay unknown
+            # (they are prefixed with the sentinel, which the caller detects).
+            cdk = cd_seg_class(seg)
+            if (cdk == "unknown") { curcwd = UNK; continue }
+            if (cdk == "cd") {
+                ci = CDW_IDX; cdtok = CT[ci + 1]
+                if (cdtok != "" && cdtok != "-") {
+                    cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
-                    } else if (curcwd != "") {
+                    } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
                 }
@@ -5730,6 +5762,270 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
     return out
 }
 '
+
+# =============================================================================
+# STATIC COMMAND-WORD RECOGNITION FOR cwd TRACKING (repo#600)
+#
+# Every cwd consumer in this file (extract_write_targets, parse_force_ops,
+# resolve_stash_cwd, and the repo#597 wt_write_mktemp_cd_chain_ok() proof)
+# used to recognise a directory change only when the command word was the
+# literal bytes `cd`. Bash runs the SAME builtin for c''d, c\d, "c"d, c$()d and
+# ${C:-c}d, so those spellings changed the real cwd while every tracker kept
+# the previous one -- and a later RELATIVE write was judged against a stale
+# (often /tmp, i.e. "harmless") cwd while it really landed in the main
+# checkout.
+#
+# This is the ONE shared recognizer all of them use. It is static on purpose:
+# it never evaluates, expands or executes anything. Two results matter:
+#
+#   cmdword_static(tok)  -- the word bash would execute, derived by
+#       shell-correct quote removal ONLY: single quotes, double quotes (with
+#       the backslash escapes bash honours inside them) and unquoted backslash
+#       escapes. Anything whose result depends on runtime state -- any `$`
+#       (parameter expansion, $(..), $((..)), ANSI-C or locale quoting), a
+#       backtick, an unquoted glob or brace character, or an unbalanced quote
+#       -- sets CMDW_UNKNOWN=1. Deleting the "harmless-looking" pieces instead
+#       (the normalisation first suggested in the issue) is NOT sound: an
+#       unset `${C:-c}` and a bound `${C}` expand differently, and a pattern
+#       can glob to a file literally named cd.
+#
+#   cd_word_class(toks, m, start) -- classifies the COMMAND POSITION of one
+#       segment, starting at toks[start] (leading NAME=value words skipped):
+#         "cd"       a straight-line cd; CDW_IDX is the index of the cd word,
+#                    so the caller reads its argument from toks[CDW_IDX + 1].
+#         "unknown"  the cwd after this segment cannot be known statically:
+#                    the command word itself is ambiguous (see above), or a
+#                    cd sits behind a grouping / conditional / wrapper prefix
+#                    (`(`, `{`, `!`, if/then/elif/else, while/until/do, time,
+#                    builtin, command) whose scope or execution this
+#                    control-flow-insensitive scan cannot follow.
+#         ""         not a directory change.
+#
+# Callers turn "unknown" into the unknown_cwd() sentinel. It never starts with
+# `/`, so no consumer can mistake it for a real path, and it is STICKY: a
+# relative cd from it stays unknown, only an absolute (or fresh-root `$NAME`)
+# cd replaces it, and it can never inherit a previously safe temporary cwd.
+# Each consumer fails closed on it (write-confinement denies a relative write,
+# force-op and stash-scope ask).
+#
+# Words in ARGUMENT positions are never inspected here, so quoted data and
+# comments that merely mention a disguised cd (`echo "c''d x"`) stay inert.
+#
+# Scope (documented, deliberately NOT a general shell interpreter): pushd/popd,
+# eval/source, functions or aliases defined in the same command, cd inside a
+# case arm, and short-circuit control flow (`false && cd /tmp; ...`) are not
+# modelled by these trackers; tracked as repo#601.
+#
+# NOTE: this is a SINGLE-QUOTED awk program. Keep comments apostrophe-free.
+# =============================================================================
+_CDWORD_AWK='
+function unknown_cwd() { return sprintf("%c", 14) "LOOM_UNKNOWN_CWD" }
+function cmdword_static(tok,   n, i, c, nc, out, in_s, in_d, SQ, DQ, BQ) {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    BQ = sprintf("%c", 96)
+    CMDW_UNKNOWN = 0
+    if (tok == "[" || tok == "[[") return tok
+    out = ""
+    in_s = 0
+    in_d = 0
+    n = length(tok)
+    for (i = 1; i <= n; i++) {
+        c = substr(tok, i, 1)
+        if (in_s) {
+            if (c == SQ) in_s = 0
+            else out = out c
+            continue
+        }
+        if (in_d) {
+            if (c == DQ) { in_d = 0; continue }
+            if (c == "$" || c == BQ) { CMDW_UNKNOWN = 1; return "" }
+            if (c == "\\") {
+                if (i == n) { CMDW_UNKNOWN = 1; return "" }
+                nc = substr(tok, i + 1, 1)
+                if (nc == "\n") { i++; continue }
+                if (nc == "$" || nc == BQ || nc == DQ || nc == "\\") { out = out nc; i++; continue }
+                out = out c
+                continue
+            }
+            out = out c
+            continue
+        }
+        if (c == SQ) { in_s = 1; continue }
+        if (c == DQ) { in_d = 1; continue }
+        if (c == "\\") {
+            if (i == n) { CMDW_UNKNOWN = 1; return "" }
+            nc = substr(tok, i + 1, 1)
+            i++
+            if (nc == "\n") continue
+            out = out nc
+            continue
+        }
+        if (c == "$" || c == BQ || c == "*" || c == "?" || c == "[" || c == "{") {
+            CMDW_UNKNOWN = 1
+            return ""
+        }
+        out = out c
+    }
+    if (in_s || in_d) { CMDW_UNKNOWN = 1; return "" }
+    return out
+}
+function cd_word_class(toks, m, start,   j, w, pre, cls) {
+    CDW_IDX = 0
+    pre = 0
+    j = start
+    while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) j++
+    while (j <= m) {
+        w = toks[j]
+        while (substr(w, 1, 1) == "(") { w = substr(w, 2); pre = 1 }
+        if (w == "") { j++; continue }
+        if (w == "!" || w == "{" || w == "if" || w == "then" || w == "elif" || \
+            w == "else" || w == "do" || w == "while" || w == "until" || \
+            w == "time" || w == "builtin" || w == "command") {
+            pre = 1
+            j++
+            if (w == "time" && j <= m && toks[j] == "-p") j++
+            if (w == "command") {
+                while (j <= m && toks[j] ~ /^-/) {
+                    if (toks[j] ~ /[vV]/) return ""
+                    j++
+                }
+            }
+            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) j++
+            continue
+        }
+        break
+    }
+    if (j > m) return ""
+    cls = cmdword_static(w)
+    if (CMDW_UNKNOWN) return "unknown"
+    if (cls != "cd") return ""
+    if (pre) return "unknown"
+    CDW_IDX = j
+    return "cd"
+}
+# skip_assign_words(s) -- byte offset of the first word of segment s that is
+# NOT a leading NAME=value assignment. A whitespace split cannot find it: in
+# `X=$(basename $F) cmd` or `X=${A:-a b} cmd` the space inside the expansion
+# does not end the assignment word, so naive tokens hand "$F)" or "b}" to the
+# recognizer as if it were the command (a false unknown, or a missed cd). This
+# walks quotes, $( ), ${ } and backticks the way bash delimits a word.
+# Returns length(s) + 1 when nothing follows the assignments, including an
+# unterminated construct (the rest of the segment is then not a command).
+function skip_assign_words(s,   n, i, c, nx, lvl, q, qs, par, kind, SQ, DQ, BQ) {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    BQ = sprintf("%c", 96)
+    n = length(s)
+    i = 1
+    while (1) {
+        while (i <= n && (substr(s, i, 1) == " " || substr(s, i, 1) == "\t")) i++
+        if (i > n) return n + 1
+        if (substr(s, i) !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) return i
+        lvl = 0
+        split("", qs)
+        split("", par)
+        split("", kind)
+        qs[0] = ""
+        while (i <= n) {
+            c = substr(s, i, 1)
+            nx = (i < n) ? substr(s, i + 1, 1) : ""
+            q = qs[lvl]
+            if (lvl == 0 && q == "" && (c == " " || c == "\t")) break
+            if (q == SQ) { if (c == SQ) qs[lvl] = ""; i++; continue }
+            if (c == "\\") { i += 2; continue }
+            if (c == BQ && lvl > 0 && kind[lvl] == "B") { lvl--; i++; continue }
+            if (q == DQ) {
+                if (c == DQ) { qs[lvl] = ""; i++; continue }
+            } else {
+                if (c == SQ) { qs[lvl] = SQ; i++; continue }
+                if (c == DQ) { qs[lvl] = DQ; i++; continue }
+                if (lvl > 0 && kind[lvl] == "P") {
+                    if (c == "(") { par[lvl]++; i++; continue }
+                    if (c == ")") { if (par[lvl] > 0) par[lvl]--; else lvl--; i++; continue }
+                }
+                if (lvl > 0 && kind[lvl] == "C") {
+                    if (c == "{") { par[lvl]++; i++; continue }
+                    if (c == "}") { if (par[lvl] > 0) par[lvl]--; else lvl--; i++; continue }
+                }
+            }
+            if (c == "$" && (nx == "(" || nx == "{")) {
+                lvl++
+                qs[lvl] = ""
+                par[lvl] = 0
+                kind[lvl] = (nx == "(") ? "P" : "C"
+                i += 2
+                continue
+            }
+            if (c == BQ) {
+                lvl++
+                qs[lvl] = ""
+                par[lvl] = 0
+                kind[lvl] = "B"
+                i++
+                continue
+            }
+            i++
+        }
+        if (i > n) return n + 1
+    }
+}
+# cd_seg_class(mseg) -- classify one segment (leading whitespace and sudo
+# already stripped; whitespace inside quotes masked by mask_ws() when the
+# caller has it, raw otherwise). Same result as cd_word_class(); the words
+# from the command word on are left in the global CT[] (unmasked), so for "cd"
+# the argument is CT[CDW_IDX + 1].
+function cd_seg_class(mseg,   off, cm, j) {
+    split("", CT)
+    off = skip_assign_words(mseg)
+    if (off > length(mseg)) return ""
+    cm = split(substr(mseg, off), CT, /[ \t]+/)
+    if (cm < 1) return ""
+    for (j = 1; j <= cm; j++) CT[j] = cmdw_unmask(CT[j])
+    return cd_word_class(CT, cm, 1)
+}
+function cmdw_unmask(s) {
+    gsub(sprintf("%c", 2), " ", s)
+    gsub(sprintf("%c", 3), "\t", s)
+    return s
+}
+'
+# Shell-side spelling of unknown_cwd() above -- the two MUST stay byte-equal.
+_LOOM_UNKNOWN_CWD=$'\016LOOM_UNKNOWN_CWD'
+
+# cmd_has_unproven_cwd_change TEXT -- succeed when ANY segment of TEXT
+# (including the first command of every $( )/backtick substitution) has a
+# command position the shared recognizer classifies as "unknown", or a cd
+# spelled any way other than the literal word `cd`. Used by the repo#597
+# single-cd proof below, which may only ever admit literal, straight-line cd
+# steps (repo#600). An awk failure counts as "found" (fail closed).
+cmd_has_unproven_cwd_change() {
+    local verdict
+    verdict=$(printf '%s' "$1" | awk "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDWORD_AWK""$_MASKWS_AWK"'
+    function scan_segments(text,   n, segs, i, seg, k) {
+        n = split(text, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            if (seg == "") continue
+            k = cd_seg_class(seg)
+            if (k == "unknown") return 1
+            if (k == "cd" && CT[CDW_IDX] != "cd") return 1
+        }
+        return 0
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        HSEP = sprintf("%c", 30)
+        bad = scan_segments(mask_ws(qsplit(buf)))
+        nh = split(subst_heads(buf, HSEP), heads, HSEP)
+        for (h = 2; h <= nh && !bad; h++) bad = scan_segments(mask_ws(heads[h]))
+        print (bad ? "FOUND" : "NONE")
+    }') || verdict="FOUND"
+    [[ "$verdict" != "NONE" ]]
+}
 
 # =============================================================================
 # QUOTE-AWARE REDIRECTION MASKING (#4245)
@@ -6628,7 +6924,7 @@ extract_write_targets() {
     # guard's separate, older qsplit() copy — the two must not both define a
     # `qsplit()` under the same awk source variable, and this file's version
     # is the more advanced of the two (rjwalters/repo#188).
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_CDWORD_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     # Unresolvable cases all return tok UNCHANGED, which is exactly the
     # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
     # lands in the main checkout). Fail-closed by construction: this function
@@ -6819,6 +7115,7 @@ extract_write_targets() {
         # the existing unresolved-chain refusal inside resolve_var().
         AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
         curcwd = startcwd
+        UNK = unknown_cwd()
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,
     # preserving embedded newlines (mirrors the #3898 multi-line
@@ -6934,6 +7231,15 @@ extract_write_targets() {
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
+            # repo#600: classify the command position BEFORE the assignment
+            # stripping below, on the quote-masked segment, with the shared
+            # recognizer (see COMMAND-WORD RECOGNITION further down). The
+            # naive `NAME=[^ \t]*` strip splits `X=$(basename $F) cmd` inside
+            # the substitution; skip_assign_words() does not.
+            cdk = cd_seg_class(substr(wsegs[i], origlen - length(seg) + 1))
+            pend_unknown = (cdk == "unknown")
+            cdtok = (cdk == "cd") ? CT[CDW_IDX + 1] : ""
+
             # `NAME=value` assignments in any ordinary shell assignment
             # position (#4881; keyword/multi-assignment shapes added by the
             # #4914 review). Recorded into varmap for LATER write targets in
@@ -7000,9 +7306,22 @@ extract_write_targets() {
             mseg = substr(gsegs[i], stripped + 1)
             mm = split(mseg, mtoks, /[ \t]+/)
 
-            if (toks[1] == "cd") {
-                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+            # COMMAND-WORD RECOGNITION (repo#600): the shared static
+            # recognizer (_CDWORD_AWK) replaces the old literal
+            # `toks[1] == "cd"` test. A statically provable spelling of cd
+            # (c\d, "c"d, c<APOS><APOS>d) is tracked exactly like the literal word,
+            # reading its argument from the token after it. A command word
+            # whose value this scan cannot prove (c$()d, ${C:-c}d, $X, a glob)
+            # or a cd behind a group/conditional prefix sets curcwd to the
+            # UNKNOWN sentinel AFTER this segment (its own redirections are
+            # opened before the command runs, in the old cwd), and the shell
+            # layer denies any later RELATIVE write -- an unknown cwd never
+            # inherits the previous, possibly harmless /tmp or `$NAME` one.
+            # (cdk / pend_unknown / cdtok were computed above, before the
+            # assignment strip.)
+            if (cdk == "cd") {
+                if (cdtok != "" && cdtok != "-") {
+                    cdarg = expand_cd_arg(cdtok, home)   # #5315
                     # SAME-COMMAND LITERAL RESOLUTION OF THE cd ARGUMENT
                     # (#582, Loom #7294): `TMP=/tmp/x; cd "$TMP/repo"; echo
                     # hi > README.md` left curcwd carrying the unexpanded
@@ -7026,8 +7345,8 @@ extract_write_targets() {
                     # Anything refused keeps the pre-existing path below
                     # (fresh-root classification => fail closed).
                     if (!segprefix) {
-                        cdres = resolve_var(toks[2])
-                        if (cdres != toks[2] && substr(cdres, 1, 1) == "/") cdarg = cdres
+                        cdres = resolve_var(cdtok)
+                        if (cdres != cdtok && substr(cdres, 1, 1) == "/") cdarg = cdres
                     }
                     # Quote-aware absolute/relative CLASSIFICATION only
                     # (#4933, widened to a PARTIALLY quoted argument by
@@ -7093,7 +7412,7 @@ extract_write_targets() {
                          cdclass ~ /^\$[A-Za-z_][A-Za-z0-9_]*(\/.*)?$/)) cdfresh = 1
                     if (cdclass ~ /^\// || cdfresh) {
                         curcwd = cdarg
-                    } else if (curcwd != "") {
+                    } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
                 }
@@ -7259,6 +7578,10 @@ extract_write_targets() {
                     if (op != "") print curcwd SEP resolve_var(op)
                 }
             }
+            # repo#600: an unresolvable command word (or a cd behind a group /
+            # conditional prefix) leaves every LATER segment with an unknown
+            # cwd. Applied after this segment-s own writes were emitted.
+            if (pend_unknown) curcwd = UNK
         }
     }'
 }
@@ -8061,6 +8384,32 @@ if worktree_isolation_guard_enabled && \
         _wtarget=$(expand_leading_tilde "$_wtarget")
 
         # -------------------------------------------------------------
+        # Unknown cwd (repo#600). extract_write_targets() emits the
+        # _LOOM_UNKNOWN_CWD sentinel as the cwd once a segment ran a command
+        # word it cannot resolve statically (c$()d, ${C:-c}d, $X, a glob) or
+        # a cd behind a group/conditional prefix: bash may have changed
+        # directory there, so a RELATIVE write after it lands somewhere this
+        # guard cannot name -- possibly the main checkout, even when the
+        # previous tracked cwd was /tmp or a proven mktemp directory. Fail
+        # closed for a relative target; an absolute one, a `$NAME`-rooted one
+        # (judged by the root-unknown rules below), and the no-isolation case
+        # keep their existing treatment.
+        # -------------------------------------------------------------
+        if [[ "$_wcwd" == "$_LOOM_UNKNOWN_CWD" ]]; then
+            mark_expandable_dollars "$_wtarget"
+            if [[ "$_MARKED_TOKEN" != $'\001'* ]]; then
+                _wclassify="$_wtarget"
+                strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
+                if [[ "$_wclassify" != /* ]]; then
+                    if _wt_isolation_in_play; then
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is relative, but an earlier command word in this same command could change the working directory in a way this guard cannot resolve statically (a quoted/escaped/expanded spelling of cd such as c''d, c\\d, \"c\"d, c\$()d or \${C:-c}d, a command word built from a variable or glob, or a cd inside a group/conditional), so it cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unknown working directories fail closed (repo#600). Spell cd literally, or write to an explicit absolute path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement-unknown-cwd" "$(_wt_confinement_context "$_wtarget")"
+                    fi
+                    continue
+                fi
+            fi
+        fi
+
+        # -------------------------------------------------------------
         # Unresolved `$…` write targets must fail CLOSED, in every cwd (#4921)
         #
         # extract_write_targets() never expands variables; a target it cannot
@@ -8444,6 +8793,14 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                 [[ -z "$_ftarget" ]] && _ftarget="@HEAD@"
                 _fcwd="$_fcpath"
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
+                # repo#600: a command word parse_force_ops() could not resolve
+                # statically (a disguised/expanded cd spelling, a cd inside a
+                # group or conditional) left the cwd UNKNOWN, so neither the
+                # branch identity nor the out-of-tree exemption can be judged
+                # -- ask, never silently allow.
+                if [[ "$_fcwd" == "$_LOOM_UNKNOWN_CWD" ]]; then
+                    ask "Command requires confirmation: $COMMAND (force operation after a command word that may change the working directory in a way this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd — so the branch it acts on is unknown)" "force-op:unknown-cwd"
+                fi
                 if [[ "$_ftarget" == "@HEAD@" ]]; then
                     _fbranch=""
                     if [[ -n "$_fcwd" ]]; then
@@ -8955,6 +9312,9 @@ if [[ "$_TMPFS_EXPLICIT_HINT" == 1 || "$_TMPFS_CARGO_HINT" == 1 ]]; then
             _TMPFS_WRITE_TARGETS="$(extract_write_targets "$COMMAND_NO_COMMENT" "$_TMPFS_BASE" | head -20)" || _TMPFS_WRITE_TARGETS=""
             while IFS=$'\037' read -r _wcwd _wtarget; do
                 [[ -n "$_wtarget" ]] || continue
+                # repo#600: an unknown cwd still ends in the target-s own
+                # path, which is all the cargo-config suffix test reads.
+                [[ "$_wcwd" == "$_LOOM_UNKNOWN_CWD" ]] && _wcwd="/__loom_unknown_cwd__"
                 _wabs="$_wtarget"
                 [[ "$_wabs" != /* ]] && _wabs="${_wcwd:-$_TMPFS_BASE}/$_wabs"
                 [[ "$_wabs" == /* ]] || continue
@@ -10652,6 +11012,23 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
         _stash_effective_gitdir=$(printf '%s\n' "$_stash_resolved" | sed -n '2p')
         _stash_effective_worktree=$(printf '%s\n' "$_stash_resolved" | sed -n '3p')
         [[ -z "$_stash_effective_cwd" ]] && _stash_effective_cwd="$CWD"
+    fi
+    # repo#600: resolve_stash_cwd() reports the _LOOM_UNKNOWN_CWD sentinel
+    # (alone, or as the prefix of a relative -C / --git-dir / --work-tree
+    # joined onto it) once a command word it cannot resolve statically -- a
+    # disguised/expanded spelling of cd, a cd inside a group or conditional --
+    # may have moved the cwd. Scope is then unknowable: a recovery asks; a
+    # create stays allowed, exactly like a create anywhere the redirect cannot
+    # name a lossless per-issue replacement.
+    if [[ "$_stash_effective_cwd" == "$_LOOM_UNKNOWN_CWD"* || \
+          "$_stash_effective_gitdir" == "$_LOOM_UNKNOWN_CWD"* || \
+          "$_stash_effective_worktree" == "$_LOOM_UNKNOWN_CWD"* ]]; then
+        if [[ "$_stash_is_recover" == true ]]; then
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear after a command word that may change the working directory in a way this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd — so the checkout whose stash stack it touches is unknown; set guards.stashScope:false / REPO_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:unknown-cwd"
+        fi
+        _stash_effective_cwd=""
+        _stash_effective_gitdir=""
+        _stash_effective_worktree=""
     fi
     # Shell-accurate quote removal for cwd/gitdir/worktree RESOLUTION only —
     # resolve_stash_cwd() threads these from the RAW argument (quotes intact),
