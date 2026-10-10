@@ -4687,14 +4687,54 @@ rm_scope_mktemp_same_command_safe() {
 # rm and write consumers can never drift apart on the shape they admit. Every
 # failure path returns 1; callers invoke it only in a condition context.
 mktemp_same_command_bound() {
-    local varname="$1" cmdtext="$2" verdict
+    local varname="$1" cmdtext="$2" tmplmode="${3:-}" tmpdir_ok=0 verdict
     [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    # repo#597: the write-confinement consumer passes "template" to also admit a
+    # literal `/tmp/` or `$TMPDIR/` template prefix (and `-t`). `$TMPDIR/` is
+    # admitted only when TMPDIR is set, absolute and not itself relative-ish;
+    # the caller separately proves it lies outside the protected area.
+    if [[ "$tmplmode" == "template" && -n "${TMPDIR:-}" && "$TMPDIR" == /* ]]; then
+        tmpdir_ok=1
+    fi
     # #7986: mask the self-referential canonicalization chain (if any) into an
     # opaque, separator-free token BEFORE the segment scan — see
     # _mktemp_canon_mask()'s doc comment above. A refusal (the token's bytes
     # already occur in the command text) fails closed.
     _mktemp_canon_mask "$varname" "$cmdtext" || return 1
-    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
+    verdict=$(printf '%s' "$_MKTEMP_CANON_MASKED" | awk -v varname="$varname" -v canontok="$_MKTEMP_CANON_TOKEN" -v tmplmode="$tmplmode" -v tmpdir_ok="$tmpdir_ok" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_ML_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_SAMECMD_ORDER_AWK"'
+    # repo#597: a `$(mktemp [-d] [-t] <template>)` RHS whose template is a
+    # literal `/tmp/<name>XXX` (or `$TMPDIR/<name>XXX` with TMPDIR proven by
+    # the caller, or a bare `-t <name>XXX`). Any other option (--tmpdir=,
+    # -p, -u, ...), quoting, expansion, directory or extra word refuses.
+    function _mktemp_template_rhs_ok(rhs,   inner, n, toks, i, t, nd, nt, ntmpl, tmpl, base) {
+        if (tmplmode != "template") return 0
+        if (rhs ~ /^".*"$/) rhs = substr(rhs, 2, length(rhs) - 2)
+        if (substr(rhs, 1, 8) != "$(mktemp" || substr(rhs, length(rhs)) != ")") return 0
+        inner = substr(rhs, 9, length(rhs) - 9)
+        if (inner !~ /^ [A-Za-z0-9 ._\/$-]*$/) return 0
+        n = split(inner, toks, " ")
+        nd = 0; nt = 0; ntmpl = 0; tmpl = ""
+        for (i = 1; i <= n; i++) {
+            t = toks[i]
+            if (t == "") continue
+            if (t == "-d") { if (nd++) return 0 }
+            else if (t == "-t") { if (nt++) return 0 }
+            else if (substr(t, 1, 1) == "-") return 0
+            else { if (ntmpl++) return 0; tmpl = t }
+        }
+        if (ntmpl != 1) return 0
+        if (substr(tmpl, 1, 5) == "/tmp/") base = substr(tmpl, 6)
+        else if (substr(tmpl, 1, 8) == "$TMPDIR/") {
+            if (tmpdir_ok != 1) return 0
+            base = substr(tmpl, 9)
+        } else if (nt && index(tmpl, "/") == 0 && index(tmpl, "$") == 0) base = tmpl
+        else return 0
+        if (base !~ /^[A-Za-z0-9._-]*XXX+$/ ) return 0
+        # `-t` takes a bare name; combined with a directory it is not a
+        # plain template (GNU rejects it, BSD differs) -- refuse.
+        if (nt && base != tmpl) return 0
+        return 1
+    }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         n = ml_segment(buf, segs)
@@ -4712,7 +4752,8 @@ mktemp_same_command_bound() {
                 rhs = substr(bseg, plen + 1)
                 total++
                 if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
-                    rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
+                    rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"" || \
+                    _mktemp_template_rhs_ok(rhs)) {
                     safe++
                     if (safeat == 0) { safeat = total; safeseg = i }
                 } else if (rhs == canontok || rhs == "\"" canontok "\"") {
@@ -4841,7 +4882,7 @@ wt_write_mktemp_same_command_safe() {
         scrubbed="${scrubbed//\$TMPDIR/}"
         [[ "$scrubbed" == *TMPDIR* ]] && return 1
     fi
-    mktemp_same_command_bound "$varname" "$cmdtext"
+    mktemp_same_command_bound "$varname" "$cmdtext" template
 }
 
 # _rm_scope_var_ref_split TOKEN -- split `$NAME<suffix>` into "NAME<TAB>suffix"; fail
@@ -7991,6 +8032,23 @@ if worktree_isolation_guard_enabled && \
                 _wdirpart=""
                 [[ "$_weff" == */* ]] && _wdirpart="${_weff%/*}"
                 if [[ "$_wdirpart" == *$'\001'* ]]; then
+                    # repo#597: a RELATIVE target whose unknown directory is the
+                    # tracked `cd $NAME` cwd, with NAME a proven same-command
+                    # mktemp output. Rebuild the `$NAME/<target>` spelling and
+                    # apply the same proof + protected-area checks as (1); the
+                    # suffix rules refuse `..`, expansions, quotes and globs,
+                    # so a relative escape out of the scratch dir still denies.
+                    if [[ "$_wmarked" != /* && "$_wmarkedcwd" == *$'\001'* ]] \
+                       && _wt_isolation_in_play; then
+                        _wjoin="$_wcwd"
+                        if [[ "$_wjoin" == \"*\" && ${#_wjoin} -ge 2 ]]; then
+                            _wjoin="${_wjoin:1:${#_wjoin}-2}"
+                        fi
+                        if [[ "$_wjoin" == '$'* ]] \
+                           && _wt_mktemp_target_admitted "${_wjoin}/${_wtarget}"; then
+                            continue
+                        fi
+                    fi
                     _wknown="${_weff%%$'\001'*}"
                     _wknown="${_wknown%/*}"
                     # Normalize BEFORE judging: a `..` traversal in the known
