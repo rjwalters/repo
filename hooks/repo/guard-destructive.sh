@@ -4693,7 +4693,11 @@ mktemp_same_command_bound() {
     # literal `/tmp/` or `$TMPDIR/` template prefix (and `-t`). `$TMPDIR/` is
     # admitted only when TMPDIR is set, absolute and not itself relative-ish;
     # the caller separately proves it lies outside the protected area.
-    if [[ "$tmplmode" == "template" && -n "${TMPDIR:-}" && "$TMPDIR" == /* ]]; then
+    # "template-dir" (the `cd $NAME` consumer) is "template" plus a hard
+    # requirement that the binding is a DIRECTORY (`-d`): without `-d` mktemp
+    # creates a FILE, `cd` into it fails, and a following relative write would
+    # land in the original cwd.
+    if [[ "$tmplmode" == template* && -n "${TMPDIR:-}" && "$TMPDIR" == /* ]]; then
         tmpdir_ok=1
     fi
     # #7986: mask the self-referential canonicalization chain (if any) into an
@@ -4707,7 +4711,7 @@ mktemp_same_command_bound() {
     # the caller, or a bare `-t <name>XXX`). Any other option (--tmpdir=,
     # -p, -u, ...), quoting, expansion, directory or extra word refuses.
     function _mktemp_template_rhs_ok(rhs,   inner, n, toks, i, t, nd, nt, ntmpl, tmpl, base) {
-        if (tmplmode != "template") return 0
+        if (tmplmode != "template" && tmplmode != "template-dir") return 0
         if (rhs ~ /^".*"$/) rhs = substr(rhs, 2, length(rhs) - 2)
         if (substr(rhs, 1, 8) != "$(mktemp" || substr(rhs, length(rhs)) != ")") return 0
         inner = substr(rhs, 9, length(rhs) - 9)
@@ -4723,6 +4727,7 @@ mktemp_same_command_bound() {
             else { if (ntmpl++) return 0; tmpl = t }
         }
         if (ntmpl != 1) return 0
+        if (tmplmode == "template-dir" && nd != 1) return 0
         if (substr(tmpl, 1, 5) == "/tmp/") base = substr(tmpl, 6)
         else if (substr(tmpl, 1, 8) == "$TMPDIR/") {
             if (tmpdir_ok != 1) return 0
@@ -4751,8 +4756,9 @@ mktemp_same_command_bound() {
             if (length(bseg) > plen && substr(bseg, 1, plen) == prefix) {
                 rhs = substr(bseg, plen + 1)
                 total++
-                if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
-                    rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"" || \
+                if (rhs == "$(mktemp -d)" || rhs == "\"$(mktemp -d)\"" || \
+                    (tmplmode != "template-dir" && \
+                     (rhs == "$(mktemp)" || rhs == "\"$(mktemp)\"")) || \
                     _mktemp_template_rhs_ok(rhs)) {
                     safe++
                     if (safeat == 0) { safeat = total; safeseg = i }
@@ -4861,7 +4867,7 @@ _wt_write_mktemp_leading_var() {
 # write-confinement block's roots (inherited TMPDIR, empty-expansion
 # spelling) — see wt_write_mktemp_target_admitted() in that block.
 wt_write_mktemp_same_command_safe() {
-    local target="$1" cmdtext="$2" varname suffix scrubbed
+    local target="$1" cmdtext="$2" mode="${3:-template}" varname suffix scrubbed
     _wt_write_mktemp_leading_var "$target" || return 1
     varname="$_WT_WRITE_VARNAME"
     suffix="$_WT_WRITE_SUFFIX"
@@ -4882,7 +4888,121 @@ wt_write_mktemp_same_command_safe() {
         scrubbed="${scrubbed//\$TMPDIR/}"
         [[ "$scrubbed" == *TMPDIR* ]] && return 1
     fi
-    mktemp_same_command_bound "$varname" "$cmdtext" template
+    mktemp_same_command_bound "$varname" "$cmdtext" "$mode"
+}
+
+# wt_write_mktemp_cd_chain_ok NAME CMDTEXT -- repo#597: the extra proof the
+# `cd $NAME; <relative write>` form needs on top of the `$NAME` binding proof.
+# A `$NAME/<x>` target never depends on the cwd, but a relative write after
+# `cd $NAME` lands in `$NAME` only if that `cd` RAN, SUCCEEDED and was never
+# undone. The binding proof cannot see any of that (`cd -`, a failed `cd` on a
+# file or a missing `$NAME/sub`, `cd $NAME || true`), so admit ONLY this
+# fail-closed shape (the caller separately requires `mktemp -d`):
+#
+#   [cd <literal> SEP]... NAME=<mktemp -d> [SEP NAME=<canon>] SEP cd $NAME SEP ...
+#
+#   - an optional prefix of plain `cd <literal-path>` steps (they cannot undo
+#     a LATER cd), then the NAME binding (plain `NAME=`, never `export`/
+#     `local`, whose status is not the mktemp's), then only further `NAME=`
+#     steps, then the single `cd` of the whole remainder, whose argument is
+#     exactly `$NAME` / `${NAME}` / `"$NAME"` / `"${NAME}"` (no suffix);
+#   - SEP is `&&`, `;` or a newline. A fresh `mktemp -d` directory always
+#     admits `cd`, so the only way that cd can fail is an EMPTY NAME (mktemp or
+#     realpath failed). An all-`&&` chain short-circuits before the write.
+#     Any `;`/newline chain ("loose") instead needs the empty case to land
+#     somewhere harmless: only an UNQUOTED `cd $NAME` (empty -> `cd` -> $HOME,
+#     whereas `cd ""` stays in the cwd), $HOME set, absolute and outside the
+#     protected area (checked by the caller via _WT_CD_CHAIN_LOOSE), no
+#     realpath chain, and an IFS/glob-safe TMPDIR so `$NAME` cannot split;
+#   - from the binding on: no `||`, backtick or lone `&`; no pipe/group
+#     around the steps before the cd; no `)`/`}` after it closing a group
+#     opened earlier; and none of trap/eval/source/`.`/exec/builtin/alias/
+#     function/enable (each can run a hidden cd before the write);
+#   - anywhere in the command: no `cd -`, `pushd`, `popd`, `OLDPWD`, `CDPATH`.
+# Publishes _WT_CD_CHAIN_LOOSE=1 when a `;`/newline separator was involved.
+_WT_CD_CHAIN_LOOSE=0
+wt_write_mktemp_cd_chain_ok() {
+    local varname="$1" cmd="$2" rest seg t w ncd=0 found=0 depth=0 bdepth=0
+    local i c loose=0 quoted=0 nsteps=0 ws=$' \t' nl=$'\n'
+    _WT_CD_CHAIN_LOOSE=0
+    [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    [[ "$cmd" =~ (^|[^A-Za-z0-9_])(pushd|popd|OLDPWD|CDPATH)([^A-Za-z0-9_]|$) ]] && return 1
+    [[ "$cmd" =~ (^|[^A-Za-z0-9_])cd[[:space:]]+- ]] && return 1
+    # Optional prefix of literal `cd <path>` steps.
+    rest="$cmd"
+    while :; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ "$rest" == "$varname="* ]] && break
+        if [[ "$rest" =~ ^cd[$ws]+[A-Za-z0-9_./][A-Za-z0-9_./-]*[$ws]*(\&\&|\;|$nl) ]]; then
+            rest="${rest:${#BASH_REMATCH[0]}}"
+        else
+            return 1
+        fi
+    done
+    # From the binding on: banned separators / constructs.
+    case "$rest" in
+        *'||'*|*'`'*) return 1 ;;
+    esac
+    t="${rest//&&/}"; t="${t//>&/}"; t="${t//&>/}"; t="${t//<&/}"
+    [[ "$t" == *'&'* ]] && return 1
+    # A `.` (source) in command position.
+    [[ "$rest" =~ (^|[\;\&\|\(\{$nl])[$ws]*\.[$ws] ]] && return 1
+    t="${rest//[^A-Za-z0-9_]/ }"
+    for w in $t; do
+        case "$w" in
+            cd) ncd=$((ncd + 1)) ;;
+            trap|eval|source|exec|builtin|alias|function|enable) return 1 ;;
+        esac
+    done
+    [[ "$ncd" -eq 1 ]] || return 1
+    # Walk the steps up to (and including the separator after) the cd.
+    t="${rest//$nl/;}"
+    while :; do
+        local sep=""
+        if [[ "$t" =~ ^([^\;\&]*)(\&\&|\;)(.*)$ ]]; then
+            seg="${BASH_REMATCH[1]}"; sep="${BASH_REMATCH[2]}"; t="${BASH_REMATCH[3]}"
+        else
+            seg="$t"; t=""
+        fi
+        seg="${seg#"${seg%%[![:space:]]*}"}"
+        seg="${seg%"${seg##*[![:space:]]}"}"
+        case "$seg" in
+            "cd \$$varname"|"cd \${$varname}")
+                found=1 ;;
+            "cd \"\$$varname\""|"cd \"\${$varname}\"")
+                found=1; quoted=1 ;;
+            "$varname="*)
+                nsteps=$((nsteps + 1))
+                case "$seg" in *'|'*|*'{'*|*'}'*) return 1 ;; esac
+                ;;
+            *) return 1 ;;
+        esac
+        [[ "$sep" == ";" ]] && loose=1
+        [[ "$found" -eq 1 ]] && break
+        [[ -n "$t" ]] || return 1
+    done
+    [[ "$found" -eq 1 ]] || return 1
+    # Nothing after the cd may close a group opened before the binding.
+    for ((i = 0; i < ${#t}; i++)); do
+        c="${t:i:1}"
+        case "$c" in
+            '(') depth=$((depth + 1)) ;;
+            ')') depth=$((depth - 1)); [[ "$depth" -lt 0 ]] && return 1 ;;
+            '{') bdepth=$((bdepth + 1)) ;;
+            '}') bdepth=$((bdepth - 1)); [[ "$bdepth" -lt 0 ]] && return 1 ;;
+        esac
+    done
+    # A `;` anywhere after the cd step can still run the write after a
+    # short-circuited (skipped) cd: `NAME=$(mktemp -d) && cd $NAME; > f`.
+    [[ "$t" == *';'* ]] && loose=1
+    if [[ "$loose" -eq 1 ]]; then
+        [[ "$quoted" -eq 0 && "$nsteps" -eq 1 ]] || return 1
+        if [[ -n "${TMPDIR:-}" && ! "$TMPDIR" =~ ^/[A-Za-z0-9._/-]*$ ]]; then
+            return 1
+        fi
+        _WT_CD_CHAIN_LOOSE=1
+    fi
+    return 0
 }
 
 # _rm_scope_var_ref_split TOKEN -- split `$NAME<suffix>` into "NAME<TAB>suffix"; fail
@@ -7888,9 +8008,9 @@ if worktree_isolation_guard_enabled && \
     #     chain failed, NAME is empty, the write goes to `/<suffix>`) must be
     #     outside the protected area too.
     _wt_mktemp_target_admitted() {
-        local _t="$1" _td _empty
+        local _t="$1" _mode="${2:-template}" _td _empty
         mktemp_scan_text_ensure
-        wt_write_mktemp_same_command_safe "$_t" "$COMMAND_MKTEMP_SCAN" || return 1
+        wt_write_mktemp_same_command_safe "$_t" "$COMMAND_MKTEMP_SCAN" "$_mode" || return 1
         _empty="${_WT_WRITE_SUFFIX:-/}"
         _empty=$(normalize_abs_path "$_empty") || return 1
         _wt_in_protected_area "$_empty" && return 1
@@ -7899,6 +8019,19 @@ if worktree_isolation_guard_enabled && \
             _td=$(normalize_abs_path "$TMPDIR") || return 1
             _wt_in_protected_area "$_td" && return 1
         fi
+        return 0
+    }
+
+    # repo#597: a `;`-chained `NAME=$(mktemp -d); cd $NAME; <write>` falls to
+    # `cd` -> $HOME when NAME is empty (mktemp failed), so $HOME must be set,
+    # absolute and outside the protected area. An all-`&&` chain short-
+    # circuits instead and needs nothing here.
+    _wt_mktemp_cd_home_ok() {
+        local _h
+        [[ "$_WT_CD_CHAIN_LOOSE" -eq 1 ]] || return 0
+        [[ -n "${HOME:-}" && "$HOME" == /* ]] || return 1
+        _h=$(normalize_abs_path "$HOME") || return 1
+        _wt_in_protected_area "$_h" && return 1
         return 0
     }
 
@@ -8034,19 +8167,28 @@ if worktree_isolation_guard_enabled && \
                 if [[ "$_wdirpart" == *$'\001'* ]]; then
                     # repo#597: a RELATIVE target whose unknown directory is the
                     # tracked `cd $NAME` cwd, with NAME a proven same-command
-                    # mktemp output. Rebuild the `$NAME/<target>` spelling and
-                    # apply the same proof + protected-area checks as (1); the
-                    # suffix rules refuse `..`, expansions, quotes and globs,
-                    # so a relative escape out of the scratch dir still denies.
+                    # `mktemp -d` output. The tracked cwd must be EXACTLY
+                    # `$NAME` (no suffix: `cd $NAME/sub` can fail), the binding
+                    # must be a directory (template-dir: `-d` required, or the
+                    # cd fails on a file), and wt_write_mktemp_cd_chain_ok()
+                    # must prove the cd ran, succeeded and was not undone.
+                    # Then rebuild the `$NAME/<target>` spelling and apply the
+                    # same proof + protected-area checks as (1); the suffix
+                    # rules refuse `..`, expansions, quotes and globs, so a
+                    # relative escape out of the scratch dir still denies.
                     if [[ "$_wmarked" != /* && "$_wmarkedcwd" == *$'\001'* ]] \
                        && _wt_isolation_in_play; then
                         _wjoin="$_wcwd"
                         if [[ "$_wjoin" == \"*\" && ${#_wjoin} -ge 2 ]]; then
                             _wjoin="${_wjoin:1:${#_wjoin}-2}"
                         fi
-                        if [[ "$_wjoin" == '$'* ]] \
-                           && _wt_mktemp_target_admitted "${_wjoin}/${_wtarget}"; then
-                            continue
+                        if [[ "$_wjoin" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)$ ]] || \
+                           [[ "$_wjoin" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$ ]]; then
+                            if wt_write_mktemp_cd_chain_ok "${BASH_REMATCH[1]}" "$COMMAND" \
+                               && _wt_mktemp_target_admitted "${_wjoin}/${_wtarget}" template-dir \
+                               && _wt_mktemp_cd_home_ok; then
+                                continue
+                            fi
                         fi
                     fi
                     _wknown="${_weff%%$'\001'*}"
