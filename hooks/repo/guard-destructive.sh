@@ -1242,6 +1242,62 @@ _force_op_cwd_outside_known_roots() {
         esac
     fi
 
+    # #602: REPO_ROOT is the ACTING checkout, which is a linked worktree when
+    # the hook starts there. The repository family (main checkout + every
+    # registered worktree + their configured roots) must also count as known,
+    # or a reset aimed at the main checkout reads as an unrelated scratch
+    # clone. Derived from git metadata only; any lookup failure or malformed
+    # result is "not proven outside" (fail closed -> keep asking).
+    local common main_root
+    common=$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null) || return 1
+    [[ -n "$common" ]] || return 1
+    [[ "$common" == /* ]] || common="$REPO_ROOT/$common"
+    common=$(cd "$common" 2>/dev/null && pwd -P) || return 1
+    [[ "$(basename "$common")" == ".git" ]] || return 1   # bare/odd layout: ambiguous
+    main_root=$(dirname "$common")
+    [[ -n "$main_root" && "$main_root" != "/" && -d "$main_root" ]] || return 1
+
+    # A cwd whose own git common dir is ours belongs to the family, however
+    # it is spelled.
+    local abs_common
+    abs_common=$(git -C "$abs" rev-parse --git-common-dir 2>/dev/null) || abs_common=""
+    if [[ -n "$abs_common" ]]; then
+        [[ "$abs_common" == /* ]] || abs_common="$abs/$abs_common"
+        abs_common=$(cd "$abs_common" 2>/dev/null && pwd -P) || return 1
+        [[ "$abs_common" == "$common" ]] && return 1
+    fi
+
+    local -a family_roots=("$main_root" "$main_root/.loom/worktrees")
+    local fam_wt
+    fam_wt=$(resolve_worktree_root "$main_root")
+    [[ -n "$fam_wt" ]] && family_roots+=("$fam_wt")
+
+    local wt_list line wt_path wt_count=0
+    wt_list=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                wt_path="${line#worktree }"
+                [[ "$wt_path" == /* ]] || return 1   # malformed entry
+                family_roots+=("$wt_path")
+                # Also its physical spelling (symlinked prefixes), if it exists.
+                if [[ -d "$wt_path" ]]; then
+                    family_roots+=("$(cd "$wt_path" 2>/dev/null && pwd -P)")
+                fi
+                wt_count=$((wt_count + 1))
+                ;;
+        esac
+    done <<< "$wt_list"
+    [[ "$wt_count" -ge 1 ]] || return 1   # empty/unparseable listing: ambiguous
+
+    local r
+    for r in "${family_roots[@]}"; do
+        [[ -n "$r" && "$r" != "/" ]] || continue
+        case "$abs" in
+            "$r"|"$r"/*) return 1 ;;
+        esac
+    done
+
     return 0
 }
 

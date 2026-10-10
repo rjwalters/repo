@@ -1344,6 +1344,60 @@ git -C "$FORCE_WT_DETACHED" checkout -q --detach
 assert_ask "forceScope protected: detached HEAD inside a managed worktree still asks (#320)" \
     "git -C $FORCE_WT_DETACHED reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
 
+# ---- protected mode: repository family known roots (#602). ----
+# From a managed linked-worktree cwd, the main checkout (and sibling registered
+# worktrees) must NOT read as an out-of-tree scratch clone.
+F602_MAIN=$(mktemp -d)
+git -C "$F602_MAIN" init -q -b main
+mkdir -p "$F602_MAIN/.loom"
+printf '%s' '{"guards":{"forceScope":"protected"}}' > "$F602_MAIN/.loom/config.json"
+git -C "$F602_MAIN" -c user.email=t@t -c user.name=t add -A
+git -C "$F602_MAIN" -c user.email=t@t -c user.name=t commit -q -m init
+git -C "$F602_MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+F602_WT1="$F602_MAIN/.loom/worktrees/issue-1"
+F602_WT2="$F602_MAIN/.loom/worktrees/issue-2"
+git -C "$F602_MAIN" worktree add -q -b feature/i1 "$F602_WT1" >/dev/null 2>&1
+git -C "$F602_MAIN" worktree add -q -b feature/i2 "$F602_WT2" >/dev/null 2>&1
+touch "$F602_WT1/.loom-managed" "$F602_WT2/.loom-managed"
+assert_ask "602: cd <main>; reset --hard from worktree cwd asks" \
+    "cd $F602_MAIN; git reset --hard" "$F602_WT1"
+assert_ask "602: cd <main> && reset --hard origin/master from worktree cwd asks" \
+    "cd $F602_MAIN && git reset --hard origin/master" "$F602_WT1"
+assert_ask "602: git -C <main> reset --hard from worktree cwd asks" \
+    "git -C $F602_MAIN reset --hard" "$F602_WT1"
+assert_ask_reason_matches "602: worktree-cwd main reset asks as a protected-branch force op" \
+    "git -C $F602_MAIN reset --hard" "targets protected branch" "$F602_WT1"
+assert_ask "602: git -C <main> reset --hard from main cwd still asks" \
+    "git -C $F602_MAIN reset --hard" "$F602_MAIN"
+# Sibling registered worktree on a protected-looking detached HEAD is in-family.
+git -C "$F602_WT2" checkout -q --detach
+assert_ask "602: sibling registered worktree detached is not a scratch clone" \
+    "git -C $F602_WT2 reset --hard HEAD~1" "$F602_WT1"
+# Symlinked spelling of the main checkout.
+F602_LINK_PARENT=$(mktemp -d)
+ln -s "$F602_MAIN" "$F602_LINK_PARENT/linkmain"
+assert_ask "602: symlinked spelling of main checkout asks" \
+    "git -C $F602_LINK_PARENT/linkmain reset --hard" "$F602_WT1"
+# Relative --git-common-dir output: acting cwd is the main checkout itself.
+assert_ask "602: relative common-dir (main cwd, subdir target) asks" \
+    "git -C $F602_MAIN/.loom reset --hard" "$F602_MAIN"
+# Stale registration: remove worktree dir on disk, main still asks.
+F602_STALE="$F602_MAIN/.loom/worktrees/issue-3"
+git -C "$F602_MAIN" worktree add -q -b feature/i3 "$F602_STALE" >/dev/null 2>&1
+touch "$F602_STALE/.loom-managed"
+rm -rf "$F602_MAIN/.loom/worktrees/issue-3/.git"
+assert_ask "602: stale/broken sibling worktree does not widen main reset to allow" \
+    "git -C $F602_MAIN reset --hard" "$F602_WT1"
+# Genuinely separate scratch clone keeps the #320/#330 allow from a worktree cwd.
+F602_SCRATCH=$(mktemp -d)
+git -C "$F602_SCRATCH" init -q -b main
+git -C "$F602_SCRATCH" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$F602_SCRATCH" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+assert_allow "602: separate scratch clone still allowed from worktree cwd (#330)" \
+    "git -C $F602_SCRATCH reset --hard HEAD~1" "$F602_WT1"
+assert_allow "602: cd to separate scratch clone still allowed from worktree cwd (#350)" \
+    "cd $F602_SCRATCH && git reset --hard HEAD~1" "$F602_WT1"
+
 # ---- protected mode: git -C <other repo> resolves cwd from the -C argument. ----
 # Command runs with the hook cwd = default-branch repo, but -C points at the
 # feature-branch repo, so the target resolves to feature/work → allow. Without
