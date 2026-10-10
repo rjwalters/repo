@@ -4196,6 +4196,111 @@ assert_deny_tag 'write-confinement (#293/#582): $(mktemp -d) target rebound afte
 tmp=\$(mktemp -d); tmp=\"\$(pwd)\"; cp rtl/generated.v \"\$tmp/\"" "$WTC_WT" \
     "worktree-write-confinement-unresolved-var"
 
+# repo#597: a same-command `NAME=$(mktemp -d /tmp/<prefix>.XXXX)` (and the
+# `-t` / literal $TMPDIR-prefix forms) is as proven /tmp-rooted as the plain form.
+_U597="worktree-write-confinement-unresolved-var"
+assert_allow 'write-confinement (#597): mktemp -d /tmp template, cp into $D/' \
+    "cd $WTC_WT
+D=\$(mktemp -d /tmp/p.XXXX); cp a \$D/; echo x" "$WTC_WT"
+assert_allow 'write-confinement (#597): mktemp -d /tmp template, cd \$D then redirect' \
+    "cd $WTC_WT
+D=\$(mktemp -d /tmp/p.XXXX); cd \$D; echo hi > out.log" "$WTC_WT"
+assert_allow 'write-confinement (#597): mktemp -t template, redirect into $D/' \
+    "cd $WTC_WT
+D=\$(mktemp -t p.XXXX); echo hi > \$D/out.log" "$WTC_WT"
+# Newly allowed by #597 (main denies it from the worktree cwd too): the plain
+# `-d` form now goes through the same `cd $NAME` chain proof as the template.
+assert_allow 'write-confinement (#597): plain mktemp -d then cd $D (newly allowed via cd-chain proof)' \
+    "cd $WTC_WT
+D=\$(mktemp -d); cd \$D; echo hi > out.log" "$WTC_WT"
+assert_deny_tag 'write-confinement (#597): no assignment stays unresolved' \
+    "cd $WTC_WT
+cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny_tag 'write-confinement (#597): ./ template denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d ./p.XXXX); cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny_tag 'write-confinement (#597): /var template denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d /var/p.XXXX); cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny_tag 'write-confinement (#597): differing second assignment denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d /tmp/p.XXXX); D=\$(foo); cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny_tag 'write-confinement (#597): --tmpdir= form denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d --tmpdir=/other p.XXXX); cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny_tag 'write-confinement (#597): unknown-variable template denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d \"\$X/p.XXXX\"); cp a \$D/" "$WTC_WT" "$_U597"
+assert_deny 'write-confinement (#597): relative escape out of the temp dir still evaluated' \
+    "cd $WTC_WT
+D=\$(mktemp -d /tmp/p.XXXX); cd \$D; echo hi > ../escape" "$WTC_WT"
+# The TMPDIR values below must name EXISTING directories: GNU mktemp (Linux CI)
+# rejects a missing TMPDIR, and assert_deny_tag's own `mktemp -d` would then
+# abort the whole suite under `set -euo pipefail` (macOS silently ignores it).
+mkdir -p /tmp/loom-597-scratch "$WTC_MAIN/scratch"
+_TMPDIR597_SAVED="${TMPDIR-__unset__}"
+unset TMPDIR
+assert_deny_tag 'write-confinement (#597): $TMPDIR template with TMPDIR unset denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d \$TMPDIR/p.XXXX); cp a \$D/" "$WTC_WT" "$_U597"
+export TMPDIR=/tmp/loom-597-scratch
+assert_allow 'write-confinement (#597): $TMPDIR template with TMPDIR outside the checkout allows' \
+    "cd $WTC_WT
+D=\$(mktemp -d \$TMPDIR/p.XXXX); cp a \$D/" "$WTC_WT"
+export TMPDIR="$WTC_MAIN/scratch"
+assert_deny_tag 'write-confinement (#597): $TMPDIR template with TMPDIR inside the checkout denied' \
+    "cd $WTC_WT
+D=\$(mktemp -d \$TMPDIR/p.XXXX); cp a \$D/" "$WTC_WT" "$_U597"
+if [[ "$_TMPDIR597_SAVED" == "__unset__" ]]; then unset TMPDIR; else export TMPDIR="$_TMPDIR597_SAVED"; fi
+rm -rf /tmp/loom-597-scratch "$WTC_MAIN/scratch"
+
+# repo#597 review: a relative write after `cd $D` lands in $D only if that cd
+# RAN, SUCCEEDED and was never undone. Every shape below writes out.log into
+# the ORIGINAL cwd at runtime, so each must deny from the MAIN checkout as
+# well as from the worktree (the earlier cases all ran from the worktree,
+# which hid these bypasses).
+for _c597 in "$WTC_MAIN" "$WTC_WT"; do
+    _w597="main"; [[ "$_c597" == "$WTC_WT" ]] && _w597="worktree"
+    assert_deny "write-confinement (#597, cwd=$_w597): cd \$D; cd - undoes the cd" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D; cd -; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): && cd \$D && cd - undoes the cd" \
+        'D=$(mktemp -d /tmp/p.XXXX) && cd $D && cd - && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): mktemp without -d makes a file, cd fails" \
+        'D=$(mktemp /tmp/p.XXXX); cd $D; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): mktemp -t without -d makes a file, cd fails" \
+        'D=$(mktemp -t p.XXXX); cd $D; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): plain mktemp makes a file, cd fails" \
+        'D=$(mktemp); cd $D; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): plain mktemp && cd still fails on a file" \
+        'D=$(mktemp) && cd $D && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): cd \$D/sub can fail" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D/sub; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): cd \$D || true falls through" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D || true; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): pushd after cd \$D" \
+        'D=$(mktemp -d /tmp/p.XXXX) && cd $D && pushd /x && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): bare cd after cd \$D" \
+        'D=$(mktemp -d /tmp/p.XXXX) && cd $D && cd && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): OLDPWD after cd \$D" \
+        'D=$(mktemp -d /tmp/p.XXXX) && cd $D && echo hi > $OLDPWD/out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): export binding status is not mktemp's" \
+        'export D=$(mktemp -d /tmp/p.XXXX) && cd $D && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): binding inside a subshell group" \
+        '(D=$(mktemp -d /tmp/p.XXXX) && cd $D && true) && echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): quoted cd \"\$D\" in a ; chain (empty D stays put)" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd "$D"; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): sourced script after cd \$D" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D; . ./x; echo hi > out.log' "$_c597"
+    assert_deny "write-confinement (#597, cwd=$_w597): relative escape after cd \$D" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D; echo hi > ../escape' "$_c597"
+    assert_allow "write-confinement (#597, cwd=$_w597): mktemp -d /tmp template, ; cd \$D; redirect" \
+        'D=$(mktemp -d /tmp/p.XXXX); cd $D; echo hi > out.log' "$_c597"
+    assert_allow "write-confinement (#597, cwd=$_w597): mktemp -d, && cd \"\$D\" && redirect" \
+        'D=$(mktemp -d /tmp/p.XXXX) && cd "$D" && echo hi > out.log' "$_c597"
+    assert_allow "write-confinement (#597, cwd=$_w597): mktemp -d -t, && cd \${D} && tee" \
+        'D=$(mktemp -d -t p.XXXX) && cd ${D} && make 2>&1 | tee out.log' "$_c597"
+done
+
 # ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
 # ---- where bash would NOT expand the `$`, or where a backtick hides a
 # ---- component the guard cannot see. ----
