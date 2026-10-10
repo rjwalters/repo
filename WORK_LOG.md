@@ -2,6 +2,16 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-10
+- **PR #606**: guard: force-op scratch exemption knows the whole repository family (#602)
+- **Issue #602** (closed): guard: force-op scratch exemption treats the main checkout as outside known roots from a worktree cwd
+- **PR #607**: policies: 2AMLogic preset turns the Dependency Dashboard off
+- **PR #605**: policies: add the 2AMLogic organization override
+- **PR #603**: fix(guard): recognise disguised cd spellings in the cwd trackers (#600)
+- **Issue #600** (closed): guard: cwd tracker misses quoted/escaped cd spellings (c''d, c\d, "c"d, ${C:-c}d)
+- **PR #599**: guard: same-command mktemp /tmp template is proven /tmp-rooted for write-confinement (#597)
+- **Issue #597** (closed): Write-confinement: treat same-command NAME=$(mktemp -d /tmp/<prefix>.XXXX) as proven /tmp-rooted
+
 ### 2026-10-09
 - **PR #595**: Guard: reconcile Loom environment, service, stash and index rules (#585)
 - **Issue #585** (closed): Guard: reconcile Loom environment service stash and index rules
