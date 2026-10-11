@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-11
+- **PR #610**: guard: cwd trackers follow control flow conservatively (#601)
+- **Issue #601** (closed): guard: cwd trackers ignore control flow (short-circuit cd, pushd, eval, functions, case arms)
+
 ### 2026-10-10
 - **PR #606**: guard: force-op scratch exemption knows the whole repository family (#602)
 - **Issue #602** (closed): guard: force-op scratch exemption treats the main checkout as outside known roots from a worktree cwd
