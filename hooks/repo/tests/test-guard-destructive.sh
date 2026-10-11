@@ -8132,6 +8132,163 @@ fi
 echo ""
 
 # =========================================================================
+# repo#608: git -C with a whitespace path (quoted / escaped) must resolve to
+# the same repo + branch as the unquoted spelling. parse_force_ops() used to
+# split the segment on raw whitespace, so `-C "/a b"` consumed only `"/a` and
+# `b"` became the subcommand: no force op was recognized and the command was
+# ALLOWED in protected AND all mode. Every case below asserts the decision AND
+# (for asks) the reason, since ask and allow both exit 0. Nothing is executed:
+# each command reaches the hook as JSON against disposable fixtures.
+# =========================================================================
+echo -e "${YELLOW}--- force-op: git -C whitespace / quoting (repo#608) ---${NC}"
+
+_f608_git() { git -c user.email=test@example.com -c user.name=test "$@"; }
+_f608_init_main() {  # <dir> -- committed repo on branch main
+    mkdir -p "$1"
+    git -C "$1" init -q >/dev/null 2>&1
+    git -C "$1" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1
+    _f608_git -C "$1" commit -q --allow-empty -m init >/dev/null 2>&1
+}
+F608_BASE=$(mktemp -d 2>/dev/null)
+F608_MAIN="$F608_BASE/main dir"                     # protected main checkout
+_f608_init_main "$F608_MAIN"
+mkdir -p "$F608_MAIN/.loom/worktrees"
+F608_WT="$F608_MAIN/.loom/worktrees/issue-1"        # managed feature worktree
+git -C "$F608_MAIN" worktree add -q -b feature/issue-1 "$F608_WT" >/dev/null 2>&1
+touch "$F608_WT/.loom-managed"
+F608_DET="$F608_MAIN/.loom/worktrees/issue-2"       # managed, detached HEAD
+git -C "$F608_MAIN" worktree add -q --detach "$F608_DET" >/dev/null 2>&1
+touch "$F608_DET/.loom-managed"
+F608_SCR_BASE=$(mktemp -d 2>/dev/null)
+F608_SCR="$F608_SCR_BASE/scratch clone"             # unrelated repo on main
+_f608_init_main "$F608_SCR"
+F608_NS_BASE=$(mktemp -d 2>/dev/null)
+F608_NS="$F608_NS_BASE/nospace"                     # no-space control on main
+_f608_init_main "$F608_NS"
+
+# Backslash-escape every space (the unquoted spelling bash accepts).
+_f608_esc() { printf '%s' "${1// /\\ }"; }
+_F608_PROT="force operation targets protected branch 'main'"
+_F608_UNK="cannot resolve statically"
+_F608_DET="force operation on a detached or unresolved branch"
+
+# <allow|ask> <reason-needle or ""> <description> <mode> <cwd> <command>
+assert_f608() {
+    local want="$1" needle="$2" desc="$3" mode="$4" cwd="$5" cmd="$6" out got reason
+    TOTAL=$((TOTAL + 1))
+    out=$(make_input "$cmd" "$cwd" | env LOOM_FORCE_SCOPE="$mode" "$GUARD" 2>&1) || true
+    got=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // ""' 2>/dev/null)
+    [[ -z "$got" ]] && got=allow
+    reason=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null)
+    if [[ "$got" == "$want" && ( -z "$needle" || "$reason" == *"$needle"* ) ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $desc"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $desc"
+        echo -e "       Command: $cmd (mode: $mode, cwd: $cwd)"
+        echo -e "       Expected: $want${needle:+ (reason containing: $needle)}"
+        echo -e "       Got: $got -- ${reason:-<no reason>}"
+    fi
+}
+
+_F608_ESC_MAIN=$(_f608_esc "$F608_MAIN")
+for _c608 in "$F608_MAIN" "$F608_WT"; do
+    _w608="main"; [[ "$_c608" == "$F608_WT" ]] && _w608="worktree"
+    # The three original spellings, reset and force-push, protected mode:
+    # resolved to the protected branch itself (not an unresolved fallback).
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C '<spaced main>' reset --hard asks (protected)" \
+        protected "$_c608" "git -C '$F608_MAIN' reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C \"<spaced main>\" reset --hard asks (protected)" \
+        protected "$_c608" "git -C \"$F608_MAIN\" reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C <backslash-escaped main> reset --hard asks (protected)" \
+        protected "$_c608" "git -C $_F608_ESC_MAIN reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C '<spaced main>' push --force origin HEAD asks (protected)" \
+        protected "$_c608" "git -C '$F608_MAIN' push --force origin HEAD"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C \"<spaced main>\" push -f origin HEAD asks (protected)" \
+        protected "$_c608" "git -C \"$F608_MAIN\" push -f origin HEAD"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C <escaped main> push --force-with-lease origin HEAD asks (protected)" \
+        protected "$_c608" "git -C $_F608_ESC_MAIN push --force-with-lease origin HEAD"
+    # all mode asks for every recognized force op; off keeps allowing.
+    assert_f608 ask "" "#608 (cwd=$_w608): -C '<spaced main>' reset --hard asks (all)" \
+        all "$_c608" "git -C '$F608_MAIN' reset --hard"
+    assert_f608 ask "" "#608 (cwd=$_w608): -C <escaped main> push --force origin HEAD asks (all)" \
+        all "$_c608" "git -C $_F608_ESC_MAIN push --force origin HEAD"
+    assert_f608 allow "" "#608 (cwd=$_w608): -C '<spaced main>' reset --hard allowed (off)" \
+        off "$_c608" "git -C '$F608_MAIN' reset --hard"
+    # Partial quoting and adjacent global options.
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): partially quoted -C <base>/'main dir' asks (protected)" \
+        protected "$_c608" "git -C $F608_BASE/'main dir' reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -c 'k=a b' before -C '<spaced main>' asks (protected)" \
+        protected "$_c608" "git -c 'user.name=a b' -C '$F608_MAIN' --no-pager reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -c \"k=a b\" with no -C still finds the subcommand" \
+        protected "$F608_MAIN" "git -c \"user.name=a b\" reset --hard"
+    # Repeated / empty -C compose in git order.
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C <base> -C 'main dir' composes (protected)" \
+        protected "$_c608" "git -C $F608_BASE -C 'main dir' reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C '' -C '<spaced main>' (empty -C stays put) asks" \
+        protected "$_c608" "git -C '' -C '$F608_MAIN' reset --hard"
+    assert_f608 allow "" "#608 (cwd=$_w608): -C '<spaced main>' -C '<feature wt>' resolves to the LAST -C (feature)" \
+        protected "$_c608" "git -C '$F608_MAIN' -C '$F608_WT' reset --hard"
+    assert_f608 ask "$_F608_PROT" "#608 (cwd=$_w608): -C '<feature wt>' -C '<spaced main>' resolves to the LAST -C (main)" \
+        protected "$_c608" "git -C '$F608_WT' -C '$F608_MAIN' reset --hard"
+    # Known feature-branch targets keep their protected-mode allowance.
+    assert_f608 allow "" "#608 (cwd=$_w608): -C '<spaced feature wt>' reset --hard allowed (protected)" \
+        protected "$_c608" "git -C '$F608_WT' reset --hard"
+    assert_f608 allow "" "#608 (cwd=$_w608): -C <escaped feature wt> push --force origin HEAD allowed (protected)" \
+        protected "$_c608" "git -C $(_f608_esc "$F608_WT") push --force origin HEAD"
+    # Managed detached-recovery reset keeps its allowance through a quoted -C.
+    assert_f608 allow "" "#608 (cwd=$_w608): -C '<detached managed wt>' reset --hard origin/main allowed (protected)" \
+        protected "$_c608" "git -C '$F608_DET' reset --hard origin/main"
+    # Dynamic / unprovable operands fail closed without being evaluated.
+    assert_f608 ask "$_F608_UNK" "#608 (cwd=$_w608): -C \"\$X\" reset --hard asks (unknown cwd)" \
+        protected "$_c608" "git -C \"\$X\" reset --hard"
+    assert_f608 ask "$_F608_UNK" "#608 (cwd=$_w608): -C \$(pwd) reset --hard asks (unknown cwd)" \
+        protected "$_c608" "git -C \$(cd '$F608_WT' && pwd) reset --hard"
+    assert_f608 ask "$_F608_UNK" "#608 (cwd=$_w608): -C '<feature wt>'* (glob) asks (unknown cwd)" \
+        protected "$_c608" "git -C '$F608_WT'* reset --hard"
+    assert_f608 ask "$_F608_UNK" "#608 (cwd=$_w608): -C ~nobody/x asks (unknown cwd)" \
+        protected "$_c608" "git -C ~nobody/x reset --hard"
+    assert_f608 ask "$_F608_UNK" "#608 (cwd=$_w608): -C \"\$(cd <spaced main> && pwd)\" (quoted, separator inside) asks" \
+        protected "$_c608" "git -C \"\$(cd '$F608_MAIN' && pwd)\" reset --hard"
+    assert_f608 ask "" "#608 (cwd=$_w608): -C \$(cd x && pwd) reset --hard asks (all)" \
+        all "$_c608" "git -C \$(cd '$F608_MAIN' && pwd) reset --hard"
+    # Inert mentions stay inert.
+    assert_f608 allow "" "#608 (cwd=$_w608): echo of a spaced -C reset is data" \
+        protected "$_c608" "echo \"git -C '$F608_MAIN' reset --hard\""
+    assert_f608 allow "" "#608 (cwd=$_w608): commit -m mentioning a spaced -C reset is data" \
+        protected "$_c608" "git commit -m \"git -C '$F608_MAIN' reset --hard\""
+    assert_f608 allow "" "#608 (cwd=$_w608): comment mentioning a spaced -C reset is inert" \
+        protected "$_c608" "true # git -C '$F608_MAIN' reset --hard"
+    assert_f608 allow "" "#608 (cwd=$_w608): heredoc body mentioning a spaced -C reset is inert" \
+        protected "$_c608" "cat <<'EOF'"$'\n'"git -C '$F608_MAIN' reset --hard"$'\n'"EOF"
+done
+# Relative -C resolves against the process cwd (from the worktree: ../../..
+# is the main checkout; after a literal cd into the base: 'main dir').
+assert_f608 ask "$_F608_PROT" "#608: relative -C '../../..' from the worktree asks (protected)" \
+    protected "$F608_WT" "git -C '../../..' reset --hard"
+assert_f608 ask "$_F608_PROT" "#608: cd <base> && git -C 'main dir' reset --hard asks (protected)" \
+    protected "$F608_WT" "cd $F608_BASE && git -C 'main dir' reset --hard"
+# No-space and no -C controls keep their verdicts.
+assert_f608 ask "$_F608_PROT" "#608 control: quoted no-space -C '<repo>' reset --hard asks (protected)" \
+    protected "$F608_NS" "git -C '$F608_NS' reset --hard"
+assert_f608 ask "$_F608_PROT" "#608 control: unquoted no-space -C <repo> reset --hard asks (protected)" \
+    protected "$F608_NS" "git -C $F608_NS reset --hard"
+assert_f608 ask "$_F608_PROT" "#608 control: plain reset --hard in the spaced main checkout asks (protected)" \
+    protected "$F608_MAIN" "git reset --hard"
+assert_f608 allow "" "#608 control: plain reset --hard in the feature worktree allowed (protected)" \
+    protected "$F608_WT" "git reset --hard"
+# Separate scratch clone outside every known root keeps its #330 exemption
+# once the spaced -C path resolves; all mode still asks.
+assert_f608 allow "" "#608: -C '<spaced scratch clone on main>' reset --hard allowed (protected, outside known roots)" \
+    protected "$F608_MAIN" "git -C '$F608_SCR' reset --hard"
+assert_f608 ask "" "#608: -C '<spaced scratch clone on main>' reset --hard asks (all)" \
+    all "$F608_MAIN" "git -C '$F608_SCR' reset --hard"
+git -C "$F608_MAIN" worktree remove --force "$F608_WT" >/dev/null 2>&1 || true
+git -C "$F608_MAIN" worktree remove --force "$F608_DET" >/dev/null 2>&1 || true
+rm -rf "$F608_BASE" "$F608_SCR_BASE" "$F608_NS_BASE"
+unset _c608 _w608 _F608_ESC_MAIN _F608_PROT _F608_UNK _F608_DET
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 
