@@ -2664,7 +2664,7 @@ parse_force_ops() {
             cdk = cd_seg_class(seg)
             if (cdk == "unknown") { curcwd = UNK; continue }
             if (cdk == "cd") {
-                ci = CDW_IDX; cdtok = CT[ci + 1]
+                cdtok = CDW_ARG
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
@@ -5509,7 +5509,7 @@ resolve_stash_cwd() {
             cdk = cd_seg_class(seg)
             if (cdk == "unknown") { curcwd = UNK; continue }
             if (cdk == "cd") {
-                ci = CDW_IDX; cdtok = CT[ci + 1]
+                cdtok = CDW_ARG
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
@@ -5848,7 +5848,9 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 #   cd_word_class(toks, m, start) -- classifies the COMMAND POSITION of one
 #       segment, starting at toks[start] (leading NAME=value words skipped):
 #         "cd"       a straight-line cd; CDW_IDX is the index of the cd word,
-#                    so the caller reads its argument from toks[CDW_IDX + 1].
+#                    so the caller reads its operand from CDW_ARG (repo#604: leading
+#                    redirections and cd options are skipped; an unprovable
+#                    option/operand shape yields "unknown").
 #         "unknown"  the cwd after this segment cannot be known statically:
 #                    the command word itself is ambiguous (see above), or a
 #                    cd sits behind a grouping / conditional / wrapper prefix
@@ -5926,11 +5928,88 @@ function cmdword_static(tok,   n, i, c, nc, out, in_s, in_d, SQ, DQ, BQ) {
     if (in_s || in_d) { CMDW_UNKNOWN = 1; return "" }
     return out
 }
+# cd_redir_skip(toks, j, m) -- repo#604. When toks[j] is a redirection word
+# (`>f`, `2>f`, `&>f`, `<f`, `{fd}>f`, `>&2`, `<<EOF`), return the index of the
+# first word AFTER it, also skipping the separate target word of a bare
+# operator (`>` `f`, `2>>` `f`). Return j unchanged when toks[j] is not a
+# redirection and -1 when it is one whose extent this scan cannot prove (a
+# process substitution target). Only an UNQUOTED leading operator counts, so
+# quoted or escaped redirection-like data is never treated as syntax.
+function cd_redir_skip(toks, j, m,   w, r) {
+    w = toks[j]
+    if (w !~ /^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(&>|[<>])/) return j
+    r = w
+    sub(/^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?/, "", r)
+    sub(/^(&>>|&>|<<<|<<-|<<|<>|<&|>&|>>|>\||>|<)/, "", r)
+    if (r ~ /^\(/) return -1
+    if (r == "") {
+        if (j + 1 > m) return -1
+        return j + 2
+    }
+    return j + 1
+}
+# cd_skip_prefix(toks, j, m) -- skip any mix of NAME=value words and leading
+# redirections (repo#604). Returns the index of the first other word, or -1.
+function cd_skip_prefix(toks, j, m,   nj) {
+    while (j <= m) {
+        if (toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) { j++; continue }
+        nj = cd_redir_skip(toks, j, m)
+        if (nj == -1) return -1
+        if (nj != j) { CDW_LEAD = 1; j = nj; continue }
+        break
+    }
+    return j
+}
+# cd_operand(toks, j, m) -- repo#604. j is the index of the cd word. Parse
+# literal options (-L -P -e -@ and combinations, a terminating --) skipping
+# redirection words, and set CDW_ARG to the operand word ("" when there is
+# none). Returns 0 when the resulting directory cannot be proven (an unknown
+# or non-literal option, an extra operand, an option without an operand, or a
+# -P operand containing dot-dot whose physical meaning differs from the logical
+# one), 1 otherwise. After -- a leading dash is an operand.
+function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
+    CDW_ARG = ""
+    opts = 0
+    nopd = 0
+    physical = 0
+    done = 0
+    p = j + 1
+    while (p <= m) {
+        w = toks[p]
+        nj = cd_redir_skip(toks, p, m)
+        if (nj == -1) return 0
+        if (nj != p) { p = nj; continue }
+        if (w == "") { p++; continue }
+        if (!done) {
+            if (w == "--") { done = 1; opts = 1; p++; continue }
+            raw = w
+            gsub(/[\\\047\042]/, "", raw)
+            if (raw ~ /^-./) {
+                if (w !~ /^-[LPe@]+$/) return 0
+                if (w ~ /P/) physical = 1
+                opts = 1
+                p++
+                continue
+            }
+        }
+        nopd++
+        if (nopd == 1) CDW_ARG = w
+        p++
+    }
+    if (nopd > 1) return 0
+    if (opts && nopd == 0) return 0
+    if (physical && CDW_ARG ~ /\.\./) return 0
+    if (CDW_ARG == "-") return 0
+    if (opts) CDW_LEAD = 1
+    return 1
+}
 function cd_word_class(toks, m, start,   j, w, pre, cls) {
     CDW_IDX = 0
+    CDW_ARG = ""
+    CDW_LEAD = 0
     pre = 0
-    j = start
-    while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) j++
+    j = cd_skip_prefix(toks, start, m)
+    if (j == -1) return "unknown"
     while (j <= m) {
         w = toks[j]
         while (substr(w, 1, 1) == "(") { w = substr(w, 2); pre = 1 }
@@ -5947,7 +6026,8 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
                     j++
                 }
             }
-            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) j++
+            j = cd_skip_prefix(toks, j, m)
+            if (j == -1) return "unknown"
             continue
         }
         break
@@ -5958,6 +6038,7 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
     if (cls != "cd") return ""
     if (pre) return "unknown"
     CDW_IDX = j
+    if (!cd_operand(toks, j, m)) return "unknown"
     return "cd"
 }
 # skip_assign_words(s) -- byte offset of the first word of segment s that is
@@ -6030,7 +6111,7 @@ function skip_assign_words(s,   n, i, c, nx, lvl, q, qs, par, kind, SQ, DQ, BQ) 
 # already stripped; whitespace inside quotes masked by mask_ws() when the
 # caller has it, raw otherwise). Same result as cd_word_class(); the words
 # from the command word on are left in the global CT[] (unmasked), so for "cd"
-# the argument is CT[CDW_IDX + 1].
+# the operand is CDW_ARG.
 function cd_seg_class(mseg,   off, cm, j) {
     split("", CT)
     off = skip_assign_words(mseg)
@@ -6068,7 +6149,7 @@ cmd_has_unproven_cwd_change() {
             if (seg == "") continue
             k = cd_seg_class(seg)
             if (k == "unknown") return 1
-            if (k == "cd" && CT[CDW_IDX] != "cd") return 1
+            if (k == "cd" && (CT[CDW_IDX] != "cd" || CDW_LEAD)) return 1
         }
         return 0
     }
@@ -7294,7 +7375,7 @@ extract_write_targets() {
             # the substitution; skip_assign_words() does not.
             cdk = cd_seg_class(substr(wsegs[i], origlen - length(seg) + 1))
             pend_unknown = (cdk == "unknown")
-            cdtok = (cdk == "cd") ? CT[CDW_IDX + 1] : ""
+            cdtok = (cdk == "cd") ? CDW_ARG : ""
 
             # `NAME=value` assignments in any ordinary shell assignment
             # position (#4881; keyword/multi-assignment shapes added by the

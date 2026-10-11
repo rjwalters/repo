@@ -286,3 +286,11 @@ wt:cd /tmp; ${C:-c}d {{MAIN}}; echo hi > out.log
 wt:D=$(mktemp -d /tmp/p.XXXX); cd $D; c''d {{MAIN}}; echo hi > out.log
 # Control: the same text as inert echo DATA must stay allowed by both.
 wt:cd /tmp; echo "c''d {{MAIN}}"; echo hi > out.log
+
+# ── cd behind a leading redirection / with options (repo#604) ─────────────
+wt:cd /tmp; >/dev/null cd {{MAIN}}; echo hi > out.log
+wt:cd /tmp; cd -P {{MAIN}}; echo hi > out.log
+wt:cd /tmp; cd -- {{MAIN}}; echo hi > out.log
+# Control: trailing redirection and inert data stay allowed by both.
+wt:cd /tmp 2>/dev/null; echo hi > out.log
+wt:cd /tmp; echo ">/dev/null cd {{MAIN}}"; echo hi > out.log
