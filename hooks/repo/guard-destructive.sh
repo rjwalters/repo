@@ -5907,15 +5907,23 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 #   cd_word_class(toks, m, start) -- classifies the COMMAND POSITION of one
 #       segment, starting at toks[start] (leading NAME=value words skipped):
 #         "cd"       a straight-line cd; CDW_IDX is the index of the cd word,
-#                    so the caller reads its operand from CDW_ARG (repo#604: leading
-#                    redirections and cd options are skipped; an unprovable
-#                    option/operand shape yields "unknown").
+#                    so the caller reads its operand from CDW_ARG (repo#604: cd
+#                    options are skipped; an unprovable option/operand shape
+#                    yields "unknown").
 #         "unknown"  the cwd after this segment cannot be known statically:
 #                    the command word itself is ambiguous (see above), or a
 #                    cd sits behind a grouping / conditional / wrapper prefix
 #                    (`(`, `{`, `!`, if/then/elif/else, while/until/do, time,
 #                    builtin, command) whose scope or execution this
-#                    control-flow-insensitive scan cannot follow.
+#                    control-flow-insensitive scan cannot follow, or the cd
+#                    carries ANY redirection (repo#611 review: bash opens
+#                    redirections BEFORE the builtin runs, and a failed open
+#                    makes bash skip the cd entirely -- `</missing cd /tmp`
+#                    leaves the cwd where it was -- so whether the cd ran
+#                    depends on a file operation this scan cannot prove).
+#                    The redirection targets of such a segment are still
+#                    judged as writes against the PRE-cd cwd by the callers;
+#                    only the post-segment cwd becomes unknown.
 #         ""         not a directory change.
 #
 # Callers turn "unknown" into the unknown_cwd() sentinel. It never starts with
@@ -6023,6 +6031,12 @@ function redir_pos(tok,   n, i, c, in_s, in_d, SQ, DQ) {
 # redirection and -1 when it is one whose extent this scan cannot prove (a
 # process substitution target). Only an UNQUOTED leading operator counts, so
 # quoted or escaped redirection-like data is never treated as syntax.
+# repo#611 review: a caller that merely STEPS OVER a redirection word still
+# cannot treat the cd as proven -- bash opens redirections before the builtin
+# runs and a failed open skips the cd (`</missing cd /tmp` leaves the cwd
+# alone). Every skip below therefore records CDW_REDIR = 1, which
+# cd_word_class turns into the "unknown" class. This function only measures
+# the EXTENT of a redirection word; it never vouches for the open succeeding.
 function cd_redir_skip(toks, j, m,   w, r) {
     w = toks[j]
     if (w !~ /^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(&>|[<>])/) return j
@@ -6038,12 +6052,14 @@ function cd_redir_skip(toks, j, m,   w, r) {
 }
 # cd_skip_prefix(toks, j, m) -- skip any mix of NAME=value words and leading
 # redirections (repo#604). Returns the index of the first other word, or -1.
+# A skipped redirection sets CDW_REDIR: the cd behind it is unprovable
+# (repo#611 review), even though its position is now known.
 function cd_skip_prefix(toks, j, m,   nj) {
     while (j <= m) {
         if (toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) { j++; continue }
         nj = cd_redir_skip(toks, j, m)
         if (nj == -1) return -1
-        if (nj != j) { CDW_LEAD = 1; j = nj; continue }
+        if (nj != j) { CDW_LEAD = 1; CDW_REDIR = 1; j = nj; continue }
         break
     }
     return j
@@ -6068,12 +6084,14 @@ function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
         if (nj == -1) {
             # A bare fd operator that ends the segment is the left half of a
             # `2>&1` / `>&2` that the segmenter cut at the ampersand: it has
-            # no target to write, so it cannot move the cwd. Anything else
+            # no target to write. It is still a redirection whose success is
+            # unprovable (fd 1 may be closed), so CDW_REDIR records it and
+            # the cd stays unprovable (repo#611 review). Anything else
             # unprovable stays unknown.
-            if (p == m && w ~ /^[0-9]*>>?$/) { p++; continue }
+            if (p == m && w ~ /^[0-9]*>>?$/) { CDW_REDIR = 1; p++; continue }
             return 0
         }
-        if (nj != p) { p = nj; continue }
+        if (nj != p) { CDW_REDIR = 1; p = nj; continue }
         if (w == "") { p++; continue }
         if (redir_pos(w) > 0) return 0
         if (!done) {
@@ -6103,6 +6121,7 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
     CDW_IDX = 0
     CDW_ARG = ""
     CDW_LEAD = 0
+    CDW_REDIR = 0
     pre = 0
     j = cd_skip_prefix(toks, start, m)
     if (j == -1) return "unknown"
@@ -6142,6 +6161,14 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
     if (pre) return "unknown"
     CDW_IDX = j
     if (!cd_operand(toks, j, m)) return "unknown"
+    # repo#611 review: bash opens redirections BEFORE the builtin runs, and a
+    # failed open makes bash skip the cd entirely (`</missing cd /tmp` leaves
+    # the cwd where it was, while this tracker would have adopted /tmp). No
+    # open is statically provable, so ANY redirection on the cd -- leading,
+    # trailing, fd-dup, glued or separated -- keeps the post-segment cwd
+    # unknown. The redirection targets themselves are still judged as writes
+    # against the PRE-cd cwd by the callers.
+    if (CDW_REDIR) return "unknown"
     return "cd"
 }
 # skip_assign_words(s) -- byte offset of the first word of segment s that is
