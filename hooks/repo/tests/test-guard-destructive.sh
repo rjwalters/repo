@@ -4471,6 +4471,115 @@ assert_ask "stash-scope (#600): cd <wt>; c''d <main>; git stash pop resolves to 
     "cd $WTC_WT; c''d $WTC_MAIN; git stash pop" "$WTC_MAIN"
 unset _U600 _C600 _S600 _T600 _SEPN600 _c600 _w600 _i600 _sp _tg _sep _sn
 
+# repo#601: the cwd trackers also ignored control flow. The shapes below leave
+# the real cwd different from the tracked one (a cd that is skipped or fails,
+# pushd/popd, eval, source, a function defined and called in the same command,
+# a cd inside a case arm, a cd in a subshell pipe stage / background job), so
+# every consumer now treats the cwd as UNKNOWN from that point: a relative
+# write denies, a force op asks, a stash recovery asks. A cd whose dependent
+# operations sit in the same && chain stays tracked, and unknown is cleared
+# only by an absolute cd. Nothing below is executed -- each command only
+# reaches the hook as JSON against disposable fake main/worktree roots.
+_U601="worktree-write-confinement-unknown-cwd"
+_C601="worktree-write-confinement"
+_NL601=$'\n'
+_P601=(
+    'false && cd /tmp'
+    'true || cd /tmp'
+    'cd /tmp || true'
+    'cd /tmp | cat'
+    'cd /tmp &'
+    "pushd $WTC_MAIN"
+    'popd'
+    "eval \"cd $WTC_MAIN\""
+    'source ./e.sh'
+    '. ./e.sh'
+    "f(){ cd $WTC_MAIN; }; f"
+    "function f { cd $WTC_MAIN; }; f"
+    "case x in x) cd $WTC_MAIN;; esac"
+)
+for _c601 in "$WTC_MAIN" "$WTC_WT"; do
+    _w601="main"; [[ "$_c601" == "$WTC_WT" ]] && _w601="worktree"
+    for _p601 in "${_P601[@]}"; do
+        # Every shape x separator that does not make the next segment part of
+        # the shape's own && chain (`false && cd /tmp && w` is success-gated).
+        for _sep in '; ' "$_NL601" ' || '; do
+            _sn="${_sep//$'\n'/<newline>}"
+            assert_deny_tag "write-confinement (#601, cwd=$_w601): ${_p601}${_sn}relative redirect" \
+                "${_p601}${_sep}echo hi > out.log" "$_c601" "$_U601"
+        done
+        assert_ask_env "force-op (#601, cwd=$_w601): ${_p601}; reset --hard asks (protected mode)" \
+            "LOOM_FORCE_SCOPE=protected" "cd $WTC_WT; ${_p601}; git reset --hard" "$_c601"
+        assert_ask_env "force-op (#601, cwd=$_w601): ${_p601}; push --force asks (protected mode)" \
+            "LOOM_FORCE_SCOPE=protected" "cd $WTC_WT; ${_p601}; git push --force origin HEAD" "$_c601"
+        assert_ask "stash-scope (#601, cwd=$_w601): ${_p601}; stash recovery asks" \
+            "cd $WTC_WT; ${_p601}; git stash pop" "$_c601"
+    done
+    # && after the directory change: the follow-up runs only when it ran.
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): true || cd /tmp && redirect (runs in the original cwd)" \
+        'true || cd /tmp && echo hi > out.log' "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): mkdir -p d && cd d; redirect (the cd may have been skipped)" \
+        'mkdir -p d && cd /tmp; echo hi > out.log' "$_c601" "$_U601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp && true; redirect (a leading cd is trusted like cd /tmp;)" \
+        'cd /tmp && true; echo hi > out.log' "$_c601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): cd /tmp && true || redirect" \
+        'cd /tmp && true || echo hi > out.log' "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): multi-line function body then redirect" \
+        "f() {${_NL601}cd /tmp${_NL601}}${_NL601}echo hi > out.log" "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): cd inside a multi-line case arm then redirect" \
+        "case x in${_NL601}x)${_NL601}cd /tmp${_NL601};;${_NL601}esac${_NL601}echo hi > out.log" "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): an absolute cd inside a later case arm cannot clear unknown" \
+        "case x in x) :;; y)${_NL601}cd /tmp;; esac; echo hi > out.log" "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): function defined earlier is called after an absolute cd" \
+        "f(){ cd $WTC_MAIN; }; cd /tmp; f; echo hi > out.log" "$_c601" "$_U601"
+    # Unknown is sticky across relative transitions...
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): pushd then a relative cd stays unknown" \
+        "pushd $WTC_MAIN; cd sub; echo hi > out.log" "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): eval then cd .. stays unknown" \
+        "eval 'cd x'; cd ..; echo hi > out.log" "$_c601" "$_U601"
+    # ...and cleared only by a proven absolute cd.
+    assert_allow "write-confinement (#601, cwd=$_w601): pushd then absolute cd /tmp recovers" \
+        "pushd $WTC_MAIN; cd /tmp; echo hi > out.log" "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): skipped cd then absolute cd /tmp recovers" \
+        'false && cd /nonexistent; cd /tmp; echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): eval then absolute cd /tmp recovers" \
+        "eval 'cd x'; cd /tmp; echo hi > out.log" "$_c601"
+    # Absolute targets keep going through their own target-specific check.
+    assert_allow "write-confinement (#601, cwd=$_w601): absolute worktree write after pushd" \
+        "pushd $WTC_MAIN; echo hi > $WTC_WT/ok.log" "$_c601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): absolute main write after a skipped cd" \
+        "false && cd /tmp; echo hi > $WTC_MAIN/evil.sh" "$_c601" "$_C601"
+    # Success-dependent idioms keep their verdict.
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp && make > log" \
+        'cd /tmp && make > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp && a && b | tee log" \
+        'cd /tmp && echo a && echo b | tee out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): false && cd /tmp && redirect is success-gated" \
+        'false && cd /tmp && echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp 2>&1 && redirect" \
+        'cd /tmp 2>&1 && echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp &&<newline> redirect" \
+        "cd /tmp &&${_NL601}echo hi > out.log" "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp || exit 1; redirect (exit is proven)" \
+        'cd /tmp || exit 1; echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp; redirect" \
+        'cd /tmp; echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): a fresh list after a conditional cd re-establishes cd" \
+        'cd /nonexistent && true; cd /tmp; echo hi > out.log' "$_c601"
+    # Inert mentions and ordinary child processes add no deny / ask.
+    assert_allow "write-confinement (#601, cwd=$_w601): quoted pushd/eval/source/case words are data" \
+        "cd /tmp; echo 'pushd $WTC_MAIN; eval x; source y; f(){ cd /; }; case x in'; echo hi > out.log" "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): comment mentioning pushd and false && cd" \
+        "cd /tmp # pushd $WTC_MAIN; false && cd /x"$'\n'"echo hi > out.log" "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): heredoc data mentioning pushd/eval/case" \
+        "cd /tmp; cat <<'EOF'${_NL601}pushd $WTC_MAIN${_NL601}eval x${_NL601}case x in${_NL601}EOF${_NL601}echo hi > out.log" "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): pushd/eval/source as arguments of an external command" \
+        'cd /tmp; ls pushd eval source . case; echo hi > out.log' "$_c601"
+    assert_allow "write-confinement (#601, cwd=$_w601): ordinary child processes keep the cwd" \
+        'cd /tmp; git log --oneline | head -1; sort -u /dev/null; echo hi > out.log' "$_c601"
+done
+unset _U601 _C601 _NL601 _P601 _c601 _w601 _p601 _sep _sn
+
 # ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
 # ---- where bash would NOT expand the `$`, or where a backtick hides a
 # ---- component the guard cannot see. ----

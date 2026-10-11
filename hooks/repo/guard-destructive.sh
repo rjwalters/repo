@@ -1809,7 +1809,7 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
         # with its own separators does not silently swallow the rest of the outer
         # one.
         if (cap && d[i] < capd) {
-            res = res "\n" seg
+            res = res (QS_MARK ? "\n" sprintf("%c", 5) "H" : "\n") seg
             seg = ""
             while (capd > d[i]) { act[capd] = 0; capd-- }
             cap = (capd > 0 && act[capd]) ? 1 : 0
@@ -1819,7 +1819,7 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
             continue
         }
         if (d[i] > 0 && (c == ";" || c == "&" || c == "|") && !bs_escaped(s, i)) {
-            if (cap) { res = res "\n" seg }
+            if (cap) { res = res (QS_MARK ? "\n" sprintf("%c", 5) "H" : "\n") seg }
             seg = ""
             cap = 1
             capd = d[i]
@@ -1830,7 +1830,7 @@ function subst_inner(s, d,   n, i, c, res, seg, cap, capd, act) {
         }
         if (cap) seg = seg c
     }
-    if (cap) res = res "\n" seg
+    if (cap) res = res (QS_MARK ? "\n" sprintf("%c", 5) "H" : "\n") seg
     return res
 }
 # subst_heads(s) — the FIRST (or only) command of every `$( … )`/backtick
@@ -2047,14 +2047,19 @@ function qsplit(s,   out, n, i, c, j, qc, ci, tc, inner, SQ, DQ, acs, acn, sdep)
             i++
             continue
         }
-        if (c == ";") { out = out "\n"; i++; continue }
+        # QS_MARK (repo#601): a caller that sets it gets the separator KIND
+        # back, as a marker byte (ENQ) plus one kind letter at the start of
+        # the segment the separator introduces: S ; A && O || P | B & R a
+        # redirection ampersand (2>&1, &>f) that is not a separator at all.
+        # Every other caller leaves QS_MARK unset and sees the old output.
+        if (c == ";") { out = out "\n" (QS_MARK ? sprintf("%c", 5) "S" : ""); i++; continue }
         if (c == "&") {
-            if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n"; i += 2; continue }
-            out = out "\n"; i++; continue
+            if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n" (QS_MARK ? sprintf("%c", 5) "A" : ""); i += 2; continue }
+            out = out "\n" (QS_MARK ? sprintf("%c", 5) ((substr(s, i - 1, 1) ~ /[<>]/ || substr(s, i + 1, 1) == ">") ? "R" : "B") : ""); i++; continue
         }
         if (c == "|") {
-            if (i < n && substr(s, i + 1, 1) == "|") { out = out "\n"; i += 2; continue }
-            out = out "\n"; i++; continue
+            if (i < n && substr(s, i + 1, 1) == "|") { out = out "\n" (QS_MARK ? sprintf("%c", 5) "O" : ""); i += 2; continue }
+            out = out "\n" (QS_MARK ? sprintf("%c", 5) "P" : ""); i++; continue
         }
         out = out c
         i++
@@ -2637,13 +2642,19 @@ parse_force_ops() {
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
         n = ml_segment(buf, segs)
+        flow_ml_kinds(buf, n, SK)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # repo#601: control-flow context shared with the other cwd
+            # trackers (see flow_begin / flow_cd in _CDWORD_AWK).
+            if (flow_begin(SK[i], seg)) curcwd = UNK
+            kb = FL_EFF
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
+            flow_track(seg)
             # cd-TRACKING (#350): thread a `cd DIR &&`/`cd DIR;` prefix earlier
             # in the SAME compound command through to later force-op segments —
             # mirrors extract_write_targets()/resolve_stash_cwd()s identical
@@ -2662,8 +2673,9 @@ parse_force_ops() {
             # group or conditional) makes the cwd UNKNOWN, which the caller
             # turns into an ask instead of judging a stale cwd.
             cdk = cd_seg_class(seg)
-            if (cdk == "unknown") { curcwd = UNK; continue }
+            if (cdk == "unknown") { flow_cd(kb, ""); curcwd = UNK; continue }
             if (cdk == "cd") {
+                if (flow_cd(kb, flow_next_kind(SK, i, n))) { curcwd = UNK; continue }
                 ci = CDW_IDX; cdtok = CT[ci + 1]
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
@@ -5460,16 +5472,21 @@ mark_expandable_dollars() {
 # =============================================================================
 resolve_stash_cwd() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK""$_HASLIVESUBST_AWK""$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_CDWORD_AWK""$_MASKWS_AWK"'
-    BEGIN { curcwd = startcwd; found = 0; UNK = unknown_cwd() }
+    BEGIN { curcwd = startcwd; found = 0; UNK = unknown_cwd(); QS_MARK = 1 }
     {
         $0 = qsplit($0)   # quote-aware segmentation
         n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) { segs[i] = flow_unmark(segs[i]); SK[i] = FL_KIND }
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # repo#601: control-flow context (see flow_begin in _CDWORD_AWK).
+            if (flow_begin(SK[i], seg)) curcwd = UNK
+            kb = FL_EFF
             if (seg == "") continue
+            flow_track(seg)
             # Mask whitespace INSIDE quoted spans before tokenizing (repo#194
             # review). Splitting on raw whitespace shreds a quoted path that
             # contains a space, so a -C or cd argument like "/main dir" became
@@ -5507,8 +5524,9 @@ resolve_stash_cwd() {
             # cwd. Relative cd / -C / --git-dir from UNKNOWN stay unknown
             # (they are prefixed with the sentinel, which the caller detects).
             cdk = cd_seg_class(seg)
-            if (cdk == "unknown") { curcwd = UNK; continue }
+            if (cdk == "unknown") { flow_cd(kb, ""); curcwd = UNK; continue }
             if (cdk == "cd") {
+                if (flow_cd(kb, flow_next_kind(SK, i, n))) { curcwd = UNK; continue }
                 ci = CDW_IDX; cdtok = CT[ci + 1]
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
@@ -5867,10 +5885,15 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 # Words in ARGUMENT positions are never inspected here, so quoted data and
 # comments that merely mention a disguised cd (`echo "c''d x"`) stay inert.
 #
-# Scope (documented, deliberately NOT a general shell interpreter): pushd/popd,
-# eval/source, functions or aliases defined in the same command, cd inside a
-# case arm, and short-circuit control flow (`false && cd /tmp; ...`) are not
-# modelled by these trackers; tracked as repo#601.
+# Scope (deliberately NOT a general shell interpreter): repo#601 adds a small
+# control-flow context on top of the recognizer (flow_* below). pushd, popd,
+# eval, source, the dot builtin, case, and a function defined in the same
+# command (and later called by name) make the cwd unknown, as does a cd inside
+# a case arm / brace group / function body, behind an or-list, in a pipe
+# stage or in a background job, and a cd that follows && once its list has
+# ended (it may have been skipped). A cd and the operations
+# gated by the same && chain stay tracked: those run only if it succeeded.
+# Aliases, traps, and `exec` are not modelled.
 #
 # NOTE: this is a SINGLE-QUOTED awk program. Keep comments apostrophe-free.
 # =============================================================================
@@ -5953,8 +5976,11 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
         break
     }
     if (j > m) return ""
+    if (w ~ /^[A-Za-z_][A-Za-z0-9_.:+@%-]*\(\)/ || (j < m && toks[j + 1] ~ /^\(\)/)) return "unknown"
     cls = cmdword_static(w)
     if (CMDW_UNKNOWN) return "unknown"
+    if (cls == "pushd" || cls == "popd" || cls == "eval" || cls == "source" || \
+        cls == "." || cls == "case" || cls == "function" || (cls in FN)) return "unknown"
     if (cls != "cd") return ""
     if (pre) return "unknown"
     CDW_IDX = j
@@ -6044,6 +6070,119 @@ function cmdw_unmask(s) {
     gsub(sprintf("%c", 2), " ", s)
     gsub(sprintf("%c", 3), "\t", s)
     return s
+}
+# ---- control-flow context for the cwd trackers (repo#601) ----------------
+# Segment KINDS (what separator introduced a segment): N start/newline,
+# S semicolon, A and-and, O or-or, P pipe, B background ampersand, R a
+# redirection ampersand (2>&1 or &>f, not a separator), H a command
+# substitution head (runs in a subshell, never alters the cwd flow).
+# qsplit() hands them over as an ENQ byte plus a letter when QS_MARK is set;
+# ml_segment() hands over separator offsets, see flow_ml_kinds().
+#
+# flow_unmark(s) strips the marker and leaves the kind in FL_KIND.
+function flow_unmark(s,   mk) {
+    mk = sprintf("%c", 5)
+    if (substr(s, 1, 1) == mk) { FL_KIND = substr(s, 2, 1); return substr(s, 3) }
+    FL_KIND = "N"
+    return s
+}
+# flow_ml_kinds(buf, n, K) -- K[k] = kind of the separator in front of
+# segment k of the ml_segment() result just produced for buf. ml_segment()
+# emits ONE segment per separator byte, so a two byte && or || leaves an
+# empty segment between its bytes; both halves get the pair kind.
+function flow_ml_kinds(buf, n, K,   k, p, ch, nx, pv) {
+    K[1] = "N"
+    for (k = 2; k <= n; k++) {
+        p = ml_segsep[k - 1]
+        ch = substr(buf, p, 1)
+        nx = substr(buf, p + 1, 1)
+        pv = substr(buf, p - 1, 1)
+        if (ch == ";") K[k] = "S"
+        else if (ch == "&") {
+            if (nx == "&" || (pv == "&" && k > 2 && ml_segsep[k - 2] == p - 1)) K[k] = "A"
+            else if (pv ~ /[<>]/ || nx == ">") K[k] = "R"
+            else K[k] = "B"
+        } else if (ch == "|") {
+            if (nx == "|" || (pv == "|" && k > 2 && ml_segsep[k - 2] == p - 1)) K[k] = "O"
+            else K[k] = "P"
+        } else K[k] = "N"
+    }
+}
+# flow_next_kind(K, i, n) -- kind of the separator after segment i, looking
+# past redirection fragments. "" at the end of the command.
+function flow_next_kind(K, i, n,   j) {
+    for (j = i + 1; j <= n; j++) {
+        if (K[j] == "R") continue
+        if (K[j] == "H") return ""
+        return K[j]
+    }
+    return ""
+}
+# flow_begin(kind, seg) -- call for every segment, in order, BEFORE its cwd
+# is used (seg already trimmed). Returns 1 when the cwd is no longer known
+# at this point: a new list begins after a conditional directory change
+# (the change may have been skipped or may have failed), or an or-branch
+# follows a list that changed directory (the branch runs only when that
+# change failed). `|| exit` is the one recovery whose cwd is proven: the
+# shell is gone before any later segment runs. FL_EFF is the effective kind.
+function flow_begin(kind, seg,   r) {
+    r = 0
+    FL_EFF = kind
+    if (kind == "H") return 0
+    if (seg ~ /^[ \t]*$/) {
+        if (kind == "A" || kind == "O" || kind == "P") FL_CARRY = kind
+        return 0
+    }
+    if (kind == "N" && FL_CARRY != "") { kind = FL_CARRY; FL_EFF = kind }
+    FL_CARRY = ""
+    if (kind == "A" || kind == "P" || kind == "R") return 0
+    if (kind == "O") {
+        if (FL_LISTCD && seg !~ /^[ \t]*(sudo[ \t]+)?exit([ \t]|$)/) { FL_COND = 1; r = 1 }
+        return r
+    }
+    if (FL_COND) r = 1
+    FL_COND = 0
+    FL_LISTCD = 0
+    return r
+}
+# flow_cd(kb, ka) -- a cwd-changing command position was found (class cd or
+# unknown). kb/ka are the kinds before/after it. Returns 1 when the change
+# must NOT be applied as a known cwd: it sits inside a case arm / function
+# body / brace group, behind an or-list, in a subshell pipe stage or in a
+# background job. A change that follows && may have been skipped: it stays
+# tracked for the && chain it gates (those operations run only if it ran) but
+# marks the list conditional, so the cwd is unknown once the list ends. A
+# leading cd followed by && is treated like a plain cd (its failure is the
+# same accepted assumption as for `cd X; cmd`), except that an or-branch
+# after it is ambiguous (see flow_begin).
+function flow_cd(kb, ka) {
+    if (kb == "H") return 0
+    FL_LISTCD = 1
+    if (FL_OPQ > 0) return 1
+    if (kb == "O" || kb == "P" || ka == "P" || ka == "B") { FL_COND = 1; return 1 }
+    if (kb == "A") FL_COND = 1
+    return 0
+}
+# flow_track(seg) -- opaque-block depth and same-command function names.
+# Inside a case statement, a brace group or a function body a directory
+# change is conditional or deferred, so none is trusted until the block
+# closes. A defined function name becomes an unknown command word.
+function flow_track(seg,   w, nm) {
+    w = seg
+    sub(/^[ \t]+/, "", w)
+    if (w ~ /^function[ \t]+[A-Za-z_]/) {
+        nm = w
+        sub(/^function[ \t]+/, "", nm)
+        sub(/[^A-Za-z0-9_.:+@%-].*$/, "", nm)
+        FN[nm] = 1
+        FL_OPQ++
+    } else if (w ~ /^[A-Za-z_][A-Za-z0-9_.:+@%-]*[ \t]*\(\)/) {
+        nm = w
+        sub(/[ \t]*\(\).*$/, "", nm)
+        FN[nm] = 1
+        FL_OPQ++
+    } else if (w ~ /^(case|\{)([ \t]|$)/) FL_OPQ++
+    else if (w ~ /^(esac|\})([ \t]|$)/) { if (FL_OPQ > 0) FL_OPQ-- }
 }
 '
 # Shell-side spelling of unknown_cwd() above -- the two MUST stay byte-equal.
@@ -7172,6 +7311,7 @@ extract_write_targets() {
         AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
         curcwd = startcwd
         UNK = unknown_cwd()
+        QS_MARK = 1   # repo#601: qsplit() reports separator kinds
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,
     # preserving embedded newlines (mirrors the #3898 multi-line
@@ -7272,20 +7412,32 @@ extract_write_targets() {
         nh = split(hbuf, heads, HSEP)
         for (k = 2; k <= nh; k++) {
             hw = mask_ws(heads[k])
-            $0 = $0 "\n" heads[k]
-            wbuf = wbuf "\n" hw
-            gbuf = gbuf "\n" mask_gt(hw)
+            HM = sprintf("%c", 5) "H"   # substitution head: own subshell
+            $0 = $0 "\n" HM heads[k]
+            wbuf = wbuf "\n" HM hw
+            gbuf = gbuf "\n" HM mask_gt(hw)
         }
         n = split($0, segs, "\n")
         nw = split(wbuf, wsegs, "\n")
         ng = split(gbuf, gsegs, "\n")
+        # repo#601: peel the separator-kind markers off all three parallel
+        # views (same length by construction, so they stay aligned).
+        for (i = 1; i <= n; i++) {
+            segs[i] = flow_unmark(segs[i]); SK[i] = FL_KIND
+            wsegs[i] = flow_unmark(wsegs[i])
+            gsegs[i] = flow_unmark(gsegs[i])
+        }
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             origlen = length(seg)
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # repo#601: control-flow context (see flow_begin in _CDWORD_AWK).
+            if (flow_begin(SK[i], seg)) curcwd = UNK
+            kb = FL_EFF
             if (seg == "") continue
+            flow_track(seg)
 
             # repo#600: classify the command position BEFORE the assignment
             # stripping below, on the quote-masked segment, with the shared
@@ -7375,6 +7527,9 @@ extract_write_targets() {
             # inherits the previous, possibly harmless /tmp or `$NAME` one.
             # (cdk / pend_unknown / cdtok were computed above, before the
             # assignment strip.)
+            if (cdk != "") {
+                if (flow_cd(kb, flow_next_kind(SK, i, n)) && cdk == "cd") { curcwd = UNK; continue }
+            }
             if (cdk == "cd") {
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)   # #5315

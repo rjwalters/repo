@@ -286,3 +286,32 @@ wt:cd /tmp; ${C:-c}d {{MAIN}}; echo hi > out.log
 wt:D=$(mktemp -d /tmp/p.XXXX); cd $D; c''d {{MAIN}}; echo hi > out.log
 # Control: the same text as inert echo DATA must stay allowed by both.
 wt:cd /tmp; echo "c''d {{MAIN}}"; echo hi > out.log
+
+# ── cwd tracking vs control flow (repo#601) ───────────────────────────────
+# A cd that is skipped or fails, pushd/popd, eval, source, a function defined
+# and called in the same command, a cd inside a case arm and a cd in a
+# background job / pipe stage all leave the real cwd different from the one a
+# straight-line tracker follows. Canonical makes the cwd unknown from there
+# (relative write -> worktree-write-confinement-unknown-cwd); the vendored
+# copy keeps its stale cwd and allows. Measured 2026-10-10 — see
+# DECLARED_DIVERGENCES.
+wt:false && cd /tmp; echo hi > out.log
+wt:true || cd /tmp; echo hi > out.log
+wt:cd /tmp || true; echo hi > out.log
+wt:mkdir -p d && cd /tmp; echo hi > out.log
+wt:cd /tmp & echo hi > out.log
+wt:pushd {{MAIN}}; echo hi > out.log
+wt:popd; echo hi > out.log
+wt:eval "cd {{MAIN}}"; echo hi > out.log
+wt:source ./e.sh; echo hi > out.log
+wt:. ./e.sh; echo hi > out.log
+wt:f(){ cd {{MAIN}}; }; f; echo hi > out.log
+wt:case x in x) cd {{MAIN}};; esac; echo hi > out.log
+# Controls: success-dependent chains, a proven `|| exit`, recovery by an
+# absolute cd, and inert mentions keep their allow in BOTH guards.
+wt:cd /tmp && make > out.log
+wt:false && cd /tmp && echo hi > out.log
+wt:cd /tmp || exit 1; echo hi > out.log
+wt:pushd {{MAIN}}; cd /tmp; echo hi > out.log
+wt:cd /tmp; echo "pushd {{MAIN}}; eval x; case x in"; echo hi > out.log
+wt:cd /tmp; ls pushd eval source; echo hi > out.log
