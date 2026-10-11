@@ -315,3 +315,15 @@ wt:cd /tmp || exit 1; echo hi > out.log
 wt:pushd {{MAIN}}; cd /tmp; echo hi > out.log
 wt:cd /tmp; echo "pushd {{MAIN}}; eval x; case x in"; echo hi > out.log
 wt:cd /tmp; ls pushd eval source; echo hi > out.log
+
+# ── git -C operand word parsing (repo#608) ────────────────────────────────
+# A quoted / escaped -C operand (and a quoted -c value) holding whitespace is
+# one shell word. Canonical splits git segments into real words and decodes
+# the -C path statically before resolving the branch; the fixture paths have
+# no spaces, so these pin the quoted spellings and adjacent -c value. The
+# spaced-path matrix itself lives in test-guard-destructive.sh (repo#608).
+wt:git -C '{{MAIN}}' reset --hard
+wt:git -C "{{MAIN}}" push --force origin HEAD
+wt:git -c 'user.name=a b' -C {{MAIN}} reset --hard
+wt:git -C $(cd {{MAIN}} && pwd) reset --hard
+wt:echo "git -C '{{MAIN}}' reset --hard"

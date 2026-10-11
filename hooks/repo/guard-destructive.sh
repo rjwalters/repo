@@ -2601,7 +2601,12 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 #   - split on ; | & && || and newline, strip a leading sudo wrapper.
 #   - only a segment whose command word is `git` is considered.
 #   - `git -C <path> ...` sets <cpath>; other pre-subcommand global options are
-#     skipped (`-c <k=v>` consumes its argument).
+#     skipped (`-c <k=v>` consumes its argument). A git segment is split into
+#     real shell words (shell_words), so a quoted/escaped operand containing
+#     whitespace stays one word, and each -C operand is statically decoded
+#     (static_path_word) to a literal path -- or the unknown-cwd sentinel when
+#     it holds an expansion/glob/unbalanced quote (repo#608). Repeated -C
+#     compose in git order; relative ones join onto the current cwd.
 #   - a preceding `cd DIR &&`/`cd DIR;` segment earlier in the SAME compound
 #     command threads DIR through as the effective cwd for later force-op
 #     segments (#350) — see the cd-tracking block below for the full
@@ -2689,26 +2694,62 @@ parse_force_ops() {
                 continue
             }
             if (toks[1] != "git") continue
+            # repo#608: re-split the git segment into real shell WORDS. The
+            # whitespace split above shreds a quoted or backslash-escaped
+            # operand holding a space (-C "/a b", -C /a\ b, -c "k=a b"), so a
+            # path fragment was read as the subcommand and the force op was
+            # never emitted -- an allow in every scope. shell_words() keeps
+            # each word raw; nothing is expanded or evaluated.
+            m = shell_words(seg, toks)
+            # ml_segment() keeps separators INSIDE a command substitution
+            # active (so smuggled commands there are still seen), which cuts
+            # `git -C $(cd x && pwd) reset --hard` into `git -C $(cd x` and
+            # `pwd) reset --hard` -- neither segment carried a recognizable
+            # force op. When this segment ends inside an open substitution or
+            # quote, re-read the ORIGINAL text through the following segments
+            # until the word closes, so the subcommand is found again (and the
+            # dynamic -C operand then makes the cwd unknown).
+            jn = i
+            while (SW_OPEN && jn < n) {
+                jn++
+                seg = substr(buf, ml_segbeg[i], ml_segsep[jn] - ml_segbeg[i])
+                sub(/^[ \t]+/, "", seg)
+                sub(/^sudo[ \t]+/, "", seg)
+                sub(/^[ \t]+/, "", seg)
+                m = shell_words(seg, toks)
+            }
             # Walk global options between `git` and the subcommand.
-            cpath = ""
+            # cpath tracks the PROCESS cwd git runs in. It starts at the
+            # tracked cd cwd (#350), which defaults to startcwd (the callers
+            # own $CWD) when no `cd` has run yet in this command, preserving
+            # the pre-#350 fallback exactly. Each -C moves it the way git
+            # does: repeated -C compose in order, a relative operand is
+            # joined onto the previous one, an empty operand stays put. The
+            # operand is decoded statically (static_path_word) so the caller
+            # gets a literal filesystem path; anything that cannot be proven
+            # (an expansion, a glob, a named-user tilde, an unbalanced quote)
+            # is UNKNOWN and the caller asks. A relative -C from an unknown
+            # (or empty) cwd is unknown too (repo#600).
+            cpath = curcwd
             k = 2
             while (k <= m) {
                 t = toks[k]
-                if (t == "-C") { cpath = toks[k+1]; k += 2; continue }
+                if (t == "-C") {
+                    if (k + 1 > m) { k = m + 1; break }
+                    gcd = static_path_word(toks[k+1], home)
+                    if (gcd == UNK) cpath = UNK
+                    else if (gcd == "") { }
+                    else if (gcd ~ /^\//) cpath = gcd
+                    else if (cpath == "" || cpath == UNK) cpath = UNK
+                    else cpath = cpath "/" gcd
+                    k += 2
+                    continue
+                }
                 if (t == "-c") { k += 2; continue }
                 if (t ~ /^-/)  { k += 1; continue }
                 break
             }
             if (k > m) continue
-            # No explicit `-C` on this segment — fall back to the tracked cd
-            # cwd (#350), which defaults to startcwd (the callers own $CWD)
-            # when no `cd` has run yet in this command, preserving the
-            # pre-#350 fallback exactly.
-            if (cpath == "") cpath = curcwd
-            # A RELATIVE -C is resolved by git against the process cwd, so
-            # from an unknown cwd it is unknown too (repo#600).
-            if (curcwd == UNK && cpath != UNK && \
-                strip_cd_quoting(expand_cd_arg(cpath, home)) !~ /^\//) cpath = UNK
             subcmd = toks[k]
             if (subcmd == "push") {
                 force = 0
@@ -6066,6 +6107,109 @@ function cd_seg_class(mseg,   off, cm, j) {
     for (j = 1; j <= cm; j++) CT[j] = cmdw_unmask(CT[j])
     return cd_word_class(CT, cm, 1)
 }
+# ---- shell word splitting + static path decoding for git -C (repo#608) ----
+# shell_words(s, W) -- split one segment into shell WORDS the way bash
+# delimits them, keeping each word RAW (quotes and backslashes intact) in
+# W[1..n]; returns n. A plain whitespace split shreds a quoted or
+# backslash-escaped path that contains a space (git -C "/a b" reset --hard
+# became -C "/a, then b" was read as the subcommand and the force op vanished
+# from the scan). Unquoted blanks end a word; blanks inside single quotes,
+# double quotes, a backslash escape, $( ), ${ } or backticks do not. An
+# unterminated construct simply runs to the end of the segment. Nothing is
+# expanded or evaluated.
+function shell_words(s, W,   n, i, c, nx, w, cnt, inw, lvl, q, qs, par, kind, SQ, DQ, BQ) {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    BQ = sprintf("%c", 96)
+    split("", W)
+    split("", qs)
+    split("", par)
+    split("", kind)
+    n = length(s)
+    cnt = 0
+    w = ""
+    inw = 0
+    lvl = 0
+    qs[0] = ""
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        nx = (i < n) ? substr(s, i + 1, 1) : ""
+        q = qs[lvl]
+        if (lvl == 0 && q == "" && (c == " " || c == "\t")) {
+            if (inw) { W[++cnt] = w; w = ""; inw = 0 }
+            continue
+        }
+        inw = 1
+        if (q == SQ) { if (c == SQ) qs[lvl] = ""; w = w c; continue }
+        if (c == "\\") { w = w c nx; i++; continue }
+        if (c == BQ && lvl > 0 && kind[lvl] == "B" && q == "") { lvl--; w = w c; continue }
+        if (q == DQ) {
+            if (c == DQ) { qs[lvl] = ""; w = w c; continue }
+        } else {
+            if (c == SQ) { qs[lvl] = SQ; w = w c; continue }
+            if (c == DQ) { qs[lvl] = DQ; w = w c; continue }
+            if (lvl > 0 && kind[lvl] == "P") {
+                if (c == "(") { par[lvl]++; w = w c; continue }
+                if (c == ")") { if (par[lvl] > 0) par[lvl]--; else lvl--; w = w c; continue }
+            }
+            if (lvl > 0 && kind[lvl] == "C") {
+                if (c == "{") { par[lvl]++; w = w c; continue }
+                if (c == "}") { if (par[lvl] > 0) par[lvl]--; else lvl--; w = w c; continue }
+            }
+        }
+        if (c == "$" && (nx == "(" || nx == "{")) {
+            lvl++
+            qs[lvl] = ""
+            par[lvl] = 0
+            kind[lvl] = (nx == "(") ? "P" : "C"
+            w = w c nx
+            i++
+            continue
+        }
+        if (c == BQ) {
+            lvl++
+            qs[lvl] = ""
+            par[lvl] = 0
+            kind[lvl] = "B"
+            w = w c
+            continue
+        }
+        w = w c
+    }
+    if (inw) W[++cnt] = w
+    # SW_OPEN: the segment ended inside a quote or substitution, so the last
+    # word continues past it (the caller may rejoin following segments).
+    SW_OPEN = (lvl > 0 || qs[lvl] != "")
+    return cnt
+}
+# static_path_word(tok, home) -- the literal directory a git -C operand names,
+# or unknown_cwd() when that cannot be proven statically. Quote removal and
+# backslash escapes follow cmdword_static() exactly (so any dollar expansion,
+# backtick, unquoted glob or brace character, or unbalanced quote is unknown).
+# A leading unquoted tilde or HOME reference is expanded from the guard process
+# own HOME (same narrow slice as expand_cd_arg); any other tilde form (a named
+# user home, or no HOME) is unknown. A result holding a newline or one of the
+# record separator bytes this file emits is unknown too, so it can never split
+# or forge an output record. The empty string means an empty operand, which git
+# treats as "stay in the current directory".
+function static_path_word(tok, home,   pre, rest, d) {
+    pre = ""
+    rest = tok
+    if (substr(tok, 1, 1) == "~") {
+        if (home == "" || (tok != "~" && substr(tok, 1, 2) != "~/")) return unknown_cwd()
+        pre = home
+        rest = substr(tok, 2)
+    } else if (substr(tok, 1, 5) == "$HOME" && (length(tok) == 5 || substr(tok, 6, 1) == "/")) {
+        if (home == "") return unknown_cwd()
+        pre = home
+        rest = substr(tok, 6)
+    }
+    d = (rest == "") ? "" : cmdword_static(rest)
+    if (rest != "" && CMDW_UNKNOWN) return unknown_cwd()
+    d = pre d
+    if (index(d, "\n") || index(d, sprintf("%c", 31)) || index(d, sprintf("%c", 14))) return unknown_cwd()
+    return d
+}
 function cmdw_unmask(s) {
     gsub(sprintf("%c", 2), " ", s)
     gsub(sprintf("%c", 3), "\t", s)
@@ -9006,11 +9150,13 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
                 # repo#600: a command word parse_force_ops() could not resolve
                 # statically (a disguised/expanded cd spelling, a cd inside a
-                # group or conditional) left the cwd UNKNOWN, so neither the
+                # group or conditional, or -- repo#608 -- a git -C operand
+                # with an expansion, glob or unbalanced quote) left the cwd
+                # UNKNOWN, so neither the
                 # branch identity nor the out-of-tree exemption can be judged
                 # -- ask, never silently allow.
                 if [[ "$_fcwd" == "$_LOOM_UNKNOWN_CWD" ]]; then
-                    ask "Command requires confirmation: $COMMAND (force operation after a command word that may change the working directory in a way this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd — so the branch it acts on is unknown)" "force-op:unknown-cwd"
+                    ask "Command requires confirmation: $COMMAND (force operation after a command word that may change the working directory in a way this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd, or a git -C operand built from an expansion or glob — so the branch it acts on is unknown)" "force-op:unknown-cwd"
                 fi
                 if [[ "$_ftarget" == "@HEAD@" ]]; then
                     _fbranch=""
