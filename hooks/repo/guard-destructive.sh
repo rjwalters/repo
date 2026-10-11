@@ -5992,6 +5992,30 @@ function cmdword_static(tok,   n, i, c, nc, out, in_s, in_d, SQ, DQ, BQ) {
     if (in_s || in_d) { CMDW_UNKNOWN = 1; return "" }
     return out
 }
+# redir_pos(tok) -- repo#604. 1-based position of the first UNQUOTED, unescaped
+# < or > in tok, 0 when there is none. A redirection operator glued to the cd
+# word (cd>f DIR) or to its operand (DIR>f) is syntax, not part of the name.
+function redir_pos(tok,   n, i, c, in_s, in_d, SQ, DQ) {
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    in_s = 0
+    in_d = 0
+    n = length(tok)
+    for (i = 1; i <= n; i++) {
+        c = substr(tok, i, 1)
+        if (in_s) { if (c == SQ) in_s = 0; continue }
+        if (in_d) {
+            if (c == "\\") { i++; continue }
+            if (c == DQ) in_d = 0
+            continue
+        }
+        if (c == SQ) { in_s = 1; continue }
+        if (c == DQ) { in_d = 1; continue }
+        if (c == "\\") { i++; continue }
+        if (c == "<" || c == ">") return i
+    }
+    return 0
+}
 # cd_redir_skip(toks, j, m) -- repo#604. When toks[j] is a redirection word
 # (`>f`, `2>f`, `&>f`, `<f`, `{fd}>f`, `>&2`, `<<EOF`), return the index of the
 # first word AFTER it, also skipping the separate target word of a bare
@@ -6041,9 +6065,17 @@ function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
     while (p <= m) {
         w = toks[p]
         nj = cd_redir_skip(toks, p, m)
-        if (nj == -1) return 0
+        if (nj == -1) {
+            # A bare fd operator that ends the segment is the left half of a
+            # `2>&1` / `>&2` that the segmenter cut at the ampersand: it has
+            # no target to write, so it cannot move the cwd. Anything else
+            # unprovable stays unknown.
+            if (p == m && w ~ /^[0-9]*>>?$/) { p++; continue }
+            return 0
+        }
         if (nj != p) { p = nj; continue }
         if (w == "") { p++; continue }
+        if (redir_pos(w) > 0) return 0
         if (!done) {
             if (w == "--") { done = 1; opts = 1; p++; continue }
             raw = w
@@ -6102,7 +6134,11 @@ function cd_word_class(toks, m, start,   j, w, pre, cls) {
     if (CMDW_UNKNOWN) return "unknown"
     if (cls == "pushd" || cls == "popd" || cls == "eval" || cls == "source" || \
         cls == "." || cls == "case" || cls == "function" || (cls in FN)) return "unknown"
-    if (cls != "cd") return ""
+    if (cls != "cd") {
+        # repo#604: `cd>/dev/null DIR` is cd with a redirection glued on.
+        if (redir_pos(w) > 1 && cmdword_static(substr(w, 1, redir_pos(w) - 1)) == "cd") return "unknown"
+        return ""
+    }
     if (pre) return "unknown"
     CDW_IDX = j
     if (!cd_operand(toks, j, m)) return "unknown"
@@ -7494,9 +7530,9 @@ extract_write_targets() {
     # as well — that costs a resolution this guard was never entitled to make,
     # and re-deriving "which `$` would bash expand" in a third place is exactly
     # the drift the mark_expandable_dollars() header warns is itself a bypass.
-    # repo#604: a cd segment's own redirections (`>F cd X`, `cd X >F`,
+    # repo#604: the redirections of a cd segment (`>F cd X`, `cd X >F`,
     # `2>F cd X`) open their targets in the PRE-cd cwd, so they are write
-    # targets like any other segment's. The cd branch used to `continue` past
+    # targets like any other. The cd branch used to `continue` past
     # the redirection scan, which let `>MAIN/evil.sh cd /tmp` through. Same
     # mtoks-based operator test as the general scan; called before curcwd moves.
     function cd_redir_targets(   j, mt, op) {

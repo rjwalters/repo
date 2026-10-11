@@ -335,3 +335,8 @@ wt:cd /tmp; cd -- {{MAIN}}; echo hi > out.log
 # Control: trailing redirection and inert data stay allowed by both.
 wt:cd /tmp 2>/dev/null; echo hi > out.log
 wt:cd /tmp; echo ">/dev/null cd {{MAIN}}"; echo hi > out.log
+wt:cd /tmp >/dev/null 2>&1; echo hi > out.log
+wt:>{{MAIN}}/evil.sh cd /tmp
+wt:cd /tmp >{{MAIN}}/evil.sh
+# A redirection glued to the operand: canonical makes the cwd unknown.
+wt:cd /tmp; cd {{MAIN}}>/dev/null; echo hi > out.log

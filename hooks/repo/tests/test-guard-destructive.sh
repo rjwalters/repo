@@ -4444,10 +4444,49 @@ for _c604 in "$WTC_MAIN" "$WTC_WT"; do
     assert_deny_tag "write-confinement (#604, cwd=$_w604): spaced destination after cd --" \
         "cd /tmp; cd -- '$WTC_MAIN'; echo hi > out.log" "$_c604" "worktree-write-confinement"
     # Unprovable shapes fail closed under the unknown-cwd tag.
-    for _sp in "cd -x" "cd -P" "cd -" ">/dev/null 2>&1 cd /tmp"; do
+    for _sp in "cd -x" "cd -P" "cd -"; do
         assert_deny_tag "write-confinement (#604, cwd=$_w604): unprovable [$_sp]" \
             "cd /tmp; $_sp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
     done
+    # A redirection glued to the cd word or to its operand is syntax, so the
+    # operand is not provable and the cwd is unknown.
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): redirection glued to the operand" \
+        "cd /tmp; cd $WTC_MAIN>/dev/null; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): redirection glued to the cd word" \
+        "cd /tmp; cd>/dev/null $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    # A trailing fd-dup (`2>&1`) on a literal cd keeps the operand.
+    # LEADING `>/dev/null 2>&1 cd X` still fails closed under the unknown-cwd
+    # tag: the segmenter cuts at the `&` before the cd word, so the cd is not
+    # reachable. That is an over-strict segmenting artefact, not a design
+    # property; a trailing fd-dup (below) keeps the operand.
+    for _sp in ">/dev/null 2>&1 cd /tmp" ">/dev/null 2>&1 cd $WTC_MAIN"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): leading fd-dup segmenting artefact [$_sp]" \
+            "cd /tmp; $_sp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    assert_allow "write-confinement (#604, cwd=$_w604): cd /tmp >/dev/null 2>&1" \
+        'cd /tmp >/dev/null 2>&1; echo hi > out.log' "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): cd /tmp 2>&1" \
+        'cd /tmp 2>&1; echo hi > out.log' "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): cd <wt> 2>&1 && write" \
+        "cd $WTC_WT 2>&1 && echo hi > out.log" "$_c604"
+    # The redirections of a cd segment are write targets, judged against the
+    # cwd BEFORE the cd runs (they are opened first).
+    for _sp in ">" "2>" ">>"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): leading [$_sp] into main on a cd segment" \
+            "${_sp}$WTC_MAIN/evil.sh cd /tmp" "$_c604" "worktree-write-confinement"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): trailing [$_sp] into main on a cd segment" \
+            "cd /tmp ${_sp}$WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): separated target on a cd segment" \
+        "cd /tmp > $WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): trailing redirect after cd -P" \
+        "cd -P /tmp >$WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): leading redirect judged in the pre-cd cwd" \
+        "cd $WTC_MAIN; >out.log cd /tmp" "$_c604" "worktree-write-confinement"
+    assert_allow "write-confinement (#604, cwd=$_w604): leading redirect before cd <main> is judged in /tmp" \
+        "cd /tmp; >out.log cd $WTC_MAIN" "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): redirect to /dev/null on a cd segment" \
+        'cd /tmp >/dev/null; echo hi > out.log' "$_c604"
     assert_deny_tag "write-confinement (#604, cwd=$_w604): cd -P with dot-dot is unknown" \
         "cd /tmp; cd -P ../x; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
     assert_deny_tag "write-confinement (#604, cwd=$_w604): process-substitution redirect before cd is unknown" \
