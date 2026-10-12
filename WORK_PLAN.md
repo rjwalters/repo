@@ -21,7 +21,7 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#616**: repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown)
+_None._
 
 ## In Progress
 
@@ -52,7 +52,6 @@ Issues carrying `loom:curated`.
 - **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
 - **#604**: guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X) *(curated)*
 - **#612**: guard: quoted git subcommand/flags and --git-dir/--work-tree hide force ops from parse_force_ops *(curated)*
-- **#616**: repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -68,11 +67,11 @@ _None._
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Operator priority | 0 |
-| Ready (`loom:issue`) | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 3 |
-| Curated | 6 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->

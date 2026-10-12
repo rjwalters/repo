@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-12
+- **PR #618**: repo-remote: opt-in AWS Spot launch via REPO_REMOTE_MARKET (#616)
+- **Issue #616** (closed): repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown)
+
 ### 2026-10-11
 - **PR #614**: guard: resolve git -C paths with whitespace for force ops (#608)
 - **Issue #608** (closed): guard: git -C with a whitespace path fails open for force ops under forceScope: protected
