@@ -80,6 +80,12 @@ meaning; under `ssm`, `public_ip` is `""` because no public IP is looked up.
 See [AWS transport: direct SSH or SSM Session
 Manager](#aws-transport-direct-ssh-or-ssm-session-manager).
 
+The `--json` output for `up` (plan and real provision) and `down` also carries
+an **additive** `market` field (repo#616): `"on-demand"` (the default) or
+`"spot"`, the configured `REPO_REMOTE_MARKET`, so automation can tell a Spot
+launch from an on-demand one **before** spending money. See [AWS market:
+on-demand or Spot](#aws-market-on-demand-or-spot).
+
 `--force` is a **separate** override with a single job: it lets `up` reuse, or
 `down` stop/terminate, an instance carrying a **fleet marker** (see
 [Fleet-marked hosts: the reuse and teardown
@@ -88,7 +94,8 @@ relax the cost gate — `--force` without a pre-supplied
 `REPO_REMOTE_INSTANCE_TYPE` still fails loudly.
 
 Exit codes: `0` success (including a dry-run plan), `2` missing/invalid required
-config (the cost gate), `3` provider authentication failed, `4` cloud operation
+config (the cost gate; also the `REPO_REMOTE_MARKET=spot` lifecycle refusals),
+`3` provider authentication failed, `4` cloud operation
 failed, `5` refused to reuse a fleet-marked instance (pass `--force`), `6`
 host-identity verification failed — the host reachable at the SSH alias is not
 this repo's instance, or its identity could not be established (see [Stale SSH
@@ -240,6 +247,10 @@ REPO_REMOTE_TRANSPORT=ssh                 # ssh (default: public IP + tcp/22 fro
 REPO_REMOTE_INSTANCE_PROFILE=             # optional IAM instance profile NAME attached at launch
                                            # (--iam-instance-profile Name=<name>); REQUIRED for a fresh ssm launch.
                                            # Setting it alone does not change the transport.
+
+# --- market (AWS only; see "AWS market: on-demand or Spot" below) ---
+REPO_REMOTE_MARKET=on-demand              # on-demand (default) or spot: a one-time Spot launch that is
+                                           # TERMINATED (never stopped) on interruption or idle shutdown
 ```
 
 Only `REPO_REMOTE_PROVIDER` (or a provider argument) and that provider's
@@ -631,6 +642,10 @@ RUNNING → offer reuse; STOPPED → offer to start.
    change and no current-IP or public-IP lookup, and re-points the alias at the
    instance ID instead — see [AWS transport: direct SSH or SSM Session
    Manager](#aws-transport-direct-ssh-or-ssm-session-manager).
+   With `REPO_REMOTE_MARKET=spot`, a **stopped** instance (pinned or
+   tag-discovered) is never started: `up` refuses (exit `2`) before
+   `start-instances` — see [AWS market: on-demand or
+   Spot](#aws-market-on-demand-or-spot). A running one is still reused.
    On AWS, reuse also **inspects the instance's actual root volume** and, if it
    is still gp2, prints a stderr advisory with the exact `aws ec2
    modify-volume` command to convert it — `up` never runs that command itself.
@@ -672,6 +687,11 @@ Requirements for the created instance:
 - **AWS: the configured instance profile, if any** — `REPO_REMOTE_INSTANCE_PROFILE=<name>`
   adds `--iam-instance-profile Name=<name>` to `run-instances` on either
   transport. A fresh `ssm` launch requires it.
+- **AWS: the configured market** — `REPO_REMOTE_MARKET=spot` adds
+  `--instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}`
+  and `--instance-initiated-shutdown-behavior terminate` to the same single
+  `run-instances` call; on-demand (the default) adds neither. See **AWS market:
+  on-demand or Spot** below.
 - For GPU hosts, see **GPU hosts** below — this needs a GPU-ready image and,
   on AWS, quota-aware handling.
 - Install an idle-shutdown guard (cron checking SSH sessions + CPU, running
@@ -686,7 +706,10 @@ Requirements for the created instance:
   GCP: prefer OS Login / IAP.
 
 If the zone/region is stocked out (common for GPU types), offer the nearest
-alternative zone or the next type down rather than failing.
+alternative zone or the next type down rather than failing. That is an offer
+to the human, not something the script does: `repo-remote up` calls
+`run-instances` exactly once and never retries another type, zone, or market
+on its own.
 
 #### Security group and SSH ingress (AWS)
 
@@ -928,11 +951,83 @@ Invalid values fail before any cloud call (exit `2`): an unknown transport,
 under `ssm` (it goes into the `ProxyCommand`), and an SSH user or key path
 that would add a line to the SSH config.
 
+#### AWS market: on-demand or Spot
+
+`REPO_REMOTE_MARKET` picks the EC2 purchasing option for a **fresh** launch
+(AWS only; the usual two config layers apply, repo wins). It is **opt-in**:
+unset, empty, or `on-demand` launches exactly as before — no market flag is
+passed and the lifecycle is unchanged.
+
+```bash
+# per-repo (or shared) config
+REPO_REMOTE_MARKET=spot
+```
+
+With `spot`, the one `run-instances` call gains two arguments:
+
+```bash
+--instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}
+--instance-initiated-shutdown-behavior terminate
+```
+
+Everything else about the launch is unchanged: tag, key pair, security group
+and SSH ingress (or the zero-inbound `ssm` group), IMDSv2 pin, typed root
+volume, instance profile, user-data (identity marker and idle guard), and the
+post-launch host-identity check.
+
+**What Spot changes about the lifecycle.**
+
+- **It terminates; it never stops.** A Spot interruption terminates the box,
+  and so does the idle guard: its `shutdown -h` is an instance-initiated
+  shutdown, which this launch turns into **termination**. The root volume, and
+  everything on it that you did not push or copy off, goes with it. Commit and
+  push often. The idle guard is still installed (it is what ends the bill).
+- **No reuse of a stopped box.** `up` never starts a stopped or stopping
+  instance under `spot` — pinned or tag-discovered. It exits `2` before
+  `start-instances`, with two ways forward: set `REPO_REMOTE_MARKET=on-demand`
+  to restart that box as before, or terminate it with
+  `repo-remote down --yes --delete` and re-run `up`. A **running** instance is
+  still reused. A pinned `REPO_REMOTE_INSTANCE_ID` that is already
+  `terminated` or `shutting-down` (an interruption or idle shutdown happened)
+  is treated as gone, and `up` launches a fresh Spot instance and writes its id
+  back.
+- **Teardown is `--delete`.** `repo-remote down --yes` without `--delete` would
+  stop the box, which this configuration does not support, so it is refused
+  (exit `2`) before any cloud call. `repo-remote down --yes --delete`
+  terminates exactly the resolved instances, with the fleet-marker guard
+  intact. The dry run (`down` without `--yes`) still lists what would be
+  affected and notes the refusal.
+- **Price and capacity are not guaranteed.** AWS may have no Spot capacity for
+  the type, or may reclaim it at any time with a two-minute notice. A rejected
+  launch (`InsufficientInstanceCapacity`, a Spot quota such as
+  `MaxSpotInstanceCountExceeded`, `SpotMaxPriceTooLow`) fails with exit `4`.
+  **Nothing is retried**: no second `run-instances`, no fallback to
+  on-demand, no other instance type. Spot vCPU quotas are separate from
+  on-demand ones (Service Quotas → EC2 → *All Standard (A, C, D, H, I, M, R,
+  T, Z) Spot Instance Requests*, `L-34B43A08`; GPU: *All G and VT Spot Instance
+  Requests*, `L-3819A6DF`).
+- **The cost estimate stays the on-demand rate.** No maximum price is passed,
+  so AWS caps the Spot price at the on-demand price. The estimate in the plan
+  and the `up` JSON is therefore an upper bound for Spot. The actual Spot
+  price varies and is usually lower.
+
+The plan (dry run) names the market and these caveats; the `up` and `down`
+JSON carry `"market":"spot"` or `"market":"on-demand"`. On reuse the field
+reports the **configuration**. It is not an inspection of the existing
+instance's actual lifecycle.
+
+Any value other than exactly `on-demand` or `spot` (including `Spot`), and
+`spot` with GCP, fails before any cloud call (exit `2`), on `up` (dry run
+included) and on `down`.
+
 #### The idle-shutdown guard
 
 The guard is a cron watchdog (`/usr/local/bin/repo-remote-idle-check`, run every
 minute) installed via cloud-init user-data. It powers the host off with
 `shutdown -h` once it has been idle for `REPO_REMOTE_IDLE_SHUTDOWN_MIN` minutes.
+On an on-demand box that **stops** it. Under `REPO_REMOTE_MARKET=spot` it
+**terminates** it, disk included (see [AWS market: on-demand or
+Spot](#aws-market-on-demand-or-spot)).
 
 **`REPO_REMOTE_IDLE_SHUTDOWN_MIN=0` (or any non-positive value) disables the
 guard outright** — no cron/watchdog script is installed at all. This is
@@ -1608,7 +1703,9 @@ which resolves the same two config layers and only ever touches instances
 carrying this repo's `repo-remote` tag. `repo-remote down` without `--yes` is a
 dry run that lists exactly what would stop; `--yes` acts, and `--delete`
 terminates. `down` is subject to the same fleet-marker guard as `up`'s reuse
-path — see **Fleet-marked hosts: the reuse and teardown guard** above.
+path — see **Fleet-marked hosts: the reuse and teardown guard** above. Under
+`REPO_REMOTE_MARKET=spot`, `down --yes` without `--delete` is refused (exit
+`2`) because a Spot box terminates rather than stops; use `--delete`.
 
 - `--status`: list all instances labeled `repo-remote=<repo-name>` with state
   and uptime; estimate accumulated cost. Uses the resolved credentials (shared
