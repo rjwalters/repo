@@ -178,14 +178,31 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_SSM_SG_FIND:-None}"
       exit 0
     fi
-    if printf '%s' "$*" | grep -qF "starts_with(Description, 'repo-remote:" && printf '%s' "$*" | grep -qF ":20')"; then
-      # Legacy-format rule lookup (aws_notice_legacy_ssh_ingress): answered
-      # independently of the owned-CIDR query below.
-      if [[ -n "${MOCK_AWS_SG_LEGACY_CIDRS:-}" ]]; then
-        printf '%s\n' "${MOCK_AWS_SG_LEGACY_CIDRS}"
-      else
-        printf 'None\n'
+    if printf '%s' "$*" | grep -qF 'starts_with(Description' \
+       && ! printf '%s' "$*" | grep -qE "starts_with\(Description, '[^']*:'\)"; then
+      # Legacy-format rule lookup (aws_notice_legacy_ssh_ingress). The owned-rule
+      # query's prefix always ends in ':' (repo-remote:<name>:<caller>:); the
+      # legacy query's does not, which is how the two are told apart -- so a test
+      # that sets owned CIDRs no longer also gets a spurious legacy NOTICE.
+      # MOCK_AWS_SG_RULE_DESCS is a space-separated list of <cidr>=<Description>;
+      # the mock EVALUATES the query's starts_with() prefix and (if present) its
+      # length() pin against each Description, so a too-loose legacy match (a
+      # caller id starting with "20", e.g. hostname 2024-mbp) fails a test here
+      # rather than only showing up on a real security group.
+      q="$*"
+      lpfx="$(printf '%s' "$q" | sed -E "s/.*starts_with\(Description, '([^']*)'.*/\1/")"
+      llen=""
+      if printf '%s' "$q" | grep -qF 'length(Description) == '; then
+        llen="$(printf '%s' "$q" | sed -E 's/.*length\(Description\) == `([0-9]+)`.*/\1/')"
       fi
+      lout=""
+      for lrule in ${MOCK_AWS_SG_RULE_DESCS:-}; do
+        lcidr="${lrule%%=*}"; ldesc="${lrule#*=}"
+        [[ "$ldesc" == "$lpfx"* ]] || continue
+        [[ -z "$llen" || ${#ldesc} -eq $llen ]] || continue
+        lout+="${lcidr} "
+      done
+      printf '%s\n' "${lout:-None}"
     elif printf '%s' "$*" | grep -qF 'starts_with(Description'; then
       # Tool-owned rule lookup (aws_tool_owned_ssh_cidrs, repo#487): the CIDRs
       # of tcp/22 rules whose Description carries the repo-remote:<name>:
@@ -998,27 +1015,31 @@ assert_contains "a failed revoke prints a loud NOTICE" "$RR_ERR" "could not revo
 assert_contains "the NOTICE hands over the manual revoke command" "$RR_ERR" "aws ec2 revoke-security-group-ingress --group-id sg-0existing"
 assert_contains "the current address is still authorized" "$(cat "$MOCK_LOG")" "CidrIp=104.7.12.215/32"
 
-# (e) Legacy-format rules (repo-remote:<name>:<YYYY-MM-DD>) get one NOTICE and
-#     are never auto-revoked; with none present there is no NOTICE.
+# (e) Legacy-format rules (`repo-remote:<name>:<YYYY-MM-DD>`, written before the
+#     per-caller marker) are never auto-revoked -- their owner is unknown -- but
+#     surface in one NOTICE. The owned-rule query no longer reports them, so
+#     nothing is revoked.
 run_rr MOCK_AWS_NEW_ID=i-0legacy MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
-  MOCK_AWS_SG_LEGACY_CIDRS=198.51.100.7/32 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
-assert_eq   "a legacy rule does not fail up" "0" "$RR_RC"
-assert_contains "a legacy rule prints the NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
-assert_contains "the NOTICE names the legacy CIDR" "$RR_ERR" "198.51.100.7/32"
-assert_eq   "a legacy rule is never revoked" "0" \
+  MOCK_AWS_SG_RULE_DESCS="52.119.115.124/32=repo-remote:myrepo:2026-09-01" \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a legacy-format rule leaves up succeeding" "0" "$RR_RC"
+assert_contains "a legacy-format rule triggers the legacy NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
+assert_contains "the legacy NOTICE names the legacy CIDR" "$RR_ERR" "52.119.115.124/32"
+assert_eq   "a legacy-format rule is never auto-revoked" "0" \
   "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
-run_rr MOCK_AWS_NEW_ID=i-0nolegacy MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
-  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
-assert_not_contains "no legacy rule means no NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
+assert_contains "the legacy query pins the exact date-only shape by length" \
+  "$(cat "$MOCK_LOG")" "length(Description) == \`"
 
-# (f) A caller id starting with "20" (e.g. a host named 2024-mbp) must not be
-#     mistaken for a legacy rule: the query pins the exact legacy length, so
-#     repo-remote:<name>:2024-mbp:<date> is excluded.
-run_rr REPO_REMOTE_CALLER=2024-mbp MOCK_AWS_NEW_ID=i-0c20 MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+# (f) A per-caller rule whose caller id starts with "20" (hostname `2024-mbp`)
+#     must NOT be reported as legacy -- that NOTICE would tell the operator to
+#     hand-revoke the live rule they are about to SSH through.
+run_rr REPO_REMOTE_CALLER=2024-mbp MOCK_AWS_NEW_ID=i-0caller20 MOCK_AWS_STATE=None \
+  MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_RULE_DESCS="104.7.12.215/32=repo-remote:myrepo:2024-mbp:2026-10-12" \
   MOCK_CURL_IP=104.7.12.215 -- up --yes --json
-assert_contains "the legacy query pins the exact legacy Description length" \
-  "$(cat "$MOCK_LOG")" "length(Description) =="
-assert_not_contains "a 20... caller id draws no legacy NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
+assert_eq   "a 20-prefixed caller id leaves up succeeding" "0" "$RR_RC"
+assert_not_contains "a per-caller rule with a 20-prefixed caller id is not flagged as legacy" \
+  "$RR_ERR" "legacy-format SSH ingress rule(s)"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
@@ -3868,12 +3889,24 @@ assert_contains "remote.md states a failed detection creates no rule and no inst
   "$MD" "creates **no** ingress rule and **no** instance"
 assert_contains "remote.md says a flaky lookup is not consent to open tcp/22" \
   "$MD" "not consent to open tcp/22"
-assert_contains "remote.md documents the per-rule owner Description marker" \
-  "$MD" "repo-remote:<repo-name>:<YYYY-MM-DD>"
+assert_contains "remote.md documents the per-caller owner Description marker" \
+  "$MD" "repo-remote:<repo-name>:<caller>:<YYYY-MM-DD>"
+assert_contains "remote.md documents REPO_REMOTE_CALLER and its hostname default" \
+  "$MD" "\`REPO_REMOTE_CALLER\` if set, otherwise the short hostname"
+assert_contains "remote.md lists REPO_REMOTE_CALLER in the config block" \
+  "$MD" "REPO_REMOTE_CALLER=  "
 assert_contains "remote.md documents replace-don't-accumulate on refresh" \
   "$MD" "Replace, don't accumulate"
+assert_contains "remote.md says only this caller's rules are revoked" \
+  "$MD" "starts with **this caller's** marker"
+assert_contains "remote.md says other callers' rules are never touched" \
+  "$MD" "**Other callers' rules**"
+assert_contains "remote.md says legacy-format rules are no longer auto-revoked" \
+  "$MD" "revoked automatically** — their owner is unknown"
+assert_contains "remote.md documents the legacy-rule NOTICE" \
+  "$MD" "NOTICE: legacy-format SSH ingress rule(s)"
 assert_contains "remote.md states unmarked rules are never revoked" \
-  "$MD" "rules without that marker are never touched"
+  "$MD" "Rules without any \`repo-remote:\` marker** are never touched"
 
 # repo#164: the fleet-marker reuse guard and its --force override are part of
 # the implemented surface, so remote.md must document them too.
