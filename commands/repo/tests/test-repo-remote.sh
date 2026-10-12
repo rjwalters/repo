@@ -789,6 +789,24 @@ assert_contains "the ingress rule carries this tooling's owner Description" \
   "$SGLOG" "Description=repo-remote:myrepo:"
 assert_contains "the created SG is attached to the instance" "$SGLOG" "security-group-ids sg-0created"
 
+# rjwalters/loom#11616: the owner marker is per-CALLER, so one host never
+# reclaims (revokes) another host's rule on a shared repo-remote box. The
+# Description carries the caller id; REPO_REMOTE_CALLER overrides the hostname.
+run_rr REPO_REMOTE_CALLER=host-a MOCK_AWS_NEW_ID=i-0caller MOCK_AWS_STATE=None \
+  MOCK_AWS_SG_FIND=None MOCK_AWS_SG_NEW_ID=sg-0created -- up --yes --json
+SGLOG_A="$(cat "$MOCK_LOG")"
+assert_contains "the owner Description carries the caller id (REPO_REMOTE_CALLER)" \
+  "$SGLOG_A" "Description=repo-remote:myrepo:host-a:"
+# A different caller writes a distinct marker, so aws_tool_owned_ssh_cidrs (which
+# matches the full repo-remote:<name>:<caller>: prefix) never sees host-a's rule.
+run_rr REPO_REMOTE_CALLER=host-b MOCK_AWS_NEW_ID=i-0callerb MOCK_AWS_STATE=None \
+  MOCK_AWS_SG_FIND=None MOCK_AWS_SG_NEW_ID=sg-0created -- up --yes --json
+SGLOG_B="$(cat "$MOCK_LOG")"
+assert_contains "a different caller writes its own marker" \
+  "$SGLOG_B" "Description=repo-remote:myrepo:host-b:"
+assert_not_contains "a different caller does not write host-a's marker" \
+  "$SGLOG_B" "Description=repo-remote:myrepo:host-a:"
+
 # (c) A previously-tagged SG is reused instead of creating a new one
 #     (idempotent across repeated `up` runs).
 run_rr MOCK_AWS_NEW_ID=i-0sgreuse MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing -- up --yes --json
