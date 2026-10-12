@@ -1,0 +1,10 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>rjwalters/.github:renovate-config"],
+  "ignorePaths": [
+    "**/node_modules/**",
+    ".loom/**",
+    ".claude/skills/repo/**",
+    ".agents/skills/repo/**"
+  ]
+}
