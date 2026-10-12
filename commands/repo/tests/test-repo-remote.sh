@@ -178,7 +178,15 @@ case "$1 $2" in
       printf '%s\n' "${MOCK_AWS_SSM_SG_FIND:-None}"
       exit 0
     fi
-    if printf '%s' "$*" | grep -qF 'starts_with(Description'; then
+    if printf '%s' "$*" | grep -qF "starts_with(Description, 'repo-remote:" && printf '%s' "$*" | grep -qF ":20')"; then
+      # Legacy-format rule lookup (aws_notice_legacy_ssh_ingress): answered
+      # independently of the owned-CIDR query below.
+      if [[ -n "${MOCK_AWS_SG_LEGACY_CIDRS:-}" ]]; then
+        printf '%s\n' "${MOCK_AWS_SG_LEGACY_CIDRS}"
+      else
+        printf 'None\n'
+      fi
+    elif printf '%s' "$*" | grep -qF 'starts_with(Description'; then
       # Tool-owned rule lookup (aws_tool_owned_ssh_cidrs, repo#487): the CIDRs
       # of tcp/22 rules whose Description carries the repo-remote:<name>:
       # marker. MOCK_AWS_SG_OWNED_CIDRS is a space-separated list; unset means
@@ -989,6 +997,28 @@ assert_eq   "a failed revoke does not fail the run" "0" "$RR_RC"
 assert_contains "a failed revoke prints a loud NOTICE" "$RR_ERR" "could not revoke this tooling's stale SSH ingress rule"
 assert_contains "the NOTICE hands over the manual revoke command" "$RR_ERR" "aws ec2 revoke-security-group-ingress --group-id sg-0existing"
 assert_contains "the current address is still authorized" "$(cat "$MOCK_LOG")" "CidrIp=104.7.12.215/32"
+
+# (e) Legacy-format rules (repo-remote:<name>:<YYYY-MM-DD>) get one NOTICE and
+#     are never auto-revoked; with none present there is no NOTICE.
+run_rr MOCK_AWS_NEW_ID=i-0legacy MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_LEGACY_CIDRS=198.51.100.7/32 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a legacy rule does not fail up" "0" "$RR_RC"
+assert_contains "a legacy rule prints the NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
+assert_contains "the NOTICE names the legacy CIDR" "$RR_ERR" "198.51.100.7/32"
+assert_eq   "a legacy rule is never revoked" "0" \
+  "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+run_rr MOCK_AWS_NEW_ID=i-0nolegacy MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_not_contains "no legacy rule means no NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
+
+# (f) A caller id starting with "20" (e.g. a host named 2024-mbp) must not be
+#     mistaken for a legacy rule: the query pins the exact legacy length, so
+#     repo-remote:<name>:2024-mbp:<date> is excluded.
+run_rr REPO_REMOTE_CALLER=2024-mbp MOCK_AWS_NEW_ID=i-0c20 MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_contains "the legacy query pins the exact legacy Description length" \
+  "$(cat "$MOCK_LOG")" "length(Description) =="
+assert_not_contains "a 20... caller id draws no legacy NOTICE" "$RR_ERR" "legacy-format SSH ingress rule(s)"
 
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 

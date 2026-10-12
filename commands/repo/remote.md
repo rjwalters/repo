@@ -756,23 +756,28 @@ landed before it ever calls `run-instances`:
      to `0.0.0.0/0` with only a printed notice.)
 4. **Authorize idempotently, and label the rule.** `authorize-security-group-ingress`
    for tcp/22 from the resolved CIDR, via `--ip-permissions` so the rule
-   carries a `Description` of `repo-remote:<repo-name>:<YYYY-MM-DD>`; a
+   carries a `Description` of `repo-remote:<repo-name>:<caller>:<YYYY-MM-DD>`,
+   where `<caller>` is `REPO_REMOTE_CALLER` (default: the short hostname,
+   sanitised to `[A-Za-z0-9_.-]`, max 40 chars); a
    duplicate rule on a reused group counts as success. That marker is what
    makes each rule traceable to its owner in an audit — and what step 4a keys
    on.
 
    4a. **Replace, don't accumulate.** Before authorizing the current address,
-   any tcp/22 rule on the group whose `Description` carries this tooling's
-   `repo-remote:<repo-name>:` marker — i.e. one *this* tooling wrote on an
+   any tcp/22 rule on the group whose `Description` carries *this caller's*
+   `repo-remote:<repo-name>:<caller>:` marker — i.e. one this host wrote on an
    earlier run — is revoked. Without this, every `up` from a new address added
    a `/32` and removed none, so a few weeks of roaming left a group admitting
    every address the operator had ever had. A rule for the address being
    authorized now is kept (a repeat run from the same place does not flap it),
    and **rules without that marker are never touched** — an operator-added or
-   pre-existing rule is not this tooling's to revoke. A revoke that fails
-   (e.g. credentials without `RevokeSecurityGroupIngress`) is a loud notice
-   with the manual command, not a failed `up`: it leaves a stale-but-narrow
-   rule behind, never a wider one.
+   pre-existing rule, a **peer host's** rule (a different `<caller>`), and a
+   **legacy-format** rule (`repo-remote:<repo-name>:<YYYY-MM-DD>`, owner
+   unknown) are all left in place, so one host can't revoke another's access.
+   Legacy rules are surfaced in a single NOTICE with the manual revoke command.
+   A revoke that fails (e.g. credentials without `RevokeSecurityGroupIngress`)
+   is a loud notice with the manual command, not a failed `up`: it leaves a
+   stale-but-narrow rule behind, never a wider one.
 5. **Verify before spending money.** `describe-security-groups` on the
    resolved group must show a tcp/22 rule, or the run fails loudly (exit `4`)
    before `run-instances` is ever called — this is what would have caught the

@@ -1682,9 +1682,13 @@ aws_revoke_stale_ssh_ingress() {  # <sg-id> <keep-cidr>
 # longer match any caller's prefix, so they are never auto-revoked (the owner is
 # unknown). Surface them in one NOTICE so the leftover exposure is visible.
 aws_notice_legacy_ssh_ingress() {  # <sg-id>
-  local sg="$1" legacy
+  local sg="$1" legacy legacy_len
+  # Legacy shape is exactly repo-remote:<name>:<YYYY-MM-DD>. JMESPath has no
+  # regex or arithmetic, so pin the total length: a per-caller rule whose
+  # caller id starts with "20" is longer and must not match.
+  legacy_len=$(( ${#NAME} + 13 + 10 ))
   legacy="$(aws ec2 describe-security-groups --group-ids "$sg" \
-    --query "SecurityGroups[0].IpPermissions[?ToPort==\`22\`].IpRanges[] | [?Description != null && starts_with(Description, 'repo-remote:${NAME}:20')].CidrIp" \
+    --query "SecurityGroups[0].IpPermissions[?ToPort==\`22\`].IpRanges[] | [?Description != null && starts_with(Description, 'repo-remote:${NAME}:20') && length(Description) == \`${legacy_len}\`].CidrIp" \
     --output text 2>/dev/null | tr '[:space:]' ' ' | sed -E 's/(^| )None( |$)/ /g; s/^ +| +$//g')" || true
   [[ -n "$legacy" ]] || return 0
   log "NOTICE: legacy-format SSH ingress rule(s) on ${sg} (tcp/22 from: ${legacy}) are no longer revoked automatically. If stale, revoke by hand with: aws ec2 revoke-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr <cidr>"
