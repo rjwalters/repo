@@ -42,6 +42,14 @@ class FakeGitHub:
         self.user_installations = []
         self.org_installations_status = None
         self.users_status = None
+        # user/installations rejects any token not issued by a GitHub App with
+        # a 403, whatever its scopes — the usual personal-account outcome.
+        self.user_installations_status = None
+        # search/issues: maps "user:<owner>" / "repo:<owner>/<repo>" to a list
+        # of updated_at dates for app-authored issues/PRs (newest first).
+        self.search_activity = {}
+        self.search_status = None
+        self.search_queries = []
         # The invoking client repository: a known sibling of the target in the
         # same account. Its visibility constrains the preset's visibility, and
         # admin on it is the evidence used to disambiguate a 404 on the target.
@@ -100,7 +108,20 @@ class FakeGitHub:
             if self.org_installations_status is not None:
                 raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.org_installations_status}")
             return {"installations": [{"app_slug": slug} for slug in self.org_installations]}
+        if route == "search/issues":
+            q = query["q"][0]
+            self.search_queries.append(q)
+            if self.search_status is not None:
+                raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.search_status}")
+            assert "author:app/renovate" in q and "updated:>=" in q
+            assert query["sort"] == ["updated"] and query["order"] == ["desc"]
+            scope = q.split()[0]
+            dates = self.search_activity.get(scope, [])
+            return {"total_count": len(dates),
+                    "items": [{"updated_at": f"{d}T12:00:00Z"} for d in dates[:1]]}
         if route == "user/installations":
+            if self.user_installations_status is not None:
+                raise policy.PolicyError(f"GitHub GET {endpoint} failed: HTTP {self.user_installations_status}")
             return {"installations": [{"app_slug": slug} for slug in self.user_installations]}
         if route.startswith(f"{target_root}/git/ref/heads/"):
             branch = route.split("/git/ref/heads/", 1)[1]
@@ -450,6 +471,114 @@ class PolicyTests(unittest.TestCase):
         self.api.viewer_login = "someone-else"
         self.assertIsNone(policy.check_app_installed(self.api, "example"))
         self.assertNotIn("user/installations", [c[0] for c in self.api.calls])
+
+    def personal_account_without_installations_access(self, viewer="example"):
+        self.api.owner_type = "User"
+        self.api.viewer_login = viewer
+        self.api.user_installations_status = 403
+
+    def test_personal_account_evidence_reports_installed_with_unverified_coverage(self):
+        self.personal_account_without_installations_access()
+        self.api.search_activity = {"user:example": ["2026-10-12", "2026-10-01", "2026-09-20"]}
+        line = policy.app_status(self.api, "example")
+        self.assertIn("Renovate GitHub App: installed (evidence: 3 renovate[bot] issues/PRs", line)
+        self.assertIn("most recent 2026-10-12", line)
+        self.assertIn("not verified", line)
+        self.assertIn(policy.USER_INSTALLATIONS_URL, line)
+        self.assertNotIn("UNKNOWN", line)
+        self.assertNotIn("NOT installed", line)
+        self.assertIn("user/installations", [c[0] for c in self.api.calls])
+        self.assertEqual(len(self.api.search_queries), 1)
+
+    def test_personal_account_evidence_with_repo_activity_confirms_coverage(self):
+        self.personal_account_without_installations_access()
+        self.api.search_activity = {"user:example": ["2026-10-12", "2026-10-01"],
+                                    "repo:example/client": ["2026-10-01"]}
+        line = policy.app_status(self.api, "example", "example/client")
+        self.assertIn("installed (evidence: 2 renovate[bot]", line)
+        self.assertIn("Coverage of example/client confirmed: 1 renovate[bot] issue/PR", line)
+        self.assertIn("most recent 2026-10-01", line)
+        self.assertNotIn("not verified", line)
+
+    def test_personal_account_evidence_without_repo_activity_flags_selection(self):
+        self.personal_account_without_installations_access()
+        self.api.search_activity = {"user:example": ["2026-10-12"]}
+        line = policy.app_status(self.api, "example", "example/client")
+        self.assertIn("installed (evidence: 1 renovate[bot] issue/PR active", line)
+        self.assertIn("Coverage of example/client itself is not verified", line)
+        self.assertIn("repository selection", line)
+        self.assertIn(policy.USER_INSTALLATIONS_URL, line)
+
+    def test_personal_account_without_evidence_stays_unknown_with_settings_url(self):
+        self.personal_account_without_installations_access()
+        line = policy.app_status(self.api, "example", "example/client")
+        self.assertTrue(line.startswith(policy.app_status_line(None)))
+        self.assertIn(policy.USER_INSTALLATIONS_URL, line)
+        self.assertIn("does not prove", line)
+        self.assertNotIn("NOT installed", line)
+        # No account-level activity means the repo search is skipped.
+        self.assertEqual(len(self.api.search_queries), 1)
+
+    def test_personal_account_search_failure_degrades_to_unknown(self):
+        self.personal_account_without_installations_access()
+        self.api.search_status = 422
+        line = policy.app_status(self.api, "example", "example/client")
+        self.assertTrue(line.startswith(policy.app_status_line(None)))
+        self.assertIn("activity search failed", line)
+        self.assertIn(policy.USER_INSTALLATIONS_URL, line)
+        self.assertNotIn("NOT installed", line)
+
+    def test_third_party_personal_account_uses_evidence(self):
+        self.personal_account_without_installations_access(viewer="someone-else")
+        self.api.search_activity = {"user:example": ["2026-10-05"]}
+        line = policy.app_status(self.api, "example")
+        self.assertIn("installed (evidence: 1 renovate[bot] issue/PR", line)
+        self.assertNotIn("user/installations", [c[0] for c in self.api.calls])
+
+    def test_own_personal_account_installations_answer_needs_no_evidence(self):
+        self.api.owner_type = "User"
+        self.api.user_installations = ["renovate"]
+        self.assertEqual(policy.app_status(self.api, "example"), policy.app_status_line(True))
+        self.assertEqual(self.api.search_queries, [])
+
+    def test_organization_output_is_unchanged_and_never_searches(self):
+        for installations, status in ((["renovate"], None), ([], None), ([], 403)):
+            with self.subTest(installations=installations, status=status):
+                self.api = FakeGitHub()
+                self.api.org_installations = installations
+                self.api.org_installations_status = status
+                expected = policy.app_status_line(policy.check_app_installed(self.api, "example"))
+                self.assertEqual(policy.app_status(self.api, "example", "example/client"), expected)
+                self.assertEqual(self.api.search_queries, [])
+
+    def test_evidence_search_window_is_dated(self):
+        import datetime
+        self.api.search_activity = {"user:example": ["2026-10-12"]}
+        policy.app_activity_evidence(self.api, "example", today=datetime.date(2026, 10, 12))
+        self.assertIn("updated:>=2026-09-12", self.api.search_queries[0])
+
+    def test_check_app_cli_personal_account_403_reports_evidence(self):
+        self.personal_account_without_installations_access()
+        self.api.search_activity = {"user:example": ["2026-10-12"],
+                                    "repo:example/client": ["2026-10-12"]}
+        with patch.object(policy, "GitHub", return_value=self.api), \
+                patch.object(sys, "argv", ["repo-org-policy.py", "check-app", "--repo", "example/client"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = policy.main()
+        self.assertEqual(code, 0)
+        self.assertIn("Coverage of example/client confirmed", out.getvalue())
+
+    def test_check_app_cli_owner_override_skips_unrelated_repo(self):
+        self.personal_account_without_installations_access()
+        self.api.search_activity = {"user:example": ["2026-10-12"]}
+        with patch.object(policy, "GitHub", return_value=self.api), \
+                patch.object(sys, "argv", ["repo-org-policy.py", "check-app", "--owner", "example",
+                                           "--repo", "other/client"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = policy.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.api.search_queries), 1)
+        self.assertIn("Coverage of any specific repository itself is not verified", out.getvalue())
 
     def test_app_status_line_names_install_url_and_admin_requirement_when_absent(self):
         line = policy.app_status_line(False)
