@@ -341,6 +341,63 @@ assert_file "resync restores a guard recorded as installed" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- an explicit guard opt-out (guardHook:disabled) survives resync (repo#557) --"
+OTGT="$SCRATCH/tgt-guard-optout"
+new_target "$OTGT"
+do_install "$SRC" "$OTGT" --no-guard
+OMETA="$OTGT/.claude/skills/repo/install-metadata.json"
+OCMETA="$OTGT/.agents/skills/repo/install-metadata.json"
+assert_contains "--no-guard records guardHook:disabled" "$(cat "$OMETA")" '"guardHook": "disabled"'
+assert_contains "--no-guard records it in the Codex metadata too" "$(cat "$OCMETA")" '"guardHook": "disabled"'
+
+FP_O="$(tree_fingerprint "$OTGT")"
+run_resync "$OTGT" --dry-run
+assert_eq "dry-run on an opted-out install is in sync" "0" "$RS_RC"
+assert_not_contains "dry-run does not propose adding guard-destructive.sh" \
+    "$RS_OUT" ".claude/skills/repo/hooks/guard-destructive.sh"
+assert_contains "dry-run reports the guard opt-out" "$RS_OUT" "Destructive-command guard disabled"
+assert_eq "dry-run on an opted-out install writes nothing" "$FP_O" "$(tree_fingerprint "$OTGT")"
+
+# Bump the source so the apply run really re-stamps both metadata files.
+echo "98.0.0" >"$SRC/VERSION"
+run_resync "$OTGT"
+assert_eq "apply resync on an opted-out install exits 0" "0" "$RS_RC"
+if [[ ! -e "$OTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "resync does not restore a guard the operator opted out of"
+else
+    no "resync does not restore a guard the operator opted out of"
+fi
+assert_contains "Claude metadata was re-stamped" "$(cat "$OMETA")" '"version": "98.0.0"'
+assert_contains "re-stamped Claude metadata keeps guardHook:disabled" "$(cat "$OMETA")" '"guardHook": "disabled"'
+assert_contains "Codex metadata was re-stamped" "$(cat "$OCMETA")" '"version": "98.0.0"'
+assert_contains "re-stamped Codex metadata keeps guardHook:disabled" "$(cat "$OCMETA")" '"guardHook": "disabled"'
+
+# The policy overrides a stale/contradictory outcome field: even if
+# guardHookInstalled were hand-edited to true, the opt-out wins.
+sed 's/"guardHookInstalled": false/"guardHookInstalled": true/' "$OMETA" >"$OMETA.new" && mv "$OMETA.new" "$OMETA"
+run_resync "$OTGT"
+if [[ ! -e "$OTGT/.claude/skills/repo/hooks/guard-destructive.sh" ]]; then
+    ok "guardHook:disabled wins over guardHookInstalled:true"
+else
+    no "guardHook:disabled wins over guardHookInstalled:true"
+fi
+
+# Legacy metadata: no guardHook field and no guardHookInstalled field at all
+# (pre-repo#490). Must keep the historical default — refresh the guard — and
+# must not invent an opt-out on re-stamp.
+LTGT="$SCRATCH/tgt-guard-legacy"
+new_target "$LTGT"
+do_install "$SRC" "$LTGT"
+LMETA="$LTGT/.claude/skills/repo/install-metadata.json"
+grep -v '"guardHookInstalled"' "$LMETA" >"$LMETA.new" && mv "$LMETA.new" "$LMETA"
+rm -f "$LTGT/.claude/skills/repo/hooks/guard-destructive.sh"
+run_resync "$LTGT"
+assert_file "legacy metadata (no policy field) still gets the guard refreshed" \
+    "$LTGT/.claude/skills/repo/hooks/guard-destructive.sh"
+assert_not_contains "legacy re-stamp does not invent a guardHook policy" "$(cat "$LMETA")" '"guardHook"'
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- version stamping keeps the C5/C6 split --"
 echo "99.9.9" >"$SRC/VERSION"
 run_resync "$TGT"

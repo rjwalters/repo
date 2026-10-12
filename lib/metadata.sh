@@ -28,7 +28,7 @@
 # exactly what the mismatch warning tells the operator.
 REPO_SKILLS_LAYOUT_VERSION=2
 
-# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list> [guard_hook_installed]
+# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list> [guard_hook_installed] [guard_hook_policy]
 #
 # The TRACKED file. Every field here is a property of the release + the selected
 # command set (or, for `filtered`/`guardHookInstalled`, a deliberate decision
@@ -44,9 +44,20 @@ REPO_SKILLS_LAYOUT_VERSION=2
 # behavior — so a pre-repo#490 call site (or a metadata read with the field
 # absent) is treated as "the guard was installed", matching what every install
 # before this field existed actually did.
+#
+# `guardHook` (repo#557): the operator's explicit guard POLICY, distinct from
+# `guardHookInstalled` (the OUTCOME of one install run). Emitted only when the
+# policy is "disabled" (`install.sh --no-guard`), so it is purely additive:
+# every install without an opt-out stays byte-identical to what this emitter
+# produced before the field existed. A recorded "disabled" policy is what makes
+# a later plain `install.sh` / resync keep the guard out; `guardHookInstalled:
+# false` alone never does, because it also means "deferred to another tool's
+# guard", which is re-evaluated on every install. Re-enabling is deleting this
+# one line from `.claude/skills/repo/install-metadata.json` and re-running
+# install.sh.
 metadata_tracked_json() {
   local version="$1" commit="$2" dev="$3" filtered="$4" commands="$5" \
-        guard_hook_installed="${6:-true}" commands_json
+        guard_hook_installed="${6:-true}" guard_hook_policy="${7:-}" commands_json
   commands_json="$(printf '%s\n' "$commands" | sed '/^$/d; s/.*/"&"/' | paste -sd, -)"
   echo "{"
   echo "  \"version\": \"$version\","
@@ -55,6 +66,7 @@ metadata_tracked_json() {
   echo "  \"dev\": $dev,"
   echo "  \"filtered\": $filtered,"
   echo "  \"guardHookInstalled\": $guard_hook_installed,"
+  [[ "$guard_hook_policy" == disabled ]] && echo "  \"guardHook\": \"disabled\","
   echo "  \"commands\": [$commands_json]"
   echo "}"
 }
