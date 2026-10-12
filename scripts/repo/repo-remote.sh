@@ -1678,6 +1678,18 @@ aws_revoke_stale_ssh_ingress() {  # <sg-id> <keep-cidr>
   done < <(aws_tool_owned_ssh_cidrs "$sg")
 }
 
+# Legacy (pre-per-caller) rules carry `repo-remote:<name>:<YYYY-MM-DD>` and no
+# longer match any caller's prefix, so they are never auto-revoked (the owner is
+# unknown). Surface them in one NOTICE so the leftover exposure is visible.
+aws_notice_legacy_ssh_ingress() {  # <sg-id>
+  local sg="$1" legacy
+  legacy="$(aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?ToPort==\`22\`].IpRanges[] | [?Description != null && starts_with(Description, 'repo-remote:${NAME}:20')].CidrIp" \
+    --output text 2>/dev/null | tr '[:space:]' ' ' | sed -E 's/(^| )None( |$)/ /g; s/^ +| +$//g')" || true
+  [[ -n "$legacy" ]] || return 0
+  log "NOTICE: legacy-format SSH ingress rule(s) on ${sg} (tcp/22 from: ${legacy}) are no longer revoked automatically. If stale, revoke by hand with: aws ec2 revoke-security-group-ingress --group-id ${sg} --protocol tcp --port 22 --cidr <cidr>"
+}
+
 # Post-authorize verification — this is what would have caught the reported
 # incident in-run: a security group whose ingress set was empty
 # ({port: null, cidr: []}), with SSH timing out indefinitely as the only
@@ -1764,6 +1776,7 @@ aws_refresh_ssh_ingress() {  # [--no-create]
   # Replace, don't accumulate: drop this tooling's own earlier /32s first
   # (repo#487), then authorize the address actually in use now.
   aws_revoke_stale_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
+  aws_notice_legacy_ssh_ingress "$RESOLVED_SG"
   aws_authorize_ssh_ingress "$RESOLVED_SG" "$RESOLVED_SSH_CIDR"
   aws_verify_ssh_ingress "$RESOLVED_SG"
 }
