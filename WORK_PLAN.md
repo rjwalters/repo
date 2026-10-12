@@ -9,6 +9,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 - **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
 - **#611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
+- **#615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
 
 ## Operator Priority
 
@@ -20,13 +21,13 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#612**: guard: quoted git subcommand/flags and --git-dir/--work-tree hide force ops from parse_force_ops
+- **#616**: repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#608**: guard: git -C with a whitespace path fails open for force ops under forceScope: protected
+_None._
 
 ## PRs Awaiting Review
 
@@ -40,6 +41,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
 - **#611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
+- **#615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
 
 ## Proposed
 
@@ -49,8 +51,8 @@ Issues carrying `loom:curated`.
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
 - **#604**: guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X) *(curated)*
-- **#608**: guard: git -C with a whitespace path fails open for force ops under forceScope: protected *(curated)*
 - **#612**: guard: quoted git subcommand/flags and --git-dir/--work-tree hide force ops from parse_force_ops *(curated)*
+- **#616**: repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -64,12 +66,12 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
+| Approved PRs awaiting merge | 3 |
 | Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 1 |

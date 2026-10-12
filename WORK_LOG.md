@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-11
+- **PR #614**: guard: resolve git -C paths with whitespace for force ops (#608)
+- **Issue #608** (closed): guard: git -C with a whitespace path fails open for force ops under forceScope: protected
 - **PR #610**: guard: cwd trackers follow control flow conservatively (#601)
 - **Issue #601** (closed): guard: cwd trackers ignore control flow (short-circuit cd, pushd, eval, functions, case arms)
 
