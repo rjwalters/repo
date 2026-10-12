@@ -50,6 +50,8 @@
 #       run — see the fleet-marker guard below).
 #       With --yes: stop them; add --delete to terminate (disk goes with it).
 #       --force overrides the fleet-marker guard described below, same as `up`.
+#       With REPO_REMOTE_MARKET=spot, `down --yes` without --delete is refused
+#       (exit 2) before any cloud call — see "AWS market" below.
 #
 #   repo-remote attach|--attach [--container|--host] [--command <cmd>] [aws|gcp]
 #       Open a session on THIS repo's existing instance, carrying a freshly
@@ -214,6 +216,30 @@
 # alias HostName: IP or instance ID) and "instance_profile" fields; under ssm
 # "public_ip" is "" because none is looked up.
 #
+# AWS market (repo#616): which EC2 purchasing option a FRESH launch uses,
+# AWS-only, resolved through the same two config layers:
+#   REPO_REMOTE_MARKET   on-demand (default) | spot — exactly those values.
+# on-demand (or unset) changes nothing: no market flags are passed. spot adds,
+# to the SAME single run-instances call, the two argv elements
+#   --instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}
+#   --instance-initiated-shutdown-behavior terminate
+# so a Spot interruption AND the idle guard's `shutdown -h` both TERMINATE the
+# box (root volume included); it is never stopped and never restarted. Hence,
+# with spot configured:
+#   * `up` never starts a stopped instance (pinned or tag-discovered) — exit 2
+#     with guidance, before start-instances is called. A running instance is
+#     still reused; a pinned instance that is already terminated (or
+#     shutting-down) is treated as gone and a fresh one is launched.
+#   * `down --yes` without --delete is refused (exit 2) before any cloud call;
+#     `down --yes --delete` terminates as usual (fleet-marker guard included).
+#   * a capacity or price rejection is a hard failure (exit 4). There is no
+#     retry, no fallback to on-demand, and no other instance type: run-instances
+#     is still called EXACTLY ONCE.
+# Any other value, or spot with GCP, exits 2 before any cloud call. The plan,
+# `up` and `down` JSON gain an additive "market" field. The estimated cost
+# stays the on-demand rate (also the default Spot maximum price), so for Spot
+# it is an upper bound; Spot price and capacity are never guaranteed.
+#
 # GitHub credentials on the VM (repo#565): `attach` is the only subcommand
 # that touches a dev-session credential; `up` (dry run or --yes), `status`,
 # `verify` and `down` never run the token command or send a token anywhere.
@@ -263,6 +289,8 @@
 # Exit codes:
 #   0  success (including a dry-run plan)
 #   2  missing / invalid required config (the cost gate; loud failure) — also
+#      the REPO_REMOTE_MARKET=spot lifecycle refusals (restarting a stopped
+#      instance, `down --yes` without --delete; repo#616) — also
 #      the SSH-ingress fail-closed refusals: current-IP detection failed and no
 #      REPO_REMOTE_SSH_CIDR was pinned, or the pinned CIDR is wider than
 #      REPO_REMOTE_SSH_MIN_PREFIX without REPO_REMOTE_ALLOW_WORLD_SSH=1
@@ -473,6 +501,7 @@ SSH_MIN_PREFIX=""  # AWS only: narrowest IPv4 prefix length accepted for SSH ing
 ALLOW_WORLD_SSH="" # AWS only: "1" opts in to an SSH-ingress CIDR wider than SSH_MIN_PREFIX
 TRANSPORT=""        # AWS only: ssh (default) | ssm (repo#564)
 INSTANCE_PROFILE="" # AWS only: IAM instance profile name for a fresh launch
+MARKET=""           # AWS only: on-demand (default) | spot (repo#616)
 REGION=""
 COST_HOURLY=""
 COST_APPROX=false
@@ -650,6 +679,11 @@ resolve_settings() {
   # by validate_transport_config().
   TRANSPORT="$(printf '%s' "${REPO_REMOTE_TRANSPORT:-ssh}" | tr '[:upper:]' '[:lower:]')"
   INSTANCE_PROFILE="${REPO_REMOTE_INSTANCE_PROFILE:-}"
+
+  # Purchasing option (repo#616). Taken verbatim — validate_market_config()
+  # accepts exactly "on-demand" or "spot" — so a typo can never be normalized
+  # into a billable mode. Unset or empty means the historical default.
+  MARKET="${REPO_REMOTE_MARKET:-on-demand}"
 
   # Dev-session GitHub credential (repo#565). Only the SOURCE is decided here;
   # nothing is run or read beyond the config values themselves.
@@ -845,6 +879,34 @@ validate_transport_config() {
     log "see 'AWS transport: direct SSH or SSM Session Manager' in commands/repo/remote.md."
     exit 2
   fi
+}
+
+# ── purchasing option (repo#616) ────────────────────────────────────────────
+# Runs for `up` (dry run included) and `down` BEFORE any cloud call. Exactly
+# two spellings are accepted; anything else — including a differently-cased
+# "Spot" — is refused rather than guessed at, because the value decides what
+# kind of capacity is bought.
+validate_market_config() {
+  case "$MARKET" in
+    on-demand) : ;;
+    spot)
+      [[ "$PROVIDER" == aws ]] \
+        || die 2 "REPO_REMOTE_MARKET=spot is AWS-only (provider is '${PROVIDER}'); unset it or set REPO_REMOTE_MARKET=on-demand. Nothing was created or changed."
+      ;;
+    *)
+      die 2 "REPO_REMOTE_MARKET='${MARKET}' is not supported (expected exactly 'on-demand' (the default) or 'spot'). Nothing was created or changed. See 'AWS market: on-demand or Spot' in commands/repo/remote.md."
+      ;;
+  esac
+}
+
+is_spot() { [[ "$PROVIDER" == aws && "$MARKET" == spot ]]; }
+
+# The lifecycle refusal shared by both stopped-instance reuse paths in aws_up:
+# a one-time Spot launch is terminated, never stopped, so a stopped box is not
+# one this configuration can manage. Dies BEFORE start-instances is called.
+spot_refuse_stopped_reuse() {  # <instance-id> <state> <how-it-was-resolved>
+  local iid="$1" state="$2" how="$3"
+  die 2 "REPO_REMOTE_MARKET=spot never restarts a stopped instance, but ${how} ${iid} is ${state}. A one-time Spot instance is terminated (not stopped) on interruption and on idle shutdown, so this box is not one the Spot configuration manages, and nothing was started or created. Either set REPO_REMOTE_MARKET=on-demand (or unset it) to restart this instance as before, or terminate it with 'repo-remote down --yes --delete' and re-run 'repo-remote up --yes' to launch a fresh Spot instance."
 }
 
 # The local half of the SSM prerequisites: the AWS CLI's Session Manager
@@ -1970,13 +2032,34 @@ aws_create() {
   # caller needs iam:PassRole on its role; AWS rejects the launch otherwise,
   # and that rejection is surfaced below like any other.
   [[ -n "$INSTANCE_PROFILE" ]] && args+=(--iam-instance-profile "Name=${INSTANCE_PROFILE}")
+  # repo#616: one-time Spot, terminated on interruption AND on an
+  # instance-initiated shutdown (the idle guard), so the box is never left
+  # stopped. Each structured value is ONE argv element. On-demand (the
+  # default) passes neither flag, exactly as before.
+  if is_spot; then
+    args+=(--instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}"
+           --instance-initiated-shutdown-behavior terminate)
+  fi
 
+  # EXACTLY ONE launch attempt, on every market: no retry, no fallback to
+  # on-demand, no other instance type (repo#616 keeps this invariant).
   iid="$(aws "${args[@]}" 2>"$errfile")"; rc=$?
   err="$(cat "$errfile" 2>/dev/null)"
   rm -f "$udfile" "$errfile"
 
   if [[ $rc -ne 0 || -z "$iid" || "$iid" == "None" ]]; then
     # Surface the quota-exceeded case with the exact remediation (remote.md).
+    if is_spot && printf '%s' "$err" | grep -qE 'InsufficientInstanceCapacity|InsufficientCapacity|MaxSpotInstanceCountExceeded|SpotMaxPriceTooLow|VcpuLimitExceeded'; then
+      local hint="Spot capacity, price and quota are not guaranteed"
+      if printf '%s' "$err" | grep -qE 'MaxSpotInstanceCountExceeded|VcpuLimitExceeded'; then
+        if [[ "$IS_GPU" == true ]]; then
+          hint="the Spot vCPU quota is exhausted: request more at Service Quotas -> EC2 -> 'All G and VT Spot Instance Requests' (quota code L-3819A6DF)"
+        else
+          hint="the Spot vCPU quota is exhausted: request more at Service Quotas -> EC2 -> 'All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests' (quota code L-34B43A08)"
+        fi
+      fi
+      die 4 "aws ec2 run-instances rejected the Spot launch of ${INSTANCE_TYPE} (REPO_REMOTE_MARKET=spot): ${err}. ${hint}. Nothing was retried — not as on-demand and not as another instance type. Retry later, pick another REPO_REMOTE_INSTANCE_TYPE or region, or set REPO_REMOTE_MARKET=on-demand if your spending policy allows it."
+    fi
     if printf '%s' "$err" | grep -q 'VcpuLimitExceeded'; then
       if [[ "$IS_GPU" == true ]]; then
         die 4 "AWS GPU vCPU quota is 0 by default (VcpuLimitExceeded). Request a limit >= this type's vCPUs at Service Quotas -> EC2 -> quota code L-DB2E81BA, then retry."
@@ -2146,6 +2229,17 @@ aws_up() {
     if [[ "$state" != missing ]]; then
       fleet_marker_gate "$INSTANCE_ID" "$(aws_fleet_marker "$INSTANCE_ID")" tag
     fi
+    # repo#616: under a Spot configuration a stopped pin is refused (never
+    # started), and a pin that Spot interruption or the idle guard has already
+    # terminated is simply gone -- launch a fresh one. On-demand is unchanged.
+    if is_spot; then
+      case "$state" in
+        stopped|stopping) spot_refuse_stopped_reuse "$INSTANCE_ID" "$state" "pinned REPO_REMOTE_INSTANCE_ID" ;;
+        terminated|shutting-down)
+          log "pinned REPO_REMOTE_INSTANCE_ID=$INSTANCE_ID is ${state} (a Spot instance is terminated on interruption and idle shutdown); creating a fresh instance."
+          state=spot-gone ;;
+      esac
+    fi
     case "$state" in
       running)          iid="$INSTANCE_ID"; reused=true ;;
       stopped|stopping) aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null 2>&1 \
@@ -2153,6 +2247,7 @@ aws_up() {
                         iid="$INSTANCE_ID"; reused=true ;;
       missing)          log "pinned REPO_REMOTE_INSTANCE_ID=$INSTANCE_ID no longer exists; creating a fresh instance."
                         INSTANCE_ID="" ;;
+      spot-gone)        INSTANCE_ID="" ;;   # repo#616, logged above
       *)                iid="$INSTANCE_ID"; reused=true ;;
     esac
   fi
@@ -2167,6 +2262,7 @@ aws_up() {
       fleet_marker_gate "$iid" "$(aws_fleet_marker "$iid")" tag
       reused=true
       if [[ "$state" == stopped || "$state" == stopping ]]; then
+        is_spot && spot_refuse_stopped_reuse "$iid" "$state" "the instance tagged repo-remote=${NAME},"
         aws ec2 start-instances --instance-ids "$iid" >/dev/null 2>&1 \
           || die 4 "failed to start reused instance $iid"
       fi
@@ -2317,6 +2413,12 @@ aws_status() {
 }
 
 aws_down() {
+  # repo#616: a Spot-configured box is terminated, never stopped, so a
+  # stop-only teardown would misrepresent the lifecycle. Refuse BEFORE any
+  # cloud call (stop-instances included); the dry run and --delete proceed.
+  if is_spot && [[ "$YES" == true && "$DELETE" != true ]]; then
+    die 2 "REPO_REMOTE_MARKET=spot: 'down --yes' would STOP the instance, but a one-time Spot instance cannot be stopped and later restarted -- this configuration terminates rather than stops (on interruption and on idle shutdown alike), and 'up' never restarts a stopped box. Nothing was stopped. Run 'repo-remote down --yes --delete' to terminate it (its disk goes with it), or set REPO_REMOTE_MARKET=on-demand to manage an on-demand instance."
+  fi
   aws_authenticate
   local ids
   if [[ -n "$INSTANCE_ID" ]]; then
@@ -3058,6 +3160,9 @@ emit_plan() {  # dry-run plan (no cloud mutation)
       printf '"transport":"%s",' "$(json_escape "$TRANSPORT")"
       printf '"instance_profile":"%s",' "$(json_escape "$INSTANCE_PROFILE")"
     fi
+    # repo#616 (additive): the purchasing option a fresh launch would use,
+    # "on-demand" | "spot", so automation can tell them apart before spending.
+    printf '"market":"%s",' "$(json_escape "$MARKET")"
     printf '"gpu":%s,' "$IS_GPU"
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"ssh_alias":"repo-remote-%s",' "$(json_escape "$NAME")"
@@ -3082,7 +3187,13 @@ emit_plan() {  # dry-run plan (no cloud mutation)
       log "  disk:                ${DISK_GB} GB"
     fi
     log "  idle shutdown:      ${IDLE_MIN} min"
-    log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
+    if is_spot; then
+      log "  market:              spot (one-time; TERMINATED, never stopped, on interruption or idle shutdown; a stopped box is never restarted; price and capacity are not guaranteed)"
+      log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human) — the on-demand rate, an upper bound for Spot (the default Spot maximum price)"
+    else
+      log "  market:              on-demand"
+      log "  est. hourly cost:    \$${COST_HOURLY}/hr$(cost_note_human)"
+    fi
     log "  ssh alias:           repo-remote-${NAME}"
     case "$GH_CRED_SOURCE" in
       command) log "  gh credential:       minted per attach by REPO_REMOTE_GH_TOKEN_CMD (not run in a dry run)" ;;
@@ -3125,6 +3236,9 @@ emit_up_result() {  # <id> <ip> <alias> <reused> [connect-target]
     fi
     printf '"instance_type":"%s",' "$(json_escape "$INSTANCE_TYPE")"
     printf '"region":"%s",' "$(json_escape "$REGION")"
+    # repo#616 (additive): the CONFIGURED purchasing option. On reuse this is
+    # the configuration, not an inspection of the existing instance.
+    printf '"market":"%s",' "$(json_escape "$MARKET")"
     printf '"gpu":%s,' "$IS_GPU"
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"reused":%s,' "$reused"
@@ -3141,7 +3255,12 @@ emit_up_result() {  # <id> <ip> <alias> <reused> [connect-target]
     log "  ssh alias:        $alias"
     log "  attach:           repo-remote attach   (verifies the host, then opens a session with a fresh GitHub credential)"
     log "  est. hourly cost: \$${COST_HOURLY}/hr$(cost_note_human)"
-    log "  teardown:         repo-remote down --yes   (or /repo:remote --down)"
+    if is_spot; then
+      log "  market:           spot (terminated on interruption or idle shutdown; never stopped or restarted)"
+      log "  teardown:         repo-remote down --yes --delete   (Spot terminates; a stop-only down is refused)"
+    else
+      log "  teardown:         repo-remote down --yes   (or /repo:remote --down)"
+    fi
   fi
 }
 
@@ -3202,8 +3321,9 @@ emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated> [fl
   # --force) if the caller re-ran with --yes.
   local ids="$1" disp="$2" marked="${3:-}"
   if [[ "$JSON_OUT" == true ]]; then
-    printf '{"action":"down","provider":"%s","name":"%s","disposition":"%s","instances":[' \
-      "$(json_escape "$PROVIDER")" "$(json_escape "$NAME")" "$(json_escape "$disp")"
+    # "market" (repo#616, additive): the configured purchasing option.
+    printf '{"action":"down","provider":"%s","name":"%s","disposition":"%s","market":"%s","instances":[' \
+      "$(json_escape "$PROVIDER")" "$(json_escape "$NAME")" "$(json_escape "$disp")" "$(json_escape "$MARKET")"
     local first=true id
     for id in $ids; do
       [[ "$first" == true ]] && first=false || printf ','
@@ -3220,7 +3340,10 @@ emit_down_result() {  # <ids> <disposition: noop|dry-run|stopped|terminated> [fl
     case "$disp" in
       noop)     log "no instances tagged repo-remote=${NAME} to stop" ;;
       dry-run)  log "DRY RUN — would stop$([[ "$DELETE" == true ]] && echo /terminate): $ids (pass --yes to act)"
-                [[ -n "$marked" ]] && log "  NOTE: fleet-marked (would be refused without --force): $marked" ;;
+                [[ -n "$marked" ]] && log "  NOTE: fleet-marked (would be refused without --force): $marked"
+                if is_spot && [[ "$DELETE" != true ]]; then
+                  log "  NOTE: REPO_REMOTE_MARKET=spot — 'down --yes' (stop) would be refused; use 'down --yes --delete' to terminate."
+                fi ;;
       stopped)  log "stopped: $ids" ;;
       terminated) log "terminated (disks removed): $ids" ;;
     esac
@@ -3284,6 +3407,8 @@ main() {
       [[ "$PROVIDER" == aws ]] && validate_aws_volume_config
       # repo#564: transport/profile values are validated just as early.
       validate_transport_config
+      # repo#616: the purchasing option, before the plan or any cloud call.
+      validate_market_config
       if [[ "$YES" != true ]]; then
         emit_plan          # dry-run: the plan (with cost) is shown, nothing spent
         exit 0
@@ -3328,6 +3453,9 @@ main() {
       ;;
     down)
       [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for down"
+      # repo#616: the market decides whether a stop-only teardown is allowed,
+      # so an invalid value fails here, before any cloud call.
+      case "$PROVIDER" in aws|gcp) validate_market_config ;; esac
       case "$PROVIDER" in
         aws) aws_down ;;
         gcp) gcp_down ;;

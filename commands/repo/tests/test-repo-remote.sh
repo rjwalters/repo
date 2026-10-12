@@ -108,6 +108,7 @@ run_rr() {
     rm -f "$MOCK_LOG.ipcount"
     rm -f "$MOCK_LOG.metadata"        # per-run --metadata-options capture (repo#562)
     rm -f "$MOCK_LOG.profile" "$MOCK_LOG.sg"  # per-run profile / SG capture (repo#564)
+    rm -f "$MOCK_LOG.market" "$MOCK_LOG.shutdown"  # per-run Spot argv capture (repo#616)
     # repo#565: per-run attach captures -- the SSH-environment payload, the
     # master's own environment, child-env leak probes, and the simulated VM.
     rm -f "$MOCK_LOG.payload" "$MOCK_LOG.masterenv" "$MOCK_LOG.staticenv" "$MOCK_LOG.minterenv"
@@ -383,8 +384,21 @@ case "$1 $2" in
       if [[ "$prev" == "--security-group-ids" ]]; then
         printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.sg"
       fi
+      # repo#616: each Spot market VALUE, one argv element per line.
+      if [[ "$prev" == "--instance-market-options" ]]; then
+        printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.market"
+      fi
+      if [[ "$prev" == "--instance-initiated-shutdown-behavior" ]]; then
+        printf '%s\n' "$a" >>"${MOCK_AWS_LOG}.shutdown"
+      fi
       prev="$a"
     done
+    # MOCK_AWS_SPOT_CAPACITY_FAIL=1: AWS has no Spot capacity for the type
+    # (repo#616) -- the caller must fail once, never retry or fall back.
+    if [[ "${MOCK_AWS_SPOT_CAPACITY_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation (reached max retries: 2): There is no Spot capacity available that matches your request." >&2
+      exit 254
+    fi
     # MOCK_AWS_PROFILE_REJECT=1: the caller lacks iam:PassRole (repo#564).
     if [[ "${MOCK_AWS_PROFILE_REJECT:-0}" == 1 ]]; then
       echo "An error occurred (UnauthorizedOperation) when calling the RunInstances operation: You are not authorized to perform: iam:PassRole on resource: arn:aws:iam::123456789012:role/rr-ssm" >&2
@@ -3524,6 +3538,232 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- AWS market: validation before any cloud call (repo#616) --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+for bad in reserved Spot SPOT on_demand ondemand " spot"; do
+  run_rr "REPO_REMOTE_MARKET=$bad" -- up --yes --json
+  assert_eq "market '$bad': up --yes refused (exit 2)" "2" "$RR_RC"
+  assert_contains "market '$bad': names the setting and the accepted values" "$RR_ERR" "expected exactly 'on-demand' (the default) or 'spot'"
+  assert_eq "market '$bad': no cloud call at all" "" "$(cat "$MOCK_LOG")"
+done
+run_rr REPO_REMOTE_MARKET=reserved -- up --json
+assert_eq "invalid market: the dry run is refused too (exit 2)" "2" "$RR_RC"
+assert_not_contains "invalid market: no plan emitted" "$RR_OUT" '"action":"plan"'
+run_rr REPO_REMOTE_MARKET=reserved -- down --yes --delete --json
+assert_eq "invalid market: down refused (exit 2)" "2" "$RR_RC"
+assert_eq "invalid market: down made no cloud call" "" "$(cat "$MOCK_LOG")"
+# Empty means "unset" -> the on-demand default.
+run_rr REPO_REMOTE_MARKET= -- up --json
+assert_eq "empty market: dry run ok" "0" "$RR_RC"
+assert_eq "empty market: resolves to on-demand" "on-demand" "$(json_field "$RR_OUT" market)"
+
+# Spot is AWS-only: refused on GCP before any gcloud call (up and down).
+GCP_KEY="$SCRATCH/gcp-sa.json"; printf '{}' >"$GCP_KEY"
+write_shared "REPO_REMOTE_PROVIDER=gcp" "GCP_PROJECT=p" "GCP_ZONE=us-central1-a" "GOOGLE_APPLICATION_CREDENTIALS=$GCP_KEY"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=e2-standard-4"
+run_rr REPO_REMOTE_MARKET=spot -- up --yes --json
+assert_eq "spot on gcp: up --yes refused (exit 2)" "2" "$RR_RC"
+assert_contains "spot on gcp: says it is AWS-only" "$RR_ERR" "REPO_REMOTE_MARKET=spot is AWS-only"
+assert_eq "spot on gcp: no gcloud call at all" "" "$(cat "$MOCK_LOG")"
+run_rr REPO_REMOTE_MARKET=spot -- up --json
+assert_eq "spot on gcp: dry run refused (exit 2)" "2" "$RR_RC"
+run_rr REPO_REMOTE_MARKET=spot MOCK_GCP_STATE=RUNNING -- down --yes --delete --json
+assert_eq "spot on gcp: down refused (exit 2)" "2" "$RR_RC"
+assert_eq "spot on gcp: down made no gcloud call" "" "$(cat "$MOCK_LOG")"
+run_rr REPO_REMOTE_MARKET=on-demand -- up --json
+assert_eq "on-demand on gcp: accepted (dry run ok)" "0" "$RR_RC"
+assert_eq "on-demand on gcp: plan reports on-demand" "on-demand" "$(json_field "$RR_OUT" market)"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS market: the dry run exposes the resolved market (repo#616) --"
+# ---------------------------------------------------------------------------
+run_rr -- up --json
+assert_eq "default dry run: market is on-demand" "on-demand" "$(json_field "$RR_OUT" market)"
+run_rr REPO_REMOTE_MARKET=spot -- up --json
+assert_eq "spot dry run: exit 0" "0" "$RR_RC"
+assert_eq "spot dry run: market is spot" "spot" "$(json_field "$RR_OUT" market)"
+assert_eq "spot dry run: cost estimate is still present (on-demand rate)" "0.384" "$(json_field "$RR_OUT" estimated_hourly_cost_usd)"
+assert_eq "spot dry run: no cloud call" "" "$(cat "$MOCK_LOG")"
+run_rr REPO_REMOTE_MARKET=spot -- up
+assert_contains "spot dry run (text): names the market" "$RR_ERR" "market:              spot"
+assert_contains "spot dry run (text): states termination, not stop" "$RR_ERR" "TERMINATED, never stopped"
+assert_contains "spot dry run (text): no price/capacity guarantee" "$RR_ERR" "price and capacity are not guaranteed"
+assert_contains "spot dry run (text): cost is an on-demand upper bound" "$RR_ERR" "upper bound for Spot"
+run_rr -- up
+assert_contains "default dry run (text): names on-demand" "$RR_ERR" "market:              on-demand"
+# Config-layer precedence: shared spot, repo on-demand -> on-demand.
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2" "REPO_REMOTE_MARKET=spot"
+run_rr -- up --json
+assert_eq "precedence: shared market applies" "spot" "$(json_field "$RR_OUT" market)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_MARKET=on-demand"
+run_rr -- up --json
+assert_eq "precedence: repo market overrides shared" "on-demand" "$(json_field "$RR_OUT" market)"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS market: Spot launch argv, exactly once (repo#616) --"
+# ---------------------------------------------------------------------------
+SPOT_OPTS="MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}"
+rm -f "$SCRATCH/ssh_config"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_NEW_ID=i-0spot MOCK_AWS_PUBLIC_IP=203.0.113.70 MOCK_SSH_HOST_ID=i-0spot -- up --yes --json
+assert_eq "spot up --yes: exit 0" "0" "$RR_RC"
+assert_eq "spot: exactly one run-instances call" "1" "$(grep -c 'ec2 run-instances' "$MOCK_LOG")"
+assert_eq "spot: --instance-market-options is ONE complete argv element, passed once" \
+  "$SPOT_OPTS" "$(cat "$MOCK_LOG.market" 2>/dev/null)"
+assert_eq "spot: --instance-initiated-shutdown-behavior terminate, passed once" \
+  "terminate" "$(cat "$MOCK_LOG.shutdown" 2>/dev/null)"
+SPOTLINE="$(grep 'ec2 run-instances' "$MOCK_LOG")"
+assert_eq "spot: the market flag appears once on the launch line" "1" \
+  "$(printf '%s' "$SPOTLINE" | grep -o -- '--instance-market-options' | wc -l | tr -d ' ')"
+assert_eq "spot: the shutdown flag appears once on the launch line" "1" \
+  "$(printf '%s' "$SPOTLINE" | grep -o -- '--instance-initiated-shutdown-behavior' | wc -l | tr -d ' ')"
+# Every other launch guard is retained on the Spot launch.
+assert_contains "spot: the configured type is launched" "$SPOTLINE" "--instance-type m5.2xlarge"
+assert_contains "spot: tagged repo-remote=<name>" "$SPOTLINE" "repo-remote,Value=myrepo"
+assert_contains "spot: key pair still attached" "$SPOTLINE" "--key-name "
+assert_contains "spot: security group still attached" "$SPOTLINE" "--security-group-ids sg-0new"
+assert_contains "spot: SSH ingress still authorized for the caller" "$(cat "$MOCK_LOG")" "authorize-security-group-ingress"
+assert_eq "spot: IMDSv2 pin retained" "$IMDS_PIN" "$(cat "$MOCK_LOG.metadata" 2>/dev/null)"
+assert_contains "spot: root volume mapping retained" "$SPOTLINE" "VolumeType=gp3,Iops=3000,Throughput=125"
+assert_contains "spot: user-data (identity marker + idle guard) retained" "$SPOTLINE" "--user-data file://"
+assert_eq "spot up JSON: market is spot" "spot" "$(json_field "$RR_OUT" market)"
+assert_eq "spot up JSON: created, not reused" "false" "$(json_field "$RR_OUT" reused)"
+assert_eq "spot up JSON: the launched id" "i-0spot" "$(json_field "$RR_OUT" instance_id)"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_NEW_ID=i-0spot MOCK_AWS_PUBLIC_IP=203.0.113.70 MOCK_SSH_HOST_ID=i-0spot -- up --yes
+assert_contains "spot up (text): teardown hint uses --delete" "$RR_ERR" "repo-remote down --yes --delete"
+
+# ssm transport + Spot: the market flags ride the same single launch.
+run_rr REPO_REMOTE_MARKET=spot REPO_REMOTE_TRANSPORT=ssm REPO_REMOTE_INSTANCE_PROFILE=rr-ssm \
+  MOCK_AWS_NEW_ID=i-0spotssm MOCK_SSH_HOST_ID=i-0spotssm -- up --yes --json
+assert_eq "spot + ssm: exit 0" "0" "$RR_RC"
+assert_eq "spot + ssm: market flag passed once" "$SPOT_OPTS" "$(cat "$MOCK_LOG.market" 2>/dev/null)"
+assert_eq "spot + ssm: profile still attached" "Name=rr-ssm" "$(cat "$MOCK_LOG.profile" 2>/dev/null)"
+assert_not_contains "spot + ssm: still no ingress authorized" "$(cat "$MOCK_LOG")" "authorize-security-group-ingress"
+
+# Default compatibility: unset and explicit on-demand emit neither flag.
+for m in unset on-demand; do
+  if [[ "$m" == unset ]]; then menv=(); else menv=("REPO_REMOTE_MARKET=$m"); fi
+  run_rr ${menv[@]+"${menv[@]}"} MOCK_AWS_NEW_ID=i-0od MOCK_AWS_PUBLIC_IP=203.0.113.71 MOCK_SSH_HOST_ID=i-0od -- up --yes --json
+  assert_eq "market $m: up --yes exit 0" "0" "$RR_RC"
+  assert_eq "market $m: exactly one run-instances call" "1" "$(grep -c 'ec2 run-instances' "$MOCK_LOG")"
+  assert_not_contains "market $m: no --instance-market-options" "$(cat "$MOCK_LOG")" "instance-market-options"
+  assert_not_contains "market $m: no --instance-initiated-shutdown-behavior" "$(cat "$MOCK_LOG")" "instance-initiated-shutdown-behavior"
+  assert_eq "market $m: JSON market is on-demand" "on-demand" "$(json_field "$RR_OUT" market)"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS market: a rejected Spot launch is not retried or downgraded (repo#616) --"
+# ---------------------------------------------------------------------------
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_SPOT_CAPACITY_FAIL=1 -- up --yes --json
+assert_eq "spot capacity rejection: exit 4" "4" "$RR_RC"
+assert_eq "spot capacity rejection: exactly one run-instances call" "1" "$(grep -c 'ec2 run-instances' "$MOCK_LOG")"
+assert_eq "spot capacity rejection: that one call was the Spot launch" "$SPOT_OPTS" "$(cat "$MOCK_LOG.market" 2>/dev/null)"
+assert_eq "spot capacity rejection: no other instance type tried" "1" "$(grep -c -- '--instance-type' "$MOCK_LOG")"
+assert_contains "spot capacity rejection: surfaces the AWS error" "$RR_ERR" "InsufficientInstanceCapacity"
+assert_contains "spot capacity rejection: says nothing was retried" "$RR_ERR" "Nothing was retried"
+assert_not_contains "spot capacity rejection: no up result" "$RR_OUT" '"action":"up"'
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_QUOTA_FAIL=1 -- up --yes --json
+assert_eq "spot quota rejection: exit 4" "4" "$RR_RC"
+assert_eq "spot quota rejection: exactly one run-instances call" "1" "$(grep -c 'ec2 run-instances' "$MOCK_LOG")"
+assert_contains "spot quota rejection: names the Spot quota, not the on-demand one" "$RR_ERR" "L-34B43A08"
+assert_not_contains "spot quota rejection: not the on-demand quota code" "$RR_ERR" "L-1216C47A"
+run_rr MOCK_AWS_QUOTA_FAIL=1 -- up --yes --json
+assert_contains "on-demand quota rejection: unchanged message" "$RR_ERR" "L-1216C47A"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS market: Spot never restarts a stopped instance (repo#616) --"
+# ---------------------------------------------------------------------------
+for st in stopped stopping; do
+  write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+  run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_STATE=$st -- up --yes --json
+  assert_eq "spot + pinned $st: refused (exit 2)" "2" "$RR_RC"
+  assert_eq "spot + pinned $st: start-instances never called" "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+  assert_eq "spot + pinned $st: nothing launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG")"
+  assert_eq "spot + pinned $st: no ingress change" "0" "$(grep -c 'security-group-ingress' "$MOCK_LOG")"
+  assert_contains "spot + pinned $st: explains the lifecycle" "$RR_ERR" "never restarts a stopped instance"
+  assert_contains "spot + pinned $st: gives the terminate path" "$RR_ERR" "repo-remote down --yes --delete"
+  assert_contains "spot + pinned $st: gives the on-demand path" "$RR_ERR" "REPO_REMOTE_MARKET=on-demand"
+done
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="i-0found stopped" -- up --yes --json
+assert_eq "spot + tagged stopped: refused (exit 2)" "2" "$RR_RC"
+assert_eq "spot + tagged stopped: start-instances never called" "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+assert_eq "spot + tagged stopped: nothing launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG")"
+assert_contains "spot + tagged stopped: names the instance" "$RR_ERR" "i-0found is stopped"
+# The fleet-marker guard still runs first on a reused instance.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_STATE=stopped MOCK_AWS_FLEET_TAG=loom -- up --yes --json
+assert_eq "spot + fleet-marked stopped pin: fleet guard still refuses first (exit 5)" "5" "$RR_RC"
+assert_eq "spot + fleet-marked stopped pin: start-instances never called" "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+# A running pin is still reused.
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_STATE=running MOCK_AWS_PUBLIC_IP=203.0.113.72 MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "spot + running pin: reused (exit 0)" "0" "$RR_RC"
+assert_eq "spot + running pin: reused=true" "true" "$(json_field "$RR_OUT" reused)"
+assert_eq "spot + running pin: nothing started" "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+assert_eq "spot + running pin: nothing launched" "0" "$(grep -c 'run-instances' "$MOCK_LOG")"
+# A pin that Spot already terminated is gone: launch a fresh Spot instance.
+for st in terminated shutting-down; do
+  run_rr REPO_REMOTE_MARKET=spot REPO_REMOTE_NO_WRITEBACK=1 MOCK_AWS_STATE=$st MOCK_AWS_NEW_ID=i-0fresh \
+    MOCK_AWS_PUBLIC_IP=203.0.113.73 MOCK_SSH_HOST_ID=i-0fresh -- up --yes --json
+  assert_eq "spot + $st pin: fresh launch (exit 0)" "0" "$RR_RC"
+  assert_eq "spot + $st pin: exactly one Spot launch" "$SPOT_OPTS" "$(cat "$MOCK_LOG.market" 2>/dev/null)"
+  assert_eq "spot + $st pin: the new id is reported" "i-0fresh" "$(json_field "$RR_OUT" instance_id)"
+  assert_eq "spot + $st pin: reused=false" "false" "$(json_field "$RR_OUT" reused)"
+  assert_eq "spot + $st pin: nothing started" "0" "$(grep -c 'start-instances' "$MOCK_LOG")"
+  assert_contains "spot + $st pin: says why" "$RR_ERR" "is ${st} (a Spot instance is terminated"
+done
+# Default compatibility: on-demand still starts a stopped pin.
+run_rr MOCK_AWS_STATE=stopped MOCK_AWS_PUBLIC_IP=203.0.113.74 MOCK_SSH_HOST_ID=i-0pinned -- up --yes --json
+assert_eq "on-demand + stopped pin: exit 0" "0" "$RR_RC"
+assert_contains "on-demand + stopped pin: start-instances still called" "$(cat "$MOCK_LOG")" "start-instances --instance-ids i-0pinned"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- AWS market: Spot teardown terminates, never stops (repo#616) --"
+# ---------------------------------------------------------------------------
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="i-0abc" -- down --yes --json
+assert_eq "spot down --yes (no --delete): refused (exit 2)" "2" "$RR_RC"
+assert_eq "spot down --yes: stop-instances never called" "0" "$(grep -c 'stop-instances' "$MOCK_LOG")"
+assert_eq "spot down --yes: no cloud call at all" "" "$(cat "$MOCK_LOG")"
+assert_contains "spot down --yes: explains terminate-not-stop" "$RR_ERR" "terminates rather than stops"
+assert_contains "spot down --yes: gives the --delete command" "$RR_ERR" "repo-remote down --yes --delete"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="i-0abc" -- down --json
+assert_eq "spot down dry run: exit 0" "0" "$RR_RC"
+assert_contains "spot down dry run: still a dry run" "$RR_OUT" '"disposition":"dry-run"'
+assert_eq "spot down dry run: JSON market is spot" "spot" "$(json_field "$RR_OUT" market)"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="i-0abc" -- down
+assert_contains "spot down dry run (text): notes the stop refusal" "$RR_ERR" "'down --yes' (stop) would be refused"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="$(printf 'i-0spota\ni-0spotb')" -- down --yes --delete --json
+assert_eq "spot down --yes --delete: exit 0" "0" "$RR_RC"
+assert_contains "spot down --yes --delete: terminated" "$RR_OUT" '"disposition":"terminated"'
+assert_eq "spot down --yes --delete: terminates exactly the resolved ids" \
+  "ec2 terminate-instances --instance-ids i-0spota i-0spotb" "$(grep 'terminate-instances' "$MOCK_LOG")"
+assert_eq "spot down --yes --delete: nothing stopped" "0" "$(grep -c 'stop-instances' "$MOCK_LOG")"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="$(printf 'i-0spota\ni-0spotmarked')" MOCK_AWS_FLEET_MARKED_IDS="i-0spotmarked" \
+  -- down --yes --delete --json
+assert_eq "spot down --delete: fleet-marker guard still refuses (exit 5)" "5" "$RR_RC"
+assert_eq "spot down --delete: refused batch terminates nothing" "0" "$(grep -c 'terminate-instances' "$MOCK_LOG")"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedspot"
+run_rr REPO_REMOTE_MARKET=spot MOCK_AWS_FIND="i-0other" -- down --yes --delete --json
+assert_eq "spot down --delete (pinned): terminates only the pin" \
+  "ec2 terminate-instances --instance-ids i-0pinnedspot" "$(grep 'terminate-instances' "$MOCK_LOG")"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr MOCK_AWS_FIND="i-0abc" -- down --yes --json
+assert_contains "on-demand down --yes: still stops" "$RR_OUT" '"disposition":"stopped"'
+assert_eq "on-demand down JSON: market is on-demand" "on-demand" "$(json_field "$RR_OUT" market)"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: remote.md documents what the script implements --"
 # ---------------------------------------------------------------------------
 MD="$(cat "$REMOTE_MD")"
@@ -3708,6 +3948,22 @@ HELP="$(bash "$RR" --help 2>&1)"
 assert_contains "--help documents attach" "$HELP" "repo-remote attach|--attach"
 assert_contains "--help documents exit 7" "$HELP" "7  \`attach\` could not resolve"
 assert_contains "--help documents the gateway contract" "$HELP" "REPO_REMOTE_GH_API_HOST"
+
+# repo#616: the opt-in Spot market, its exact launch arguments, and its
+# lifecycle and cost semantics.
+assert_contains "remote.md documents the market section" "$MD" "#### AWS market: on-demand or Spot"
+assert_contains "remote.md documents the market setting" "$MD" "REPO_REMOTE_MARKET=spot"
+assert_contains "remote.md documents the exact market options" "$MD" \
+  "--instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}"
+assert_contains "remote.md documents the shutdown behavior" "$MD" "--instance-initiated-shutdown-behavior terminate"
+assert_contains "remote.md documents the default" "$MD" "unset, empty, or \`on-demand\` launches exactly as before"
+assert_contains "remote.md documents non-reuse" "$MD" "**No reuse of a stopped box.**"
+assert_contains "remote.md documents Spot teardown" "$MD" "**Teardown is \`--delete\`.**"
+assert_contains "remote.md documents no guarantee" "$MD" "**Price and capacity are not guaranteed.**"
+assert_contains "remote.md documents no retry" "$MD" "**Nothing is retried**"
+assert_contains "remote.md documents the additive market field" "$MD" '`"market":"spot"`'
+HELP616="$(bash "$RR" --help 2>&1)"
+assert_contains "--help documents REPO_REMOTE_MARKET" "$HELP616" "REPO_REMOTE_MARKET   on-demand (default) | spot"
 
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"
