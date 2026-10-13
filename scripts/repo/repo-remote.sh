@@ -53,6 +53,31 @@
 #       With REPO_REMOTE_MARKET=spot, `down --yes` without --delete is refused
 #       (exit 2) before any cloud call — see "AWS market" below.
 #
+#   repo-remote prune|--prune [--yes] [--json] [aws|gcp]   Garbage-collect stale
+#       SSH aliases (#628). Lists the `Host repo-remote-*` blocks in
+#       REPO_REMOTE_SSH_CONFIG (default ~/.ssh/config) whose box no longer
+#       exists at the configured provider/region -- the block's HostName matches
+#       no live instance's public IP or id, and its alias is not
+#       repo-remote-<tag> for a live instance's repo-remote tag -- and, with
+#       --yes, removes them plus their known_hosts entries (`ssh-keygen -R
+#       <HostName>`). Dry run by default. Fails CLOSED: if the provider lookup
+#       errors or returns anything unparseable (exit 4), nothing is removed. A
+#       block it cannot judge (multi-pattern Host line, no HostName) and every
+#       block that is not `Host repo-remote-*` are never touched. The removal
+#       uses the same lock, same-directory temp file, `ssh -G` parse check and
+#       atomic mv as the alias writer. It judges only the configured
+#       provider/region, so run the dry run first when you use several.
+#       `down --yes --delete` removes the terminated box's alias and
+#       known_hosts entry itself; a stop-only `down --yes` keeps both.
+#
+# Naming (#628): <name> is the directory name of the PRIMARY checkout (the
+# parent of `git rev-parse --git-common-dir`), so a main checkout and every
+# linked worktree of one repo resolve the same alias, repo-remote=<name> tag
+# and SSH ingress marker. Outside a `.git`-dir checkout (bare repo, no git) it
+# falls back to the basename of the git toplevel / cwd. A box tagged with a
+# worktree directory name by an earlier version is no longer found by tag;
+# pin it with REPO_REMOTE_INSTANCE_ID or re-tag it repo-remote=<name>.
+#
 #   repo-remote attach|--attach [--container|--host] [--command <cmd>] [aws|gcp]
 #       Open a session on THIS repo's existing instance, carrying a freshly
 #       resolved GitHub credential (repo#565). It is the credential-aware
@@ -324,7 +349,8 @@
 #      REPO_REMOTE_SSH_MIN_PREFIX without REPO_REMOTE_ALLOW_WORLD_SSH=1
 #      (repo#487)
 #   3  provider authentication failed
-#   4  cloud operation failed
+#   4  cloud operation failed (for `prune`: the provider lookup failed and
+#      nothing was removed)
 #   5  refused to act (reuse via `up`, stop/terminate via `down`) on a
 #      fleet-marked instance (pass --force to override)
 #   6  host-identity verification failed — the host reachable at the SSH alias
@@ -400,7 +426,7 @@ DELETE=false     # --down --delete
 ATTACH_MODE=auto       # attach: auto | container | host (repo#565)
 ATTACH_COMMAND=""      # attach --command <cmd>
 ATTACH_HAS_COMMAND=false
-ACTION=""        # up | down | status | verify | attach
+ACTION=""        # up | down | status | verify | attach | prune
 PROVIDER_ARG=""  # aws | gcp (positional override)
 
 # ── JSON emission (no jq dependency for output; values are controlled) ──────
@@ -461,6 +487,23 @@ is_linked_worktree() {
   gitdir="$(cd "$gitdir" 2>/dev/null && pwd -P)" || return 1
   commondir="$(cd "$commondir" 2>/dev/null && pwd -P)" || return 1
   [[ "$gitdir" != "$commondir" ]]
+}
+
+# primary_checkout_name -- the directory name of the PRIMARY checkout (#628):
+# the parent of `git rev-parse --git-common-dir`, resolved physically. The
+# primary checkout and every linked worktree share one common dir, so they all
+# get the same name -- and therefore the same repo-remote-<name> alias,
+# repo-remote=<name> instance tag and SSH ingress marker. Prints nothing and
+# returns 1 when the common dir is not a directory literally named `.git`
+# (bare repo, submodule, no git), so the caller falls back to the
+# --show-toplevel basename.
+primary_checkout_name() {
+  local commondir
+  commondir="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ -n "$commondir" ]] || return 1
+  commondir="$(cd "$commondir" 2>/dev/null && pwd -P)" || return 1
+  [[ "$(basename "$commondir")" == .git ]] || return 1
+  basename "$(dirname "$commondir")"
 }
 
 # warn_worktree_env <read|write> -- repo#538: loud warning when an in-tree
@@ -668,7 +711,8 @@ resolve_settings() {
   # lower-case the provider
   PROVIDER="$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')"
 
-  NAME="$(basename "${GIT_ROOT:-$PWD}")"
+  NAME="$(primary_checkout_name || true)"
+  [[ -n "$NAME" ]] || NAME="$(basename "${GIT_ROOT:-$PWD}")"
   CALLER="$(repo_remote_caller)"
 
   INSTANCE_TYPE="${REPO_REMOTE_INSTANCE_TYPE:-}"
@@ -2536,6 +2580,7 @@ aws_down() {
     # shellcheck disable=SC2086
     aws ec2 terminate-instances --instance-ids $ids >/dev/null 2>&1 \
       || die 4 "aws ec2 terminate-instances failed for: $ids"
+    remove_ssh_alias "repo-remote-${NAME}"
     emit_down_result "$ids" "terminated"
   else
     # shellcheck disable=SC2086
@@ -2643,6 +2688,7 @@ gcp_down() {
   if [[ "$DELETE" == true ]]; then
     gcloud compute instances delete "$vm" --zone "$REGION" --quiet >/dev/null 2>&1 \
       || die 4 "gcloud compute instances delete failed for $vm"
+    remove_ssh_alias "repo-remote-${NAME}"
     emit_down_result "$vm" "terminated"
   else
     gcloud compute instances stop "$vm" --zone "$REGION" --quiet >/dev/null 2>&1 \
@@ -2859,6 +2905,193 @@ write_ssh_alias() {  # <ip | instance-id> [ssm-region]
   chmod 600 "$cfg" 2>/dev/null || true
   release_ssh_alias_lock "$cfg"
   printf '%s' "$alias"
+}
+
+# ── alias removal + prune (#628) ────────────────────────────────────────────
+# ssh_alias_hostname <cfg> <alias> -- the first HostName of the single-pattern
+# "Host <alias>" block in <cfg>; empty when there is no such block.
+ssh_alias_hostname() {  # <cfg> <alias>
+  [[ -f "$1" ]] || return 0
+  awk -v a="$2" '
+    /^[[:space:]]*(Host|Match)[[:space:]]/ { inb = ($1 == "Host" && NF == 2 && $2 == a); next }
+    inb && tolower($1) == "hostname" {print $2; exit}
+  ' "$1"
+}
+
+# strip_ssh_alias_blocks <cfg> <out> <alias>... -- copy <cfg> to <out> without
+# the single-pattern "Host <alias>" blocks named (a block ends at the next Host
+# or Match line). Every other byte is preserved. Header lines are matched on
+# fields ($1 == "Host", NF == 2), exactly like prune's scanner, so an indented
+# or trailing-space header is both reported and actually stripped.
+strip_ssh_alias_blocks() {  # <cfg> <out> <alias>...
+  local cfg="$1" out="$2"; shift 2
+  local list; list="$(printf '%s\n' "$@")"
+  awk -v list="$list" '
+    BEGIN { n = split(list, l, "\n"); for (i = 1; i <= n; i++) drop[l[i]] = 1 }
+    /^[[:space:]]*(Host|Match)[[:space:]]/ { skip = ($1 == "Host" && NF == 2 && ($2 in drop)) }
+    skip { next }
+    { print }
+  ' "$cfg" >"$out"
+}
+
+# remove_ssh_alias_blocks <alias>... -- remove the named Host blocks from
+# REPO_REMOTE_SSH_CONFIG under the same lock, same-directory temp file, `ssh -G`
+# parse check and atomic mv as write_ssh_alias, then `ssh-keygen -R` each
+# removed HostName (unless a surviving block still uses it). Only
+# `repo-remote-*` aliases are ever accepted. Returns non-zero, leaving the
+# config untouched, if the result would not parse.
+remove_ssh_alias_blocks() {  # <alias>...
+  local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}" a
+  for a in "$@"; do
+    if [[ "$a" != repo-remote-* || ! "$a" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      log "refusing to remove non repo-remote alias '${a}'"
+      return 1
+    fi
+  done
+  [[ -f "$cfg" ]] || return 0
+  acquire_ssh_alias_lock "$cfg"
+  local tmp hosts="" h
+  tmp="$(mktemp "$(dirname "$cfg")/.ssh_config.XXXXXX")"
+  for a in "$@"; do
+    h="$(ssh_alias_hostname "$cfg" "$a")"
+    [[ -n "$h" ]] && hosts+="${h}"$'\n'
+  done
+  strip_ssh_alias_blocks "$cfg" "$tmp" "$@"
+  if cmp -s "$cfg" "$tmp"; then
+    rm -f "$tmp"; release_ssh_alias_lock "$cfg"; return 0
+  fi
+  if ! ssh -G -F "$tmp" repo-remote-prune-check >/dev/null 2>&1; then
+    log "SSH config would not parse after removing the alias block(s) -- leaving ${cfg} untouched"
+    rm -f "$tmp"; release_ssh_alias_lock "$cfg"
+    return 1
+  fi
+  chmod --reference="$cfg" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$cfg"
+  release_ssh_alias_lock "$cfg"
+  while IFS= read -r h; do
+    [[ -n "$h" ]] || continue
+    # Keep the entry if a surviving block still points at the same host.
+    if grep -Eiq "^[[:space:]]*HostName[[:space:]]+${h//./\\.}[[:space:]]*$" "$cfg" 2>/dev/null; then
+      continue
+    fi
+    ssh-keygen -R "$h" >/dev/null 2>&1 || true
+  done <<<"$hosts"
+  return 0
+}
+
+# remove_ssh_alias <alias> -- the post-terminate cleanup used by down --delete.
+# The box is already gone, so a failure here is a warning, never an error.
+remove_ssh_alias() {  # <alias>
+  local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
+  [[ -f "$cfg" ]] || return 0
+  [[ -n "$(awk -v a="$1" '$1 == "Host" && NF == 2 && $2 == a {print "y"; exit}' "$cfg")" ]] || return 0
+  if remove_ssh_alias_blocks "$1"; then
+    log "removed SSH alias ${1} (and its known_hosts entry) from ${cfg}"
+  else
+    log "WARNING: could not remove SSH alias ${1} from ${cfg}; run 'repo-remote prune' later"
+  fi
+}
+
+# prune_live_rows -- one "<id>\t<public-ip|None>\t<repo-remote tag|None>" row per
+# instance that still exists at the provider (any non-terminated state).
+# Fails (non-zero) on a lookup error or on any row it cannot parse, so prune
+# fails CLOSED rather than judging aliases against a partial picture.
+prune_live_rows() {
+  local out line tab=$'\t' row_re
+  row_re="^i-[A-Za-z0-9]+${tab}[^${tab}]+${tab}[^${tab}]+\$"
+  if [[ "$PROVIDER" == aws ]]; then
+    out="$(aws ec2 describe-instances \
+      --filters "Name=tag-key,Values=repo-remote" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query "Reservations[].Instances[].[InstanceId,PublicIpAddress,Tags[?Key=='repo-remote']|[0].Value]" \
+      --output text 2>/dev/null)" || return 1
+    out="$(printf '%s\n' "$out" | tr -s '[:blank:]' '\t')"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" =~ $row_re ]] || return 1
+    done <<<"$out"
+  else
+    out="$(gcloud compute instances list --filter='labels.repo-remote:*' \
+      --format='csv[no-heading](name,networkInterfaces[0].accessConfigs[0].natIP,labels.repo-remote)' 2>/dev/null)" \
+      || return 1
+    local n ip tag
+    out="$(while IFS=, read -r n ip tag; do
+      [[ -z "$n" ]] && continue
+      printf '%s\t%s\t%s\n' "$n" "${ip:-None}" "${tag:-None}"
+    done <<<"$out")"
+  fi
+  printf '%s\n' "$out"
+}
+
+# prune_aliases -- `repo-remote prune [--yes] [--json]`. Remove the
+# `Host repo-remote-*` blocks in REPO_REMOTE_SSH_CONFIG whose box no longer
+# exists at the configured provider/region, plus their known_hosts entries.
+# A block is KEPT when its HostName matches a live instance's public IP or id,
+# or its alias is repo-remote-<tag> for a live instance's repo-remote tag (a
+# stopped box's recorded IP is stale by design), or when it cannot be judged
+# (multi-pattern Host line, unusual characters, no HostName). Dry run by default.
+prune_aliases() {
+  local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}" rows
+  if [[ "$PROVIDER" == aws ]]; then aws_authenticate; else gcp_authenticate; fi
+  rows="$(prune_live_rows)" \
+    || die 4 "could not list the live ${PROVIDER} instances; nothing was removed (prune fails closed). Check credentials/region and retry."
+  local -a stale=() stale_hosts=() kept=()
+  local alias host id ip tag live
+  if [[ -f "$cfg" ]]; then
+    while IFS=$'\t' read -r alias host; do
+      [[ -n "$alias" ]] || continue
+      if [[ -z "$host" || ! "$host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+        kept+=("$alias"); continue
+      fi
+      live=false
+      while IFS=$'\t' read -r id ip tag; do
+        [[ -n "$id" ]] || continue
+        if [[ "$host" == "$id" || "$host" == "$ip" || "$alias" == "repo-remote-${tag}" || "$alias" == "$id" ]]; then
+          live=true; break
+        fi
+      done <<<"$rows"
+      if [[ "$live" == true ]]; then kept+=("$alias"); else stale+=("$alias"); stale_hosts+=("$host"); fi
+    done < <(awk '
+      /^[[:space:]]*(Host|Match)[[:space:]]/ {
+        if (alias != "") print alias "\t" host
+        alias = ""; host = ""
+        if ($1 == "Host" && NF == 2 && $2 ~ /^repo-remote-[A-Za-z0-9._-]+$/) alias = $2
+        next
+      }
+      alias != "" && host == "" && tolower($1) == "hostname" { host = $2 }
+      END { if (alias != "") print alias "\t" host }
+    ' "$cfg")
+  fi
+
+  local removed=false
+  if [[ "$YES" == true && ${#stale[@]} -gt 0 ]]; then
+    remove_ssh_alias_blocks "${stale[@]}" || die 4 "failed to remove the stale aliases from ${cfg}"
+    removed=true
+  fi
+
+  local disp=dry-run
+  [[ "$YES" == true ]] && disp=removed
+  if [[ "$JSON_OUT" == true ]]; then
+    local first=true a
+    printf '{"action":"prune","provider":"%s","disposition":"%s","stale":[' "$(json_escape "$PROVIDER")" "$disp"
+    for a in ${stale[@]+"${stale[@]}"}; do
+      [[ "$first" == true ]] && first=false || printf ','
+      printf '"%s"' "$(json_escape "$a")"
+    done
+    printf '],"kept":%s}\n' "${#kept[@]}"
+  elif [[ ${#stale[@]} -eq 0 ]]; then
+    log "no stale repo-remote-* aliases in ${cfg}"
+  else
+    local i
+    for i in "${!stale[@]}"; do
+      if [[ "$removed" == true ]]; then
+        log "removed stale alias ${stale[$i]} (HostName ${stale_hosts[$i]})"
+      else
+        log "stale alias ${stale[$i]} (HostName ${stale_hosts[$i]}) -- would remove"
+      fi
+    done
+    [[ "$removed" == true ]] || log "DRY RUN -- ${#stale[@]} stale alias(es) in ${cfg} (pass --yes to remove them and their known_hosts entries)"
+  fi
 }
 
 # ── dev-session GitHub credential + attach (repo#565) ───────────────────────
@@ -3635,11 +3868,12 @@ parse_args() {
   local attach_flag=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      up|status|down|verify|attach) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
+      up|status|down|verify|attach|prune) [[ -z "$ACTION" ]] && ACTION="$1" || die 64 "multiple actions given ($ACTION, $1)" ;;
       --status)       ACTION="status" ;;
       --down)         ACTION="down" ;;
       --verify)       ACTION="verify" ;;
       --attach)       ACTION="attach" ;;
+      --prune)        ACTION="prune" ;;
       --container)    [[ "$ATTACH_MODE" == host ]] && die 64 "--container and --host are mutually exclusive"
                       ATTACH_MODE=container; attach_flag=true ;;
       --host)         [[ "$ATTACH_MODE" == container ]] && die 64 "--container and --host are mutually exclusive"
@@ -3656,7 +3890,7 @@ parse_args() {
     esac
     shift
   done
-  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | verify | down | attach; see --help)"
+  [[ -n "$ACTION" ]] || die 64 "no action given (expected: up | status | verify | down | attach | prune; see --help)"
   if [[ "$attach_flag" == true && "$ACTION" != attach ]]; then
     die 64 "--container, --host and --command apply only to attach"
   fi
@@ -3721,6 +3955,15 @@ main() {
       [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for attach"
       case "$PROVIDER" in
         aws|gcp) attach_session; exit $? ;;
+        *)       die 2 "unknown provider '$PROVIDER'" ;;
+      esac
+      ;;
+    prune)
+      # No cost gate: prune spends nothing and touches only the local SSH
+      # config (and known_hosts) -- see prune_aliases (#628).
+      [[ -n "$PROVIDER" ]] || die 2 "REPO_REMOTE_PROVIDER (or an aws|gcp argument) is required for prune"
+      case "$PROVIDER" in
+        aws|gcp) prune_aliases ;;
         *)       die 2 "unknown provider '$PROVIDER'" ;;
       esac
       ;;
