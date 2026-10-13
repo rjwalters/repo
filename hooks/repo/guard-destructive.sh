@@ -9587,6 +9587,26 @@ if [[ "$_FORCE_PRESCAN" == *git* || "$_FORCE_PRESCAN" == *push* || "$_FORCE_PRES
                     elif [[ -n "$_fcwd" ]]; then
                         _fbranch=$(git -C "$_fcwd" symbolic-ref --short HEAD 2>/dev/null || true)
                     fi
+                    # repo#632: the files a hard reset rewrites live in the
+                    # WORK TREE, not in the git dir / cwd the branch above was
+                    # read from. A --work-tree/GIT_WORK_TREE aimed at a
+                    # checkout of this repo family (the protected main
+                    # checkout, or another worktree) is judged by THAT
+                    # checkout's branch -- same verdict as running from there.
+                    # A work tree provably outside the family (scratch clone,
+                    # #320/#330) is left to the existing logic.
+                    if [[ -n "$_fworktree" ]] && \
+                       ! _force_op_cwd_outside_known_roots "$_fworktree"; then
+                        _wtbranch=$(git -C "$_fworktree" symbolic-ref --short HEAD 2>/dev/null || true)
+                        if [[ -z "$_wtbranch" ]]; then
+                            ask "Command requires confirmation: $COMMAND (force operation rewrites a work tree in this repository whose branch cannot be resolved)" "force-op:detached"
+                        fi
+                        _wtdefault=$(resolve_default_branch "$_fworktree")
+                        if [[ "$_wtbranch" == "main" || "$_wtbranch" == "master" ]] || \
+                           { [[ -n "$_wtdefault" && "$_wtbranch" == "$_wtdefault" ]]; }; then
+                            ask "Command requires confirmation: $COMMAND (force operation rewrites the work tree of protected branch '$_wtbranch')" "force-op:protected"
+                        fi
+                    fi
                     # The managed-worktree recovery carve-out is only proven
                     # for the plain cwd shape; an explicit git dir or work
                     # tree keeps asking.

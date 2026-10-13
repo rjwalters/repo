@@ -1398,6 +1398,30 @@ assert_allow "602: separate scratch clone still allowed from worktree cwd (#330)
 assert_allow "602: cd to separate scratch clone still allowed from worktree cwd (#350)" \
     "cd $F602_SCRATCH && git reset --hard HEAD~1" "$F602_WT1"
 
+# ---- protected mode: --work-tree aimed at the main checkout (#632). ----
+# The git dir resolves to the feature worktree, but the files rewritten are the
+# main checkout's. checkout/clean are not force ops in this guard (only
+# push/reset are parsed by parse_force_ops), so those shapes are out of scope.
+F602_WT1_GD=$(git -C "$F602_WT1" rev-parse --absolute-git-dir)
+assert_ask "632: --work-tree <main> reset --hard from worktree asks" \
+    "git --work-tree $F602_MAIN reset --hard" "$F602_WT1"
+assert_ask "632: --work-tree=<main> reset --hard from worktree asks" \
+    "git --work-tree=$F602_MAIN reset --hard" "$F602_WT1"
+assert_ask "632: GIT_WORK_TREE=<main> reset --hard from worktree asks" \
+    "GIT_WORK_TREE=$F602_MAIN git reset --hard" "$F602_WT1"
+assert_ask "632: --git-dir <wt-gitdir> --work-tree <main> reset --hard asks" \
+    "git --git-dir $F602_WT1_GD --work-tree $F602_MAIN reset --hard" "$F602_WT1"
+assert_ask_reason_matches "632: --work-tree <main> asks as protected force op" \
+    "git --work-tree $F602_MAIN reset --hard" "protected branch" "$F602_WT1"
+assert_ask "632: relative --work-tree to main asks" \
+    "git --work-tree ../../.. reset --hard" "$F602_WT1"
+assert_allow "632: --work-tree <acting worktree> still allowed" \
+    "git --work-tree $F602_WT1 reset --hard" "$F602_WT1"
+assert_allow "632: --work-tree . in acting worktree still allowed" \
+    "git --work-tree . reset --hard" "$F602_WT1"
+assert_allow "632: --work-tree <scratch clone> from worktree still allowed" \
+    "git --git-dir $F602_SCRATCH/.git --work-tree $F602_SCRATCH reset --hard HEAD~1" "$F602_WT1"
+
 # ---- protected mode: git -C <other repo> resolves cwd from the -C argument. ----
 # Command runs with the hook cwd = default-branch repo, but -C points at the
 # feature-branch repo, so the target resolves to feature/work → allow. Without
