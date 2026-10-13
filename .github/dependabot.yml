@@ -13,7 +13,7 @@ updates:
       timezone: "America/Los_Angeles"
     cooldown:
       default-days: 14
-    labels: ["dependencies", "loom:review-requested", "tier:maintenance"]
+    labels: ["dependencies", "loom:review-requested"]
     groups:
       github-actions:
         patterns: ["*"]
@@ -28,7 +28,7 @@ updates:
       timezone: "America/Los_Angeles"
     cooldown:
       default-days: 14
-    labels: ["dependencies", "loom:review-requested", "tier:maintenance"]
+    labels: ["dependencies", "loom:review-requested"]
     groups:
       docker-minor-patch:
         patterns: ["*"]
