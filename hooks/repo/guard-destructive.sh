@@ -2769,11 +2769,14 @@ parse_force_ops() {
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
+                    cdbase = curcwd
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
+                    # repo#625: a cd to a missing directory fails and stays put
+                    if (cd_unreached(cdarg, cdbase, flow_next_kind(SK, i, n), home)) curcwd = UNK
                 }
                 continue
             }
@@ -5750,11 +5753,14 @@ resolve_stash_cwd() {
                 if (cdtok != "" && cdtok != "-") {
                     cdarg = expand_cd_arg(cdtok, home)
                     cdclass = strip_cd_quoting(cdarg)
+                    cdbase = curcwd
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
+                    # repo#625: a cd to a missing directory fails and stays put
+                    if (cd_unreached(cdarg, cdbase, flow_next_kind(SK, i, n), home)) curcwd = UNK
                 }
                 continue
             }
@@ -6534,6 +6540,29 @@ function static_path_word(tok, home,   pre, rest, d) {
     d = pre d
     if (index(d, "\n") || index(d, sprintf("%c", 31)) || index(d, sprintf("%c", 14))) return unknown_cwd()
     return d
+}
+# cd_unreached(cdarg, base, ka, home) -- repo#625: 1 when a statically known
+# cd target is NOT proven to have been reached. A failed cd leaves the shell in
+# its old directory, so after `cd /missing; cmd` (or newline / ||) the next
+# command runs in the OLD cwd. A cd joined to the next command by && is safe
+# (the next command never runs after a failed cd). Otherwise the target counts
+# as reached only when it exists, checked on the literal path (a relative
+# operand is joined onto base, which must itself be an absolute known cwd).
+# An operand that is not statically decodable is left to the existing
+# unknown/fresh-root handling (returns 0). The path goes to test as a single
+# quoted argument, never through eval.
+function cd_unreached(cdarg, base, ka, home,   d, q, sq) {
+    if (ka == "A") return 0
+    d = static_path_word(cdarg, home)
+    if (d == "" || d == unknown_cwd()) return 0
+    if (substr(d, 1, 1) != "/") {
+        if (substr(base, 1, 1) != "/") return 0
+        d = base "/" d
+    }
+    sq = sprintf("%c", 39)
+    q = d
+    gsub(sq, sq "\\" sq sq, q)
+    return (system("test -d " sq q sq) != 0)
 }
 function cmdw_unmask(s) {
     gsub(sprintf("%c", 2), " ", s)
@@ -8116,11 +8145,14 @@ extract_write_targets() {
                     if (index(cdarg, SQ) == 0 && index(cdarg, "\\") == 0 && \
                         (cdclass ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*\}(\/.*)?$/ || \
                          cdclass ~ /^\$[A-Za-z_][A-Za-z0-9_]*(\/.*)?$/)) cdfresh = 1
+                    cdbase = curcwd
                     if (cdclass ~ /^\// || cdfresh) {
                         curcwd = cdarg
                     } else if (curcwd != "" && curcwd != UNK) {
                         curcwd = curcwd "/" cdarg
                     }
+                    # repo#625: a cd to a missing directory fails and stays put
+                    if (cd_unreached(cdarg, cdbase, flow_next_kind(SK, i, n), home)) curcwd = UNK
                 }
                 continue
             }
