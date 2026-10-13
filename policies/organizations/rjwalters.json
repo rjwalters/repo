@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "provider": "dependabot",
+    "dependabotSecurityUpdates": true,
+    "renovate": null
+  }
+}
