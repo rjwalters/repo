@@ -325,6 +325,10 @@ git --git-dir .git reset --hard
 git --work-tree . reset --hard
 GIT_DIR=.git GIT_WORK_TREE=. git reset --hard
 echo 'git "reset" --hard'
+# repo#632: --work-tree / GIT_WORK_TREE aimed at the main checkout from a worktree.
+wt:git --work-tree {{MAIN}} reset --hard
+wt:git --work-tree={{MAIN}} reset --hard
+wt:GIT_WORK_TREE={{MAIN}} git reset --hard
 
 # ── git -C operand word parsing (repo#608) ────────────────────────────────
 # A quoted / escaped -C operand (and a quoted -c value) holding whitespace is
