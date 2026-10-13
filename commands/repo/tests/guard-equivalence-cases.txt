@@ -357,3 +357,11 @@ wt:cd /nonexistent-xyz || echo hi > out.log
 # Control: && never runs the write after a failed cd; an existing dir is reached.
 wt:cd /nonexistent-xyz && echo hi > out.log
 wt:cd /tmp; echo hi > out.log
+
+# ── zsh directory-stack cd (repo#626) ─────────────────────────────────────
+wt:cd +1 && echo hi > out.log
+wt:cd /tmp; cd +1 && echo hi > out.log
+wt:cd /tmp; cd -- -1 && echo hi > out.log
+wt:cd /tmp; cd ~+1 && echo hi > out.log
+# Control: a literal directory named +1 is spelled ./+1.
+wt:cd /tmp; cd ./+1 && echo hi > out.log

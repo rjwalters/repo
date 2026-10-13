@@ -6254,7 +6254,8 @@ function cd_skip_prefix(toks, j, m,   nj) {
 # none). Returns 0 when the resulting directory cannot be proven (an unknown
 # or non-literal option, an extra operand, an option without an operand, or a
 # -P operand containing dot-dot whose physical meaning differs from the logical
-# one), 1 otherwise. After -- a leading dash is an operand.
+# one, or a directory-stack operand +N / -N / ~+ / ~- (repo#626)), 1
+# otherwise. After -- a leading dash is an operand.
 function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
     CDW_ARG = ""
     opts = 0
@@ -6301,6 +6302,16 @@ function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
     if (opts && nopd == 0) return 0
     if (physical && CDW_ARG ~ /\.\./) return 0
     if (CDW_ARG == "-") return 0
+    # repo#626: in zsh (the default Bash-tool shell on macOS) `cd +N` and
+    # `cd -N` select entry N of the directory stack, and zsh honors that even
+    # when the word is quoted or follows `--`; `~+`, `~-`, `~+N` and `~-N`
+    # are stack/OLDPWD tilde forms in both shells. The stack is invisible
+    # here, so the resulting directory is unprovable -- never a relative
+    # directory named `+1`. A literal directory of that name is `./+1`.
+    raw = CDW_ARG
+    gsub(/[\\\047\042]/, "", raw)
+    if (raw ~ /^[+-][0-9]+$/) return 0
+    if (raw ~ /^~[+-]/) return 0
     if (opts) CDW_LEAD = 1
     return 1
 }

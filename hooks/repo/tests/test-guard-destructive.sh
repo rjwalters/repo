@@ -4738,6 +4738,79 @@ for _c601 in "$WTC_MAIN" "$WTC_WT"; do
 done
 unset _U601 _C601 _NL601 _P601 _c601 _w601 _p601 _sep _sn
 
+# repo#626: in zsh (the Bash tool's default shell on macOS) `cd +N` / `cd -N`
+# jump to entry N of the directory stack, which the guard cannot see. The
+# shared recognizer cd_operand() therefore treats an operand matching
+# ^[+-][0-9]+$ (after quote removal -- zsh ignores quoting for the stack form,
+# and `cd -- -1` reaches the operand slot past the option branch) and the
+# tilde stack forms ~+ / ~- as UNPROVABLE, so every cwd consumer sees an
+# unknown cwd instead of a relative directory named `+1`. pushd/popd were
+# already unknown (repo#601); they are re-checked here with no argument too.
+# A real directory named `+1` exists in the worktree so the old misreading
+# resolved to an existing, allowed directory; it is still reachable as
+# `cd ./+1`. (The force-op consumer is covered beside the repo#612 fixture.)
+_U626="worktree-write-confinement-unknown-cwd"
+_NL626=$'\n'
+mkdir -p "$WTC_WT/+1"
+_P626=(
+    'cd +1'
+    'cd +0'
+    'cd +12'
+    'cd -1'
+    "cd '+1'"
+    'cd "+1"'
+    'cd \+1'
+    'cd -- -1'
+    'cd -- +1'
+    'cd -P +1'
+    'cd ~+1'
+    'cd ~-1'
+    'cd ~-'
+    'pushd'
+    'pushd /tmp'
+    'popd'
+)
+for _c626 in "$WTC_MAIN" "$WTC_WT"; do
+    _w626="main"; [[ "$_c626" == "$WTC_WT" ]] && _w626="worktree"
+    for _p626 in "${_P626[@]}"; do
+        for _sep in '; ' "$_NL626" ' && '; do
+            _sn="${_sep//$'\n'/<newline>}"
+            assert_deny_tag "write-confinement (#626, cwd=$_w626): ${_p626}${_sn}relative redirect" \
+                "${_p626}${_sep}echo hi > out.log" "$_c626" "$_U626"
+            assert_deny_tag "write-confinement (#626, cwd=$_w626): cd /tmp; ${_p626}${_sn}relative redirect" \
+                "cd /tmp; ${_p626}${_sep}echo hi > out.log" "$_c626" "$_U626"
+            assert_deny_tag "write-confinement (#626, cwd=$_w626): cd <wt>; ${_p626}${_sn}relative redirect" \
+                "cd $WTC_WT; ${_p626}${_sep}echo hi > out.log" "$_c626" "$_U626"
+        done
+        assert_ask "stash-scope (#626, cwd=$_w626): cd <wt>; ${_p626}; stash recovery asks" \
+            "cd $WTC_WT; ${_p626}; git stash pop" "$_c626"
+        assert_ask "stash-scope (#626, cwd=$_w626): cd <wt>; ${_p626} && stash recovery asks" \
+            "cd $WTC_WT; ${_p626} && git stash pop" "$_c626"
+    done
+    # Unknown stays sticky across a relative cd, and is cleared by an absolute one.
+    assert_deny_tag "write-confinement (#626, cwd=$_w626): cd <wt>; cd +1; cd sub stays unknown" \
+        "cd $WTC_WT; cd +1; cd sub && echo hi > out.log" "$_c626" "$_U626"
+    assert_allow "write-confinement (#626, cwd=$_w626): cd +1; absolute cd /tmp recovers" \
+        "cd +1; cd /tmp; echo hi > out.log" "$_c626"
+    # Controls: the literal directory named +1 is spelled ./+1 and still resolves.
+    assert_allow "write-confinement (#626, cwd=$_w626): cd <wt>; cd ./+1; relative write lands in <wt>/+1" \
+        "cd $WTC_WT; cd ./+1; echo hi > out.log" "$_c626"
+    assert_allow "write-confinement (#626, cwd=$_w626): cd <wt>/+1; relative write" \
+        "cd $WTC_WT/+1; echo hi > out.log" "$_c626"
+    assert_deny_tag "write-confinement (#626, cwd=$_w626): cd <main>; cd ./+1 && relative write lands in main" \
+        "cd $WTC_MAIN; cd ./+1 && echo hi > out.log" "$_c626" "worktree-write-confinement"
+    assert_allow "write-confinement (#626, cwd=$_w626): cd /tmp; cd +1x && relative write (not a stack index)" \
+        "cd /tmp; cd +1x && echo hi > out.log" "$_c626"
+    assert_allow "write-confinement (#626, cwd=$_w626): quoted 'cd +1' text is inert" \
+        "cd /tmp; echo 'cd +1'; echo hi > out.log" "$_c626"
+    assert_allow "write-confinement (#626, cwd=$_w626): absolute worktree write after cd +1" \
+        "cd +1; echo hi > $WTC_WT/ok.log" "$_c626"
+    assert_allow "stash-scope (#626, cwd=$_w626): cd <wt>; cd ./+1; stash recovery in the worktree" \
+        "cd $WTC_WT; cd ./+1; git stash pop" "$_c626"
+done
+rmdir "$WTC_WT/+1"
+unset _U626 _NL626 _P626 _c626 _w626 _p626 _sep _sn
+
 # ---- (d) Quoting subtleties: dequote_expandable() must refuse any token
 # ---- where bash would NOT expand the `$`, or where a backtick hides a
 # ---- component the guard cannot see. ----
@@ -8469,6 +8542,27 @@ for _cwd612 in "$F612_MAIN" "$F612_WT"; do
     assert_fo612 ask - "repo#612 control (cwd=$_w612): quoted \"--git-dir=~/…\" stays literal and asks" \
         "$P612 $H612" "$_cwd612" 'git "--git-dir=~/scratch/.git" "--work-tree=~/scratch" reset --hard'
 done
+# -- repo#626: a directory-stack cd (`cd +1`, `cd -- -1`, `cd ~+1`, pushd,
+# popd) makes the force-op cwd unknown. F612_FEAT/+1 exists, so the old
+# misreading resolved it to the feature checkout and allowed the hard reset.
+mkdir -p "$F612_FEAT/+1"
+for _cwd626 in "$F612_MAIN" "$F612_WT"; do
+    _w626=main; [[ "$_cwd626" == "$F612_WT" ]] && _w626=worktree
+    for _p626 in 'cd +1' 'cd +0' 'cd -1' "cd '+1'" 'cd -- -1' 'cd -- +1' 'cd -P +1' 'cd ~+1' 'cd ~-1' 'pushd' 'popd'; do
+        for _sep in '; ' ' && '; do
+            assert_fo612 ask force-op:unknown-cwd "repo#626 (cwd=$_w626): cd <feat>; ${_p626}${_sep}reset --hard asks" \
+                "$P612" "$_cwd626" "cd $F612_FEAT; ${_p626}${_sep}git reset --hard"
+        done
+        assert_fo612 ask force-op:unknown-cwd "repo#626 (cwd=$_w626): cd <feat>; ${_p626} && push --force HEAD asks" \
+            "$P612" "$_cwd626" "cd $F612_FEAT; ${_p626} && git push --force origin HEAD"
+    done
+    # Controls: the literal directory is reached with ./+1 or an absolute path.
+    assert_fo612 allow - "repo#626 control (cwd=$_w626): cd <feat>; cd ./+1 && reset --hard allowed" \
+        "$P612" "$_cwd626" "cd $F612_FEAT; cd ./+1 && git reset --hard"
+    assert_fo612 allow - "repo#626 control (cwd=$_w626): cd <feat>/+1 && reset --hard allowed" \
+        "$P612" "$_cwd626" "cd $F612_FEAT/+1 && git reset --hard"
+done
+unset _cwd626 _w626 _p626 _sep
 rm -rf "$F612_BASE"
 echo ""
 
