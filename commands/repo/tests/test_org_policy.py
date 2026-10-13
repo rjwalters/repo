@@ -686,6 +686,23 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
         self.assertFalse(any(e.endswith("/installations") for e, _, _ in self.api.calls))
 
+    def test_dependabot_apply_cli_does_not_report_the_renovate_app(self):
+        self.use_dependabot()
+        self.api.files["renovate-config.json"] = "{}\n"
+        plan_file = ROOT / ".test-dependabot-plan.json"
+        plan_file.write_text(policy.dump(self.plan()))
+        try:
+            with patch.object(policy, "GitHub", return_value=self.api), \
+                    patch.object(sys, "argv", ["repo-org-policy.py", "apply", "--plan", str(plan_file), "--yes"]), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out:
+                code = policy.main()
+        finally:
+            plan_file.unlink()
+        self.assertEqual(code, 0)
+        self.assertIn("/repo:deps in example/client", out.getvalue())
+        self.assertNotIn("Renovate GitHub App", out.getvalue())
+        self.assertFalse(any(e.endswith("/installations") for e, _, _ in self.api.calls))
+
     def test_dependabot_provider_rejects_a_leftover_renovate_block(self):
         self.use_dependabot({"dependencies": {"provider": "dependabot", "dependabotSecurityUpdates": True}})
         with self.assertRaisesRegex(policy.PolicyError, "renovate to null"):

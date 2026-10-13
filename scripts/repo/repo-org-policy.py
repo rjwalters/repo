@@ -671,7 +671,10 @@ def main():
             plan = json.loads(args.plan.read_text())
             print(apply_plan(api, plan))
             client = repo_name(plan["client"])
-            print(app_status(api, client.split("/")[0], client))
+            # Only a Renovate policy needs the App; for provider dependabot an
+            # "App NOT installed, no PRs will be raised" line would be false.
+            if provider_of(plan["after"]) == "renovate":
+                print(app_status(api, client.split("/")[0], client))
         else:
             if args.owner:
                 owner = args.owner
