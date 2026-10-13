@@ -8405,6 +8405,37 @@ done
 assert_fo612 allow - 'repo#612 control: scope off allows a quoted reset' "REPO_FORCE_SCOPE=off" "$F612_MAIN" 'git "reset" --hard'
 assert_fo612 deny - 'repo#612 control: catastrophic quoted force-push to main still denies in off mode' \
     "REPO_FORCE_SCOPE=off" "$F612_MAIN" 'git push --force origin "main"'
+
+# -- a joined --git-dir=~… / --work-tree=~… keeps its tilde literal --
+# Neither bash nor zsh (default options) tilde-expands after `=` in an
+# ordinary argument, so git receives the relative path `<cwd>/~/…`, not
+# $HOME/…. The guard must not resolve the scratch clone under $HOME for
+# these words (that allowed what main asks). HOME points at F612_BASE so
+# `~/scratch` would name the scratch clone if it WERE expanded.
+H612="HOME=$F612_BASE"
+for _cwd612 in "$F612_MAIN" "$F612_WT"; do
+    _w612=main; [[ "$_cwd612" == "$F612_WT" ]] && _w612=worktree
+    for _c612 in 'git --git-dir=~/scratch/.git --work-tree=~/scratch reset --hard' \
+                 'git --git-dir=~/scratch/.git reset --hard' \
+                 'git --work-tree=~/scratch reset --hard' \
+                 'git --git-dir=~ --work-tree=~ reset --hard' \
+                 'git --git-dir=~/scratch/.git --work-tree=~/scratch push -f origin HEAD'; do
+        assert_fo612 ask - "repo#612 (cwd=$_w612): joined tilde stays literal, $_c612 asks" \
+            "$P612 $H612" "$_cwd612" "$_c612"
+    done
+    # Controls: forms the shell DOES expand keep resolving the scratch clone.
+    for _c612 in 'git --git-dir ~/scratch/.git --work-tree ~/scratch reset --hard' \
+                 'git -C ~/scratch reset --hard' \
+                 'git --git-dir=$HOME/scratch/.git --work-tree=$HOME/scratch reset --hard' \
+                 'GIT_DIR=$HOME/scratch/.git GIT_WORK_TREE=$HOME/scratch git reset --hard' \
+                 'GIT_DIR=~/scratch/.git GIT_WORK_TREE=~/scratch git reset --hard'; do
+        assert_fo612 allow - "repo#612 control (cwd=$_w612): shell-expanded $_c612 allowed" \
+            "$P612 $H612" "$_cwd612" "$_c612"
+    done
+    # Control: a quoted joined word was already literal and still is.
+    assert_fo612 ask - "repo#612 control (cwd=$_w612): quoted \"--git-dir=~/…\" stays literal and asks" \
+        "$P612 $H612" "$_cwd612" 'git "--git-dir=~/scratch/.git" "--work-tree=~/scratch" reset --hard'
+done
 rm -rf "$F612_BASE"
 echo ""
 

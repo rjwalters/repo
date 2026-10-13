@@ -2861,6 +2861,11 @@ parse_force_ops() {
                 # quoting for fo_join() (`--git-dir=$HOME/x` stays resolvable).
                 if (rawt ~ /^--(git-dir|work-tree)=/) {
                     v = rawt; sub(/^--[a-z-]+=/, "", v)
+                    # bash and zsh do NOT tilde-expand after `=` in an
+                    # ordinary argument, so git receives `<cwd>/~/…`: keep a
+                    # leading tilde literal so fo_join() does not resolve
+                    # $HOME (which allowed what main asks).
+                    if (substr(v, 1, 1) == "~") v = "\\" v
                     if (rawt ~ /^--git-dir=/) { gd_raw = v; gd_set = 1 } else { wt_raw = v; wt_set = 1 }
                     k++; continue
                 }
