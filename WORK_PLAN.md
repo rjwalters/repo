@@ -7,8 +7,6 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
-- **#611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
 - **#615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
 
 ## Operator Priority
@@ -39,18 +37,13 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#560**: feat(install): persisted --no-guard opt-out for destructive guard hook
-- **#611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
 - **#615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#557**: install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
-- **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal *(curated)*
-- **#604**: guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X) *(curated)*
 - **#612**: guard: quoted git subcommand/flags and --git-dir/--work-tree hide force ops from parse_force_ops *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -59,19 +52,19 @@ _None._
 
 ## Epics
 
-- **#579**: Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal
+_None._
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 1 |
 | Operator priority | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 5 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
-| Active epics | 1 |
+| Active epics | 0 |
 <!-- guide:plan-body:end -->

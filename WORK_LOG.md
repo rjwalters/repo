@@ -2,7 +2,18 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-13
+- **PR #611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
+- **Issue #604** (closed): guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X)
+
 ### 2026-10-12
+- **PR #621**: chore(deps): adopt Renovate via the rjwalters/.github preset
+- **PR #620**: fix(repo-remote): per-caller SSH ingress marker so one host can't revoke another's rule (loom#11616)
+- **PR #560**: feat(install): persisted --no-guard opt-out for destructive guard hook
+- **Issue #557** (closed): install.sh: per-repo opt-out so a reinstall does not re-wire the guard-destructive PreToolUse hook
+- **PR #624**: org-policy check-app: report Renovate on personal accounts from activity evidence
+- **Issue #623** (closed): org-policy check-app: report Renovate installation from behavioral evidence on personal accounts instead of a bare UNKNOWN
+- **Issue #579** (closed): Guard: upstream Loom's vendored-only guard functions so Loom can re-vendor in full and pick up the tmpfs refusal
 - **PR #618**: repo-remote: opt-in AWS Spot launch via REPO_REMOTE_MARKET (#616)
 - **Issue #616** (closed): repo-remote: optional Spot launch (one-time, terminate on interruption/shutdown)
 
