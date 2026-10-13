@@ -130,7 +130,12 @@ class FakeGitHub:
             assert method == "POST" and payload["base_tree"] == "base-tree"
             files = dict(self.files)
             for entry in payload["tree"]:
-                files[entry["path"]] = entry["content"]
+                if "content" in entry:
+                    files[entry["path"]] = entry["content"]
+                else:
+                    # sha: null deletes; GitHub refuses it for a path the base lacks.
+                    assert entry["sha"] is None and entry["path"] in files
+                    del files[entry["path"]]
             sha = policy.digest(policy.dump(files))[:40]
             self.trees[sha] = files
             return {"sha": sha}
@@ -634,6 +639,70 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("nothing to publish", result)
         self.assertIn("/repo:deps --install", result)
         self.assertIn("No organization PR is pending", result)
+
+    # ---- provider: dependabot
+    DEPENDABOT = {"dependencies": {"provider": "dependabot", "dependabotSecurityUpdates": True,
+                                   "renovate": None, "policySource": "example/policy dependabot.json"}}
+
+    def use_dependabot(self, override=None):
+        self.api.source["policies/organizations/example.json"] = policy.dump(override or self.DEPENDABOT)
+
+    def test_dependabot_provider_removes_the_preset_and_records_the_settings(self):
+        self.use_dependabot()
+        self.api.files["renovate-config.json"] = "{}\n"
+        plan = self.plan()
+        self.assertIsNone(plan["after"]["renovate-config.json"])
+        deps = json.loads(plan["after"]["repo-policy.json"])["dependencies"]
+        self.assertEqual(deps, {"provider": "dependabot", "dependabotAlerts": True,
+                                "dependabotSecurityUpdates": True,
+                                "policySource": "example/policy dependabot.json"})
+        result = policy.apply_plan(self.api, plan)
+        committed = next(iter(self.api.commits.values()))["files"]
+        self.assertEqual(set(committed), {"README.md", "repo-policy.json"})
+        self.assertIn("removes renovate-config.json", json.dumps(self.api.calls))
+        self.assertIn("/repo:deps in example/client", result)
+        self.assertNotIn("--install", result)
+
+    def test_dependabot_provider_retry_reuses_the_branch(self):
+        self.use_dependabot()
+        self.api.files["renovate-config.json"] = "{}\n"
+        plan = self.plan()
+        first = policy.apply_plan(self.api, plan)
+        count = len(self.api.writes)
+        self.assertEqual(policy.apply_plan(self.api, plan), first)
+        self.assertEqual(len(self.api.writes), count)
+
+    def test_dependabot_provider_never_deletes_an_absent_preset(self):
+        self.use_dependabot()
+        policy.apply_plan(self.api, self.plan())  # the fake asserts on a deletion of a missing path
+        tree = next(p for e, m, p in self.api.writes if e.endswith("/git/trees"))
+        self.assertEqual([entry["path"] for entry in tree["tree"]], ["repo-policy.json"])
+
+    def test_dependabot_provider_plan_needs_no_app(self):
+        self.use_dependabot()
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            policy.show_plan(self.api, self.plan())
+        self.assertIn("Provider: dependabot", out.getvalue())
+        self.assertNotIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
+        self.assertFalse(any(e.endswith("/installations") for e, _, _ in self.api.calls))
+
+    def test_dependabot_provider_rejects_a_leftover_renovate_block(self):
+        self.use_dependabot({"dependencies": {"provider": "dependabot", "dependabotSecurityUpdates": True}})
+        with self.assertRaisesRegex(policy.PolicyError, "renovate to null"):
+            self.plan()
+
+    def test_dependabot_provider_requires_security_updates(self):
+        self.use_dependabot({"dependencies": {"provider": "dependabot", "renovate": None}})
+        with self.assertRaisesRegex(policy.PolicyError, "dependabotSecurityUpdates true"):
+            self.plan()
+
+    def test_policy_source_is_dependabot_only_and_unknown_providers_fail(self):
+        self.use_dependabot({"dependencies": {"policySource": "x"}})
+        with self.assertRaisesRegex(policy.PolicyError, "only to provider dependabot"):
+            self.plan()
+        self.use_dependabot({"dependencies": {"provider": "snyk"}})
+        with self.assertRaisesRegex(policy.PolicyError, "provider must be one of"):
+            self.plan()
 
     def test_apply_cli_requires_opt_in_without_reading_plan(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/repo/repo-org-policy.py"),

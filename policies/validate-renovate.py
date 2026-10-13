@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate every effective canonical profile with a native Renovate validator.
 
+A profile whose provider is not renovate is checked by validate() alone.
+
 Usage: python3 policies/validate-renovate.py [validator command ...]
 Defaults to renovate-config-validator from PATH. No GitHub access is needed.
 """
@@ -33,6 +35,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="repo-policy-validation-") as scratch:
         for name, value in profiles:
             policy.validate(value)
+            if value["dependencies"]["provider"] != "renovate":
+                print(f"Skipping {name}: provider {value['dependencies']['provider']} has no Renovate preset", flush=True)
+                continue
             preset = Path(scratch) / (name + ".json")
             preset.write_text(policy.dump(value["dependencies"]["renovate"]))
             print(f"Validating {name}", flush=True)
