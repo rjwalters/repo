@@ -95,7 +95,12 @@ VM_BIN="$SCRATCH/vmbin"
 VM_DOCKER_BIN="$SCRATCH/vmdockerbin"
 MOCK_VM_LOG="$SCRATCH/vm.log"
 MINT_DIR="$SCRATCH/mint"
-mkdir -p "$VM_HOME/myrepo" "$VM_BIN" "$VM_DOCKER_BIN" "$MINT_DIR"
+# repo#627: the device-flow fixtures (scripted GitHub responses, mock sleep)
+# and the script's private TMPDIR.
+DEV_DIR="$SCRATCH/devflow"
+DEV_BIN="$SCRATCH/devbin"
+RR_TMPDIR="$SCRATCH/rrtmp"
+mkdir -p "$VM_HOME/myrepo" "$VM_BIN" "$VM_DOCKER_BIN" "$MINT_DIR" "$DEV_DIR" "$DEV_BIN"
 RR_OUT=""; RR_ERR=""; RR_RC=0
 run_rr() {
     local -a envs=()
@@ -113,6 +118,10 @@ run_rr() {
     # master's own environment, child-env leak probes, and the simulated VM.
     rm -f "$MOCK_LOG.payload" "$MOCK_LOG.masterenv" "$MOCK_LOG.staticenv" "$MOCK_LOG.minterenv"
     rm -f "$MOCK_VM_LOG".*
+    # repo#627: per-run device-flow captures (curl stdin, poll counter, sleeps)
+    # and the script's own TMPDIR, emptied so a test can grep what it wrote.
+    rm -f "$MOCK_LOG.curlstdin" "$MOCK_LOG.pollcount" "$MOCK_LOG.sleeps"
+    rm -rf "$RR_TMPDIR"; mkdir -p "$RR_TMPDIR"
     local errf; errf="$(mktemp)"
     # REPO_REMOTE_SSH_READY_* default to 0 here so the suite never pays the
     # real 120s readiness window (repo#449); the assignments below come BEFORE
@@ -130,6 +139,7 @@ run_rr() {
         REPO_REMOTE_IP_POLL_ATTEMPTS=2 \
         REPO_REMOTE_IP_POLL_INTERVAL=0 \
         REPO_REMOTE_ATTACH_CTL_BASE="$SCRATCH" \
+        TMPDIR="$RR_TMPDIR" \
         MOCK_VM_HOME="$VM_HOME" MOCK_VM_BIN="$VM_BIN" MOCK_VM_DOCKER_BIN="$VM_DOCKER_BIN" \
         MOCK_VM_LOG="$MOCK_VM_LOG" MINT_DIR="$MINT_DIR" MINT_COUNT="$MINT_DIR/count" \
         "${envs[@]}" \
@@ -486,6 +496,32 @@ chmod +x "$MOCK_BIN/gcloud"
 cat >"$MOCK_BIN/curl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+# repo#627: GitHub's device-flow endpoints, scripted per test.
+#   MOCK_GH_DEVICE_RESP  file holding the device-code response body
+#   MOCK_GH_DEVICE_RC    exit status for the device-code request (failure)
+#   MOCK_GH_POLL         file with one token-endpoint response per line; poll
+#                        N answers line N (the last line repeats); a line
+#                        `rc=<n>` makes that poll exit <n> with no body.
+# A poll's stdin (the form body, which carries the device code) is captured on
+# its own, separately from the argv log above.
+for a in "$@"; do
+  case "$a" in
+    https://github.com/login/device/code)
+      cat >/dev/null
+      [[ -n "${MOCK_GH_DEVICE_RC:-}" ]] && exit "$MOCK_GH_DEVICE_RC"
+      cat "${MOCK_GH_DEVICE_RESP:-/dev/null}"
+      exit 0 ;;
+    https://github.com/login/oauth/access_token)
+      { cat; printf '\n'; } >>"${MOCK_AWS_LOG:-/dev/null}.curlstdin"
+      cf="${MOCK_AWS_LOG:-/dev/null}.pollcount"
+      n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" >"$cf"
+      line="$(sed -n "${n}p" "${MOCK_GH_POLL:-/dev/null}")"
+      [[ -n "$line" ]] || line="$(tail -n1 "${MOCK_GH_POLL:-/dev/null}")"
+      case "$line" in rc=*) exit "${line#rc=}" ;; esac
+      printf '%s' "$line"
+      exit 0 ;;
+  esac
+done
 [[ "${MOCK_CURL_FAIL:-0}" == 1 ]] && exit 1
 printf '%s' "${MOCK_CURL_IP:-203.0.113.7}"
 exit 0
@@ -556,6 +592,7 @@ if [[ "$last" == *"repo-remote attach bootstrap"* ]]; then
   env -i PATH="$vmpath:/usr/bin:/bin" HOME="$MOCK_VM_HOME" SHELL="$MOCK_VM_BIN/vmshell" \
     MOCK_VM_LOG="$MOCK_VM_LOG" MOCK_DOCKER_RUNNING="${MOCK_DOCKER_RUNNING:-}" \
     MOCK_DOCKER_CONFIG_ENV="${MOCK_DOCKER_CONFIG_ENV:-}" MOCK_VM_SHELL_RC="${MOCK_VM_SHELL_RC:-0}" \
+    MOCK_GH_LOGIN="${MOCK_GH_LOGIN-octo-person}" \
     ${fwd[@]+"${fwd[@]}"} /bin/sh -c "$last"
   exit $?
 fi
@@ -627,6 +664,17 @@ case "$1" in
     esac
     exit 0 ;;
   exec)
+    # repo#627: the identity lookup (`... gh api user --jq .login`) is
+    # answered here and recorded apart from the session's own docker exec.
+    case " $* " in
+      *" gh api user "*)
+        for a in "$@"; do printf '%s\n' "$a"; done >"$MOCK_VM_LOG.whoargv"
+        env | grep -E '^(GH_|GIT_CONFIG_|LC_REPO_REMOTE)' | sort >"$MOCK_VM_LOG.whoenv"
+        if [ -n "${GH_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}" ] && [ -n "$MOCK_GH_LOGIN" ]; then
+          printf '%s\n' "$MOCK_GH_LOGIN"; exit 0
+        fi
+        echo "HTTP 401: Bad credentials" >&2; exit 1 ;;
+    esac
     for a in "$@"; do printf '%s\n' "$a"; done >"$MOCK_VM_LOG.dockerargv"
     env | grep -E '^(GH_|GIT_CONFIG_|LC_REPO_REMOTE)' | sort >"$MOCK_VM_LOG.dockerenv"
     exit 0 ;;
@@ -642,6 +690,26 @@ pwd >"$MOCK_VM_LOG.shellpwd"
 exit "${MOCK_VM_SHELL_RC:-0}"
 MOCK
 chmod +x "$VM_BIN/vmshell"
+# repo#627: gh on the VM host answers the identity lookup when a token is in
+# its environment (MOCK_GH_LOGIN, default octo-person; empty = lookup fails).
+cat >"$VM_BIN/gh" <<'MOCK'
+#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >"$MOCK_VM_LOG.ghargv"
+if [ -n "${GH_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}" ] && [ -n "$MOCK_GH_LOGIN" ]; then
+  printf '%s\n' "$MOCK_GH_LOGIN"; exit 0
+fi
+echo "HTTP 401: Bad credentials" >&2; exit 1
+MOCK
+chmod +x "$VM_BIN/gh"
+# repo#627: a mock `sleep` for device-flow polling, put on PATH only by the
+# tests that want it (PATH="$DEV_BIN:..."): it logs the requested interval
+# and returns at once, so polling is instant and the interval is assertable.
+cat >"$DEV_BIN/sleep" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}.sleeps"
+exit 0
+MOCK
+chmod +x "$DEV_BIN/sleep"
 
 # repo#565: the fixture token command. It logs that it ran (into the same log
 # as every ssh/aws call, so ordering is assertable), counts its runs, records
@@ -3122,6 +3190,8 @@ assert_canary_absent() {
 write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
 CMD_ENV_LINE="REPO_REMOTE_GH_TOKEN_CMD='$MINT_DIR/minter.sh'"
 STATIC_ENV_LINE="REPO_REMOTE_GH_TOKEN='$STATIC_CANARY'"
+# repo#627: a static token is used ONLY with this break-glass opt-out.
+ALLOW_STATIC_LINE="REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE"
 ENV_SUM_BEFORE="$(cksum <"$REPO/.env")"
 SHARED_SUM_BEFORE="$(cksum <"$SHARED")"
@@ -3229,35 +3299,59 @@ reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_VM_SHELL_RC=5 -- attach --host --command "false"
 assert_eq "--command: attach exits with the remote command's status" "5" "$RR_RC"
 
-# (e) Static token only: today's behavior, delivered the same way, plus a
-#     one-line notice that names the command form and never the token.
+# (e) Static token (repo#627): refused (exit 2, before connecting) without the
+#     break-glass opt-out, naming the device flow as the replacement. With
+#     REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1 it is delivered the same way, under
+#     a prominent shared-identity warning, and never printed.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
 reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
-assert_eq "static only: exit 0" "0" "$RR_RC"
+assert_eq "static without the opt-out -> exit 2" "2" "$RR_RC"
+assert_eq "static without the opt-out: refused before connecting" "0" "$(grep -c 'ControlMaster=yes' "$MOCK_LOG")"
+assert_eq "static without the opt-out: nothing was forwarded" "no" "$([[ -f "$MOCK_LOG.payload" ]] && echo yes || echo no)"
+assert_contains "static without the opt-out: names the device flow as the replacement" "$RR_ERR" "REPO_REMOTE_GH_APP_CLIENT_ID"
+assert_contains "static without the opt-out: names the break-glass flag" "$RR_ERR" "REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1"
+assert_not_contains "static without the opt-out: the token is not printed" "$RR_ERR$RR_OUT" "$STATIC_CANARY"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE" "REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=yes"
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "static: an opt-out value other than 1 is not the opt-out -> exit 2" "2" "$RR_RC"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "static only (opt-out): exit 0" "0" "$RR_RC"
 assert_eq "static only: the payload is the static token" "$STATIC_CANARY" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
 assert_contains "static only: the container session gets it" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_TOKEN=$STATIC_CANARY"
 assert_eq "static only: no token command ran" "0" "$(mint_count)"
-NOTICE="$(grep -F 'NOTICE: using the static REPO_REMOTE_GH_TOKEN' <<<"$RR_ERR")"
-assert_eq "static only: exactly one notice line" "1" "$(grep -c . <<<"$NOTICE")"
-assert_contains "static only: the notice recommends REPO_REMOTE_GH_TOKEN_CMD" "$NOTICE" "REPO_REMOTE_GH_TOKEN_CMD"
+assert_contains "static only: warns that the session is a shared, long-lived identity" "$RR_ERR" "ONE shared, long-lived identity"
+assert_contains "static only: the warning names the device flow" "$(grep -F 'WARNING:' <<<"$RR_ERR")" "REPO_REMOTE_GH_APP_CLIENT_ID"
+assert_eq "static only: no device flow was started" "0" "$(grep -c 'github.com/login' "$MOCK_LOG")"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_contains "static only: the warning is printed on EVERY attach" "$RR_ERR" "ONE shared, long-lived identity"
 assert_canary_absent "static only: the static token appears nowhere but its own config line" "$STATIC_CANARY" config-holds-it
 assert_eq "static only: the static token is never exported to child processes (ssh)" "0" "$(cat "$MOCK_LOG.staticenv" 2>/dev/null | wc -l | tr -d ' ')"
 
-# (f) Neither: a plain session, nothing forwarded, nothing exported.
+# (f) Neither (repo#627): attach REQUIRES a credential -- exit 7 before
+#     connecting, with an actionable message; no unauthenticated session.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
 reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
-assert_eq "no credential: exit 0 (a plain session)" "0" "$RR_RC"
-assert_not_contains "no credential: nothing is forwarded" "$(grep -F 'attach bootstrap' "$MOCK_LOG")" "SendEnv=LC_REPO_REMOTE_GH_TOKEN"
+assert_eq "no credential -> exit 7 (no unauthenticated session)" "7" "$RR_RC"
+assert_eq "no credential: nothing connected" "0" "$(grep -c 'ControlMaster=yes' "$MOCK_LOG")"
+assert_eq "no credential: no session" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
 assert_eq "no credential: no payload" "no" "$([[ -f "$MOCK_LOG.payload" ]] && echo yes || echo no)"
-assert_not_contains "no credential: no GH_TOKEN in the session" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_TOKEN"
-assert_not_contains "no credential: no git helper either" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GIT_CONFIG_"
-assert_contains "no credential: says the VM stays unauthenticated" "$RR_ERR" "none configured"
+assert_contains "no credential: says how to configure the device flow" "$RR_ERR" "Set REPO_REMOTE_GH_APP_CLIENT_ID"
 
-# (g) Both: the command wins, the static token is ignored — never delivered,
-#     never inherited by the command — and the notice says so.
+# (g) Both: without the opt-out a configured static token is still refused,
+#     even next to a command (repo#627). With it, the command wins, the static
+#     token is ignored -- never delivered, never inherited by the command --
+#     and the notice says so.
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "both, no opt-out: the static token is refused -> exit 2" "2" "$RR_RC"
+assert_eq "both, no opt-out: the token command never ran" "0" "$(mint_count)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
 reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
 assert_eq "both: exit 0" "0" "$RR_RC"
@@ -3276,7 +3370,7 @@ reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
 assert_eq "layers: the per-repo command overrides the shared one" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
 assert_eq "layers: the shared command did not run" "0" "$(grep -c '^other-ran$' "$MOCK_LOG")"
-write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN_CMD=" "$STATIC_ENV_LINE"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN_CMD=" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
 reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
 assert_eq "layers: an empty per-repo command disables the shared one" "$STATIC_CANARY" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
@@ -3288,15 +3382,16 @@ assert_eq "layers: a shared command applies when the repo sets none" "ghs_from_t
 write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
 
 # (i) Fail CLOSED on a bad token command: no session, no payload, no
-#     fallback to the static token, and none of the command's output shown.
-write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE"
+#     fallback to the (opted-in) static token, and none of the command's
+#     output shown.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
 for mode in fail empty multiline space; do
   reset_mint
   run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true MINT_MODE="$mode" -- attach
   assert_eq "token command '$mode' -> exit 7" "7" "$RR_RC"
   assert_eq "token command '$mode': no session was opened" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
   assert_eq "token command '$mode': nothing was forwarded" "no" "$([[ -f "$MOCK_LOG.payload" ]] && echo yes || echo no)"
-  assert_contains "token command '$mode': says the static token was NOT used" "$RR_ERR" "NOT used instead"
+  assert_contains "token command '$mode': says no other source was used" "$RR_ERR" "no other source was used instead"
   assert_not_contains "token command '$mode': no static fallback" "$RR_ERR$RR_OUT" "$STATIC_CANARY"
   assert_canary_absent "token command '$mode': its token-like output is never shown" "$CANARY_1" config-holds-it
 done
@@ -3387,9 +3482,15 @@ reset_mint; run_rr MOCK_AWS_FIND=$'i-0pinnedbox\trunning' -- down
 lifecycle_clean "lifecycle: down (dry run) never runs the token command"
 reset_mint; run_rr MOCK_AWS_FIND=$'i-0pinnedbox\trunning' -- down --yes
 lifecycle_clean "lifecycle: down --yes never runs the token command"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
+reset_mint; run_rr -- up --json
+assert_eq "plan JSON: static source (opt-out set)" "static" "$(json_field "$RR_OUT" gh_credential_source)"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
 reset_mint; run_rr -- up --json
-assert_eq "plan JSON: static source" "static" "$(json_field "$RR_OUT" gh_credential_source)"
+assert_eq "plan JSON: a static token without the opt-out is not a source" "none" "$(json_field "$RR_OUT" gh_credential_source)"
+reset_mint; run_rr -- up
+assert_contains "plan: says attach will refuse the static token" "$RR_ERR" "attach will refuse until it is removed"
+lifecycle_clean "lifecycle: a refused static token is never printed by the plan"
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
 reset_mint; run_rr -- up --json
 assert_eq "plan JSON: no source" "none" "$(json_field "$RR_OUT" gh_credential_source)"
@@ -3402,7 +3503,7 @@ assert_eq "bash -x attach: exit 0" "0" "$RR_RC"
 assert_contains "bash -x attach: tracing really was on" "$RR_ERR" "+ "
 assert_eq "bash -x attach: the token was still delivered" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
 assert_not_contains "bash -x attach: the minted token is never traced" "$RR_ERR" "$CANARY_1"
-write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
 RR_BASH_X=1 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
 assert_eq "bash -x attach (static): exit 0" "0" "$RR_RC"
 assert_not_contains "bash -x attach (static): the static token is never traced" "$RR_ERR" "$STATIC_CANARY"
@@ -3466,7 +3567,7 @@ for bad in "https://gateway.invalid" "gateway.invalid:8443" "gateway.invalid/api
 done
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_API_HOST=gateway.invalid"
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
-assert_eq "gateway without any credential -> exit 2" "2" "$RR_RC"
+assert_eq "gateway without any credential -> exit 7 (no credential at all, repo#627)" "7" "$RR_RC"
 git -C "$REPO" remote set-url origin https://gitlab.example/acme/widgets.git
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CMD_ENV_LINE" "REPO_REMOTE_GH_API_HOST=gateway.invalid"
 reset_mint
@@ -3520,7 +3621,7 @@ write_shared "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-
 run_rr -- attach
 assert_eq "attach without a provider -> exit 2" "2" "$RR_RC"
 write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
-write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN='two words'"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_TOKEN='two words'" "$ALLOW_STATIC_LINE"
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
 assert_eq "a malformed static token -> exit 2 before connecting" "2" "$RR_RC"
 assert_eq "malformed static token: nothing connected" "0" "$(grep -c 'ControlMaster=yes' "$MOCK_LOG")"
@@ -3604,6 +3705,286 @@ PY
 else
   skip "gh evidence: real gh routing / TLS checks" "set RR_GH_EVIDENCE=1 (and have gh on PATH) to run them"
 fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- attach: per-user GitHub App token via the device flow (repo#627) --"
+# ---------------------------------------------------------------------------
+# REPO_REMOTE_GH_APP_CLIENT_ID makes every attach run GitHub's OAuth device
+# flow after the host identity is verified: the user code and verification
+# URL go to stderr, the token endpoint is polled honoring interval/slow_down
+# and expiry, and the resulting user token goes through the existing
+# SendEnv delivery. GitHub is a scripted mock curl; `sleep` is a mock that
+# logs the interval. Two distinct canaries: the device code (a bearer secret
+# for the poll; allowed ONLY in curl's stdin) and the access token.
+DEVICE_CANARY='DEVC0DE-c4n4ry-0123456789abcdef'
+DTOK_1="ghu_D3v1ce1-\$(id>$SCRATCH/pwned4)\`id>$SCRATCH/pwned5\`;|&<>*x"
+DTOK_2='ghu_D3v1ce2-replacement-token'
+CLIENT_ID='Iv23liTestClient01'
+CLIENT_LINE="REPO_REMOTE_GH_APP_CLIENT_ID=$CLIENT_ID"
+PENDING='{"error":"authorization_pending","error_description":"The authorization request is still pending."}'
+dev_resp() {  # [expires_in] [interval]
+  printf '{"device_code":"%s","user_code":"WDJB-MJHT","verification_uri":"https://github.com/login/device","expires_in":%s,"interval":%s}\n' \
+    "$DEVICE_CANARY" "${1:-899}" "${2:-5}" >"$DEV_DIR/device.json"
+}
+tok_json() { printf '{"access_token":"%s","expires_in":28800,"token_type":"bearer","scope":""}' "$1"; }
+poll_script() { printf '%s\n' "$@" >"$DEV_DIR/poll"; }
+run_dev() {  # run_rr with GitHub mocked and sleep logged
+  run_rr PATH="$DEV_BIN:$MOCK_BIN:$PATH" MOCK_GH_DEVICE_RESP="$DEV_DIR/device.json" MOCK_GH_POLL="$DEV_DIR/poll" "$@"
+}
+sleeps() { tr '\n' ' ' <"$MOCK_LOG.sleeps" 2>/dev/null | sed 's/ $//'; }
+polls() { cat "$MOCK_LOG.pollcount" 2>/dev/null || printf '0'; }
+github_calls() { grep -c 'github.com/login' "$MOCK_LOG"; }
+# assert_device_secrets_absent <label> -- the device code and BOTH tokens are
+# nowhere a secret may land; the device code may appear ONLY in curl's stdin.
+assert_device_secrets_absent() {
+  local where="" c f
+  for c in "$DEVICE_CANARY" "$DTOK_1" "$DTOK_2"; do
+    [[ "$RR_OUT$RR_ERR" == *"$c"* ]] && where+=" output"
+    for f in "$MOCK_LOG" "$MOCK_VM_LOG.dockerargv" "$MOCK_VM_LOG.shellargv" "$MOCK_VM_LOG.whoargv" \
+             "$MOCK_VM_LOG.ghargv" "$SCRATCH/ssh_config" "$REPO/.env" "$SHARED"; do
+      [[ -f "$f" ]] && grep -qF -e "$c" "$f" && where+=" $(basename "$f")"
+    done
+    grep -rqF -e "$c" "$VM_HOME" "$RR_TMPDIR" "$XDG" 2>/dev/null && where+=" disk"
+  done
+  grep -qF -e "$DTOK_1" "$MOCK_LOG.curlstdin" 2>/dev/null && where+=" token-in-curl-stdin"
+  compgen -G "$SCRATCH/rr-attach.*" >/dev/null && where+=" control-dir-left-behind"
+  if [[ -z "$where" ]]; then ok "$1"; else no "$1" "found in:$where"; fi
+}
+nothing_sent() {  # <label>
+  local why=""
+  [[ -f "$MOCK_LOG.payload" ]] && why+=" payload"
+  grep -q 'attach bootstrap' "$MOCK_LOG" && why+=" session"
+  [[ "$(mint_count)" == 0 ]] || why+=" token-command-ran"
+  if [[ -z "$why" ]]; then ok "$1"; else no "$1" "sent:$why"; fi
+}
+dev_resp
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE"
+
+# (D1) Happy path, dev container: authorized on the first poll.
+poll_script "$(tok_json "$DTOK_1")"
+reset_mint
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "device: attach -> exit 0" "0" "$RR_RC"
+assert_eq "device: the payload is the user token, byte for byte" "$DTOK_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_contains "device: the container session gets GH_TOKEN = the user token" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_TOKEN=$DTOK_1"
+assert_contains "device: shows the verification URL on stderr" "$RR_ERR" "open   https://github.com/login/device"
+assert_contains "device: shows the user code on stderr" "$RR_ERR" "enter  WDJB-MJHT"
+assert_not_contains "device: nothing about the flow on stdout" "$RR_OUT" "WDJB-MJHT"
+assert_contains "device: says the token is per-user and expires" "$RR_ERR" "per-user GitHub App token from the device flow"
+assert_contains "device: the VM reports which account the session acts as" "$RR_ERR" "acting as GitHub user octo-person"
+assert_contains "device: the identity lookup ran in the container with the token by NAME" "$(cat "$MOCK_VM_LOG.whoenv" 2>/dev/null)" "GH_TOKEN=$DTOK_1"
+argv_has "device: the identity lookup is gh api user" "$MOCK_VM_LOG.whoargv" "user"
+assert_eq "device: the session's own docker exec is still the login shell" "-l" "$(tail -n1 "$MOCK_VM_LOG.dockerargv" 2>/dev/null)"
+assert_eq "device: waited the server's interval before the first poll" "5" "$(sleeps)"
+assert_eq "device: exactly one poll" "1" "$(polls)"
+assert_eq "device: no token command ran" "0" "$(mint_count)"
+L_MASTER="$(line_of 'ControlMaster=yes')"; L_PROBE="$(line_of 'sh -s')"
+L_DEV="$(line_of 'github.com/login/device/code')"; L_POLL="$(line_of 'github.com/login/oauth/access_token')"
+L_SESSION="$(line_of 'attach bootstrap')"
+if (( L_MASTER > 0 && L_MASTER < L_PROBE && L_PROBE < L_DEV && L_DEV < L_POLL && L_POLL < L_SESSION )); then
+  ok "device: order is connect -> verify identity -> device flow -> deliver"
+else
+  no "device: order is connect -> verify identity -> device flow -> deliver" "master=$L_MASTER probe=$L_PROBE dev=$L_DEV poll=$L_POLL session=$L_SESSION"
+fi
+assert_contains "device: the public client ID is the only form value in curl's argv" "$(grep -F 'login/device/code' "$MOCK_LOG")" "client_id=$CLIENT_ID"
+assert_not_contains "device: the poll's argv carries no form values (stdin only)" "$(grep -F 'oauth/access_token' "$MOCK_LOG")" "device_code"
+assert_contains "device: the poll reads its body from stdin" "$(grep -F 'oauth/access_token' "$MOCK_LOG")" "--data @-"
+CSTDIN="$(cat "$MOCK_LOG.curlstdin" 2>/dev/null)"
+assert_contains "device: the device code reaches curl on stdin" "$CSTDIN" "device_code=$DEVICE_CANARY"
+assert_contains "device: with the device-code grant type" "$CSTDIN" "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+assert_contains "device: and the client ID" "$CSTDIN" "client_id=$CLIENT_ID"
+assert_device_secrets_absent "device: device code and token absent from argv, output, config, TMPDIR and VM disk"
+if [[ ! -e "$SCRATCH/pwned4" && ! -e "$SCRATCH/pwned5" ]]; then
+  ok "device: a command-substitution token is never evaluated"
+else
+  no "device: a command-substitution token is never evaluated" "pwned marker exists"
+fi
+
+# (D2) Refresh: attaching again runs the flow again and delivers the NEW token.
+poll_script "$(tok_json "$DTOK_2")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "device refresh: exit 0" "0" "$RR_RC"
+assert_eq "device refresh: the flow ran again" "1" "$(grep -c 'github.com/login/device/code' "$MOCK_LOG")"
+assert_eq "device refresh: the new session gets the new token" "$DTOK_2" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "device refresh: nothing is provisioned, started or stopped" "0" \
+  "$(grep -cE 'run-instances|start-instances|stop-instances|terminate-instances' "$MOCK_LOG")"
+assert_device_secrets_absent "device refresh: secrets absent everywhere"
+
+# (D3) authorization_pending twice, then authorized: keeps the interval.
+poll_script "$PENDING" "$PENDING" "$(tok_json "$DTOK_1")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "device pending x2: exit 0" "0" "$RR_RC"
+assert_eq "device pending x2: three polls" "3" "$(polls)"
+assert_eq "device pending x2: the interval is honored each time" "5 5 5" "$(sleeps)"
+assert_contains "device pending x2 (host session): the login shell gets the token" "$(cat "$MOCK_VM_LOG.shellenv" 2>/dev/null)" "GH_TOKEN=$DTOK_1"
+assert_contains "device (host session): the identity comes from gh on the host" "$RR_ERR" "acting as GitHub user octo-person"
+assert_device_secrets_absent "device pending x2: secrets absent everywhere"
+
+# (D4) slow_down adds 5 seconds; a larger interval returned with it wins.
+poll_script '{"error":"slow_down"}' "$PENDING" "$(tok_json "$DTOK_1")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "device slow_down: exit 0" "0" "$RR_RC"
+assert_eq "device slow_down: the interval grows by 5 and stays grown" "5 10 10" "$(sleeps)"
+poll_script '{"error":"slow_down","interval":20}' "$(tok_json "$DTOK_1")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "device slow_down: GitHub's larger returned interval is used" "5 20" "$(sleeps)"
+dev_resp 899 08
+poll_script "$(tok_json "$DTOK_1")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "device: a zero-padded interval is read as decimal, not octal" "8" "$(sleeps)"
+dev_resp
+
+# (D5) Failures: exit 7, nothing sent, and NO fallback -- the config also
+#      holds a token command and an opted-in static token.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE" \
+  "$CMD_ENV_LINE" "$STATIC_ENV_LINE" "$ALLOW_STATIC_LINE"
+dev_fail() {  # <label> <expected-stderr> <extra run_rr env...>
+  local label="$1" want="$2"; shift 2
+  reset_mint
+  run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true "$@" -- attach
+  assert_eq "device $label -> exit 7" "7" "$RR_RC"
+  assert_contains "device $label: says why" "$RR_ERR" "$want"
+  nothing_sent "device $label: nothing sent, no fallback to the command or the static token"
+  assert_not_contains "device $label: the static token is not used or shown" "$RR_ERR$RR_OUT" "$STATIC_CANARY"
+  assert_device_secrets_absent "device $label: secrets absent everywhere"
+}
+poll_script '{"error":"expired_token","error_description":"The device_code has expired."}'
+dev_fail "expired_token" "expired before it was authorized"
+poll_script "$PENDING" '{"error":"access_denied","error_description":"The user has denied your application access."}'
+dev_fail "access_denied (declined)" "declined"
+assert_eq "device access_denied: stopped at the denial" "2" "$(polls)"
+poll_script 'upstream connect error <html>'
+dev_fail "non-JSON token response" "was not JSON"
+poll_script '{"token_type":"bearer","scope":""}'
+dev_fail "success body without access_token" "neither an access token nor an error"
+poll_script '{"access_token":"ghu_has\"quote","token_type":"bearer"}'
+dev_fail "an access_token with JSON escapes" "neither an access token nor an error"
+poll_script '{"error":"incorrect_device_code"}'
+dev_fail "unexpected OAuth error" "incorrect_device_code"
+poll_script '{"error":"<b>x</b>"}'
+dev_fail "unexpected error text" "an unrecognized error"
+assert_not_contains "device: an unshaped error value is never echoed" "$RR_ERR" "<b>"
+poll_script 'rc=28'
+dev_fail "token endpoint unreachable" "lost contact with GitHub"
+dev_fail "device-code endpoint unreachable" "could not reach GitHub" MOCK_GH_DEVICE_RC=6
+assert_eq "device-code endpoint unreachable: no poll" "0" "$(polls)"
+printf 'Not Found\n' >"$DEV_DIR/device.json"
+dev_fail "non-JSON device-code response" "was not JSON"
+printf '{"error":"device_flow_disabled"}\n' >"$DEV_DIR/device.json"
+dev_fail "device flow disabled on the App" "device_flow_disabled"
+printf '{"device_code":"%s","user_code":"\\u001b[2J","verification_uri":"https://github.com/login/device","expires_in":899,"interval":5}\n' "$DEVICE_CANARY" >"$DEV_DIR/device.json"
+dev_fail "a malformed user_code" "malformed device_code, user_code or verification_uri"
+printf '{"device_code":"%s","user_code":"WDJB-MJHT","verification_uri":"https://evil.example/login","expires_in":899,"interval":5}\n' "$DEVICE_CANARY" >"$DEV_DIR/device.json"
+dev_fail "a verification_uri off github.com" "malformed device_code, user_code or verification_uri"
+assert_not_contains "device: a foreign verification URL is never shown" "$RR_ERR" "evil.example"
+dev_resp 12 5
+poll_script "$PENDING"
+dev_fail "expires_in exhausted (timeout)" "timed out"
+assert_eq "device timeout: polled only within expires_in" "5 5" "$(sleeps)"
+dev_resp 99999 5
+poll_script "$PENDING"
+dev_fail "a huge expires_in is capped at 15 min" "timed out"
+assert_eq "device cap: 900s of 5s polls at most" "180" "$(polls)"
+dev_resp
+
+# (D6) Precedence: the device flow wins over a token command (the operator's
+#      ruling on #627); an EMPTY per-repo client ID switches a shared one off.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE" "$CMD_ENV_LINE"
+poll_script "$(tok_json "$DTOK_1")"
+reset_mint
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "precedence: device + command -> exit 0" "0" "$RR_RC"
+assert_eq "precedence: the device token is delivered" "$DTOK_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "precedence: the token command did not run" "0" "$(mint_count)"
+assert_contains "precedence: the notice says the command is not run" "$RR_ERR" "REPO_REMOTE_GH_TOKEN_CMD is not run"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2" "$CLIENT_LINE"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_APP_CLIENT_ID=" "$CMD_ENV_LINE"
+reset_mint
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "layers: an empty per-repo client ID disables the shared one" "$CANARY_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_eq "layers: ... so no device flow ran" "0" "$(github_calls)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox"
+reset_mint
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "layers: a shared client ID applies when the repo sets none" "$DTOK_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$STATIC_ENV_LINE"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+assert_eq "device + a static token without the opt-out -> still refused (exit 2)" "2" "$RR_RC"
+assert_eq "device + refused static: refused before any device flow" "0" "$(github_calls)"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+
+# (D7) The host identity gates the device flow: no verified host, no flow.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE"
+run_dev MOCK_SSH_HOST_ID=i-0strangersbox -- attach
+assert_eq "device, identity mismatch -> exit 6" "6" "$RR_RC"
+assert_eq "device, identity mismatch: GitHub was never contacted" "0" "$(github_calls)"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_SSH_MUX_CHECK_FAIL=1 -- attach
+assert_eq "device, connection lost while waiting -> exit 6" "6" "$RR_RC"
+assert_eq "device, connection lost: nothing was delivered" "0" "$(grep -c 'attach bootstrap' "$MOCK_LOG")"
+for bad in 'Iv1 bad' 'Iv1&x=1' "Iv1'x"; do
+  write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "REPO_REMOTE_GH_APP_CLIENT_ID=\"$bad\""
+  run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- attach
+  assert_eq "client ID '$bad' refused -> exit 2" "2" "$RR_RC"
+  assert_eq "client ID '$bad': before connecting or contacting GitHub" "0" "$(( $(github_calls) + $(grep -c 'ControlMaster=yes' "$MOCK_LOG") ))"
+done
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE"
+
+# (D8) The identity line is best effort: a failed or odd lookup warns, the
+#      session still opens, and an unshaped value is never printed.
+poll_script "$(tok_json "$DTOK_1")"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true MOCK_GH_LOGIN= -- attach
+assert_eq "identity lookup fails: the session still opens" "0" "$RR_RC"
+assert_contains "identity lookup fails: warned" "$RR_ERR" "could not confirm which GitHub account"
+assert_eq "identity lookup fails: the session still started" "-l" "$(tail -n1 "$MOCK_VM_LOG.dockerargv" 2>/dev/null)"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_GH_LOGIN='evil;$(id)' -- attach
+assert_contains "identity: a value not shaped like a login is not trusted" "$RR_ERR" "could not confirm which GitHub account"
+assert_not_contains "identity: ... and never printed" "$RR_ERR" "evil;"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_VM_NO_DOCKER=1 -- attach
+assert_contains "identity on a docker-less host still works" "$RR_ERR" "acting as GitHub user octo-person"
+
+# (D9) Gateway mode: the device token travels as GH_ENTERPRISE_TOKEN, and the
+#      identity lookup runs with the same routing environment.
+git -C "$REPO" remote add origin https://github.com/acme/widgets.git
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE" "REPO_REMOTE_GH_API_HOST=gateway.invalid"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "device + gateway: exit 0" "0" "$RR_RC"
+assert_contains "device + gateway: GH_ENTERPRISE_TOKEN is the device token" "$(cat "$MOCK_VM_LOG.dockerenv" 2>/dev/null)" "GH_ENTERPRISE_TOKEN=$DTOK_1"
+assert_contains "device + gateway: the identity lookup is routed to the gateway" "$(cat "$MOCK_VM_LOG.whoenv" 2>/dev/null)" "GH_HOST=gateway.invalid"
+argv_has "device + gateway: the identity lookup empties GH_TOKEN" "$MOCK_VM_LOG.whoargv" "GH_TOKEN="
+assert_device_secrets_absent "device + gateway: secrets absent everywhere"
+git -C "$REPO" remote remove origin
+
+# (D10) Tracing: `bash -x` never shows the device code or the token.
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinnedbox" "$CLIENT_LINE"
+poll_script "$PENDING" '{"error":"slow_down"}' "$(tok_json "$DTOK_1")"
+RR_BASH_X=1 run_dev MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_DOCKER_RUNNING=true -- attach
+assert_eq "bash -x device attach: exit 0" "0" "$RR_RC"
+assert_contains "bash -x device attach: tracing really was on" "$RR_ERR" "+ "
+assert_eq "bash -x device attach: the token was still delivered" "$DTOK_1" "$(cat "$MOCK_LOG.payload" 2>/dev/null)"
+assert_not_contains "bash -x device attach: the token is never traced" "$RR_ERR" "$DTOK_1"
+assert_not_contains "bash -x device attach: the device code is never traced" "$RR_ERR" "$DEVICE_CANARY"
+assert_device_secrets_absent "bash -x device attach: secrets absent everywhere"
+
+# (D11) Lifecycle commands and dry runs never contact the device endpoints.
+reset_mint; run_dev -- up
+assert_eq "device lifecycle: up (dry run) -> exit 0" "0" "$RR_RC"
+assert_contains "device lifecycle: the plan names the device flow" "$RR_ERR" "device flow, run by each attach (not run in a dry run)"
+reset_mint; run_dev -- up --json
+assert_eq "device lifecycle: plan JSON source is device" "device" "$(json_field "$RR_OUT" gh_credential_source)"
+assert_eq "device lifecycle: up --json never contacts GitHub" "0" "$(github_calls)"
+run_dev MOCK_AWS_STATE=running MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_AWS_PUBLIC_IP=203.0.113.42 -- up --yes --json
+assert_eq "device lifecycle: up --yes -> exit 0" "0" "$RR_RC"
+assert_eq "device lifecycle: up --yes never contacts GitHub" "0" "$(github_calls)"
+run_dev MOCK_AWS_FIND=$'i-0pinnedbox\trunning\tm5.2xlarge\t203.0.113.42\t2026-01-01' -- status --json
+assert_eq "device lifecycle: status never contacts GitHub" "0" "$(github_calls)"
+run_dev MOCK_SSH_HOST_ID=i-0pinnedbox -- verify --json
+assert_eq "device lifecycle: verify never contacts GitHub" "0" "$(github_calls)"
+run_dev MOCK_AWS_FIND=$'i-0pinnedbox\trunning' -- down --yes
+assert_eq "device lifecycle: down never contacts GitHub" "0" "$(github_calls)"
+assert_eq "device lifecycle: no poll interval was ever slept" "" "$(sleeps)"
+rm -f "$REPO/.env"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -4007,7 +4388,7 @@ assert_contains "remote.md: token rsync targets the alias" "$MD" "repo-remote-<n
 
 # repo#565: the credential-aware attach path and its contract.
 assert_contains "remote.md documents the token command" "$MD" "REPO_REMOTE_GH_TOKEN_CMD"
-assert_contains "remote.md calls the minted token the recommended path" "$MD" "the recommended path is a minted token"
+assert_contains "remote.md calls the device flow the required path" "$MD" "the required path is the device flow"
 assert_contains "remote.md documents the gateway setting" "$MD" "REPO_REMOTE_GH_API_HOST"
 assert_contains "remote.md documents the attach subcommand" "$MD" "repo-remote attach"
 assert_contains "remote.md documents /repo:remote --attach" "$MD" "/repo:remote --attach"
@@ -4029,6 +4410,20 @@ HELP="$(bash "$RR" --help 2>&1)"
 assert_contains "--help documents attach" "$HELP" "repo-remote attach|--attach"
 assert_contains "--help documents exit 7" "$HELP" "7  \`attach\` could not resolve"
 assert_contains "--help documents the gateway contract" "$HELP" "REPO_REMOTE_GH_API_HOST"
+
+# repo#627: the per-user device flow, the static-token opt-out, and the
+# no-credential refusal.
+assert_contains "remote.md documents the App client ID" "$MD" "REPO_REMOTE_GH_APP_CLIENT_ID"
+assert_contains "remote.md documents the static-token opt-out" "$MD" "REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1"
+assert_contains "remote.md documents the precedence" "$MD" "Precedence is device flow > command > static"
+assert_contains "remote.md documents slow_down handling" "$MD" "adding 5 seconds on"
+assert_contains "remote.md documents the token lifetime" "$MD" "about **8 hours**"
+assert_contains "remote.md documents the no-credential refusal" "$MD" "There is no unauthenticated session any more."
+assert_contains "remote.md documents the identity line" "$MD" "repo-remote: acting as GitHub user <login>"
+assert_contains "remote.md documents device-code hygiene" "$FMD" "passed to \`curl\` on **stdin** through a pipe"
+assert_contains "--help documents the App client ID" "$HELP" "REPO_REMOTE_GH_APP_CLIENT_ID"
+assert_contains "--help documents the static opt-out" "$HELP" "REPO_REMOTE_ALLOW_STATIC_GH_TOKEN"
+assert_contains "--help documents exit 7 for no credential" "$HELP" "none is"
 
 # repo#616: the opt-in Spot market, its exact launch arguments, and its
 # lifecycle and cost semantics.
