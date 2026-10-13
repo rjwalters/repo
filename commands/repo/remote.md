@@ -53,7 +53,45 @@ repo-remote attach [--container|--host] [--command <cmd>]
                                      # verify the host, THEN resolve the GitHub credential, then open a
                                      # session on the existing instance (connect and reconnect; repo#565)
 repo-remote down [--yes] [--delete]  # dry-run listing without --yes; stop (or --delete to terminate) with --yes
+repo-remote prune [--yes] [--json]   # list (or with --yes remove) stale repo-remote-* SSH aliases; see below
 ```
+
+#### One name per repo, and cleaning up SSH aliases (#628)
+
+`<name>` (the `repo-remote-<name>` alias, the `repo-remote=<name>` instance
+tag, the SSH ingress marker) is the directory name of the **primary checkout**:
+the parent of `git rev-parse --git-common-dir`, resolved physically. A main
+checkout and every linked worktree of one repo therefore resolve the same
+alias and the same box, instead of `repo-remote-issue-576` for a worktree
+named `issue-576`. When the common dir is not a `.git` directory (a bare repo,
+no git at all) the name falls back to the basename of the git toplevel (or the
+cwd). There is no new setting. **One-time effect:** a box that an earlier
+version tagged with a worktree directory name is no longer found by tag from
+the main checkout. Pin it with `REPO_REMOTE_INSTANCE_ID`, or re-tag it
+`repo-remote=<name>`.
+
+Aliases are cleaned up in two places, both editing only `Host repo-remote-*`
+blocks, under the same lock, atomic temp-file `mv` and `ssh -G` parse check
+that the alias writer uses, and both followed by `ssh-keygen -R <HostName>`:
+
+- `down --yes --delete` (AWS and GCP) removes the terminated box's alias and
+  known_hosts entry after the terminate succeeds. A failed cleanup is only a
+  warning (the box is already gone). A stop-only `down --yes` keeps both,
+  because the box still exists.
+- `repo-remote prune` removes the aliases of boxes that no longer exist. It is
+  a **dry run** unless `--yes` is given. It lists the instances carrying a
+  `repo-remote` tag/label at the configured provider and region and keeps a
+  block whose `HostName` is a live instance's public IP or id, or whose alias is
+  `repo-remote-<tag>` for a live instance (a stopped box's recorded IP is stale
+  by design). It **fails closed**: if the lookup errors or returns anything it
+  cannot parse, it exits `4` and removes nothing. A block it cannot judge
+  (multi-pattern `Host` line, no `HostName`) and every non-`repo-remote-*`
+  block stay byte-identical. It judges only the configured provider/region, so
+  aliases for boxes in another region or provider look stale: read the dry run
+  first. `--json` prints `{"action":"prune","provider":..,"disposition":
+  "dry-run"|"removed","stale":[..],"kept":N}`. The VM-side idle shutdown cannot
+  reach your local `~/.ssh/config`, so `prune` is the way to clear aliases left
+  by it.
 
 `--yes` **removes the prompt, not the consent.** A cost-relevant field missing
 from config — the provider, its credentials, or `REPO_REMOTE_INSTANCE_TYPE` —
@@ -96,7 +134,7 @@ relax the cost gate — `--force` without a pre-supplied
 Exit codes: `0` success (including a dry-run plan), `2` missing/invalid required
 config (the cost gate; also the `REPO_REMOTE_MARKET=spot` lifecycle refusals),
 `3` provider authentication failed, `4` cloud operation
-failed, `5` refused to reuse a fleet-marked instance (pass `--force`), `6`
+failed (for `prune`: the provider lookup failed, nothing removed), `5` refused to reuse a fleet-marked instance (pass `--force`), `6`
 host-identity verification failed — the host reachable at the SSH alias is not
 this repo's instance, or its identity could not be established (see [Stale SSH
 aliases and released public IPs](#stale-ssh-aliases-and-released-public-ips-host-identity-verification);

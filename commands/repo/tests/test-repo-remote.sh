@@ -258,9 +258,14 @@ case "$1 $2" in
     fi
     exit 0 ;;
   "ec2 describe-instances")
+    # #628: a failing instance listing (prune must fail closed on it).
+    if [[ "${MOCK_AWS_DESCRIBE_FAIL:-0}" == 1 ]]; then
+      echo "An error occurred (RequestLimitExceeded) when calling the DescribeInstances operation" >&2
+      exit 254
+    fi
     # Fleet-marker lookup (repo#164) is also an --instance-ids call, so it must
     # be matched FIRST by its Tags[?Key=...] query projection.
-    if printf '%s' "$*" | grep -qF "Tags[?Key=="; then
+    if printf '%s' "$*" | grep -qF "Tags[?Key==" && ! printf '%s' "$*" | grep -qF "tag-key"; then
       # repo#170: down's tag-discovery path can resolve MULTIPLE ids, so the
       # per-id marker needs to be distinguishable in tests (mixed-batch
       # scenarios). MOCK_AWS_FLEET_MARKED_IDS, when set, is a space-separated
@@ -4440,6 +4445,247 @@ assert_contains "remote.md documents no retry" "$MD" "**Nothing is retried**"
 assert_contains "remote.md documents the additive market field" "$MD" '`"market":"spot"`'
 HELP616="$(bash "$RR" --help 2>&1)"
 assert_contains "--help documents REPO_REMOTE_MARKET" "$HELP616" "REPO_REMOTE_MARKET   on-demand (default) | spot"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- stable name from the primary checkout; alias cleanup and prune (#628) --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "fixture base 628" >/dev/null 2>&1 || true
+WT628="$SCRATCH/issue-628-wt"
+git -C "$REPO" worktree add -q --detach "$WT628" >/dev/null 2>&1
+if [[ -d "$WT628" ]]; then
+    WT628="$(cd "$WT628" && pwd -P)"
+    mkdir -p "$WT628/sub/dir"
+    printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" >"$WT628/.env"
+    run_rr -- up --json
+    NAME_MAIN="$(json_field "$RR_OUT" name)"
+    RR_CWD="$WT628" run_rr -- up --json
+    assert_eq "naming: linked worktree plan name equals the primary checkout's" "$NAME_MAIN" "$(json_field "$RR_OUT" name)"
+    assert_eq "naming: the name is the primary checkout directory" "myrepo" "$(json_field "$RR_OUT" name)"
+    RR_CWD="$WT628/sub/dir" run_rr -- up --json
+    assert_eq "naming: a subdirectory of a worktree resolves the same name" "myrepo" "$(json_field "$RR_OUT" name)"
+    RR_CWD="$REPO" run_rr MOCK_AWS_FIND="" -- status --json
+    RR_CWD="$WT628" run_rr MOCK_AWS_FIND="" -- status --json
+    assert_contains "naming: status from a worktree looks up the repo-remote=myrepo tag" \
+        "$(cat "$MOCK_LOG")" "Values=myrepo"
+    assert_not_contains "naming: status from a worktree never uses the worktree dir name" \
+        "$(cat "$MOCK_LOG")" "issue-628-wt"
+    # up from the worktree writes the SAME alias, and the ingress marker uses it.
+    rm -f "$SCRATCH/ssh_config"
+    RR_CWD="$WT628" run_rr REPO_REMOTE_NO_WRITEBACK=1 MOCK_AWS_NEW_ID=i-0wt628 MOCK_AWS_STATE=None \
+        MOCK_AWS_PUBLIC_IP=203.0.113.62 MOCK_SSH_HOST_ID=i-0wt628 -- up --yes --json
+    assert_eq "naming: up from a worktree succeeds" "0" "$RR_RC"
+    assert_contains "naming: up from a worktree writes repo-remote-myrepo" \
+        "$(cat "$SCRATCH/ssh_config" 2>/dev/null)" "Host repo-remote-myrepo"
+    assert_not_contains "naming: no worktree-named alias is written" \
+        "$(cat "$SCRATCH/ssh_config" 2>/dev/null)" "issue-628-wt"
+    assert_contains "naming: ingress marker carries the stable name" \
+        "$(cat "$MOCK_LOG")" "repo-remote:myrepo:"
+    git -C "$REPO" worktree remove --force "$WT628" >/dev/null 2>&1 || true
+else
+    no "naming fixture: git worktree add failed"
+fi
+# Fallback: no git at all -> basename of the cwd.
+NOGIT628="$SCRATCH/plain-dir"
+mkdir -p "$NOGIT628"
+RR_CWD="$NOGIT628" run_rr REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge -- up --json
+assert_eq "naming: outside git falls back to the cwd basename" "plain-dir" "$(json_field "$RR_OUT" name)"
+# Fallback: a bare repository's common dir is not a .git dir -> toplevel/cwd basename.
+git init -q --bare "$SCRATCH/bare628.git" >/dev/null 2>&1
+RR_CWD="$SCRATCH/bare628.git" run_rr REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge -- up --json
+assert_eq "naming: a bare repo falls back to its own basename" "bare628.git" "$(json_field "$RR_OUT" name)"
+
+# Mock ssh-keygen: record -R, pass everything else to the real one.
+REAL_SSH_KEYGEN="$(command -v ssh-keygen)"
+cat >"$MOCK_BIN/ssh-keygen" <<MOCK
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == "-R" ]]; then
+    printf 'ssh-keygen %s\n' "\$*" >>"\${MOCK_AWS_LOG:-/dev/null}"
+    exit 0
+  fi
+done
+exec "$REAL_SSH_KEYGEN" "\$@"
+MOCK
+chmod +x "$MOCK_BIN/ssh-keygen"
+
+CFG628="$SCRATCH/prune_ssh_config"
+write_cfg628() {
+    rm -f "$CFG628" "$CFG628.lock"
+    cat >"$CFG628" <<'CFG'
+Host github.com
+    HostName github.com
+    User git
+
+Host repo-remote-pr-11132
+    HostName 198.51.100.1
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+
+Host repo-remote-live
+    HostName 198.51.100.7
+    User ubuntu
+
+Host repo-remote-myrepo
+    HostName 198.51.100.50
+    User ubuntu
+
+Host repo-remote-ssm-gone
+    HostName i-0gone
+    User ubuntu
+
+Host repo-remote-a repo-remote-b
+    HostName 198.51.100.99
+
+Host unrelated-stale
+    HostName 198.51.100.2
+    User me
+CFG
+}
+LIVE628=$'i-0live\t198.51.100.7\tlive\ni-0stopped\tNone\tmyrepo'
+
+# (a) dry run: lists only stale repo-remote-* blocks, changes nothing.
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune
+assert_eq "prune dry run: exit 0" "0" "$RR_RC"
+assert_contains "prune dry run: lists the stale IP alias" "$RR_ERR" "repo-remote-pr-11132"
+assert_contains "prune dry run: lists the stale ssm alias" "$RR_ERR" "repo-remote-ssm-gone"
+assert_not_contains "prune dry run: live alias (by IP) not listed" "$RR_ERR" "alias repo-remote-live"
+assert_not_contains "prune dry run: stopped box's alias (by tag) not listed" "$RR_ERR" "alias repo-remote-myrepo"
+assert_not_contains "prune dry run: unrelated Host block not listed" "$RR_ERR" "unrelated-stale"
+assert_not_contains "prune dry run: multi-pattern Host line not listed" "$RR_ERR" "repo-remote-a"
+assert_eq "prune dry run: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+assert_eq "prune dry run: no known_hosts removal" "0" "$(grep -c 'ssh-keygen' "$MOCK_LOG")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --json
+assert_contains "prune --json: dry-run disposition" "$RR_OUT" '"disposition":"dry-run"'
+assert_contains "prune --json: stale list" "$RR_OUT" '"stale":["repo-remote-pr-11132","repo-remote-ssm-gone"]'
+
+# (b) --yes removes only the stale blocks and their known_hosts entries.
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --yes
+assert_eq "prune --yes: exit 0" "0" "$RR_RC"
+AFTER628="$(cat "$CFG628")"
+assert_not_contains "prune --yes: stale IP block removed" "$AFTER628" "Host repo-remote-pr-11132"
+assert_not_contains "prune --yes: stale ssm block removed" "$AFTER628" "Host repo-remote-ssm-gone"
+assert_contains "prune --yes: live block kept" "$AFTER628" "Host repo-remote-live"
+assert_contains "prune --yes: stopped box's block kept" "$AFTER628" "Host repo-remote-myrepo"
+assert_contains "prune --yes: unrelated blocks kept" "$AFTER628" "Host unrelated-stale"
+assert_contains "prune --yes: github block kept" "$AFTER628" "Host github.com"
+assert_contains "prune --yes: multi-pattern block kept" "$AFTER628" "Host repo-remote-a repo-remote-b"
+assert_contains "prune --yes: ssh-keygen -R for the stale IP" "$(cat "$MOCK_LOG")" "ssh-keygen -R 198.51.100.1"
+assert_contains "prune --yes: ssh-keygen -R for the stale instance id" "$(cat "$MOCK_LOG")" "ssh-keygen -R i-0gone"
+assert_eq "prune --yes: exactly two known_hosts removals" "2" "$(grep -c '^ssh-keygen -R' "$MOCK_LOG")"
+assert_eq "prune --yes: no lock dir left behind" "" "$( [[ -e "$CFG628.lock" ]] && echo present )"
+# Expected file = original minus the two stale blocks, byte for byte.
+EXPECT628="$(printf '%s\n' "$BEFORE628" | awk '
+  /^Host / { skip = ($0 == "Host repo-remote-pr-11132" || $0 == "Host repo-remote-ssm-gone") }
+  !skip { print }')"
+assert_eq "prune --yes: everything else byte-identical" "$EXPECT628" "$AFTER628"
+
+# (c) fail closed: a provider lookup error removes nothing (dry run and --yes).
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_DESCRIBE_FAIL=1 -- prune --yes
+assert_eq "prune lookup failure: exit 4" "4" "$RR_RC"
+assert_contains "prune lookup failure: says nothing was removed" "$RR_ERR" "nothing was removed"
+assert_eq "prune lookup failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+assert_eq "prune lookup failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+# ...and so does an answer that cannot be parsed (ambiguity).
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="garbled output" -- prune --yes
+assert_eq "prune unparseable lookup: exit 4" "4" "$RR_RC"
+assert_eq "prune unparseable lookup: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+
+# (d) a failed ssh -G parse check leaves the config untouched.
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" MOCK_SSH_G_FAIL=1 -- prune --yes
+assert_eq "prune parse-check failure: exit 4" "4" "$RR_RC"
+assert_eq "prune parse-check failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+assert_eq "prune parse-check failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+
+# (e) provider is required.
+write_shared "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" -- prune
+assert_eq "prune without a provider: exit 2" "2" "$RR_RC"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+
+# (f) down --yes --delete removes the alias + known_hosts entry; stop-only keeps both.
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="i-0abc" -- down --yes --json
+assert_contains "down --yes (stop only): stopped" "$RR_OUT" '"disposition":"stopped"'
+assert_eq "down --yes (stop only): config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+assert_eq "down --yes (stop only): no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="i-0abc" -- down --delete --json
+assert_eq "down --delete dry run: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="i-0abc" -- down --yes --delete --json
+assert_contains "down --yes --delete: terminated" "$RR_OUT" '"disposition":"terminated"'
+assert_not_contains "down --yes --delete: this box's alias removed" "$(cat "$CFG628")" "Host repo-remote-myrepo"
+assert_contains "down --yes --delete: other aliases kept" "$(cat "$CFG628")" "Host repo-remote-live"
+assert_contains "down --yes --delete: unrelated blocks kept" "$(cat "$CFG628")" "Host unrelated-stale"
+assert_contains "down --yes --delete: known_hosts entry removed" "$(cat "$MOCK_LOG")" "ssh-keygen -R 198.51.100.50"
+# A failed terminate removes nothing.
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="i-0abc" MOCK_AWS_TERMINATE_FAIL=1 -- down --yes --delete --json
+if [[ "$RR_RC" == 4 ]]; then
+    assert_eq "failed terminate: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+fi
+# No config file at all: terminate still succeeds.
+rm -f "$CFG628"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="i-0abc" -- down --yes --delete --json
+assert_eq "down --yes --delete with no ssh config: exit 0" "0" "$RR_RC"
+
+# (g) GCP terminate removes the alias; GCP stop keeps it.
+write_shared "REPO_REMOTE_PROVIDER=gcp" "GCP_PROJECT=p" "GCP_ZONE=us-central1-a" \
+             "GOOGLE_APPLICATION_CREDENTIALS=$SCRATCH/sa.json"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=e2-standard-4"
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_GCP_STATE=RUNNING -- down --yes --json
+assert_eq "gcp stop-only: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_GCP_STATE=RUNNING -- down --yes --delete --json
+assert_contains "gcp terminate: terminated" "$RR_OUT" '"disposition":"terminated"'
+assert_not_contains "gcp terminate: alias removed" "$(cat "$CFG628")" "Host repo-remote-myrepo"
+assert_contains "gcp terminate: known_hosts entry removed" "$(cat "$MOCK_LOG")" "ssh-keygen -R 198.51.100.50"
+assert_contains "gcp terminate: unrelated blocks kept" "$(cat "$CFG628")" "Host unrelated-stale"
+# gcp prune: live vm kept, stale removed, lookup output via the mock gcloud list.
+cat >"$MOCK_BIN/gcloud" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_AWS_LOG:-/dev/null}"
+if [[ "$1 $2 $3" == "compute instances list" ]]; then
+  [[ "${MOCK_GCP_LIST_FAIL:-0}" == 1 ]] && exit 1
+  printf '%s' "${MOCK_GCP_LIST:-}"; exit 0
+fi
+case "$1 $2 ${3:-}" in
+  "compute instances describe")
+    if printf '%s' "$*" | grep -qF 'labels.'; then
+      printf '%s\n' "${MOCK_GCP_FLEET_LABEL:-}"
+    elif printf '%s' "$*" | grep -qF 'natIP'; then
+      printf '%s\n' "${MOCK_GCP_IP:-1.2.3.4}"
+    else
+      printf '%s\n' "${MOCK_GCP_STATE:-}"
+    fi
+    exit 0 ;;
+esac
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/gcloud"
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_GCP_LIST_FAIL=1 -- prune --yes
+assert_eq "gcp prune lookup failure: exit 4" "4" "$RR_RC"
+assert_eq "gcp prune lookup failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_GCP_LIST=$'repo-remote-live,198.51.100.7,live\n' -- prune --yes
+assert_eq "gcp prune --yes: exit 0" "0" "$RR_RC"
+assert_not_contains "gcp prune --yes: stale block removed" "$(cat "$CFG628")" "Host repo-remote-pr-11132"
+assert_contains "gcp prune --yes: live block kept" "$(cat "$CFG628")" "Host repo-remote-live"
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+rm -f "$MOCK_BIN/ssh-keygen"
+
+# Docs: remote.md documents the naming, prune and the exit code.
+MD628="$(cat "$REMOTE_MD")"
+assert_contains "remote.md documents prune" "$MD628" "repo-remote prune [--yes]"
+assert_contains "remote.md documents the primary-checkout name" "$MD628" "primary checkout"
+assert_contains "remote.md documents prune failing closed" "$MD628" "fails closed"
+assert_contains "remote.md documents terminate removing the alias" "$MD628" "down --yes --delete"
+HELP628="$(bash "$RR" --help 2>&1)"
+assert_contains "--help documents prune" "$HELP628" "repo-remote prune|--prune"
 
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"
