@@ -8258,6 +8258,156 @@ fi
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Force-op: quoted words and git dir / work tree selectors (repo#612) ---${NC}"
+# =========================================================================
+#
+# parse_force_ops() compared the git word, the subcommand and the force flags
+# as RAW words and only consumed a separate value for -C/-c, so
+# `git "reset" --hard`, `git reset "--hard"`, `git --git-dir .git reset
+# --hard` and `git --work-tree . reset --hard` were allowed in every mode.
+# Words are now decoded statically, global options are walked with git's
+# arity, and --git-dir/--work-tree/GIT_DIR/GIT_WORK_TREE select the repository
+# the branch is resolved from. Every case asserts the decision AND the
+# decision-log tag, not just the exit status.
+
+# _fo612_verdict <env-assignments> <cwd> <cmd> -> "<decision> <tag>"
+_fo612_verdict() {
+    local envs="$1" cwd="$2" cmd="$3" logdir out dec tag=""
+    local -a ea=()
+    [[ -n "$envs" ]] && read -r -a ea <<< "$envs"
+    logdir=$(mktemp -d 2>/dev/null)
+    out=$(make_input "$cmd" "$cwd" | env ${ea[@]+"${ea[@]}"} REPO_GUARD_DECISION_LOG=1 \
+        REPO_GUARD_DECISION_LOG_FILE="$logdir/d.log" "$GUARD" 2>&1) || true
+    dec=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null) || dec=""
+    [[ -z "$dec" ]] && dec=allow
+    if [[ "$dec" != allow ]]; then
+        tag=$(tail -1 "$logdir/d.log" 2>/dev/null | jq -r '.pattern' 2>/dev/null) || tag=""
+    fi
+    rm -rf "$logdir"
+    printf '%s %s' "$dec" "$tag"
+}
+# assert_fo612 <decision> <tag|-> <description> <env-assignments> <cwd> <cmd>
+# A tag of "-" checks the decision only (allow verdicts carry no tag).
+assert_fo612() {
+    local want="$1" want_tag="$2" desc="$3" envs="$4" cwd="$5" cmd="$6" got
+    TOTAL=$((TOTAL + 1))
+    got=$(_fo612_verdict "$envs" "$cwd" "$cmd")
+    if [[ "${got%% *}" == "$want" && ( "$want_tag" == "-" || "${got#* }" == "$want_tag" ) ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $desc"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $desc"
+        echo -e "       Command: $cmd (cwd: $cwd, env: ${envs:-none})"
+        echo -e "       Expected: $want $want_tag, got: $got"
+    fi
+}
+
+_fo612_git() { git -c user.email=test@example.com -c user.name=test "$@"; }
+F612_BASE=$(mktemp -d 2>/dev/null)
+F612_BASE=$(cd "$F612_BASE" && pwd -P)
+# Protected main checkout (on main), with a sub dir and a managed worktree.
+F612_MAIN="$F612_BASE/main"
+mkdir -p "$F612_MAIN/sub"
+git -C "$F612_MAIN" init -q -b main >/dev/null 2>&1
+_fo612_git -C "$F612_MAIN" commit -q --allow-empty -m one >/dev/null 2>&1
+_fo612_git -C "$F612_MAIN" commit -q --allow-empty -m two >/dev/null 2>&1
+git -C "$F612_MAIN" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1
+F612_WT="$F612_MAIN/.loom/worktrees/issue-1"
+mkdir -p "$F612_MAIN/.loom/worktrees"
+_fo612_git -C "$F612_MAIN" worktree add -q -b feature/issue-1 "$F612_WT" >/dev/null 2>&1
+printf '# Loom-managed worktree marker\n# Issue: 1\n# Branch: feature/issue-1\n' > "$F612_WT/.loom-managed"
+git -C "$F612_WT" checkout -q --detach >/dev/null 2>&1
+# Feature-branch checkout.
+F612_FEAT="$F612_BASE/feat"
+mkdir -p "$F612_FEAT"
+git -C "$F612_FEAT" init -q -b main >/dev/null 2>&1
+_fo612_git -C "$F612_FEAT" commit -q --allow-empty -m one >/dev/null 2>&1
+_fo612_git -C "$F612_FEAT" commit -q --allow-empty -m two >/dev/null 2>&1
+git -C "$F612_FEAT" checkout -q -b feature/work >/dev/null 2>&1
+# Separate scratch clone on a branch literally named main.
+F612_SCR="$F612_BASE/scratch"
+mkdir -p "$F612_SCR"
+git -C "$F612_SCR" init -q -b main >/dev/null 2>&1
+_fo612_git -C "$F612_SCR" commit -q --allow-empty -m one >/dev/null 2>&1
+_fo612_git -C "$F612_SCR" commit -q --allow-empty -m two >/dev/null 2>&1
+
+P612="REPO_FORCE_SCOPE=protected"
+A612="REPO_FORCE_SCOPE=all"
+
+# -- the four reproducers from the issue, both modes --
+for _c612 in 'git "reset" --hard' 'git reset "--hard"' 'git --git-dir .git reset --hard' 'git --work-tree . reset --hard'; do
+    assert_fo612 ask force-op:all "repo#612 all: $_c612 asks" "$A612" "$F612_MAIN" "$_c612"
+    assert_fo612 ask force-op:protected "repo#612 protected on main: $_c612 asks" "$P612" "$F612_MAIN" "$_c612"
+done
+
+# -- quoted / escaped spellings of git, the subcommand and the flags --
+for _c612 in '"git" reset --hard' "g''it re\\set --ha''rd" "git push \"--force\" origin HEAD" "git push '-f' origin HEAD" \
+             'git push --force-with-lease origin "HEAD"' 'git push "--force-with-lease=main" origin HEAD' \
+             "git push -f origin 'HEAD:main'"; do
+    assert_fo612 ask force-op:protected "repo#612 protected on main: $_c612 asks" "$P612" "$F612_MAIN" "$_c612"
+done
+assert_fo612 ask force-op:all "repo#612 all: \"git\" \"push\" \"-f\" asks" "$A612" "$F612_MAIN" '"git" "push" "-f" origin feature/x'
+assert_fo612 ask force-op:protected 'repo#612: quoted refspec naming the configured default branch asks' \
+    "$P612 REPO_DEFAULT_BRANCH=develop" "$F612_FEAT" 'git push --force origin "develop"'
+
+# -- global options with a separate value, joined forms, composition --
+for _c612 in 'git --git-dir=.git reset --hard' 'git --work-tree=. reset --hard' \
+             'git --namespace ns reset --hard' 'git --super-prefix p/ reset --hard' \
+             'git --config-env core.x=V reset --hard' 'git --attr-source HEAD reset --hard' \
+             'git -c core.x=1 --git-dir .git reset --hard' 'git "--git-dir" .git reset --hard' \
+             'git -C sub --git-dir ../.git --work-tree .. reset --hard' \
+             'cd sub && git --git-dir ../.git reset --hard' \
+             'GIT_DIR=.git git reset --hard' 'GIT_WORK_TREE=. git reset --hard' \
+             'GIT_DIR=.git GIT_WORK_TREE=. git reset --hard' 'GIT_DIR=.git git push --force origin HEAD'; do
+    assert_fo612 ask force-op:protected "repo#612 protected on main: $_c612 asks" "$P612" "$F612_MAIN" "$_c612"
+done
+assert_fo612 ask force-op:all 'repo#612 all: GIT_DIR=.git GIT_WORK_TREE=. git reset --hard asks' \
+    "$A612" "$F612_MAIN" 'GIT_DIR=.git GIT_WORK_TREE=. git reset --hard'
+# Command-line flags override the environment, in both directions.
+assert_fo612 ask force-op:protected 'repo#612: --git-dir/--work-tree override a scratch GIT_DIR/GIT_WORK_TREE' \
+    "$P612" "$F612_MAIN" "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR git --git-dir .git --work-tree . reset --hard"
+assert_fo612 allow - 'repo#612: scratch --git-dir/--work-tree override a main-checkout GIT_DIR' \
+    "$P612" "$F612_MAIN" "GIT_DIR=.git GIT_WORK_TREE=. git --git-dir $F612_SCR/.git --work-tree $F612_SCR reset --hard"
+
+# -- undecodable words in a deciding position fail closed --
+assert_fo612 ask force-op:undecodable 'repo#612: variable subcommand next to --hard asks' "$P612" "$F612_FEAT" 'git $SUB --hard'
+assert_fo612 ask force-op:undecodable 'repo#612: variable command word before reset --hard asks' "$P612" "$F612_FEAT" '$G reset --hard'
+assert_fo612 ask force-op:undecodable 'repo#612: variable global option before reset --hard asks' "$P612" "$F612_FEAT" 'git "$OPT" x reset --hard'
+assert_fo612 ask force-op:unknown-cwd 'repo#612: variable --git-dir operand asks' "$P612" "$F612_FEAT" 'git --git-dir "$GD" reset --hard'
+assert_fo612 ask force-op:unknown-cwd 'repo#612: variable GIT_DIR assignment asks' "$P612" "$F612_FEAT" 'GIT_DIR=$X git reset --hard'
+assert_fo612 ask force-op:unknown-cwd 'repo#612: variable -C operand asks' "$P612" "$F612_FEAT" 'git -C "$X" reset --hard'
+assert_fo612 ask force-op:unresolved-target 'repo#612: variable force-push refspec asks' "$P612" "$F612_FEAT" 'git push --force origin "$B"'
+assert_fo612 ask force-op:all 'repo#612 all: variable subcommand next to --hard asks' "$A612" "$F612_FEAT" 'git $SUB --hard'
+
+# -- controls: feature branch, scratch clone, detached recovery, inert text --
+for _c612 in 'git "reset" "--hard"' 'git --git-dir .git reset --hard' 'git --work-tree . reset --hard' \
+             'GIT_DIR=.git GIT_WORK_TREE=. git reset --hard' 'git push "--force" origin feature/work' \
+             'git --namespace ns push -f origin "feature/work"'; do
+    assert_fo612 allow - "repo#612 control, feature branch: $_c612 allowed" "$P612" "$F612_FEAT" "$_c612"
+done
+assert_fo612 allow - 'repo#612 control: scratch --git-dir + --work-tree from the main checkout allowed' \
+    "$P612" "$F612_MAIN" "git --git-dir $F612_SCR/.git --work-tree $F612_SCR reset --hard"
+assert_fo612 allow - 'repo#612 control: quoted reset via -C <scratch> allowed' \
+    "$P612" "$F612_MAIN" "git -C $F612_SCR \"reset\" \"--hard\""
+assert_fo612 allow - 'repo#612 control: scratch GIT_DIR/GIT_WORK_TREE from the main checkout allowed' \
+    "$P612" "$F612_MAIN" "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR git reset --hard"
+assert_fo612 ask force-op:protected 'repo#612: scratch --work-tree but main-checkout repo (cwd) asks' \
+    "$P612" "$F612_MAIN" "git --work-tree $F612_SCR reset --hard"
+assert_fo612 ask force-op:protected 'repo#612: scratch --git-dir with the main checkout as work tree asks' \
+    "$P612" "$F612_MAIN" "git --git-dir $F612_SCR/.git reset --hard"
+assert_fo612 allow - 'repo#612 control: detached managed-worktree recovery with quoted flags allowed' \
+    "$P612" "$F612_WT" 'git "reset" "--hard" origin/main'
+assert_fo612 ask force-op:detached 'repo#612: recovery carve-out does not extend to an explicit --work-tree' \
+    "$P612" "$F612_WT" 'git --work-tree . reset --hard origin/main'
+for _c612 in 'echo "git \"reset\" --hard"' "printf '%s' 'git --git-dir .git reset --hard'" \
+             'git commit --allow-empty -m "git reset \"--hard\""' 'true # git "reset" --hard'; do
+    assert_fo612 allow - "repo#612 control, inert text: $_c612 allowed" "$P612" "$F612_MAIN" "$_c612"
+done
+assert_fo612 allow - 'repo#612 control: scope off allows a quoted reset' "REPO_FORCE_SCOPE=off" "$F612_MAIN" 'git "reset" --hard'
+assert_fo612 deny - 'repo#612 control: catastrophic quoted force-push to main still denies in off mode' \
+    "REPO_FORCE_SCOPE=off" "$F612_MAIN" 'git push --force origin "main"'
+rm -rf "$F612_BASE"
+echo ""
+
 # repo#608: git -C with a whitespace path (quoted / escaped) must resolve to
 # the same repo + branch as the unquoted spelling. parse_force_ops() used to
 # split the segment on raw whitespace, so `-C "/a b"` consumed only `"/a` and
