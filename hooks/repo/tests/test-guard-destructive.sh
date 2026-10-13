@@ -4425,6 +4425,38 @@ for _c600 in "$WTC_MAIN" "$WTC_WT"; do
         "c\$()d /tmp; cd sub; echo hi > out.log" "$_c600" "$_U600"
 done
 
+# repo#625: a cd to a MISSING directory fails and leaves the shell where it
+# was, so a `;`/newline/`||`-sequenced relative write lands in the original
+# cwd. A statically known cd target now counts as reached only when it exists
+# (literal path) or the next command is joined by `&&`; otherwise the cwd is
+# unknown and the relative write fails closed. Existing directories and `&&`
+# chains keep their decision.
+for _c625 in "$WTC_MAIN" "$WTC_WT"; do
+    _w625="main"; [[ "$_c625" == "$WTC_WT" ]] && _w625="worktree"
+    _U625="worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd <missing>; relative write" \
+        "cd /nonexistent-xyz; echo hi > out.log" "$_c625" "$_U625"
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd <missing> newline relative write" \
+        "cd /nonexistent-xyz"$'\n'"echo hi > out.log" "$_c625" "$_U625"
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd <missing> || relative write" \
+        "cd /nonexistent-xyz || echo hi > out.log" "$_c625" "$_U625"
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd <missing relative>; relative write" \
+        "cd /tmp; cd nonexistent-xyz; echo hi > out.log" "$_c625" "$_U625"
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd quoted <missing>; relative write" \
+        "cd '/nonexistent xyz'; echo hi > out.log" "$_c625" "$_U625"
+    # Existing directory with `;` and `&&` with a missing one: unchanged.
+    assert_deny_tag "write-confinement (#625, cwd=$_w625): cd <main>; relative write still lands in main" \
+        "cd $WTC_MAIN; echo hi > out.log" "$_c625" "worktree-write-confinement"
+    assert_allow "write-confinement (#625, cwd=$_w625): cd /tmp; relative write (existing dir)" \
+        "cd /tmp; echo hi > out.log" "$_c625"
+    assert_allow "write-confinement (#625, cwd=$_w625): cd <worktree>; relative write (existing dir)" \
+        "cd $WTC_WT; echo hi > out.log" "$_c625"
+done
+assert_allow "write-confinement (#625, cwd=worktree): cd <missing> && relative write keeps today's decision" \
+    "cd /nonexistent-xyz && echo hi > out.log" "$WTC_WT"
+assert_allow "write-confinement (#625, cwd=main): cd <missing> && relative write keeps today's decision" \
+    "cd /nonexistent-xyz && echo hi > out.log" "$WTC_MAIN"
+
 # repo#604: a cd behind a leading redirection (`>/dev/null cd X`) and cd
 # options (`cd -P X`, `cd -- X`) were not recognised, so a later RELATIVE write
 # was judged against the stale cwd. The shared recognizer now skips proven
@@ -7590,8 +7622,9 @@ assert_wc allow "#582 cd: absolute literal cd into /tmp then relative write allo
 assert_wc deny "#582 cd: cd /tmp; V=<main>/src; cd \"\$V\"; write denies (was a join bypass)" "$WC_WT" "" "cd /tmp; V=$WC_MAIN/src; cd \"\$V\"; echo pwned > evil.sh"
 assert_wc deny "#582 cd: exported V=<main> then cd \"\$V\" and write denies" "$WC_WT" "" "cd /tmp; export V=$WC_MAIN; cd \"\$V\"; echo x > f.txt"
 # Same-command LITERAL resolution of the cd argument (Loom #7294).
-assert_wc allow "#582 cd: literal V=/tmp/x; cd \"\$V/repo\"; relative write allows (from main cwd)" "$WC_MAIN" "" $'TMP=/tmp/x582\ncd "$TMP/repo"\necho hi > README.md'
-assert_wc allow "#582 cd: literal \${V}/sub cd argument allows" "$WC_WT" "" 'cd /tmp; V=/tmp/a; cd "${V}/b"; echo hi > f.txt'
+# repo#625: these cd targets must EXIST (a missing target leaves the cwd unknown), so they use /usr/bin.
+assert_wc allow "#582 cd: literal V=/tmp/x; cd \"\$V/repo\"; relative write allows (from main cwd)" "$WC_MAIN" "" $'TMP=/usr\ncd "$TMP/bin"\necho hi > README.md'
+assert_wc allow "#582 cd: literal \${V}/sub cd argument allows" "$WC_WT" "" 'cd /tmp; V=/usr; cd "${V}/bin"; echo hi > f.txt'
 assert_wc allow "#582 cd: unquoted literal cd \$V && write allows" "$WC_MAIN" "" 'TMP=/tmp/x582; cd $TMP && echo hi > README.md'
 assert_wc deny "#582 cd: literal V resolving into the main checkout, cd + relative write denies" "$WC_WT" "" $'SNEAK='"$WC_MAIN"$'/src\ncd "$SNEAK/deep"\necho pwned > evil.sh'
 assert_wc deny "#582 cd: conflicting reassignment of the cd variable denies" "$WC_WT" "" "cd /tmp; V=/tmp/a; V=$WC_MAIN; cd \"\$V\"; echo x > f.txt"
