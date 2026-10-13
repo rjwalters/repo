@@ -4425,6 +4425,129 @@ for _c600 in "$WTC_MAIN" "$WTC_WT"; do
         "c\$()d /tmp; cd sub; echo hi > out.log" "$_c600" "$_U600"
 done
 
+# repo#604: a cd behind a leading redirection (`>/dev/null cd X`) and cd
+# options (`cd -P X`, `cd -- X`) were not recognised, so a later RELATIVE write
+# was judged against the stale cwd. The shared recognizer now skips proven
+# leading redirections and parses the portable -L/-P and `--`; anything it cannot
+# prove makes the cwd unknown. Commands only ever reach the hook as JSON.
+for _c604 in "$WTC_MAIN" "$WTC_WT"; do
+    _w604="main"; [[ "$_c604" == "$WTC_WT" ]] && _w604="worktree"
+    # A cd carrying a redirection is UNKNOWN after the segment (repo#611
+    # review): the redirection open is not statically provable and a failed
+    # open makes bash skip the cd. The relative write then fails closed.
+    for _sp in ">/dev/null cd" "2>/dev/null cd" "> /dev/null cd" "2> /dev/null cd" "&>/dev/null cd" "</dev/null cd" "{fd}>/dev/null cd" "A=1 >/dev/null B=2 cd"; do
+        _spw="${_sp//$'\n'/ }"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp; $_spw <main>; redirect" \
+            "cd /tmp; $_sp $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    # Option shapes have no redirection: the cd is tracked and the write
+    # lands in main under the plain confinement tag.
+    for _sp in "c''d -P" "cd -P" "cd -L" "cd -PL" "cd --" "cd -P --" "\\cd -P"; do
+        _spw="${_sp//$'\n'/ }"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp; $_spw <main>; redirect" \
+            "cd /tmp; $_sp $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): newline separator" \
+        "cd /tmp"$'\n'">/dev/null cd $WTC_MAIN"$'\n'"echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): tee after cd -P" \
+        "cd /tmp; cd -P $WTC_MAIN; echo hi | tee out.log" "$_c604" "worktree-write-confinement"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): spaced destination after cd --" \
+        "cd /tmp; cd -- '$WTC_MAIN'; echo hi > out.log" "$_c604" "worktree-write-confinement"
+    # Unprovable shapes fail closed under the unknown-cwd tag.
+    for _sp in "cd -x" "cd -P" "cd -"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): unprovable [$_sp]" \
+            "cd /tmp; $_sp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    # -e and -@ are rejected by zsh and bash 3.2 (cwd unchanged), so they are
+    # unprovable too (repo#611 review).
+    for _sp in "cd -e" "cd -@" "cd -Pe" "cd -e@"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp; $_sp /tmp; redirect" \
+            "cd /tmp; $_sp /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): $_sp /tmp; redirect" \
+            "$_sp /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd <main>; cd -e /tmp; redirect" \
+        "cd $WTC_MAIN; cd -e /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    # A redirection glued to the cd word or to its operand is syntax, so the
+    # operand is not provable and the cwd is unknown.
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): redirection glued to the operand" \
+        "cd /tmp; cd $WTC_MAIN>/dev/null; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): redirection glued to the cd word" \
+        "cd /tmp; cd>/dev/null $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    # Any redirection on a cd — leading or trailing, fd-dup included — leaves
+    # the post-segment cwd UNKNOWN (repo#611 review): its open is not
+    # statically provable and a failed open makes bash skip the builtin.
+    # `>/dev/null 2>&1 cd X` also fails closed: the segmenter cuts at the `&`
+    # before the cd word, and the redirection rule covers it besides.
+    for _sp in ">/dev/null 2>&1 cd /tmp" ">/dev/null 2>&1 cd $WTC_MAIN"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): leading fd-dup segmenting artefact [$_sp]" \
+            "cd /tmp; $_sp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp >/dev/null 2>&1 is unknown" \
+        'cd /tmp >/dev/null 2>&1; echo hi > out.log' "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp 2>&1 is unknown" \
+        'cd /tmp 2>&1; echo hi > out.log' "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd <wt> 2>&1 && write is unknown" \
+        "cd $WTC_WT 2>&1 && echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    # The redirections of a cd segment are write targets, judged against the
+    # cwd BEFORE the cd runs (they are opened first).
+    for _sp in ">" "2>" ">>"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): leading [$_sp] into main on a cd segment" \
+            "${_sp}$WTC_MAIN/evil.sh cd /tmp" "$_c604" "worktree-write-confinement"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): trailing [$_sp] into main on a cd segment" \
+            "cd /tmp ${_sp}$WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): separated target on a cd segment" \
+        "cd /tmp > $WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): trailing redirect after cd -P" \
+        "cd -P /tmp >$WTC_MAIN/evil.sh" "$_c604" "worktree-write-confinement"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): leading redirect judged in the pre-cd cwd" \
+        "cd $WTC_MAIN; >out.log cd /tmp" "$_c604" "worktree-write-confinement"
+    assert_allow "write-confinement (#604, cwd=$_w604): leading redirect before cd <main> is judged in /tmp" \
+        "cd /tmp; >out.log cd $WTC_MAIN" "$_c604"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): redirect to /dev/null on a cd segment is unknown" \
+        'cd /tmp >/dev/null; echo hi > out.log' "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd -P with dot-dot is unknown" \
+        "cd /tmp; cd -P ../x; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): process-substitution redirect before cd is unknown" \
+        "cd /tmp; >(cat) cd /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): mktemp chain with a second redirected cd" \
+        "D=\$(mktemp -d /tmp/p.XXXX); cd \$D; >/dev/null cd $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    # repo#611 review: a redirection whose open FAILS makes bash skip the cd
+    # entirely (redirections are opened before the builtin runs), so the
+    # modeled cwd must not adopt the operand while the later relative write
+    # lands in the real (protected) cwd. Every cd carrying a redirection is
+    # therefore unknown after the segment; the relative write fails closed.
+    for _fr in \
+        "</definitely/loom-missing-input cd /tmp" \
+        "</definitely/loom-missing-input cd /tmp 2>/dev/null" \
+        ">/definitely/loom-missing-dir/f cd /tmp" \
+        "2>/definitely/loom-missing-dir/f cd /tmp" \
+        "cd /tmp </definitely/loom-missing-input" \
+        "cd /tmp >/definitely/loom-missing-dir/f" \
+        "cd /tmp 2>/definitely/loom-missing-dir/f" \
+        "cd /tmp > /definitely/loom-missing-dir/f"; do
+        assert_deny_tag "write-confinement (#611, cwd=$_w604): failed-open redirection skips the cd [${_fr//$'\n'/ }]" \
+            "$_fr; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    # Controls.
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp trailing stderr redirect is unknown" \
+        'cd /tmp 2>/dev/null; echo hi > out.log' "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): >/dev/null cd /tmp is unknown" \
+        '>/dev/null cd /tmp; echo hi > out.log' "$_c604" "worktree-write-confinement-unknown-cwd"
+    assert_allow "write-confinement (#604, cwd=$_w604): cd -P /tmp" \
+        'cd -P /tmp; echo hi > out.log' "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): cd -- /tmp" \
+        'cd -- /tmp; echo hi > out.log' "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): redirection-like quoted data is inert" \
+        "cd /tmp; echo '>/dev/null cd $WTC_MAIN' \"cd -P $WTC_MAIN\"; echo hi > out.log" "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): comment is inert" \
+        "cd /tmp # >/dev/null cd $WTC_MAIN"$'\n'"echo hi > out.log" "$_c604"
+    assert_allow "write-confinement (#604, cwd=$_w604): absolute write after unknown cwd into /tmp" \
+        'cd -x; echo hi > /tmp/ok.log' "$_c604"
+done
+echo ""
+
 # Statically provable spellings are tracked exactly like the literal word, in
 # BOTH directions: into the worktree they allow, and the quote/backslash
 # counterexamples a naive "strip every quote and backslash" normaliser would
@@ -4556,8 +4679,11 @@ for _c601 in "$WTC_MAIN" "$WTC_WT"; do
         'cd /tmp && echo a && echo b | tee out.log' "$_c601"
     assert_allow "write-confinement (#601, cwd=$_w601): false && cd /tmp && redirect is success-gated" \
         'false && cd /tmp && echo hi > out.log' "$_c601"
-    assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp 2>&1 && redirect" \
-        'cd /tmp 2>&1 && echo hi > out.log' "$_c601"
+    # repo#611 review: the trailing fd-dup on the cd makes the post-cd cwd
+    # unknown (a failed redirect open skips the builtin), so the &&-gated
+    # relative write fails closed.
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): cd /tmp 2>&1 && redirect is unknown" \
+        'cd /tmp 2>&1 && echo hi > out.log' "$_c601" "$_U601"
     assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp &&<newline> redirect" \
         "cd /tmp &&${_NL601}echo hi > out.log" "$_c601"
     assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp || exit 1; redirect (exit is proven)" \
