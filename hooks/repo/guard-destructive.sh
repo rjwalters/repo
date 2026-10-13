@@ -3150,9 +3150,13 @@ parse_force_ops() {
                     if (!tu && fo_is_force(t, "push")) { force = 1; continue }
                     if (!tu && t ~ /^-/) continue
                     np++
+                    if (np >= 2 && tu && substr(T[j], 1, 1) == "+") force = 1
                     pos[np] = t
                     posunk[np] = tu
                 }
+                # repo#634: a `+`-prefixed refspec (`+main`, `+HEAD:main`) forces
+                # the update by itself, so it is a force signal with no flag.
+                for (p = 2; p <= np; p++) if (!posunk[p] && substr(pos[p], 1, 1) == "+") force = 1
                 if (!force) continue
                 # pos[1] is the remote; pos[2..np] are refspecs. Emit ONE line per
                 # positional refspec so a protected branch in ANY refspec position
@@ -3170,6 +3174,8 @@ parse_force_ops() {
                         sub(/^\+/, "", rs)
                         ci = index(rs, ":")
                         if (ci > 0) rs = substr(rs, ci + 1)
+                        # repo#634: a qualified destination names the same branch.
+                        sub(/^refs\/heads\//, "", rs)
                         target = "@HEAD@"
                         if (rs != "HEAD" && rs != "") target = rs
                         print cpath SEP target SEP "" SEP gdir SEP wtree
@@ -4177,6 +4183,11 @@ ALWAYS_BLOCK_PATTERNS=(
     'git push -f origin master'
     'git push --force-with-lease origin main'
     'git push --force-with-lease origin master'
+    # repo#634: qualified (refs/heads/<b>) and `+`-forced spellings of the same
+    # push. Anchored on the end of the refspec so `+main:other` or
+    # `refs/heads/main-x` do not match.
+    'git push (--force|-f|--force-with-lease)(=[^[:space:]]*)? origin \+?([^[:space:]:]*:)?refs/heads/(main|master)([[:space:];&|]|$)'
+    'git push ((--force|-f|--force-with-lease)(=[^[:space:]]*)? )?origin \+([^[:space:]:]*:)?(refs/heads/)?(main|master)([[:space:];&|]|$)'
 
     # Filesystem destruction — anchored to a *real* root/home target so that a
     # scoped path like `rm -rf /tmp/x` no longer trips the catastrophic rule,
@@ -9744,7 +9755,7 @@ _force_detached_reset_recovery_ok() {
 # an undecodable command word (`$G reset --hard`) fails closed there.
 _FORCE_PRESCAN="${COMMAND_ASK_SCAN//[\"\'\\]/}"
 if [[ "$_FORCE_PRESCAN" == *git* || "$_FORCE_PRESCAN" == *push* || "$_FORCE_PRESCAN" == *reset* ]] && \
-   echo "$_FORCE_PRESCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
+   echo "$_FORCE_PRESCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard|push[^;&|]*[[:space:]]\+[^[:space:]])'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
         _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN" "$CWD")

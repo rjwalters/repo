@@ -8536,6 +8536,49 @@ assert_fo612 allow - 'repo#612 control: scope off allows a quoted reset' "REPO_F
 assert_fo612 deny - 'repo#612 control: catastrophic quoted force-push to main still denies in off mode' \
     "REPO_FORCE_SCOPE=off" "$F612_MAIN" 'git push --force origin "main"'
 
+# -- repo#634: qualified / `+` refspec spellings of a protected-branch force push --
+# Deny tier: each spelling must get the same verdict as the plain forced push
+# of main (deny, in every mode including off), quoted or not.
+for _c634 in 'git push --force origin HEAD:refs/heads/main' 'git push --force origin "HEAD:refs/heads/main"' \
+             "git push -f origin 'HEAD:refs/heads/master'" 'git push --force-with-lease origin HEAD:refs/heads/main' \
+             'git push --force-with-lease=main origin HEAD:refs/heads/main' 'git push --force origin refs/heads/main' \
+             'git push origin +HEAD:main' 'git push origin +main' 'git push origin "+main"' \
+             'git push origin +HEAD:refs/heads/main' 'git push --force origin +main' 'git push origin +master'; do
+    for _m634 in all protected off; do
+        assert_fo612 deny - "repo#634 $_m634: $_c634 denies like the plain form" \
+            "REPO_FORCE_SCOPE=$_m634" "$F612_FEAT" "$_c634"
+    done
+done
+# Parser tier: with a configured default branch (not covered by the literal
+# deny patterns) the normalized destination must match the protected name.
+for _c634 in 'git push --force origin HEAD:refs/heads/develop' 'git push --force origin "HEAD:refs/heads/develop"' \
+             'git push --force-with-lease origin HEAD:refs/heads/develop' 'git push origin +HEAD:develop' \
+             'git push origin +develop' 'git push origin +HEAD:refs/heads/develop' 'git push origin "+develop"' \
+             'git push origin feature/x +develop'; do
+    assert_fo612 ask force-op:protected "repo#634 protected: $_c634 asks" \
+        "$P612 REPO_DEFAULT_BRANCH=develop" "$F612_FEAT" "$_c634"
+    assert_fo612 ask force-op:all "repo#634 all: $_c634 asks" \
+        "$A612 REPO_DEFAULT_BRANCH=develop" "$F612_FEAT" "$_c634"
+done
+# `+HEAD` resolves the checked-out branch.
+assert_fo612 ask force-op:protected 'repo#634 protected on main: +HEAD asks' "$P612" "$F612_MAIN" 'git push origin +HEAD'
+assert_fo612 allow - 'repo#634 protected on feature branch: +HEAD allowed' "$P612" "$F612_FEAT" 'git push origin +HEAD'
+# Negatives: other branches keep their verdicts.
+for _c634 in 'git push --force origin HEAD:refs/heads/feature/x' 'git push origin +feature/x' \
+             'git push origin +HEAD:refs/heads/feature/x' 'git push -f origin refs/heads/feature/x' \
+             'git push origin +main-x' 'git push origin +HEAD:refs/heads/main-x' \
+             'git push origin +feature/x:refs/heads/feature/y'; do
+    assert_fo612 allow - "repo#634 protected: $_c634 stays allowed" "$P612" "$F612_FEAT" "$_c634"
+    assert_fo612 ask force-op:all "repo#634 all: $_c634 asks" "$A612" "$F612_FEAT" "$_c634"
+done
+assert_fo612 allow - 'repo#634: unforced push of refs/heads/feature/x allowed (protected)' "$P612" "$F612_FEAT" 'git push origin refs/heads/feature/x'
+assert_fo612 allow - 'repo#634: unforced push of refs/heads/feature/x allowed (all)' "$A612" "$F612_FEAT" 'git push origin refs/heads/feature/x'
+assert_fo612 allow - 'repo#634: unforced plus-free HEAD:refs/heads/feature/x allowed (all)' "$A612" "$F612_FEAT" 'git push origin HEAD:refs/heads/feature/x'
+# Undecodable destination stays an ask.
+assert_fo612 ask force-op:unresolved-target 'repo#634: +"$B" asks unresolved-target' "$P612" "$F612_FEAT" 'git push origin +"$B"'
+assert_fo612 ask force-op:unresolved-target 'repo#634: --force "HEAD:refs/heads/$B" asks unresolved-target' "$P612" "$F612_FEAT" 'git push --force origin "HEAD:refs/heads/$B"'
+assert_fo612 ask force-op:unresolved-target 'repo#634: --force "$B" still asks unresolved-target' "$P612" "$F612_FEAT" 'git push --force origin "$B"'
+
 # -- a joined --git-dir=~… / --work-tree=~… keeps its tilde literal --
 # Neither bash nor zsh (default options) tilde-expands after `=` in an
 # ordinary argument, so git receives the relative path `<cwd>/~/…`, not
