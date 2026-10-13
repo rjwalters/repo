@@ -4,6 +4,13 @@
 Python 3.9+ and authenticated gh are required. All API requests use github.com;
 all writes require an explicit apply of a saved plan. No client files, settings,
 or default branches are modified. Only two organization files are managed.
+
+Two providers. `renovate` publishes the resolved preset (renovate-config.json)
+beside repo-policy.json. `dependabot` publishes repo-policy.json alone and
+removes renovate-config.json: Dependabot has no shared preset, so each client's
+dependabot.yml is that client's (or the organization's own renderer's) concern,
+and repo-policy.json records the provider, the two Dependabot settings and, in
+`policySource`, where the organization keeps its Dependabot policy.
 """
 
 import argparse
@@ -21,6 +28,7 @@ from urllib.parse import quote, urlencode, urlparse
 
 SOURCE_REPO = "rjwalters/repo"
 MANAGED_FILES = {"repo-policy.json", "renovate-config.json"}
+PROVIDERS = ("renovate", "dependabot")
 RENOVATE_APP_SLUG = "renovate"
 RENOVATE_INSTALL_URL = "https://github.com/apps/renovate"
 USER_INSTALLATIONS_URL = "https://github.com/settings/installations"
@@ -101,15 +109,29 @@ def validate(policy):
     if set(policy) != {"schemaVersion", "dependencies"}:
         raise PolicyError("Unknown policy fields; supported fields: schemaVersion, dependencies")
     deps = policy["dependencies"]
-    if not isinstance(deps, dict) or set(deps) != {
-        "provider", "dependabotAlerts", "dependabotSecurityUpdates", "renovate"
-    }:
+    required = {"provider", "dependabotAlerts", "dependabotSecurityUpdates", "renovate"}
+    if not isinstance(deps, dict) or not required <= set(deps) <= required | {"policySource"}:
         raise PolicyError("Invalid dependencies policy fields")
-    if deps["provider"] != "renovate":
-        raise PolicyError("Organization policy installation currently supports provider: renovate")
+    if deps["provider"] not in PROVIDERS:
+        raise PolicyError(f"dependencies.provider must be one of: {', '.join(PROVIDERS)}")
     for key in ("dependabotAlerts", "dependabotSecurityUpdates"):
         if type(deps[key]) is not bool:
             raise PolicyError(f"dependencies.{key} must be a boolean")
+    if deps["provider"] == "dependabot":
+        # An owner override replaces the default's Renovate block with null;
+        # a leftover block would be a second, unused definition of the policy.
+        if deps["renovate"] is not None:
+            raise PolicyError("provider dependabot: set dependencies.renovate to null")
+        # With Renovate gone, Dependabot is the only thing that raises security
+        # PRs; both settings off would leave an organization with none.
+        if not (deps["dependabotAlerts"] and deps["dependabotSecurityUpdates"]):
+            raise PolicyError("provider dependabot needs dependabotAlerts and dependabotSecurityUpdates true")
+        source = deps.get("policySource")
+        if source is not None and (not isinstance(source, str) or not source.strip()):
+            raise PolicyError("dependencies.policySource must be a non-empty string")
+        return
+    if "policySource" in deps:
+        raise PolicyError("dependencies.policySource applies only to provider dependabot")
     renovate = deps["renovate"]
     if not isinstance(renovate, dict):
         raise PolicyError("dependencies.renovate must be a Renovate config object")
@@ -162,9 +184,19 @@ def load_policy(api, owner, source_dir=None):
     return policy, source
 
 
+def provider_of(rendered):
+    return json.loads(rendered["repo-policy.json"])["dependencies"]["provider"]
+
+
 def render(policy, source, owner):
+    """Managed file name -> content; None means the file must not exist."""
     deps = copy.deepcopy(policy["dependencies"])
     renovate = deps.pop("renovate")
+    if deps["provider"] == "dependabot":
+        return {
+            "renovate-config.json": None,
+            "repo-policy.json": dump({"schemaVersion": 1, "source": source, "dependencies": deps}),
+        }
     deps["renovatePreset"] = f"github>{owner}/.github:renovate-config"
     return {
         "renovate-config.json": dump(renovate),
@@ -428,8 +460,15 @@ def check_preset_visibility(api, client, target, create_repository):
               f"{target} cannot be consumed from a public client.", file=sys.stderr)
 
 
-def deps_handoff(client, pending_pr):
+def deps_handoff(client, pending_pr, provider="renovate"):
     """Name the next command for the invoking client, and what must happen first."""
+    if provider == "dependabot":
+        reconcile = (f"run /repo:deps in {client} to reconcile that client (remove any Renovate "
+                     "config, and check its dependabot.yml against the organization's policySource "
+                     "and its Dependabot alert and security-update settings)")
+        if pending_pr:
+            return f"Next: merge the organization PR above, then {reconcile}."
+        return f"Next: {reconcile}. No organization PR is pending, so nothing has to be merged first."
     reconcile = (f"run /repo:deps --install in {client} to reconcile that client (its "
                  "renovate.json, Dependabot state, ignorePaths for installer-owned roots, and "
                  "security-PR ownership)")
@@ -453,7 +492,9 @@ def make_plan(api, client, source_dir=None, create_repository=None):
         if create_repository is None:
             verdict, evidence = classify_absence(api, owner, client, target)
             raise PolicyError(absence_message(verdict, evidence, target))
-        check_preset_visibility(api, client, target, create_repository)
+        if policy["dependencies"]["provider"] == "renovate":
+            # Only a Renovate preset is consumed across repositories.
+            check_preset_visibility(api, client, target, create_repository)
     before = {name: read_file(api, target, name, current["head"]) if current else None
               for name in sorted(MANAGED_FILES)}
     after = render(policy, source, owner)
@@ -490,11 +531,16 @@ def show_plan(api, plan):
     if plan["createRepository"]:
         print(f"Create repository: {plan['createRepository']} {plan['target']}")
     for name in sorted(MANAGED_FILES):
+        after = plan["after"][name]
         print("".join(difflib.unified_diff(
-            (plan["before"][name] or "").splitlines(True), plan["after"][name].splitlines(True),
+            (plan["before"][name] or "").splitlines(True), (after or "").splitlines(True),
             fromfile=f"{plan['target']}/{name} (current)",
-            tofile=f"{plan['target']}/{name} (proposed)")), end="")
+            tofile=f"{plan['target']}/{name} ({'proposed' if after is not None else 'removed'})")), end="")
     print("Policy PR required." if changed(plan) else "Organization policy is current.")
+    if provider_of(plan["after"]) == "dependabot":
+        print("Provider: dependabot. No GitHub App is needed; Dependabot alerts and security "
+              "updates are repository settings, checked per repository by /repo:deps.")
+        return
     # Config presence never proves the App that acts on it is installed —
     # report that separately so "policy published" and "policy published but
     # inert" cannot read the same in this output.
@@ -520,9 +566,10 @@ def apply_plan(api, plan):
     fresh = make_plan(api, client, create_repository=plan["createRepository"])
     if fresh != plan:
         raise PolicyError("Source or organization changed after preview; regenerate and review the plan")
+    provider = provider_of(plan["after"])
     if not changed(plan):
         return ("Organization policy is current; nothing to publish.\n"
-                + deps_handoff(client, pending_pr=False))
+                + deps_handoff(client, pending_pr=False, provider=provider))
     prefix = f"repos/{target}"
     # Publishing the same policy from two clients must reuse the same org PR.
     publication = {key: plan[key] for key in ("target", "base", "after")}
@@ -558,10 +605,15 @@ def apply_plan(api, plan):
             if read_file(api, target, name, existing_head) != content:
                 raise PolicyError(f"Existing branch {branch} differs from the reviewed plan")
     else:
+        # A None entry deletes the file (sha: null), and only when it exists:
+        # GitHub refuses a deletion of a path the base tree does not have.
         tree = api.api(f"{prefix}/git/trees", "POST", {
             "base_tree": current["tree"], "tree": [
                 {"path": name, "mode": "100644", "type": "blob", "content": content}
-                for name, content in sorted(plan["after"].items())]})
+                if content is not None else
+                {"path": name, "mode": "100644", "type": "blob", "sha": None}
+                for name, content in sorted(plan["after"].items())
+                if content is not None or plan["before"][name] is not None]})
         commit = api.api(f"{prefix}/git/commits", "POST", {
             "message": "chore: reconcile organization dependency policy",
             "tree": tree["sha"], "parents": [current["head"]]})
@@ -569,16 +621,20 @@ def apply_plan(api, plan):
     query = urlencode({"state": "open", "head": f"{owner}:{branch}", "base": current["branch"]})
     prs = api.api(f"{prefix}/pulls?{query}")
     if prs:
-        return f"{prs[0]['html_url']}\n" + deps_handoff(client, pending_pr=True)
+        return f"{prs[0]['html_url']}\n" + deps_handoff(client, pending_pr=True, provider=provider)
     body = (f"Install organization policy from {SOURCE_REPO}@{plan['source']['revision']}.\n\n"
             "The canonical preferences remain in rjwalters/repo/policies/. "
             "Edit them there and rerun /repo:org-policy to update this copy.\n\n"
-            "This PR updates only repo-policy.json and renovate-config.json. "
-            "Merging activates the preset for repositories that extend it. "
-            "GitHub App installation, client onboarding, and repository settings are separate steps.")
+            + ("This PR updates only repo-policy.json and removes renovate-config.json: the "
+               "organization's provider is Dependabot, which has no shared preset. Each client's "
+               "dependabot.yml and its repository settings are separate steps."
+               if provider == "dependabot" else
+               "This PR updates only repo-policy.json and renovate-config.json. "
+               "Merging activates the preset for repositories that extend it. "
+               "GitHub App installation, client onboarding, and repository settings are separate steps."))
     pr = api.api(f"{prefix}/pulls", "POST", {"title": "chore: reconcile organization dependency policy",
                  "head": branch, "base": current["branch"], "body": body})
-    return f"{pr['html_url']}\n" + deps_handoff(client, pending_pr=True)
+    return f"{pr['html_url']}\n" + deps_handoff(client, pending_pr=True, provider=provider)
 
 
 def main():

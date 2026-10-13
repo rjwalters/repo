@@ -77,6 +77,18 @@ unless migration is authorized. With no provider or organization policy, offer
 [[org-policy]] before proposing new automation; do not silently assume that
 missing `dependabot.yml` means dependencies are unmanaged.
 
+**Organization provider `dependabot`.** When the deployed `repo-policy.json`
+says `"provider": "dependabot"`, the organization has chosen Dependabot. Do not
+propose Renovate. Any Renovate config in the client is a migration leftover:
+report it as `both-active` or `renovate-only` and offer its removal once the
+client's `dependabot.yml` is in place. If `dependencies.policySource` is set,
+the organization renders or owns each client's `dependabot.yml` there. Report
+the client file against that source and **do not rewrite it here**: a local
+edit would be overwritten as drift. Point at `policySource` instead. Both
+`dependabotAlerts` and `dependabotSecurityUpdates` are `true` under this
+provider, so a client with either off (or security updates `paused`) is a
+finding, not the expected state the Renovate note below describes.
+
 Report separately: deployed policy source/revision and drift, provider/config,
 **GitHub App installation status** (Renovate path only — see below), app
 operation, dependency graph, vulnerability alerts, security PR provider,
