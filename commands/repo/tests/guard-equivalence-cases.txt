@@ -350,3 +350,10 @@ wt:>{{MAIN}}/evil.sh cd /tmp
 wt:cd /tmp >{{MAIN}}/evil.sh
 # A redirection glued to the operand: canonical makes the cwd unknown.
 wt:cd /tmp; cd {{MAIN}}>/dev/null; echo hi > out.log
+
+# ── cd to a missing directory (repo#625) ──────────────────────────────────
+wt:cd /nonexistent-xyz; echo hi > out.log
+wt:cd /nonexistent-xyz || echo hi > out.log
+# Control: && never runs the write after a failed cd; an existing dir is reached.
+wt:cd /nonexistent-xyz && echo hi > out.log
+wt:cd /tmp; echo hi > out.log
