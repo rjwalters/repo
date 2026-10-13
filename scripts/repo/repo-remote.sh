@@ -65,9 +65,10 @@
 #         2. open ONE SSH master connection over repo-remote-<name> and verify
 #            the host identity over it exactly like `verify` (exit 6 on a
 #            mismatch or an unverifiable host — fails closed);
-#         3. only then resolve the credential (run REPO_REMOTE_GH_TOKEN_CMD, or
-#            read the static REPO_REMOTE_GH_TOKEN) — exit 7 if the command
-#            fails, with NO fallback to the static token;
+#         3. only then resolve the credential (run GitHub's device flow for
+#            a per-user token, or REPO_REMOTE_GH_TOKEN_CMD, or — break-glass
+#            only — read the static REPO_REMOTE_GH_TOKEN) — exit 7 if it
+#            fails, with NO fallback to any other source;
 #         4. open the session over that same verified master connection, with
 #            the token carried as an SSH environment value (never argv), and
 #            land in the dev container (`docker exec`) when it is running,
@@ -243,11 +244,29 @@
 # GitHub credentials on the VM (repo#565): `attach` is the only subcommand
 # that touches a dev-session credential; `up` (dry run or --yes), `status`,
 # `verify` and `down` never run the token command or send a token anywhere.
-# Settings, resolved through the same two config layers (repo wins):
-#   REPO_REMOTE_GH_TOKEN_CMD   RECOMMENDED. A command run LOCALLY by
+# attach REQUIRES a credential (repo#627): with no source configured it exits
+# 7 instead of opening an unauthenticated session.
+# Settings, resolved through the same two config layers (repo wins);
+# precedence device > command > static:
+#   REPO_REMOTE_GH_APP_CLIENT_ID  REQUIRED PATH. The public client ID of a
+#                              GitHub App with Device Flow enabled. Each attach
+#                              runs GitHub's OAuth device flow LOCALLY: it
+#                              prints a verification URL and a one-time code on
+#                              stderr, waits (honoring interval / slow_down, at
+#                              most expires_in, capped at 15 min) while the
+#                              person running attach approves it in a browser,
+#                              and delivers the resulting GitHub App USER access
+#                              token (that person's own account, limited to the
+#                              App's permissions, expiring after about 8 hours).
+#                              No client secret and no refresh token; re-run
+#                              attach to refresh. The device code reaches curl
+#                              on stdin only, never argv. Declined, expired,
+#                              timed out, unreachable or malformed: exit 7.
+#   REPO_REMOTE_GH_TOKEN_CMD   A command run LOCALLY by
 #                              `bash -c` (stdin </dev/null) whose stdout is the
 #                              token, e.g. a GitHub App installation-token
-#                              minter. When non-empty it takes precedence over
+#                              minter. Used when no client ID is set; when
+#                              non-empty it takes precedence over
 #                              REPO_REMOTE_GH_TOKEN. It runs with this
 #                              process's environment and the operator's own
 #                              trust (the config files are already sourced as
@@ -258,9 +277,15 @@
 #                              more than one line, or any whitespace/control
 #                              character in the token. Its stdout and stderr
 #                              are never displayed.
-#   REPO_REMOTE_GH_TOKEN       a static token (legacy). Still delivered the same
-#                              way, with a one-line notice recommending the
-#                              command form. Never written anywhere.
+#   REPO_REMOTE_GH_TOKEN       a static token (legacy). REFUSED (exit 2, before
+#                              connecting) unless REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1
+#                              is also set — whatever else is configured, so a
+#                              shared remote.env cannot quietly keep a shared
+#                              PAT. With the opt-out it is delivered the same
+#                              way, with a prominent warning on every attach
+#                              that the session runs as one shared, long-lived
+#                              identity. Never written anywhere.
+#   REPO_REMOTE_ALLOW_STATIC_GH_TOKEN  `1` = break-glass opt-out for the above.
 #   REPO_REMOTE_GH_API_HOST    optional API gateway hostname (bare DNS name, no
 #                              scheme/port/path; github.com and *.github.com
 #                              refused). The gateway must serve the GitHub
@@ -285,6 +310,9 @@
 # persist it) and add one that reads the variable by NAME. Nothing is written
 # to remote.env, the per-repo config, the SSH config, or the VM's disk; no
 # `gh auth login`, no stored git credential.
+# Before the session starts, the VM runs `gh api user --jq .login` where the
+# session will run and prints "acting as GitHub user <login>" (repo#627); a
+# failed lookup is a warning, never a refusal.
 #
 # Exit codes:
 #   0  success (including a dry-run plan)
@@ -302,9 +330,10 @@
 #   6  host-identity verification failed — the host reachable at the SSH alias
 #      is not the instance this repo expects, or its identity could not be
 #      established (NOT overridable with --force)
-#   7  `attach` could not resolve the dev-session credential:
-#      REPO_REMOTE_GH_TOKEN_CMD failed or printed a malformed token. Nothing
-#      was sent to the VM and the static token was NOT used instead.
+#   7  `attach` could not resolve the dev-session credential: none is
+#      configured, the device flow was declined, expired, timed out or failed,
+#      or REPO_REMOTE_GH_TOKEN_CMD failed or printed a malformed token. Nothing
+#      was sent to the VM and no other source was used instead.
 #   64 usage error
 # (`attach` otherwise exits with the remote session's own status.)
 #
@@ -2839,7 +2868,10 @@ write_ssh_alias() {  # <ip | instance-id> [ssm-region]
 # command string, a log line, a config file, or anything on the VM's disk.
 GH_TOKEN_CMD=""        # REPO_REMOTE_GH_TOKEN_CMD — run ONLY by attach
 GH_TOKEN_STATIC=""     # REPO_REMOTE_GH_TOKEN, held in an unexported variable
-GH_CRED_SOURCE="none"  # command | static | none
+GH_APP_CLIENT_ID=""    # REPO_REMOTE_GH_APP_CLIENT_ID — the GitHub App's public client ID (repo#627)
+GH_STATIC_ALLOWED=false  # REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1 (break-glass opt-out, repo#627)
+GH_STATIC_REFUSED=false  # a static token is configured WITHOUT the opt-out: attach refuses (exit 2)
+GH_CRED_SOURCE="none"  # device | command | static | none
 GH_API_HOST=""         # REPO_REMOTE_GH_API_HOST (optional gateway)
 GH_GATEWAY_REPO=""     # <owner>/<repo> for GH_REPO in gateway mode
 GH_SESSION_TOKEN=""    # the resolved token; set only inside attach's untraced window
@@ -2848,29 +2880,70 @@ ATTACH_CTL_DIR=""      # private dir holding attach's SSH control socket
 # a stock Ubuntu sshd accepts (`AcceptEnv LANG LC_*`); the remote bootstrap
 # unsets it before starting anything.
 RR_TOKEN_ENV=LC_REPO_REMOTE_GH_TOKEN
+# GitHub's device-flow endpoints (repo#627). Fixed on purpose: there is no
+# override, so a config value can never redirect the flow (and the device
+# code) somewhere else. The suite drives them with a mock `curl` on PATH.
+GH_DEVICE_CODE_URL="https://github.com/login/device/code"
+GH_DEVICE_TOKEN_URL="https://github.com/login/oauth/access_token"
+GH_DEVICE_GRANT="urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+GH_DEVICE_MAX_WAIT=900   # upper bound on the wait, whatever expires_in says
 
 # Decide the credential SOURCE from config. Runs for every subcommand (it is
 # part of resolve_settings) and therefore must never execute or read anything
-# beyond the two config values. Precedence: a non-empty
-# REPO_REMOTE_GH_TOKEN_CMD wins over REPO_REMOTE_GH_TOKEN; the usual layer rule
-# (per-repo file over shared file) decides each value first, so a per-repo
+# beyond the config values. Precedence (repo#627): a non-empty
+# REPO_REMOTE_GH_APP_CLIENT_ID (device flow, a per-user token) wins over a
+# non-empty REPO_REMOTE_GH_TOKEN_CMD, which wins over the static
+# REPO_REMOTE_GH_TOKEN -- and the static token is a source ONLY with
+# REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1; without it, a configured static token
+# makes attach refuse (GH_STATIC_REFUSED). The usual layer rule (per-repo file
+# over shared file) decides each value first, so a per-repo
 # `REPO_REMOTE_GH_TOKEN_CMD=` (empty) switches a shared command off.
 resolve_gh_credential_config() {
   local _x=""
   [[ $- == *x* ]] && { _x=1; set +x; }
   GH_TOKEN_CMD="${REPO_REMOTE_GH_TOKEN_CMD:-}"
   GH_TOKEN_STATIC="${REPO_REMOTE_GH_TOKEN:-}"
+  GH_APP_CLIENT_ID="${REPO_REMOTE_GH_APP_CLIENT_ID:-}"
   GH_API_HOST="${REPO_REMOTE_GH_API_HOST:-}"
+  GH_STATIC_ALLOWED=false
+  [[ "${REPO_REMOTE_ALLOW_STATIC_GH_TOKEN:-}" == 1 ]] && GH_STATIC_ALLOWED=true
+  GH_STATIC_REFUSED=false
+  [[ -n "$GH_TOKEN_STATIC" && "$GH_STATIC_ALLOWED" != true ]] && GH_STATIC_REFUSED=true
   # load_config sources the layers under `set -a`, which EXPORTS every value:
   # left alone, the static token would be inherited by every child process
   # (aws, curl, ssh, the token command itself). Keep both shell-local.
   export -n REPO_REMOTE_GH_TOKEN REPO_REMOTE_GH_TOKEN_CMD 2>/dev/null || true
-  if [[ -n "$GH_TOKEN_CMD" ]]; then
+  if [[ -n "$GH_APP_CLIENT_ID" ]]; then
+    GH_CRED_SOURCE="device"
+  elif [[ -n "$GH_TOKEN_CMD" ]]; then
     GH_CRED_SOURCE="command"
-  elif [[ -n "$GH_TOKEN_STATIC" ]]; then
+  elif [[ -n "$GH_TOKEN_STATIC" && "$GH_STATIC_ALLOWED" == true ]]; then
     GH_CRED_SOURCE="static"
   else
     GH_CRED_SOURCE="none"
+  fi
+  [[ -n "$_x" ]] && set -x
+  return 0
+}
+
+# validate_gh_credential_config -- attach's pre-connection credential checks
+# (repo#627). Nothing has connected and nothing has been run when this fails.
+validate_gh_credential_config() {
+  local _x=""
+  [[ $- == *x* ]] && { _x=1; set +x; }
+  if [[ "$GH_STATIC_REFUSED" == true ]]; then
+    die 2 "REPO_REMOTE_GH_TOKEN is set, but a static token is no longer accepted: it makes every session act on GitHub as one shared, long-lived identity. Replace it with the per-user device flow -- set REPO_REMOTE_GH_APP_CLIENT_ID to the GitHub App's client ID and remove REPO_REMOTE_GH_TOKEN (a per-repo 'REPO_REMOTE_GH_TOKEN=' clears a shared one). Break-glass only: REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1 keeps using it. Nothing was connected or sent. See 'GitHub credentials on the VM' in commands/repo/remote.md."
+  fi
+  if [[ -n "$GH_APP_CLIENT_ID" ]] && ! [[ "$GH_APP_CLIENT_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    die 2 "REPO_REMOTE_GH_APP_CLIENT_ID is not a GitHub App client ID (expected letters, digits, '.', '_' or '-', e.g. Iv23li...). Nothing was connected or sent."
+  fi
+  if [[ "$GH_CRED_SOURCE" == static ]]; then
+    local why
+    why="$(gh_token_problem "$GH_TOKEN_STATIC")"
+    [[ -z "$why" ]] || die 2 "REPO_REMOTE_GH_TOKEN is not a usable token (${why}); nothing was connected or sent."
+  fi
+  if [[ "$GH_CRED_SOURCE" == none ]]; then
+    die 7 "no GitHub credential is configured, and attach no longer opens an unauthenticated session. Set REPO_REMOTE_GH_APP_CLIENT_ID to the GitHub App's client ID (in remote.env or the per-repo config): each attach then runs GitHub's device flow, you approve it in a browser, and the session acts as YOUR GitHub account for about 8 hours. Nothing was connected or sent. See 'GitHub credentials on the VM' in commands/repo/remote.md."
   fi
   [[ -n "$_x" ]] && set -x
   return 0
@@ -2934,8 +3007,6 @@ validate_gh_gateway_config() {
     why="it is not a bare DNS hostname (no port, path, user, or whitespace; at least one dot)"
   elif [[ "$lower" == github.com || "$lower" == *.github.com ]]; then
     why="github.com is not a gateway; unset REPO_REMOTE_GH_API_HOST to talk to GitHub directly"
-  elif [[ "$GH_CRED_SOURCE" == none ]]; then
-    why="a gateway needs a credential, and so does git; set REPO_REMOTE_GH_TOKEN_CMD (recommended) or REPO_REMOTE_GH_TOKEN"
   elif ! GH_GATEWAY_REPO="$(origin_github_repo)"; then
     why="gateway mode routes gh with GH_REPO=<gateway>/<owner>/<repo>, so this checkout's origin must be a github.com repository (https://github.com/<owner>/<repo> or git@github.com:<owner>/<repo>)"
   fi
@@ -2943,28 +3014,166 @@ validate_gh_gateway_config() {
   die 2 "REPO_REMOTE_GH_API_HOST='${h}' is not supported: ${why}. Nothing was connected and no credential was resolved. See 'GitHub API gateway' in commands/repo/remote.md."
 }
 
+# ── device flow (repo#627) ──────────────────────────────────────────────────
+# JSON is read without jq/python: only flat fields GitHub controls are needed,
+# matched with bash's own regex engine (no subprocess ever sees a value). A
+# string value holding a quote or a backslash is deliberately NOT matched, so
+# it reads as absent and the response is rejected as malformed.
+JV=""
+json_get_str() {  # <json> <key> -> JV = the string value, or ""
+  JV=""
+  local re='"'"$2"'"[[:space:]]*:[[:space:]]*"([^"\]*)"'
+  [[ "$1" =~ $re ]] && JV="${BASH_REMATCH[1]}"
+  # shellcheck disable=SC2050  # deliberate: a fresh match drops the captured value from BASH_REMATCH
+  [[ x =~ x ]]
+  return 0
+}
+json_get_num() {  # <json> <key> -> JV = the non-negative integer value, or ""
+  JV=""
+  local re='"'"$2"'"[[:space:]]*:[[:space:]]*([0-9]{1,9})([^0-9]|$)'
+  [[ "$1" =~ $re ]] && JV="${BASH_REMATCH[1]}"
+  # shellcheck disable=SC2050  # deliberate, as above
+  [[ x =~ x ]]
+  return 0
+}
+json_is_object() { [[ "$1" =~ ^[[:space:]]*\{.*\}[[:space:]]*$ ]]; }
+# An OAuth error code is shown to the operator only when it has the shape of
+# one; anything else from the response body is never displayed.
+gh_device_error_name() {  # <code>
+  if [[ "$1" =~ ^[a-z_]{1,64}$ ]]; then printf '%s' "$1"; else printf 'an unrecognized error'; fi
+}
+
+# gh_device_flow -- obtain a GitHub App USER access token for the person
+# running attach, through GitHub's OAuth device flow, into GH_SESSION_TOKEN.
+# Called only from resolve_gh_session_token (untraced window, after the host
+# identity is verified). Every failure is exit 7 with nothing sent to the VM
+# and no fallback to any other source. Hygiene:
+#   * the client ID is public and is the only value in curl's argv;
+#   * the device code (a bearer secret for the poll) and the returned token
+#     reach curl on STDIN through a pipe from the printf builtin, and are read
+#     back with bash regexes -- never argv, never a file, never printed;
+#   * response bodies are never displayed (only a validated error code).
+gh_device_flow() {
+  local body rc dcode ucode uri interval expires elapsed=0 start="$SECONDS" err new tok
+  body="$(curl -sS --proto '=https' --max-time 30 -X POST -H 'Accept: application/json' \
+            --data "client_id=${GH_APP_CLIENT_ID}" "$GH_DEVICE_CODE_URL" </dev/null 2>/dev/null)"
+  rc=$?
+  if (( rc != 0 )); then
+    die 7 "could not reach GitHub to start the device flow (curl exit ${rc}); no credential was resolved and nothing was sent to the VM."
+  fi
+  if ! json_is_object "$body"; then
+    body=""
+    die 7 "GitHub's device-code response was not JSON; check that REPO_REMOTE_GH_APP_CLIENT_ID is the App's client ID and that the App has Device Flow enabled. Nothing was sent to the VM."
+  fi
+  json_get_str "$body" error; err="$JV"
+  if [[ -n "$err" ]]; then
+    body=""
+    die 7 "GitHub refused to start the device flow ($(gh_device_error_name "$err")); check REPO_REMOTE_GH_APP_CLIENT_ID and that the App has Device Flow enabled in its settings. Nothing was sent to the VM."
+  fi
+  json_get_str "$body" device_code;      dcode="$JV"
+  json_get_str "$body" user_code;        ucode="$JV"
+  json_get_str "$body" verification_uri; uri="$JV"
+  json_get_num "$body" interval;         interval=$(( 10#${JV:-5} ))
+  json_get_num "$body" expires_in;       expires=$(( 10#${JV:-$GH_DEVICE_MAX_WAIT} ))
+  body=""
+  if ! [[ "$dcode" =~ ^[A-Za-z0-9_-]{1,255}$ && "$ucode" =~ ^[A-Za-z0-9-]{1,32}$ \
+          && "$uri" =~ ^https://github\.com/[A-Za-z0-9/._-]*$ ]]; then
+    dcode=""
+    die 7 "GitHub's device-code response is missing or has a malformed device_code, user_code or verification_uri; nothing was sent to the VM."
+  fi
+  (( interval < 1 )) && interval=1
+  (( interval > 120 )) && interval=120
+  (( expires > GH_DEVICE_MAX_WAIT )) && expires=$GH_DEVICE_MAX_WAIT
+  log "GitHub sign-in for this session (device flow; the session will act as YOUR GitHub account):"
+  log "  1. open   ${uri}"
+  log "  2. enter  ${ucode}"
+  log "  Waiting up to $(( (expires + 59) / 60 )) min for you to authorize the App (Ctrl-C cancels; the verified SSH connection stays open meanwhile)."
+  while :; do
+    if (( elapsed + interval > expires || SECONDS - start >= expires )); then
+      dcode=""
+      die 7 "timed out after about $(( (expires + 59) / 60 )) min waiting for the device flow to be authorized; nothing was sent to the VM. Run attach again for a new code."
+    fi
+    sleep "$interval"
+    elapsed=$(( elapsed + interval ))
+    body="$(printf 'client_id=%s&device_code=%s&grant_type=%s' "$GH_APP_CLIENT_ID" "$dcode" "$GH_DEVICE_GRANT" \
+              | curl -sS --proto '=https' --max-time 30 -X POST -H 'Accept: application/json' \
+                  --data @- "$GH_DEVICE_TOKEN_URL" 2>/dev/null)"
+    rc=$?
+    if (( rc != 0 )); then
+      body=""; dcode=""
+      die 7 "lost contact with GitHub while waiting for the device flow (curl exit ${rc}); nothing was sent to the VM. Run attach again."
+    fi
+    if ! json_is_object "$body"; then
+      body=""; dcode=""
+      die 7 "GitHub's token response was not JSON; nothing was sent to the VM. Run attach again."
+    fi
+    json_get_str "$body" access_token; tok="$JV"
+    json_get_str "$body" error;        err="$JV"
+    json_get_num "$body" interval;     new="${JV:+$(( 10#$JV ))}"
+    body=""; JV=""
+    [[ -n "$tok" ]] && break
+    case "$err" in
+      authorization_pending) ;;
+      slow_down)
+        # GitHub: add 5 seconds to the interval (it also returns the new one).
+        interval=$(( interval + 5 ))
+        [[ -n "$new" ]] && (( new > interval && new <= 120 )) && interval="$new"
+        ;;
+      expired_token)
+        dcode=""
+        die 7 "the device code expired before it was authorized; nothing was sent to the VM. Run attach again for a new code." ;;
+      access_denied)
+        dcode=""
+        die 7 "the device-flow authorization was declined at GitHub; no credential was resolved and nothing was sent to the VM." ;;
+      "")
+        dcode=""
+        die 7 "GitHub's token response held neither an access token nor an error; nothing was sent to the VM." ;;
+      *)
+        dcode=""
+        die 7 "GitHub ended the device flow with $(gh_device_error_name "$err"); nothing was sent to the VM. Run attach again." ;;
+    esac
+  done
+  dcode=""
+  local why
+  why="$(gh_token_problem "$tok")"
+  if [[ -n "$why" ]]; then
+    tok=""
+    die 7 "the device flow returned an unusable token (${why}); nothing was sent to the VM."
+  fi
+  GH_SESSION_TOKEN="$tok"
+  tok=""
+  log "GitHub credential: a per-user GitHub App token from the device flow (it expires after about 8 hours; run attach again to get a new one)."
+}
+
 # Resolve the session credential into GH_SESSION_TOKEN. Called ONLY by
 # attach_session, after the host identity is verified, with xtrace disabled.
-# Fails closed: a failed or malformed command result is exit 7 and NEVER falls
-# back to the static token. The command's stdout/stderr are never displayed.
+# Fails closed: a failed device flow or a failed/malformed command result is
+# exit 7 and NEVER falls back to another source. The command's stdout/stderr
+# are never displayed. `none` never reaches here (attach refused it already).
 resolve_gh_session_token() {
   GH_SESSION_TOKEN=""
   local out="" rc why
+  if [[ -n "$GH_TOKEN_STATIC" && "$GH_CRED_SOURCE" != static ]]; then
+    log "NOTICE: the static REPO_REMOTE_GH_TOKEN is ignored because a higher-precedence source is configured (it is never used as a fallback)."
+  fi
   case "$GH_CRED_SOURCE" in
-    command)
-      if [[ -n "$GH_TOKEN_STATIC" ]]; then
-        log "NOTICE: REPO_REMOTE_GH_TOKEN_CMD is set, so the static REPO_REMOTE_GH_TOKEN is ignored (it is never used as a fallback)."
+    device)
+      if [[ -n "$GH_TOKEN_CMD" ]]; then
+        log "NOTICE: REPO_REMOTE_GH_APP_CLIENT_ID is set, so REPO_REMOTE_GH_TOKEN_CMD is not run (the device flow takes precedence)."
       fi
+      gh_device_flow
+      ;;
+    command)
       out="$("${BASH:-bash}" -c "$GH_TOKEN_CMD" </dev/null 2>/dev/null)"
       rc=$?
       if (( rc != 0 )); then
         out=""
-        die 7 "REPO_REMOTE_GH_TOKEN_CMD exited ${rc}: no credential was resolved, nothing was sent to the VM, and the static REPO_REMOTE_GH_TOKEN was NOT used instead. The command's output is never displayed (it may carry credential material); run it yourself to debug."
+        die 7 "REPO_REMOTE_GH_TOKEN_CMD exited ${rc}: no credential was resolved, nothing was sent to the VM, and no other source was used instead. The command's output is never displayed (it may carry credential material); run it yourself to debug."
       fi
       why="$(gh_token_problem "$out")"
       if [[ -n "$why" ]]; then
         out=""
-        die 7 "REPO_REMOTE_GH_TOKEN_CMD succeeded but its output is not a usable token (${why}); it must print exactly one line holding the token. Nothing was sent to the VM, and the static REPO_REMOTE_GH_TOKEN was NOT used instead."
+        die 7 "REPO_REMOTE_GH_TOKEN_CMD succeeded but its output is not a usable token (${why}); it must print exactly one line holding the token. Nothing was sent to the VM, and no other source was used instead."
       fi
       GH_SESSION_TOKEN="$out"
       out=""
@@ -2972,10 +3181,15 @@ resolve_gh_session_token() {
       ;;
     static)
       GH_SESSION_TOKEN="$GH_TOKEN_STATIC"
-      log "NOTICE: using the static REPO_REMOTE_GH_TOKEN; set REPO_REMOTE_GH_TOKEN_CMD to mint a short-lived token for each attach instead (see 'GitHub credentials on the VM' in remote.md)."
+      log "WARNING: ========================================================================"
+      log "WARNING: this session uses the static REPO_REMOTE_GH_TOKEN (REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1)."
+      log "WARNING: everything it does on GitHub runs as ONE shared, long-lived identity -- the"
+      log "WARNING: token's owner -- not as you. Set REPO_REMOTE_GH_APP_CLIENT_ID (per-user device"
+      log "WARNING: flow) and remove the static token; see 'GitHub credentials on the VM' in remote.md."
+      log "WARNING: ========================================================================"
       ;;
     *)
-      log "GitHub credential: none configured (REPO_REMOTE_GH_TOKEN_CMD and REPO_REMOTE_GH_TOKEN are unset); gh and git-over-https on the VM stay unauthenticated."
+      die 7 "no GitHub credential is configured; nothing was sent to the VM."
       ;;
   esac
 }
@@ -3044,6 +3258,28 @@ if [ "$rr_mode" = container ] && [ "$rr_use_ctr" != 1 ]; then
   echo "repo-remote: ERROR: --container was given, but the dev container '$rr_ctr' is not running on this host." >&2
   exit 98
 fi
+# repo#627: say which GitHub account this session acts as, asked from where the
+# session will run (the container, else the host). Best effort: the token was
+# already checked when it was issued, so a failed lookup warns and the session
+# still opens. Only a value shaped like a GitHub login is ever printed.
+if [ "$rr_cred" = 1 ]; then
+  rr_who=""
+  if [ "$rr_use_ctr" = 1 ]; then
+    set -- docker exec -i
+    for rr_v in $rr_envs; do set -- "$@" -e "$rr_v"; done
+    if [ -n "$rr_gw" ]; then set -- "$@" -e GH_TOKEN=; fi
+    rr_who="$("$@" "$rr_ctr" gh api user --jq .login </dev/null 2>/dev/null)"
+  elif command -v gh >/dev/null 2>&1; then
+    rr_who="$(gh api user --jq .login </dev/null 2>/dev/null)"
+  fi
+  case "$rr_who" in
+    ''|*[!A-Za-z0-9-]*)
+      echo "repo-remote: WARNING: could not confirm which GitHub account this session acts as ('gh api user' failed, or gh is not installed where the session runs; an App installation token has no user, so this is expected with one). Opening the session anyway." >&2 ;;
+    *)
+      echo "repo-remote: acting as GitHub user $rr_who" >&2 ;;
+  esac
+  unset rr_who
+fi
 if [ "$rr_use_ctr" = 1 ]; then
   if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$rr_ctr" 2>/dev/null | grep -q '^GH_TOKEN='; then
     echo "repo-remote: WARNING: container '$rr_ctr' was created with GH_TOKEN in its configuration, which Docker stores on the VM's disk. This session overrides it; recreate the container without '-e GH_TOKEN' to remove the stored copy." >&2
@@ -3085,14 +3321,8 @@ attach_session() {
     || die 2 "the repo name '${NAME}' contains characters attach will not put into a remote command (allowed: letters, digits, . _ -)"
   validate_transport_config
   [[ "$PROVIDER" == aws && "$TRANSPORT" == ssm ]] && ssm_preflight
+  validate_gh_credential_config
   validate_gh_gateway_config
-  if [[ "$GH_CRED_SOURCE" == static ]]; then
-    local why _x=""
-    [[ $- == *x* ]] && { _x=1; set +x; }
-    why="$(gh_token_problem "$GH_TOKEN_STATIC")"
-    [[ -z "$why" ]] || die 2 "REPO_REMOTE_GH_TOKEN is not a usable token (${why}); nothing was connected or sent."
-    [[ -n "$_x" ]] && set -x
-  fi
   case "$PROVIDER" in
     aws) aws_expected_identity ;;
     gcp) gcp_expected_identity ;;
@@ -3206,8 +3436,8 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     printf '"idle_shutdown_min":%s,' "$IDLE_MIN"
     printf '"ssh_alias":"repo-remote-%s",' "$(json_escape "$NAME")"
     # repo#565 (additive): where `attach` would get the GitHub credential —
-    # "command" | "static" | "none". Reported, never resolved: a dry run does
-    # not run the command.
+    # "device" (repo#627) | "command" | "static" | "none". Reported, never
+    # resolved: a dry run neither runs the command nor starts the device flow.
     printf '"gh_credential_source":"%s",' "$(json_escape "$GH_CRED_SOURCE")"
     printf '"estimated_hourly_cost_usd":%s,' "$COST_HOURLY"
     printf '"estimated_cost_approximate":%s,' "$COST_APPROX"
@@ -3235,10 +3465,14 @@ emit_plan() {  # dry-run plan (no cloud mutation)
     fi
     log "  ssh alias:           repo-remote-${NAME}"
     case "$GH_CRED_SOURCE" in
+      device)  log "  gh credential:       per-user GitHub App token via the device flow, run by each attach (not run in a dry run)" ;;
       command) log "  gh credential:       minted per attach by REPO_REMOTE_GH_TOKEN_CMD (not run in a dry run)" ;;
-      static)  log "  gh credential:       static REPO_REMOTE_GH_TOKEN (consider REPO_REMOTE_GH_TOKEN_CMD)" ;;
-      *)       log "  gh credential:       none (the VM stays unauthenticated)" ;;
+      static)  log "  gh credential:       static REPO_REMOTE_GH_TOKEN (REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1): a shared, long-lived identity" ;;
+      *)       log "  gh credential:       none -- attach will refuse; set REPO_REMOTE_GH_APP_CLIENT_ID (device flow)" ;;
     esac
+    if [[ "$GH_STATIC_REFUSED" == true ]]; then
+      log "  NOTE: REPO_REMOTE_GH_TOKEN is set without REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1; attach will refuse until it is removed (use REPO_REMOTE_GH_APP_CLIENT_ID)."
+    fi
     if [[ "$PROVIDER" == aws ]]; then
       if [[ "$TRANSPORT" == ssm ]]; then
         log "  transport:           ssm (SSH over SSM Session Manager to the instance ID; zero-inbound security group, no public IP needed)"
