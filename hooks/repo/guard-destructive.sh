@@ -6099,7 +6099,10 @@ function cd_operand(toks, j, m,   p, w, nj, opts, nopd, raw, physical, done) {
             raw = w
             gsub(/[\\\047\042]/, "", raw)
             if (raw ~ /^-./) {
-                if (w !~ /^-[LPe@]+$/) return 0
+                # Only -L/-P are portable across bash 3.2, bash 5 and zsh. -e and -@
+                # fail in some of them (cwd unchanged), so they are unprovable
+                # (repo#611 review).
+                if (w !~ /^-[LP]+$/) return 0
                 if (w ~ /P/) physical = 1
                 opts = 1
                 p++

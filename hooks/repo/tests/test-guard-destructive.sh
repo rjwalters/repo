@@ -4428,7 +4428,7 @@ done
 # repo#604: a cd behind a leading redirection (`>/dev/null cd X`) and cd
 # options (`cd -P X`, `cd -- X`) were not recognised, so a later RELATIVE write
 # was judged against the stale cwd. The shared recognizer now skips proven
-# leading redirections and parses -L/-P/-e/-@ and `--`; anything it cannot
+# leading redirections and parses the portable -L/-P and `--`; anything it cannot
 # prove makes the cwd unknown. Commands only ever reach the hook as JSON.
 for _c604 in "$WTC_MAIN" "$WTC_WT"; do
     _w604="main"; [[ "$_c604" == "$WTC_WT" ]] && _w604="worktree"
@@ -4442,7 +4442,7 @@ for _c604 in "$WTC_MAIN" "$WTC_WT"; do
     done
     # Option shapes have no redirection: the cd is tracked and the write
     # lands in main under the plain confinement tag.
-    for _sp in "c''d -P" "cd -P" "cd -L" "cd -e" "cd -PL" "cd --" "cd -P --" "\\cd -P"; do
+    for _sp in "c''d -P" "cd -P" "cd -L" "cd -PL" "cd --" "cd -P --" "\\cd -P"; do
         _spw="${_sp//$'\n'/ }"
         assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp; $_spw <main>; redirect" \
             "cd /tmp; $_sp $WTC_MAIN; echo hi > out.log" "$_c604" "worktree-write-confinement"
@@ -4458,6 +4458,16 @@ for _c604 in "$WTC_MAIN" "$WTC_WT"; do
         assert_deny_tag "write-confinement (#604, cwd=$_w604): unprovable [$_sp]" \
             "cd /tmp; $_sp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
     done
+    # -e and -@ are rejected by zsh and bash 3.2 (cwd unchanged), so they are
+    # unprovable too (repo#611 review).
+    for _sp in "cd -e" "cd -@" "cd -Pe" "cd -e@"; do
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): cd /tmp; $_sp /tmp; redirect" \
+            "cd /tmp; $_sp /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+        assert_deny_tag "write-confinement (#604, cwd=$_w604): $_sp /tmp; redirect" \
+            "$_sp /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
+    done
+    assert_deny_tag "write-confinement (#604, cwd=$_w604): cd <main>; cd -e /tmp; redirect" \
+        "cd $WTC_MAIN; cd -e /tmp; echo hi > out.log" "$_c604" "worktree-write-confinement-unknown-cwd"
     # A redirection glued to the cd word or to its operand is syntax, so the
     # operand is not provable and the cwd is unknown.
     assert_deny_tag "write-confinement (#604, cwd=$_w604): redirection glued to the operand" \
