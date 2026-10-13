@@ -8587,6 +8587,85 @@ for _cwd626 in "$F612_MAIN" "$F612_WT"; do
         "$P612" "$_cwd626" "cd $F612_FEAT/+1 && git reset --hard"
 done
 unset _cwd626 _w626 _p626 _sep
+
+# -- repo#633: git behind a transparent command wrapper --
+# parse_force_ops() only stripped a leading sudo, so `command git reset
+# --hard`, `env git reset --hard`, `nohup git reset --hard` (and exec, nice,
+# time, builtin, noglob) recorded no force op and were ALLOWED on the
+# protected main checkout. The wrapper chain is now walked to the word it
+# runs; env NAME=value / -i / -u feed GIT_DIR / GIT_WORK_TREE, env -C moves
+# the cwd, and a wrapper option the scan cannot decode fails closed.
+for _w633 in 'command' 'command -p' 'command --' 'env' 'env --' 'env -i' 'env -u X' 'env FOO=1' \
+             'env -i FOO=1' 'exec' 'exec -a name' 'exec -cl' 'nice' 'nice -n 5' 'nice -5' \
+             'nice --adjustment=3' 'nohup' 'nohup --' 'time' 'time -p' 'builtin' 'noglob' \
+             'nohup env' 'env nohup nice' 'sudo env' 'command env -i nohup'; do
+    assert_fo612 ask force-op:protected "repo#633 protected on main: $_w633 git reset --hard asks" \
+        "$P612" "$F612_MAIN" "$_w633 git reset --hard"
+    assert_fo612 ask force-op:protected "repo#633 protected on main: $_w633 git push --force origin HEAD asks" \
+        "$P612" "$F612_MAIN" "$_w633 git push --force origin HEAD"
+done
+assert_fo612 ask force-op:all 'repo#633 all: env git reset --hard asks' "$A612" "$F612_MAIN" 'env git reset --hard'
+# env assignments feed the existing GIT_DIR / GIT_WORK_TREE selectors.
+for _c633 in 'env GIT_DIR=.git git push --force origin HEAD' 'env GIT_DIR=.git git push -f origin feature/x:main' \
+             'env "GIT_DIR=.git" git reset --hard' 'env GIT_WORK_TREE=. git reset --hard' \
+             'env -i GIT_DIR=.git GIT_WORK_TREE=. git reset --hard' 'nohup env GIT_DIR=.git git push --force-with-lease origin' \
+             'time GIT_DIR=.git git reset --hard' "env -C $F612_MAIN git reset --hard" \
+             "env -C$F612_MAIN git reset --hard" "env --chdir=$F612_MAIN git reset --hard" \
+             "env --chdir $F612_MAIN git reset --hard" "env -C $F612_SCR git -C $F612_MAIN reset --hard" \
+             "env -C $F612_MAIN/sub git --git-dir ../.git --work-tree .. reset --hard" \
+             "cd $F612_SCR && env -C $F612_MAIN git reset --hard"; do
+    assert_fo612 ask force-op:protected "repo#633 protected on main: $_c633 asks" "$P612" "$F612_MAIN" "$_c633"
+done
+# Clearing / unsetting the environment drops a scratch GIT_DIR: git then
+# resolves the main checkout from its cwd.
+for _c633 in "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env -i git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env - git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env --ignore-environment git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR exec -c git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env -u GIT_DIR -u GIT_WORK_TREE git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env --unset=GIT_DIR --unset=GIT_WORK_TREE git reset --hard" \
+             "env GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR env -i git reset --hard"; do
+    assert_fo612 ask force-op:protected "repo#633 protected on main: $_c633 asks" "$P612" "$F612_MAIN" "$_c633"
+done
+# Undecodable wrapper words fail closed.
+for _c633 in 'env --frobnicate git reset --hard' 'env -S "git reset" --hard' 'env -Z git reset --hard' \
+             'command -x git reset --hard' 'nohup --frob git reset --hard' 'exec --frob git reset --hard' \
+             'nice --frob git reset --hard' 'time --frob git reset --hard' 'nohup sudo -E git reset --hard' \
+             'env $OPT git reset --hard' 'command "$O" git push --force origin HEAD'; do
+    assert_fo612 ask force-op:undecodable "repo#633: $_c633 asks (undecodable wrapper)" "$P612" "$F612_FEAT" "$_c633"
+done
+for _c633 in 'env -C "$D" git reset --hard' 'env GIT_DIR=$X git reset --hard' 'env GIT_DIR+=x git reset --hard' \
+             'env GIT_DIR=~/x git reset --hard' "GIT_DIR=$F612_SCR/.git nohup sudo git reset --hard" \
+             'GIT_DIR=.git env -u "$V" git reset --hard'; do
+    assert_fo612 ask force-op:unknown-cwd "repo#633: $_c633 asks (unknown cwd / git dir)" "$P612" "$F612_FEAT" "$_c633"
+done
+# Worktree --work-tree parity with #632: a wrapper never turns the reset of
+# the main checkout from a managed worktree into an allow.
+assert_fo612 ask - "repo#633 (cwd=worktree): env git --work-tree <main> reset --hard asks" \
+    "$P612" "$F612_WT" "env git --work-tree $F612_MAIN reset --hard origin/main"
+assert_fo612 ask - "repo#633 (cwd=worktree): env GIT_WORK_TREE=<main> git reset --hard asks" \
+    "$P612" "$F612_WT" "env GIT_WORK_TREE=$F612_MAIN git reset --hard origin/main"
+assert_fo612 ask force-op:protected "repo#633 (cwd=worktree): env -C <main> git reset --hard asks" \
+    "$P612" "$F612_WT" "env -C $F612_MAIN git reset --hard"
+# Controls: non-destructive wrapped commands, scratch clones and the feature
+# branch keep their verdicts; a command -v lookup runs nothing.
+for _c633 in 'env git status' 'command git log' 'nohup git fetch' 'env FOO=1 git status' 'command -v git' \
+             'command -V git reset --hard' 'env' 'nohup git push origin feature/x' 'time git diff'; do
+    assert_fo612 allow - "repo#633 control on main: $_c633 allowed" "$P612" "$F612_MAIN" "$_c633"
+done
+for _c633 in "env -C $F612_SCR git reset --hard" "command git -C $F612_SCR reset --hard" \
+             "env GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR git reset --hard" \
+             "env -i GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR git reset --hard" \
+             "GIT_DIR=$F612_SCR/.git GIT_WORK_TREE=$F612_SCR nohup git reset --hard" \
+             "cd $F612_SCR && env git reset --hard" "env -C $F612_MAIN git -C $F612_SCR reset --hard"; do
+    assert_fo612 allow - "repo#633 control, scratch clone from main: $_c633 allowed" "$P612" "$F612_MAIN" "$_c633"
+done
+for _c633 in 'env git reset --hard' 'command git push --force origin feature/work' 'nohup nice git reset --hard'; do
+    assert_fo612 allow - "repo#633 control, feature branch: $_c633 allowed" "$P612" "$F612_FEAT" "$_c633"
+done
+assert_fo612 allow - 'repo#633 control (cwd=worktree): detached recovery via env stays allowed' \
+    "$P612" "$F612_WT" 'env git reset --hard origin/main'
+unset _w633 _c633
 rm -rf "$F612_BASE"
 echo ""
 

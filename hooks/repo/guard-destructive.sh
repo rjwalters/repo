@@ -2623,6 +2623,12 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
 #   - split on ; | & && || and newline, strip a leading sudo wrapper.
+#   - repo#633: a chain of transparent command wrappers before the git word
+#     (command, env, exec, nice, nohup, time, builtin, noglob, and sudo behind
+#     one of them) is walked to the word it runs (fo_unwrap). env NAME=value,
+#     -i/-u feed the GIT_DIR/GIT_WORK_TREE selectors, env -C moves the process
+#     cwd like git -C, and a wrapper option the scan cannot decode fails
+#     closed (FO_UNDEC cpath, or an unknown cwd / git dir).
 #   - only a segment whose command word is `git` is considered. Since repo#612
 #     the command word, the global options, the subcommand, the force flags
 #     and the push refspecs are compared AFTER static quote removal
@@ -2706,6 +2712,196 @@ parse_force_ops() {
         if (v ~ /^\//) return v
         if (base == UNK || base == "") return UNK
         return base "/" v
+    }
+    # ---- repo#633: transparent command wrappers before the git word ----
+    # `command git`, `env git`, `exec git`, `nice git`, `nohup git`,
+    # `time git`, `builtin git`, `noglob git` and a `sudo` behind another
+    # wrapper all run git itself, so fo_unwrap() walks them (and their
+    # options) and returns the index of the word they run. It fails closed:
+    # a wrapper option this scan cannot decode statically sets FW_UNDEC (the
+    # caller then emits the FO_UNDEC sentinel when a push/reset word and a
+    # force flag follow), and an operand that needs runtime expansion makes
+    # the cwd or the git dir UNKNOWN. Nothing is ever evaluated.
+    #
+    # fo_lit(s) -- a DECODED word as a raw single-quoted literal for
+    # fo_join() and cmdword_static(); a word holding a single quote becomes a
+    # lone dollar, which never decodes (unknown).
+    function fo_lit(s) {
+        if (index(s, SQ1)) return "$"
+        return SQ1 s SQ1
+    }
+    # fo_env_clear() -- the wrapper runs git with an empty environment
+    # (env -i, env -, exec -c), so earlier GIT_DIR / GIT_WORK_TREE
+    # assignments no longer apply and git discovers the repo from its cwd.
+    function fo_env_clear() {
+        envgd_raw = ""; envgd_set = 0; envwt_raw = ""; envwt_set = 0
+    }
+    # fo_env_uncertain() -- the wrapper may or may not pass the environment
+    # on (sudo resets it by policy), so an earlier GIT_DIR / GIT_WORK_TREE
+    # becomes unknown rather than trusted either way.
+    function fo_env_uncertain() {
+        if (envgd_set) envgd_raw = "$"
+        if (envwt_set) envwt_raw = "$"
+    }
+    # fo_wassign(raw) -- 1 when raw is a NAME=value word after a wrapper
+    # (env and sudo take them as arguments, the time keyword as a prefix
+    # assignment). GIT_DIR / GIT_WORK_TREE feed the same env selectors a
+    # leading assignment does. An appending += and a value starting with a
+    # tilde (bash expands it in an assignment-shaped argument, zsh does not)
+    # become a lone dollar, so the selector is unknown.
+    function fo_wassign(raw,   d, nm, v, app) {
+        if (raw ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) {
+            nm = raw; sub(/\+?=.*$/, "", nm)
+            v = raw; sub(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "", v)
+            app = (raw ~ /^[A-Za-z_][A-Za-z0-9_]*\+=/)
+            if (substr(v, 1, 1) == "~") v = "$"
+        } else {
+            d = cmdword_static(raw)
+            if (CMDW_UNKNOWN || d !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) return 0
+            nm = d; sub(/\+?=.*$/, "", nm)
+            v = d; sub(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "", v)
+            app = (d ~ /^[A-Za-z_][A-Za-z0-9_]*\+=/)
+            v = fo_lit(v)
+        }
+        if (app) v = "$"
+        if (nm == "GIT_DIR") { envgd_raw = v; envgd_set = 1 }
+        else if (nm == "GIT_WORK_TREE") { envwt_raw = v; envwt_set = 1 }
+        return 1
+    }
+    # fo_optfx(wr, c, v) -- the effect of short option c (value v, a raw
+    # word) of wrapper wr. Only options that change the cwd or the
+    # environment git sees have one: env -i / exec -c clear the
+    # environment, env -u NAME unsets NAME, env -C DIR changes directory
+    # exactly like git -C.
+    function fo_optfx(wr, c, v,   nm) {
+        if (wr == "env") {
+            if (c == "i") fo_env_clear()
+            else if (c == "u") {
+                nm = cmdword_static(v)
+                if (CMDW_UNKNOWN) fo_env_uncertain()
+                else if (nm == "GIT_DIR") { envgd_raw = ""; envgd_set = 0 }
+                else if (nm == "GIT_WORK_TREE") { envwt_raw = ""; envwt_set = 0 }
+            } else if (c == "C") FW_CWD = fo_join(FW_CWD, v)
+        } else if (wr == "exec") {
+            if (c == "c") fo_env_clear()
+        }
+    }
+    # fo_short(T, m, w, wr, noarg, witharg) -- decode the short-option
+    # cluster T[w] of wrapper wr. A letter in noarg takes no value; a letter
+    # in witharg takes the rest of the cluster or the next word. Any other
+    # letter sets FW_UNDEC. Returns the index of the next word.
+    function fo_short(T, m, w, wr, noarg, witharg,   o, j, c, n) {
+        o = cmdword_static(T[w])
+        n = length(o)
+        for (j = 2; j <= n; j++) {
+            c = substr(o, j, 1)
+            if (index(noarg, c)) { fo_optfx(wr, c, ""); continue }
+            if (index(witharg, c)) {
+                if (j < n) { fo_optfx(wr, c, fo_lit(substr(o, j + 1))); return w + 1 }
+                if (w + 1 > m) { FW_UNDEC = 1; return w + 1 }
+                fo_optfx(wr, c, T[w + 1])
+                return w + 2
+            }
+            FW_UNDEC = 1
+            return w + 1
+        }
+        return w + 1
+    }
+    # fo_wopts(T, m, w, wr) -- walk the options of wrapper wr starting at
+    # T[w]; returns the index of the first word after them. Sets FW_UNDEC on
+    # an option it does not know, FW_NOTRUN when the wrapper only reports on
+    # the command instead of running it (command -v / -V).
+    function fo_wopts(T, m, w, wr,   o, v) {
+        while (w <= m && !FW_UNDEC) {
+            o = cmdword_static(T[w])
+            # A NAME=value word ends the options even when its value needs
+            # expansion; fo_wassign() then records it (unknown).
+            if (CMDW_UNKNOWN && T[w] ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) return w
+            if (CMDW_UNKNOWN) { FW_UNDEC = 1; return w }
+            if (o == "--") return w + 1
+            if (wr == "env" && o == "-") { fo_env_clear(); w++; continue }
+            if (o !~ /^-./) return w
+            if (wr == "command") {
+                if (o !~ /^-[pvV]+$/) { FW_UNDEC = 1; return w }
+                if (o ~ /[vV]/) { FW_NOTRUN = 1; return w }
+                w++; continue
+            }
+            if (wr == "env") {
+                if (o == "--ignore-environment") { fo_env_clear(); w++; continue }
+                if (o == "--null" || o == "--debug" || o == "--list-signal-handling" || \
+                    o ~ /^--(block|default|ignore)-signal(=.*)?$/) { w++; continue }
+                if (o == "--unset" || o == "--chdir") {
+                    if (w + 1 > m) { FW_UNDEC = 1; return w }
+                    fo_optfx("env", (o == "--unset") ? "u" : "C", T[w + 1])
+                    w += 2; continue
+                }
+                if (o ~ /^--(unset|chdir)=/) {
+                    v = o; sub(/^--[a-z]+=/, "", v)
+                    fo_optfx("env", (o ~ /^--unset=/) ? "u" : "C", fo_lit(v))
+                    w++; continue
+                }
+                if (o ~ /^--/) { FW_UNDEC = 1; return w }
+                w = fo_short(T, m, w, "env", "i0v", "uC"); continue
+            }
+            if (wr == "exec") {
+                if (o ~ /^--/) { FW_UNDEC = 1; return w }
+                w = fo_short(T, m, w, "exec", "cl", "a"); continue
+            }
+            if (wr == "nice") {
+                if (o ~ /^--?[0-9]+$/ || o ~ /^--adjustment=/) { w++; continue }
+                if (o == "--adjustment") { w += 2; continue }
+                if (o ~ /^--/) { FW_UNDEC = 1; return w }
+                w = fo_short(T, m, w, "nice", "", "n"); continue
+            }
+            if (wr == "time") {
+                if (o == "--append" || o == "--verbose" || o == "--portability" || o == "--quiet" || \
+                    o ~ /^--(format|output)=/) { w++; continue }
+                if (o == "--format" || o == "--output") { w += 2; continue }
+                if (o ~ /^--/) { FW_UNDEC = 1; return w }
+                w = fo_short(T, m, w, "time", "pavq", "fo"); continue
+            }
+            # nohup, builtin, noglob and sudo: no option is decoded.
+            FW_UNDEC = 1
+            return w
+        }
+        return w
+    }
+    # fo_undec_hit(T, m) -- fail-closed test for an undecodable wrapper: some
+    # decodable word of T[1..m], read whitespace-split (env -S takes the
+    # whole command as ONE word), is push or reset, and some piece is a
+    # push or reset force flag.
+    function fo_undec_hit(T, m,   j, w, np, P, q, hs, hf) {
+        hs = 0; hf = 0
+        for (j = 1; j <= m; j++) {
+            w = cmdword_static(T[j])
+            if (CMDW_UNKNOWN) continue
+            np = split(w, P, /[ \t\n]+/)
+            for (q = 1; q <= np; q++) {
+                if (P[q] == "push" || P[q] == "reset") hs = 1
+                if (fo_is_force(P[q], "push") || fo_is_force(P[q], "reset")) hf = 1
+            }
+        }
+        return (hs && hf)
+    }
+    # fo_unwrap(T, m) -- index of the word the leading wrapper chain of
+    # T[1..m] runs (1 when there is no wrapper). FW_CWD is the cwd that
+    # word runs in (curcwd, moved by env -C).
+    function fo_unwrap(T, m,   w, ww, wrapped) {
+        FW_UNDEC = 0; FW_NOTRUN = 0; FW_CWD = curcwd
+        w = 1; wrapped = 0
+        while (w <= m) {
+            if (wrapped && fo_wassign(T[w])) { w++; continue }
+            ww = cmdword_static(T[w])
+            if (CMDW_UNKNOWN) return w
+            if (ww != "command" && ww != "env" && ww != "exec" && ww != "nice" && \
+                ww != "nohup" && ww != "time" && ww != "builtin" && ww != "noglob" && \
+                ww != "sudo") return w
+            if (ww == "sudo") fo_env_uncertain()
+            wrapped = 1
+            w = fo_wopts(T, m, w + 1, ww)
+            if (FW_UNDEC || FW_NOTRUN) return w
+        }
+        return w
     }
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
@@ -2828,6 +3024,22 @@ parse_force_ops() {
                 m = shell_words(substr(rseg, skip_assign_words(rseg)), T)
             }
             if (m == 0) continue
+            # repo#633: look through command / env / exec / nice / nohup /
+            # time / builtin / noglob (and a sudo behind one of them) to the
+            # word they run, so `env git reset --hard` is the same force op
+            # as the bare form. env NAME=value and -u / -i feed the GIT_DIR /
+            # GIT_WORK_TREE selectors above; env -C moves the process cwd.
+            fs = fo_unwrap(T, m)
+            if (FW_NOTRUN) continue
+            if (FW_UNDEC) {
+                if (fo_undec_hit(T, m)) print FO_UNDEC SEP "@HEAD@"
+                continue
+            }
+            if (fs > m) continue
+            if (fs > 1) {
+                for (q = fs; q <= m; q++) T[q - fs + 1] = T[q]
+                m = m - fs + 1
+            }
             gw = cmdword_static(T[1])
             if (CMDW_UNKNOWN) {
                 # An undecodable command word (`$G reset --hard`) may be git:
@@ -2852,7 +3064,7 @@ parse_force_ops() {
             # order, so the raw values are recorded here and resolved after
             # the loop. A command-line flag overrides the environment, and a
             # later flag overrides an earlier one.
-            proccwd = curcwd
+            proccwd = FW_CWD
             gd_raw = envgd_raw; gd_set = envgd_set
             wt_raw = envwt_raw; wt_set = envwt_set
             undec = 0
