@@ -1329,8 +1329,45 @@ FORCE_SCRATCH_CWD_PROTECTED=$(mktemp -d)
 git -C "$FORCE_SCRATCH_CWD_PROTECTED" init -q -b main
 git -C "$FORCE_SCRATCH_CWD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$FORCE_SCRATCH_CWD_PROTECTED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
-assert_ask_env "forceScope protected: cwd itself already equals scratch clone still asks (#350 known limitation)" \
+assert_ask_env "forceScope protected: cwd itself already equals scratch clone still asks (#350 known limitation; #635 anchors only via CLAUDE_PROJECT_DIR)" \
     "LOOM_FORCE_SCOPE=protected" "git reset --hard HEAD~1" "$FORCE_SCRATCH_CWD_PROTECTED"
+
+# ---- #635: scratch-clone cwd aimed at the main checkout via -C / --git-dir +
+# --work-tree. The hook's cwd-derived family is the scratch clone itself, so
+# CLAUDE_PROJECT_DIR (cwd-independent anchor) must add the main checkout.
+F635_MAIN=$(mktemp -d)
+git -C "$F635_MAIN" init -q -b main
+git -C "$F635_MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$F635_MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m second
+F635_SCRATCH=$(mktemp -d)
+git -C "$F635_SCRATCH" init -q -b main
+git -C "$F635_SCRATCH" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+F635_ENV="LOOM_FORCE_SCOPE=protected CLAUDE_PROJECT_DIR=$F635_MAIN"
+# run_guard_env takes a single KEY=VAL; these cases need two, so wrap it.
+f635_case() {  # expected(ask|allow) description env_kvs cmd cwd
+    local expected="$1" description="$2" env_kvs="$3" cmd="$4" cwd="$5" out decision
+    TOTAL=$((TOTAL + 1))
+    # shellcheck disable=SC2086
+    out=$(make_input "$cmd" "$cwd" | env $env_kvs "$GUARD" 2>&1) || true
+    decision=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null)
+    [[ -n "$decision" ]] || decision=allow
+    if [[ "$decision" == "$expected" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (env: $env_kvs, cwd: $cwd)"
+        echo -e "       Expected: $expected; Got: $out"
+    fi
+}
+f635_case ask "635: scratch cwd, anchor=main: git -C <main> reset --hard asks" \
+    "$F635_ENV" "git -C $F635_MAIN reset --hard HEAD~1" "$F635_SCRATCH"
+f635_case ask "635: scratch cwd, anchor=main: --git-dir + --work-tree <main> reset --hard asks" \
+    "$F635_ENV" "git --git-dir $F635_MAIN/.git --work-tree $F635_MAIN reset --hard HEAD~1" "$F635_SCRATCH"
+f635_case allow "635: scratch cwd, anchor=main: pure scratch cd-then-reset still allowed" \
+    "$F635_ENV" "cd $FORCE_SCRATCH_CD_PROTECTED && git reset --hard HEAD~1" "$F635_SCRATCH"
+f635_case ask "635: anchor set but not a git repo fails closed (asks)" \
+    "LOOM_FORCE_SCOPE=protected CLAUDE_PROJECT_DIR=/nonexistent-635" \
+    "cd $FORCE_SCRATCH_CD_PROTECTED && git reset --hard HEAD~1" "$F635_SCRATCH"
 
 # CWD inside a managed worktree (the default $REPO_ROOT/.loom/worktrees area)
 # with detached/ambiguous identity → still asks. Path-based containment only

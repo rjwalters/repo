@@ -1217,6 +1217,13 @@ resolve_worktree_root() {
 # to exec) and could in principle export it further, but that is Loom-specific
 # scope, not this file's. Fail-closed (keep asking) is preserved rather than
 # guessing.
+#
+# #635 UPDATE: the anchor now exists as an OPTIONAL input. When
+# CLAUDE_PROJECT_DIR (exported by Claude Code to hook processes) is set, its
+# repository family is added to the known roots, so a scratch-clone cwd can no
+# longer launder `-C <main>` / `--git-dir <main>/.git --work-tree <main>`.
+# Unset keeps the previous behaviour; set-but-unresolvable fails closed. The
+# cwd-equals-scratch self-match above is unchanged (still asks).
 # =============================================================================
 _force_op_cwd_outside_known_roots() {
     local dir="$1"
@@ -1248,47 +1255,67 @@ _force_op_cwd_outside_known_roots() {
     # or a reset aimed at the main checkout reads as an unrelated scratch
     # clone. Derived from git metadata only; any lookup failure or malformed
     # result is "not proven outside" (fail closed -> keep asking).
-    local common main_root
-    common=$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null) || return 1
-    [[ -n "$common" ]] || return 1
-    [[ "$common" == /* ]] || common="$REPO_ROOT/$common"
-    common=$(cd "$common" 2>/dev/null && pwd -P) || return 1
-    [[ "$(basename "$common")" == ".git" ]] || return 1   # bare/odd layout: ambiguous
-    main_root=$(dirname "$common")
-    [[ -n "$main_root" && "$main_root" != "/" && -d "$main_root" ]] || return 1
+    # #635: REPO_ROOT derives from the hook's own cwd, so when the hook runs
+    # inside an unrelated scratch clone the "family" is the scratch clone and
+    # the main checkout reads as outside (`cd /tmp/s && git -C <main> reset
+    # --hard`). CLAUDE_PROJECT_DIR is a cwd-independent anchor; when set, its
+    # repository family is checked too. Set-but-unresolvable fails closed.
+    local -a anchors=("$REPO_ROOT")
+    if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+        local anchor_top
+        anchor_top=$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null) || return 1
+        [[ -n "$anchor_top" && -d "$anchor_top" ]] || return 1
+        anchor_top=$(cd "$anchor_top" 2>/dev/null && pwd -P) || return 1
+        anchors+=("$anchor_top")
+        case "$abs" in
+            "$anchor_top"|"$anchor_top"/*) return 1 ;;
+        esac
+    fi
 
-    # A cwd whose own git common dir is ours belongs to the family, however
-    # it is spelled.
     local abs_common
     abs_common=$(git -C "$abs" rev-parse --git-common-dir 2>/dev/null) || abs_common=""
     if [[ -n "$abs_common" ]]; then
         [[ "$abs_common" == /* ]] || abs_common="$abs/$abs_common"
         abs_common=$(cd "$abs_common" 2>/dev/null && pwd -P) || return 1
-        [[ "$abs_common" == "$common" ]] && return 1
     fi
 
-    local -a family_roots=("$main_root" "$main_root/.loom/worktrees")
-    local fam_wt
-    fam_wt=$(resolve_worktree_root "$main_root")
-    [[ -n "$fam_wt" ]] && family_roots+=("$fam_wt")
+    local -a family_roots=()
+    local anchor common main_root fam_wt wt_list line wt_path wt_count
+    for anchor in "${anchors[@]}"; do
+        common=$(git -C "$anchor" rev-parse --git-common-dir 2>/dev/null) || return 1
+        [[ -n "$common" ]] || return 1
+        [[ "$common" == /* ]] || common="$anchor/$common"
+        common=$(cd "$common" 2>/dev/null && pwd -P) || return 1
+        [[ "$(basename "$common")" == ".git" ]] || return 1   # bare/odd layout: ambiguous
+        main_root=$(dirname "$common")
+        [[ -n "$main_root" && "$main_root" != "/" && -d "$main_root" ]] || return 1
 
-    local wt_list line wt_path wt_count=0
-    wt_list=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null) || return 1
-    while IFS= read -r line; do
-        case "$line" in
-            "worktree "*)
-                wt_path="${line#worktree }"
-                [[ "$wt_path" == /* ]] || return 1   # malformed entry
-                family_roots+=("$wt_path")
-                # Also its physical spelling (symlinked prefixes), if it exists.
-                if [[ -d "$wt_path" ]]; then
-                    family_roots+=("$(cd "$wt_path" 2>/dev/null && pwd -P)")
-                fi
-                wt_count=$((wt_count + 1))
-                ;;
-        esac
-    done <<< "$wt_list"
-    [[ "$wt_count" -ge 1 ]] || return 1   # empty/unparseable listing: ambiguous
+        # A cwd whose own git common dir is ours belongs to the family,
+        # however it is spelled.
+        [[ -n "$abs_common" && "$abs_common" == "$common" ]] && return 1
+
+        family_roots+=("$main_root" "$main_root/.loom/worktrees")
+        fam_wt=$(resolve_worktree_root "$main_root")
+        [[ -n "$fam_wt" ]] && family_roots+=("$fam_wt")
+
+        wt_count=0
+        wt_list=$(git -C "$anchor" worktree list --porcelain 2>/dev/null) || return 1
+        while IFS= read -r line; do
+            case "$line" in
+                "worktree "*)
+                    wt_path="${line#worktree }"
+                    [[ "$wt_path" == /* ]] || return 1   # malformed entry
+                    family_roots+=("$wt_path")
+                    # Also its physical spelling (symlinked prefixes), if it exists.
+                    if [[ -d "$wt_path" ]]; then
+                        family_roots+=("$(cd "$wt_path" 2>/dev/null && pwd -P)")
+                    fi
+                    wt_count=$((wt_count + 1))
+                    ;;
+            esac
+        done <<< "$wt_list"
+        [[ "$wt_count" -ge 1 ]] || return 1   # empty/unparseable listing: ambiguous
+    done
 
     local r
     for r in "${family_roots[@]}"; do
