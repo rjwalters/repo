@@ -4493,7 +4493,7 @@ mkdir -p "$NOGIT628"
 RR_CWD="$NOGIT628" run_rr REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge -- up --json
 assert_eq "naming: outside git falls back to the cwd basename" "plain-dir" "$(json_field "$RR_OUT" name)"
 # Fallback: a bare repository's common dir is not a .git dir -> toplevel/cwd basename.
-git init -q --bare "$SCRATCH/bare628.git" >/dev/null 2>&1
+git_fixture_init "$SCRATCH/bare628.git" --bare >/dev/null 2>&1
 RR_CWD="$SCRATCH/bare628.git" run_rr REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge -- up --json
 assert_eq "naming: a bare repo falls back to its own basename" "bare628.git" "$(json_field "$RR_OUT" name)"
 
@@ -4600,6 +4600,22 @@ run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" MOCK_SSH_G_FAIL
 assert_eq "prune parse-check failure: exit 4" "4" "$RR_RC"
 assert_eq "prune parse-check failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
 assert_eq "prune parse-check failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+
+# (d2) an indented / trailing-space Host header is judged AND stripped the same
+# way: prune's scanner matches on fields, so removal must too (otherwise --yes
+# would report the block "removed" and leave it in place).
+rm -f "$CFG628" "$CFG628.lock"
+printf '%s\n' 'Host repo-remote-live' '    HostName 198.51.100.7' '' \
+    '  Host repo-remote-indented  ' '    HostName 198.51.100.33' '    User ubuntu' '' \
+    'Host unrelated-stale' '    HostName 198.51.100.2' >"$CFG628"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --yes --json
+assert_eq "prune indented header: exit 0" "0" "$RR_RC"
+assert_contains "prune indented header: reported stale" "$RR_OUT" '"stale":["repo-remote-indented"]'
+assert_not_contains "prune indented header: block actually stripped" "$(cat "$CFG628")" "repo-remote-indented"
+assert_not_contains "prune indented header: its HostName stripped too" "$(cat "$CFG628")" "198.51.100.33"
+assert_contains "prune indented header: live block kept" "$(cat "$CFG628")" "Host repo-remote-live"
+assert_contains "prune indented header: unrelated block kept" "$(cat "$CFG628")" "Host unrelated-stale"
+assert_contains "prune indented header: known_hosts entry removed" "$(cat "$MOCK_LOG")" "ssh-keygen -R 198.51.100.33"
 
 # (e) provider is required.
 write_shared "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"

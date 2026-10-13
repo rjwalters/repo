@@ -2912,21 +2912,23 @@ write_ssh_alias() {  # <ip | instance-id> [ssm-region]
 # "Host <alias>" block in <cfg>; empty when there is no such block.
 ssh_alias_hostname() {  # <cfg> <alias>
   [[ -f "$1" ]] || return 0
-  awk -v a="Host $2" '
-    /^[[:space:]]*(Host|Match)[[:space:]]/ { inb = ($0 == a); next }
+  awk -v a="$2" '
+    /^[[:space:]]*(Host|Match)[[:space:]]/ { inb = ($1 == "Host" && NF == 2 && $2 == a); next }
     inb && tolower($1) == "hostname" {print $2; exit}
   ' "$1"
 }
 
 # strip_ssh_alias_blocks <cfg> <out> <alias>... -- copy <cfg> to <out> without
 # the single-pattern "Host <alias>" blocks named (a block ends at the next Host
-# or Match line). Every other byte is preserved.
+# or Match line). Every other byte is preserved. Header lines are matched on
+# fields ($1 == "Host", NF == 2), exactly like prune's scanner, so an indented
+# or trailing-space header is both reported and actually stripped.
 strip_ssh_alias_blocks() {  # <cfg> <out> <alias>...
   local cfg="$1" out="$2"; shift 2
   local list; list="$(printf '%s\n' "$@")"
   awk -v list="$list" '
-    BEGIN { n = split(list, l, "\n"); for (i = 1; i <= n; i++) drop["Host " l[i]] = 1 }
-    /^[[:space:]]*(Host|Match)[[:space:]]/ { skip = ($0 in drop) }
+    BEGIN { n = split(list, l, "\n"); for (i = 1; i <= n; i++) drop[l[i]] = 1 }
+    /^[[:space:]]*(Host|Match)[[:space:]]/ { skip = ($1 == "Host" && NF == 2 && ($2 in drop)) }
     skip { next }
     { print }
   ' "$cfg" >"$out"
@@ -2982,7 +2984,7 @@ remove_ssh_alias_blocks() {  # <alias>...
 remove_ssh_alias() {  # <alias>
   local cfg="${REPO_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
   [[ -f "$cfg" ]] || return 0
-  [[ -n "$(awk -v a="Host $1" '$0 == a {print "y"; exit}' "$cfg")" ]] || return 0
+  [[ -n "$(awk -v a="$1" '$1 == "Host" && NF == 2 && $2 == a {print "y"; exit}' "$cfg")" ]] || return 0
   if remove_ssh_alias_blocks "$1"; then
     log "removed SSH alias ${1} (and its known_hosts entry) from ${cfg}"
   else
