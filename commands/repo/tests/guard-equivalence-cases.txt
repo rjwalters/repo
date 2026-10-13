@@ -315,6 +315,16 @@ wt:cd /tmp || exit 1; echo hi > out.log
 wt:pushd {{MAIN}}; cd /tmp; echo hi > out.log
 wt:cd /tmp; echo "pushd {{MAIN}}; eval x; case x in"; echo hi > out.log
 wt:cd /tmp; ls pushd eval source; echo hi > out.log
+# repo#612: quoted subcommand/flag words and git-dir / work-tree selectors
+# hid force ops from the force-scope parser. The harness runs in the default
+# (all) force scope, so each must ask; a quoted reset that is only text stays
+# allowed in both guards.
+git "reset" --hard
+git reset "--hard"
+git --git-dir .git reset --hard
+git --work-tree . reset --hard
+GIT_DIR=.git GIT_WORK_TREE=. git reset --hard
+echo 'git "reset" --hard'
 
 # ── git -C operand word parsing (repo#608) ────────────────────────────────
 # A quoted / escaped -C operand (and a quoted -c value) holding whitespace is

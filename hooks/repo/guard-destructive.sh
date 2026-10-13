@@ -1301,6 +1301,30 @@ _force_op_cwd_outside_known_roots() {
     return 0
 }
 
+# _force_op_dirs_outside_known_roots CWD GITDIR WORKTREE (repo#612) — the
+# out-of-tree exemption for a force op that may name an explicit repository
+# (--git-dir / GIT_DIR) and/or work tree (--work-tree / GIT_WORK_TREE). The
+# ref that moves lives in the git dir, and the files a hard reset rewrites
+# live in the work tree. Without a git dir, git DISCOVERS the repository from
+# the process cwd; without a work tree, the cwd is the work tree. So the cwd
+# is involved unless BOTH selectors are given, and EVERY location involved
+# must be provably outside: a scratch work tree driven from the main
+# checkout's repository (or vice versa) keeps asking. With neither selector
+# this is exactly _force_op_cwd_outside_known_roots CWD.
+_force_op_dirs_outside_known_roots() {
+    local fcwd="$1" gitdir="$2" worktree="$3"
+    if [[ -z "$gitdir" || -z "$worktree" ]]; then
+        _force_op_cwd_outside_known_roots "$fcwd" || return 1
+    fi
+    if [[ -n "$worktree" ]]; then
+        _force_op_cwd_outside_known_roots "$worktree" || return 1
+    fi
+    if [[ -n "$gitdir" ]]; then
+        _force_op_cwd_outside_known_roots "$gitdir" || return 1
+    fi
+    return 0
+}
+
 # =============================================================================
 # force-op branch-scope toggle — default ALL (preserve current behaviour).
 #
@@ -2599,14 +2623,24 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
 #   - split on ; | & && || and newline, strip a leading sudo wrapper.
-#   - only a segment whose command word is `git` is considered.
-#   - `git -C <path> ...` sets <cpath>; other pre-subcommand global options are
-#     skipped (`-c <k=v>` consumes its argument). A git segment is split into
-#     real shell words (shell_words), so a quoted/escaped operand containing
-#     whitespace stays one word, and each -C operand is statically decoded
-#     (static_path_word) to a literal path -- or the unknown-cwd sentinel when
-#     it holds an expansion/glob/unbalanced quote (repo#608). Repeated -C
-#     compose in git order; relative ones join onto the current cwd.
+#   - only a segment whose command word is `git` is considered. Since repo#612
+#     the command word, the global options, the subcommand, the force flags
+#     and the push refspecs are compared AFTER static quote removal
+#     (cmdword_static), so `"git" re''set "--hard"` is recognized; a word that
+#     needs runtime expansion in a deciding position fails closed (FO_UNDEC
+#     cpath, or an @UNRESOLVED@ push target).
+#   - the segment is split into real shell words (shell_words, repo#608), so a
+#     quoted/escaped operand containing whitespace stays one word.
+#   - pre-subcommand global options are walked with git's real arity: -C, -c,
+#     --git-dir, --work-tree, --namespace, --super-prefix, --config-env and
+#     --attr-source consume a separate value (the long ones also accept
+#     --opt=value). Path operands are statically decoded (static_path_word,
+#     repo#608) to a literal path, or the unknown-cwd sentinel when they hold
+#     an expansion/glob/unbalanced quote. Repeated -C compose in git order
+#     onto the process cwd, which is emitted as <cpath>. --git-dir/--work-tree
+#     and a leading GIT_DIR=/GIT_WORK_TREE= assignment are resolved against
+#     the final process cwd (flags override the environment) and emitted as
+#     fields 4 and 5 (repo#612).
 #   - a preceding `cd DIR &&`/`cd DIR;` segment earlier in the SAME compound
 #     command threads DIR through as the effective cwd for later force-op
 #     segments (#350) — see the cd-tracking block below for the full
@@ -2632,12 +2666,58 @@ function ml_segment(buf, segs,   SQ, DQ, s, n, seg, segc, i, c, qc, ci, tc, j, i
 # site), just made explicit so a LATER `cd` in the same command can override it.
 parse_force_ops() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK$_CDEXPAND_AWK$_CDQUOTE_AWK$_CDWORD_AWK"'
+    # repo#612 helpers. fo_is_force(w, sc) -- w (already decoded) is a force
+    # flag of push (--force, -f, --force-with-lease[=...]) or reset (--hard),
+    # selected by sc.
+    function fo_is_force(w, sc) {
+        if (sc == "push") return (w == "--force" || w == "-f" || w == "--force-with-lease" || w ~ /^--force-with-lease=/)
+        return (w == "--hard")
+    }
+    # fo_any_force(A, from, to) -- some decodable word in A[from..to] is a
+    # push or reset force flag.
+    function fo_any_force(A, from, to,   j, w) {
+        for (j = from; j <= to; j++) {
+            w = cmdword_static(A[j])
+            if (CMDW_UNKNOWN) continue
+            if (fo_is_force(w, "push") || fo_is_force(w, "reset")) return 1
+        }
+        return 0
+    }
+    # fo_any_sub(A, from, to) -- some decodable word in A[from..to] is push
+    # or reset.
+    function fo_any_sub(A, from, to,   j, w) {
+        for (j = from; j <= to; j++) {
+            w = cmdword_static(A[j])
+            if (CMDW_UNKNOWN) continue
+            if (w == "push" || w == "reset") return 1
+        }
+        return 0
+    }
+    # fo_join(base, raw) -- resolve one raw path operand (-C, --git-dir,
+    # --work-tree, GIT_DIR, GIT_WORK_TREE) against base the way git does,
+    # decoding it with the repo#608 static_path_word(). An operand that
+    # needs runtime expansion is UNKNOWN, and so is a relative operand from
+    # an unknown or empty base. An empty operand (git -C "") leaves base
+    # unchanged.
+    function fo_join(base, raw,   v) {
+        v = static_path_word(raw, home)
+        if (v == UNK) return UNK
+        if (v == "") return base
+        if (v ~ /^\//) return v
+        if (base == UNK || base == "") return UNK
+        return base "/" v
+    }
     BEGIN {
         SEP = sprintf("%c", 31)  # US (unit separator) — non-whitespace so bash
                                  # read does not trim an empty cpath.
         buf = ""
         curcwd = startcwd
         UNK = unknown_cwd()
+        # cpath sentinel for a force op whose git word, global option or
+        # subcommand cannot be decoded statically (repo#612). Must stay
+        # byte-equal to the shell-side _LOOM_UNDECODABLE_FORCE_OP.
+        FO_UNDEC = sprintf("%c", 14) "LOOM_UNDECODABLE_FORCE_OP"
+        SQ1 = sprintf("%c", 39)
     }
     # Slurp the whole (possibly multi-line) command, then segment ONCE with the
     # shared quote-aware lexer (#71) so a multi-line quoted DATA literal whose
@@ -2677,8 +2757,12 @@ parse_force_ops() {
             # a word this scan cannot resolve (c$()d, ${C:-c}d, a cd behind a
             # group or conditional) makes the cwd UNKNOWN, which the caller
             # turns into an ask instead of judging a stale cwd.
+            #
+            # repo#612: an "unknown" segment is NOT skipped. Its command word
+            # may itself be git (`$G reset --hard`), so it falls through to
+            # the classification below, which fails closed on it.
             cdk = cd_seg_class(seg)
-            if (cdk == "unknown") { flow_cd(kb, ""); curcwd = UNK; continue }
+            if (cdk == "unknown") { flow_cd(kb, ""); curcwd = UNK }
             if (cdk == "cd") {
                 if (flow_cd(kb, flow_next_kind(SK, i, n))) { curcwd = UNK; continue }
                 cdtok = CDW_ARG
@@ -2693,64 +2777,149 @@ parse_force_ops() {
                 }
                 continue
             }
-            if (toks[1] != "git") continue
-            # repo#608: re-split the git segment into real shell WORDS. The
-            # whitespace split above shreds a quoted or backslash-escaped
-            # operand holding a space (-C "/a b", -C /a\ b, -c "k=a b"), so a
-            # path fragment was read as the subcommand and the force op was
-            # never emitted -- an allow in every scope. shell_words() keeps
-            # each word raw; nothing is expanded or evaluated.
-            m = shell_words(seg, toks)
+            # repo#612: the command word, the global options, the subcommand
+            # and the force flags are all DECODED with the shared static
+            # recognizer (cmdword_static, _CDWORD_AWK) before they are
+            # compared, so `"git" "reset" "--hard"`, `git re""set --ha\rd`
+            # and friends are the same force op git runs. Nothing is ever
+            # evaluated. A word this scan cannot decode (any `$`, a backtick,
+            # an unquoted glob/brace, an unbalanced quote) in a position that
+            # decides WHETHER this is a force op fails closed: when a force
+            # flag is present the segment is emitted with the FO_UNDEC cpath
+            # sentinel, which the caller always asks on.
+            #
+            # A leading run of NAME=value words is skipped (the same
+            # skip_assign_words() bash-accurate word walk cd_seg_class uses),
+            # and GIT_DIR / GIT_WORK_TREE assignments in it are recorded: they
+            # select the repository and work tree exactly like --git-dir and
+            # --work-tree (repo#202/#204 precedent in resolve_stash_cwd()).
+            aoff = skip_assign_words(seg)
+            if (aoff > length(seg)) continue
+            envgd_raw = ""; envwt_raw = ""; envgd_set = 0; envwt_set = 0
+            # An appending GIT_DIR+=x depends on the inherited value, so its
+            # raw value is replaced by a lone dollar, which never decodes.
+            if (aoff > 1) {
+                na = shell_words(substr(seg, 1, aoff - 1), AW)
+                for (a = 1; a <= na; a++) {
+                    if (AW[a] ~ /^GIT_DIR\+?=/) { envgd_raw = AW[a]; sub(/^GIT_DIR\+?=/, "", envgd_raw); envgd_set = 1; if (AW[a] ~ /^GIT_DIR\+=/) envgd_raw = "$" }
+                    else if (AW[a] ~ /^GIT_WORK_TREE\+?=/) { envwt_raw = AW[a]; sub(/^GIT_WORK_TREE\+?=/, "", envwt_raw); envwt_set = 1; if (AW[a] ~ /^GIT_WORK_TREE\+=/) envwt_raw = "$" }
+                }
+            }
+            # repo#608: split into real shell WORDS (shell_words keeps each
+            # word raw; nothing is expanded), so `-C "/a b"` stays one word.
+            m = shell_words(substr(seg, aoff), T)
             # ml_segment() keeps separators INSIDE a command substitution
             # active (so smuggled commands there are still seen), which cuts
             # `git -C $(cd x && pwd) reset --hard` into `git -C $(cd x` and
-            # `pwd) reset --hard` -- neither segment carried a recognizable
-            # force op. When this segment ends inside an open substitution or
-            # quote, re-read the ORIGINAL text through the following segments
-            # until the word closes, so the subcommand is found again (and the
-            # dynamic -C operand then makes the cwd unknown).
+            # `pwd) reset --hard`. When this segment ends inside an open
+            # substitution or quote, re-read the ORIGINAL text through the
+            # following segments until the word closes, so the subcommand is
+            # found again (and the dynamic operand then makes the cwd unknown).
             jn = i
             while (SW_OPEN && jn < n) {
                 jn++
-                seg = substr(buf, ml_segbeg[i], ml_segsep[jn] - ml_segbeg[i])
-                sub(/^[ \t]+/, "", seg)
-                sub(/^sudo[ \t]+/, "", seg)
-                sub(/^[ \t]+/, "", seg)
-                m = shell_words(seg, toks)
+                rseg = substr(buf, ml_segbeg[i], ml_segsep[jn] - ml_segbeg[i])
+                sub(/^[ \t]+/, "", rseg)
+                sub(/^sudo[ \t]+/, "", rseg)
+                sub(/^[ \t]+/, "", rseg)
+                m = shell_words(substr(rseg, skip_assign_words(rseg)), T)
             }
-            # Walk global options between `git` and the subcommand.
-            # cpath tracks the PROCESS cwd git runs in. It starts at the
-            # tracked cd cwd (#350), which defaults to startcwd (the callers
-            # own $CWD) when no `cd` has run yet in this command, preserving
-            # the pre-#350 fallback exactly. Each -C moves it the way git
-            # does: repeated -C compose in order, a relative operand is
-            # joined onto the previous one, an empty operand stays put. The
-            # operand is decoded statically (static_path_word) so the caller
-            # gets a literal filesystem path; anything that cannot be proven
-            # (an expansion, a glob, a named-user tilde, an unbalanced quote)
-            # is UNKNOWN and the caller asks. A relative -C from an unknown
-            # (or empty) cwd is unknown too (repo#600).
-            cpath = curcwd
+            if (m == 0) continue
+            gw = cmdword_static(T[1])
+            if (CMDW_UNKNOWN) {
+                # An undecodable command word (`$G reset --hard`) may be git:
+                # fail closed when a decoded push/reset word AND a force flag
+                # follow it.
+                if (fo_any_sub(T, 2, m) && fo_any_force(T, 2, m)) print FO_UNDEC SEP "@HEAD@"
+                continue
+            }
+            if (gw != "git") continue
+            # Walk the global options between `git` and the subcommand with
+            # their real arity (git.c handle_options): -C, -c, --git-dir,
+            # --work-tree, --namespace, --super-prefix, --config-env and
+            # --attr-source take a SEPARATE value; the long ones also have a
+            # joined --opt=value form. Before repo#612 only -C/-c consumed a
+            # value, so `git --git-dir .git reset --hard` read `.git` as the
+            # subcommand and was never classified.
+            #
+            # proccwd is the process cwd git runs in: each -C chdirs
+            # immediately, composing relative to the previous one. A RELATIVE
+            # --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE is interpreted
+            # against the FINAL post--C cwd wherever it sits in the argument
+            # order, so the raw values are recorded here and resolved after
+            # the loop. A command-line flag overrides the environment, and a
+            # later flag overrides an earlier one.
+            proccwd = curcwd
+            gd_raw = envgd_raw; gd_set = envgd_set
+            wt_raw = envwt_raw; wt_set = envwt_set
+            undec = 0
             k = 2
             while (k <= m) {
-                t = toks[k]
-                if (t == "-C") {
-                    if (k + 1 > m) { k = m + 1; break }
-                    gcd = static_path_word(toks[k+1], home)
-                    if (gcd == UNK) cpath = UNK
-                    else if (gcd == "") { }
-                    else if (gcd ~ /^\//) cpath = gcd
-                    else if (cpath == "" || cpath == UNK) cpath = UNK
-                    else cpath = cpath "/" gcd
-                    k += 2
-                    continue
+                rawt = T[k]
+                # Joined long forms are matched on the RAW word when the
+                # option name itself is literal, so the value keeps its own
+                # quoting for fo_join() (`--git-dir=$HOME/x` stays resolvable).
+                if (rawt ~ /^--(git-dir|work-tree)=/) {
+                    v = rawt; sub(/^--[a-z-]+=/, "", v)
+                    # bash and zsh do NOT tilde-expand after `=` in an
+                    # ordinary argument, so git receives `<cwd>/~/…`: keep a
+                    # leading tilde literal so fo_join() does not resolve
+                    # $HOME (which allowed what main asks).
+                    if (substr(v, 1, 1) == "~") v = "\\" v
+                    if (rawt ~ /^--git-dir=/) { gd_raw = v; gd_set = 1 } else { wt_raw = v; wt_set = 1 }
+                    k++; continue
                 }
-                if (t == "-c") { k += 2; continue }
-                if (t ~ /^-/)  { k += 1; continue }
+                if (rawt ~ /^--[A-Za-z][A-Za-z0-9-]*=/) { k++; continue }
+                t = cmdword_static(rawt)
+                if (CMDW_UNKNOWN) { undec = 1; break }
+                if (t == "-C") {
+                    if (k + 1 > m) break
+                    proccwd = fo_join(proccwd, T[k + 1])
+                    k += 2; continue
+                }
+                if (t == "--git-dir" || t == "--work-tree") {
+                    if (k + 1 > m) break
+                    if (t == "--git-dir") { gd_raw = T[k + 1]; gd_set = 1 } else { wt_raw = T[k + 1]; wt_set = 1 }
+                    k += 2; continue
+                }
+                if (t == "-c" || t == "--namespace" || t == "--super-prefix" || \
+                    t == "--config-env" || t == "--attr-source") { k += 2; continue }
+                if (t ~ /^--(git-dir|work-tree)=/) {
+                    # Quoted option name: the value was decoded with it, so
+                    # hand fo_join() a single-quoted literal of the result.
+                    v = t; sub(/^--[a-z-]+=/, "", v)
+                    v = SQ1 v SQ1
+                    if (t ~ /^--git-dir=/) { gd_raw = v; gd_set = 1 } else { wt_raw = v; wt_set = 1 }
+                    k++; continue
+                }
+                if (t ~ /^-/) { k++; continue }
                 break
             }
             if (k > m) continue
-            subcmd = toks[k]
+            if (undec) {
+                if (fo_any_force(T, k + 1, m)) print FO_UNDEC SEP "@HEAD@"
+                continue
+            }
+            subcmd = cmdword_static(T[k])
+            if (CMDW_UNKNOWN) {
+                if (fo_any_force(T, k + 1, m)) print FO_UNDEC SEP "@HEAD@"
+                continue
+            }
+            if (subcmd != "push" && subcmd != "reset") continue
+            # Resolve the repository / work-tree selectors against the final
+            # process cwd. Anything that cannot be resolved statically makes
+            # the whole op target UNKNOWN (the caller asks). cpath is the
+            # process cwd (where git discovers the repo when no git dir is
+            # given, and the work tree when none is given); gdir / wtree are
+            # emitted as extra fields so the caller resolves the branch from
+            # the repository git will really use.
+            cpath = proccwd
+            gdir = ""; wtree = ""
+            if (gd_set) gdir = fo_join(proccwd, gd_raw)
+            if (wt_set) wtree = fo_join(proccwd, wt_raw)
+            if (cpath == UNK || gdir == UNK || wtree == UNK) { cpath = UNK; gdir = ""; wtree = "" }
+            if (gd_set && gdir == "" && cpath != UNK) cpath = UNK
+            if (wt_set && wtree == "" && cpath != UNK) cpath = UNK
             if (subcmd == "push") {
                 force = 0
                 np = 0
@@ -2759,29 +2928,36 @@ parse_force_ops() {
                 # refspecs from a prior segment cannot leak into this one now
                 # that we read every positional slot, not just pos[2].
                 split("", pos)
+                split("", posunk)
                 for (j = k+1; j <= m; j++) {
-                    t = toks[j]
-                    if (t == "--force" || t == "-f" || t == "--force-with-lease" || t ~ /^--force-with-lease=/) { force = 1; continue }
-                    if (t ~ /^-/) continue
+                    t = cmdword_static(T[j])
+                    tu = CMDW_UNKNOWN
+                    if (!tu && fo_is_force(t, "push")) { force = 1; continue }
+                    if (!tu && t ~ /^-/) continue
                     np++
                     pos[np] = t
+                    posunk[np] = tu
                 }
                 if (!force) continue
                 # pos[1] is the remote; pos[2..np] are refspecs. Emit ONE line per
                 # positional refspec so a protected branch in ANY refspec position
                 # (not just the first) reaches the per-line check in the caller. A
                 # bare push with no refspec (np < 2) resolves the checked-out branch.
+                # Refspecs are DECODED (repo#612), so a quoted protected name is
+                # still that name; one this scan cannot decode (`origin "$B"`)
+                # becomes the @UNRESOLVED@ target, which the caller asks on.
                 if (np < 2) {
-                    print cpath SEP "@HEAD@"
+                    print cpath SEP "@HEAD@" SEP "" SEP gdir SEP wtree
                 } else {
                     for (p = 2; p <= np; p++) {
+                        if (posunk[p]) { print cpath SEP "@UNRESOLVED@" SEP "" SEP gdir SEP wtree; continue }
                         rs = pos[p]
                         sub(/^\+/, "", rs)
                         ci = index(rs, ":")
                         if (ci > 0) rs = substr(rs, ci + 1)
                         target = "@HEAD@"
                         if (rs != "HEAD" && rs != "") target = rs
-                        print cpath SEP target
+                        print cpath SEP target SEP "" SEP gdir SEP wtree
                     }
                 }
             } else if (subcmd == "reset") {
@@ -2794,20 +2970,22 @@ parse_force_ops() {
                 # bare `git reset --hard` defaults to the literal "HEAD", so
                 # the field is never empty on a reset line; a push line never
                 # carries one, which is how the caller tells them apart. The
-                # token is raw (quotes intact): a quoted target simply fails
-                # the exact-string tests in the caller and keeps asking.
+                # TARGET token stays raw (quotes intact): a quoted target
+                # simply fails the exact-string tests in the caller and keeps
+                # asking. Flags are decoded (repo#612).
                 for (j = k+1; j <= m; j++) {
-                    t = toks[j]
-                    if (t == "--hard") { hard = 1; continue }
+                    t = cmdword_static(T[j])
+                    tu = CMDW_UNKNOWN
+                    if (!tu && t == "--hard") { hard = 1; continue }
                     # `--` ends options; whatever follows is not a plain
                     # recovery target, so mark the line unrecognized.
-                    if (t == "--") { if (rt == "") rt = "--"; break }
-                    if (t ~ /^-/) continue
-                    if (rt == "") rt = t
+                    if (!tu && t == "--") { if (rt == "") rt = "--"; break }
+                    if (!tu && t ~ /^-/) continue
+                    if (rt == "") rt = T[j]
                 }
                 if (hard) {
                     if (rt == "") rt = "HEAD"
-                    print cpath SEP "@HEAD@" SEP rt
+                    print cpath SEP "@HEAD@" SEP rt SEP gdir SEP wtree
                 }
             }
         }
@@ -6478,6 +6656,9 @@ function flow_track(seg,   w, nm) {
 '
 # Shell-side spelling of unknown_cwd() above -- the two MUST stay byte-equal.
 _LOOM_UNKNOWN_CWD=$'\016LOOM_UNKNOWN_CWD'
+# Shell-side spelling of parse_force_ops' FO_UNDEC sentinel (repo#612) -- the
+# two MUST stay byte-equal.
+_LOOM_UNDECODABLE_FORCE_OP=$'\016LOOM_UNDECODABLE_FORCE_OP'
 
 # cmd_has_unproven_cwd_change TEXT -- succeed when ANY segment of TEXT
 # (including the first command of every $( )/backtick substitution) has a
@@ -9301,8 +9482,14 @@ _force_detached_reset_recovery_ok() {
 # quoted `--body`/`-m` value is prose, and asking on it stalls ordinary issue
 # and commit authoring. Matches Loom's vendored copy, which has always scanned
 # the redacted copy here.
-if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
-   echo "$COMMAND_ASK_SCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
+# repo#612: the pre-check reads a copy with every quote and backslash removed,
+# so a quoted or partially quoted spelling (`git reset "--hard"`, `"-f"`,
+# `--ha''rd`, `"git"`) still reaches the parser, which decodes each word
+# statically. `push`/`reset` also admit the parse without a literal `git`, so
+# an undecodable command word (`$G reset --hard`) fails closed there.
+_FORCE_PRESCAN="${COMMAND_ASK_SCAN//[\"\'\\]/}"
+if [[ "$_FORCE_PRESCAN" == *git* || "$_FORCE_PRESCAN" == *push* || "$_FORCE_PRESCAN" == *reset* ]] && \
+   echo "$_FORCE_PRESCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
         _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN" "$CWD")
@@ -9314,26 +9501,53 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
             # "protected" mode: ask only for protected-branch or ambiguous
             # targets; allow own working branches. resolve_default_branch() plus
             # the main/master literals form the protected set.
-            while IFS=$'\037' read -r _fcpath _ftarget _fresettarget; do
+            #
+            # Fields 4/5 (repo#612) are the resolved --git-dir/GIT_DIR and
+            # --work-tree/GIT_WORK_TREE selectors, empty when absent.
+            while IFS=$'\037' read -r _fcpath _ftarget _fresettarget _fgitdir _fworktree; do
                 [[ -z "$_ftarget" ]] && _ftarget="@HEAD@"
                 _fcwd="$_fcpath"
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
+                # repo#612: the git word, a global option or the subcommand
+                # could not be decoded statically next to a force flag, so
+                # whether this is a force op at all is unknown -- ask.
+                if [[ "$_fcwd" == "$_LOOM_UNDECODABLE_FORCE_OP" ]]; then
+                    ask "Command requires confirmation: $COMMAND (possible force operation whose git command, global option, or subcommand word cannot be decoded statically — e.g. it depends on a variable or substitution — so this guard cannot tell what it does)" "force-op:undecodable"
+                fi
                 # repo#600: a command word parse_force_ops() could not resolve
                 # statically (a disguised/expanded cd spelling, a cd inside a
                 # group or conditional, or -- repo#608 -- a git -C operand
                 # with an expansion, glob or unbalanced quote) left the cwd
                 # UNKNOWN, so neither the
                 # branch identity nor the out-of-tree exemption can be judged
-                # -- ask, never silently allow.
+                # -- ask, never silently allow. repo#612: the same applies to
+                # a -C / --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE
+                # operand that needs runtime expansion.
                 if [[ "$_fcwd" == "$_LOOM_UNKNOWN_CWD" ]]; then
-                    ask "Command requires confirmation: $COMMAND (force operation after a command word that may change the working directory in a way this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd, or a git -C operand built from an expansion or glob — so the branch it acts on is unknown)" "force-op:unknown-cwd"
+                    ask "Command requires confirmation: $COMMAND (force operation after a command word that may change the working directory, or with a git -C/--git-dir/--work-tree/GIT_DIR/GIT_WORK_TREE operand, that this guard cannot resolve statically — e.g. a quoted/escaped/expanded spelling of cd, or an operand built from an expansion or glob — so the branch it acts on is unknown)" "force-op:unknown-cwd"
+                fi
+                # repo#612: a refspec that cannot be decoded statically
+                # (`git push --force origin "$B"`) may name a protected branch.
+                # Same out-of-tree exemption as a protected target (#330).
+                if [[ "$_ftarget" == "@UNRESOLVED@" ]]; then
+                    if ! _force_op_dirs_outside_known_roots "$_fcwd" "$_fgitdir" "$_fworktree"; then
+                        ask "Command requires confirmation: $COMMAND (force push to a refspec this guard cannot resolve statically, so it may name a protected branch)" "force-op:unresolved-target"
+                    fi
+                    continue
                 fi
                 if [[ "$_ftarget" == "@HEAD@" ]]; then
                     _fbranch=""
-                    if [[ -n "$_fcwd" ]]; then
+                    if [[ -n "$_fgitdir" ]]; then
+                        # An explicit git dir decides which HEAD moves; it
+                        # is already absolute (resolved by the parser).
+                        _fbranch=$(git --git-dir="$_fgitdir" symbolic-ref --short HEAD 2>/dev/null || true)
+                    elif [[ -n "$_fcwd" ]]; then
                         _fbranch=$(git -C "$_fcwd" symbolic-ref --short HEAD 2>/dev/null || true)
                     fi
-                    if [[ -z "$_fbranch" ]] && \
+                    # The managed-worktree recovery carve-out is only proven
+                    # for the plain cwd shape; an explicit git dir or work
+                    # tree keeps asking.
+                    if [[ -z "$_fbranch" && -z "$_fgitdir" && -z "$_fworktree" ]] && \
                        _force_detached_reset_recovery_ok "$_fcwd" "$_fresettarget"; then
                         # Managed-worktree recovery reset (#582, Loom #5772 /
                         # #7530) -- see _force_detached_reset_recovery_ok().
@@ -9352,13 +9566,13 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                         # headless runs with no human to answer. Any CWD
                         # inside the repo/a worktree, or one this guard cannot
                         # classify, still asks exactly as before.
-                        if ! _force_op_cwd_outside_known_roots "$_fcwd"; then
+                        if ! _force_op_dirs_outside_known_roots "$_fcwd" "$_fgitdir" "$_fworktree"; then
                             ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
                         fi
                     fi
                     _ftarget="$_fbranch"
                 fi
-                _fdefault=$(resolve_default_branch "$_fcwd")
+                _fdefault=$(resolve_default_branch "${_fgitdir:-$_fcwd}")
                 if [[ "$_ftarget" == "main" || "$_ftarget" == "master" ]] || \
                    { [[ -n "$_fdefault" && "$_ftarget" == "$_fdefault" ]]; }; then
                     # Protected-branch target — ask, never silently allow
@@ -9372,7 +9586,7 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                     # with no human to answer. Any CWD inside the repo/a
                     # worktree, or one this guard cannot classify, still
                     # asks exactly as before.
-                    if ! _force_op_cwd_outside_known_roots "$_fcwd"; then
+                    if ! _force_op_dirs_outside_known_roots "$_fcwd" "$_fgitdir" "$_fworktree"; then
                         ask "Command requires confirmation: $COMMAND (force operation targets protected branch '$_ftarget')" "force-op:protected"
                     fi
                 fi
