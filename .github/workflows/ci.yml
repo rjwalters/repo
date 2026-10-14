@@ -46,17 +46,16 @@ concurrency:
 
 jobs:
   organization-policy:
-    name: Validate organization Renovate policies
+    name: Validate organization Dependabot policies
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Validate all effective organization profiles
-        run: python3 policies/validate-renovate.py npm exec --yes --package=renovate@44.106.0 -- renovate-config-validator
-      - name: Verify security and routine release-age behavior
-        run: npm exec --yes --package=renovate@44.106.0 -- node policies/test-release-age.mjs
+      - name: Install PyYAML
+        run: python3 -m pip install --user pyyaml
+      - name: Validate effective profiles and .github/dependabot.yml
+        run: python3 policies/validate-dependabot.py
+      - name: Test the validator (cooldown mutation cases)
+        run: python3 -m unittest commands/repo/tests/test_validate_dependabot.py
 
   test:
     name: pnpm test (guard/handoff/loss-check suite)

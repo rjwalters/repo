@@ -83,14 +83,14 @@ python3 -m unittest discover -s commands/repo/tests -p 'test_org_policy.py'
 Local-source plans are preview-only. Publishing needs canonical source on
 GitHub and a newly generated plan. Never include credentials in these files.
 
-For every effective profile, validate its `dependencies.renovate` object with
-`renovate-config-validator --strict <file>` before publishing source changes.
-`policies/validate-renovate.py` renders the effective profiles and invokes that
-validator; CI runs it with a pinned Renovate version.
-`test-release-age.mjs` also exercises that version's alert classification and
-release filtering against a synthetic advisory, checking the one-day and
-14-day holds plus explicit zero-delay behavior. It makes no registry/platform
-requests; real lockfile resolution still needs validation in the client pilot.
+`policies/validate-dependabot.py` runs `validate()` on the default and every
+organization profile, asserts the policy cooldown (`routineDays` 14,
+`securityDays` 1), and structurally checks `.github/dependabot.yml` (version 2,
+non-empty `updates[]`, integer `cooldown.default-days` equal to `routineDays`).
+The one-day security value exists only in the policy; the rendered file has no
+security key. It is offline and needs PyYAML. CI runs it together with
+`commands/repo/tests/test_validate_dependabot.py`, which mutates the cooldown
+and `default-days` in-process and expects failures.
 
 References: [organization presets](https://docs.renovatebot.com/config-presets/#grouporganization-level-presets),
 [security fixes](https://docs.renovatebot.com/configuration-options/#vulnerabilityalerts),
