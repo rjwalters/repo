@@ -2,7 +2,15 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-14
+- **PR #658**: Dependabot default 2/5: Dependabot validator + CI job (#638)
+- **PR #657**: Dependabot default 1/5: policy model (provider=dependabot, cooldown) (#638)
+- **Issue #653** (closed): Dependabot default 2/5: Dependabot validator + CI job (#638)
+- **Issue #652** (closed): Dependabot default 1/5: policy model (provider=dependabot, cooldown) (#638)
+
 ### 2026-10-13
+- **PR #651**: fix(guard): anchor scratch-clone exemption family on CLAUDE_PROJECT_DIR (#635)
+- **PR #650**: Dependabot: render dependabot.yml from the org policy
 - **PR #648**: Remove Renovate config: Dependabot takes over
 - **PR #647**: Dependabot: render dependabot.yml from the org policy
 - **PR #646**: policy: the rjwalters account moves to Dependabot
@@ -16,6 +24,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **PR #631**: fix(guard): cd to a missing directory leaves the cwd unknown (#625)
 - **PR #630**: repo-remote: require a per-user GitHub App token (device flow) for attach (#627)
 - **PR #615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
+- **Issue #635** (closed): guard: the scratch-clone exemption allows a force op aimed at the main checkout from an unrelated clone
 - **Issue #634** (closed): guard: qualified or +refspec force pushes to the protected branch (HEAD:refs/heads/<branch>) are not recognized
 - **Issue #633** (closed): guard: force ops behind command/env/nohup wrappers (command git reset --hard) are not parsed
 - **Issue #632** (closed): guard: git --work-tree <main> from a worktree rewrites the protected checkout and is allowed
