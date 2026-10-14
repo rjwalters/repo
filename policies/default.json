@@ -1,21 +1,31 @@
 {
   "schemaVersion": 1,
   "dependencies": {
-    "provider": "renovate",
+    "provider": "dependabot",
     "dependabotAlerts": true,
-    "dependabotSecurityUpdates": false,
-    "renovate": {
-      "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-      "extends": ["config:recommended"],
-      "minimumReleaseAge": "14 days",
-      "minimumReleaseAgeBehaviour": "timestamp-required",
-      "internalChecksFilter": "strict",
-      "automerge": false,
-      "automergeType": "pr",
-      "vulnerabilityAlerts": {
-        "enabled": true,
-        "minimumReleaseAge": "1 day",
-        "automerge": false
+    "dependabotSecurityUpdates": true,
+    "renovate": null,
+    "dependabot": {
+      "cooldown": {
+        "routineDays": 14,
+        "securityDays": 1
+      },
+      "schedule": {
+        "interval": "weekly",
+        "day": "monday",
+        "time": "06:00",
+        "timezone": "America/Los_Angeles"
+      },
+      "labels": ["dependencies"],
+      "groups": {
+        "github-actions": {
+          "patterns": ["*"],
+          "update-types": ["major", "minor", "patch"]
+        },
+        "minor-patch": {
+          "patterns": ["*"],
+          "update-types": ["minor", "patch"]
+        }
       }
     }
   }

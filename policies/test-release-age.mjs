@@ -7,6 +7,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+// Skip when the default policy is not Renovate-backed (e.g. provider=dependabot).
+const policy = JSON.parse(fs.readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), 'default.json'), 'utf8',
+)).dependencies;
+if (policy.provider !== 'renovate' || !policy.renovate) {
+  console.log(`Skipping release-age test: provider=${policy.provider}, no Renovate config.`);
+  process.exit(0);
+}
+
 const validator = process.env.PATH.split(path.delimiter)
   .map(directory => path.join(directory, 'renovate-config-validator'))
   .find(filename => fs.existsSync(filename));

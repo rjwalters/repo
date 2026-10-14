@@ -110,7 +110,7 @@ def validate(policy):
         raise PolicyError("Unknown policy fields; supported fields: schemaVersion, dependencies")
     deps = policy["dependencies"]
     required = {"provider", "dependabotAlerts", "dependabotSecurityUpdates", "renovate"}
-    if not isinstance(deps, dict) or not required <= set(deps) <= required | {"policySource"}:
+    if not isinstance(deps, dict) or not required <= set(deps) <= required | {"policySource", "dependabot"}:
         raise PolicyError("Invalid dependencies policy fields")
     if deps["provider"] not in PROVIDERS:
         raise PolicyError(f"dependencies.provider must be one of: {', '.join(PROVIDERS)}")
@@ -129,9 +129,18 @@ def validate(policy):
         source = deps.get("policySource")
         if source is not None and (not isinstance(source, str) or not source.strip()):
             raise PolicyError("dependencies.policySource must be a non-empty string")
+        block = deps.get("dependabot")
+        if block is not None:
+            if not isinstance(block, dict):
+                raise PolicyError("dependencies.dependabot must be an object")
+            cooldown = block.get("cooldown", {})
+            if not isinstance(cooldown, dict) or any(
+                    type(v) is not int or v < 0 for v in cooldown.values()):
+                raise PolicyError("dependabot.cooldown values must be whole numbers of days")
         return
-    if "policySource" in deps:
-        raise PolicyError("dependencies.policySource applies only to provider dependabot")
+    for key in ("policySource", "dependabot"):
+        if key in deps:
+            raise PolicyError(f"dependencies.{key} applies only to provider dependabot")
     renovate = deps["renovate"]
     if not isinstance(renovate, dict):
         raise PolicyError("dependencies.renovate must be a Renovate config object")

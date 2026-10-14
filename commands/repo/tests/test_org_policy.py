@@ -20,7 +20,27 @@ ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location("org_policy", ROOT / "scripts/repo/repo-org-policy.py")
 policy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(policy)
-DEFAULT = json.loads((ROOT / "policies/default.json").read_text())
+CANONICAL_DEFAULT = json.loads((ROOT / "policies/default.json").read_text())
+# The canonical default is now Dependabot; the Renovate rendering path stays
+# supported for owners that opt in, so its tests run against this legacy profile.
+DEFAULT = {
+    "schemaVersion": 1,
+    "dependencies": {
+        "provider": "renovate",
+        "dependabotAlerts": True,
+        "dependabotSecurityUpdates": False,
+        "renovate": {
+            "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+            "extends": ["config:recommended"],
+            "minimumReleaseAge": "14 days",
+            "minimumReleaseAgeBehaviour": "timestamp-required",
+            "internalChecksFilter": "strict",
+            "automerge": False,
+            "automergeType": "pr",
+            "vulnerabilityAlerts": {"enabled": True, "minimumReleaseAge": "1 day", "automerge": False},
+        },
+    },
+}
 
 
 class FakeGitHub:
@@ -206,6 +226,24 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(config["minimumReleaseAge"], "14 days")
         self.assertEqual(DEFAULT["dependencies"]["renovate"]["vulnerabilityAlerts"]["minimumReleaseAge"], "1 day")
         self.assertIn("policies/organizations/example.json", plan["source"]["files"])
+
+    def test_canonical_default_is_dependabot_with_cooldown(self):
+        policy.validate(CANONICAL_DEFAULT)
+        deps = CANONICAL_DEFAULT["dependencies"]
+        self.assertEqual(deps["provider"], "dependabot")
+        self.assertIsNone(deps["renovate"])
+        self.assertEqual(deps["dependabot"]["cooldown"], {"routineDays": 14, "securityDays": 1})
+        for org in sorted((ROOT / "policies/organizations").glob("*.json")):
+            merged = policy.merge(CANONICAL_DEFAULT, json.loads(org.read_text()))
+            policy.validate(merged)
+            self.assertEqual(merged["dependencies"]["provider"], "dependabot")
+
+    def test_dependabot_block_is_dependabot_only_and_cooldown_is_validated(self):
+        bad = policy.merge(CANONICAL_DEFAULT, {"dependencies": {"dependabot": {"cooldown": {"routineDays": "14"}}}})
+        with self.assertRaisesRegex(policy.PolicyError, "whole numbers"):
+            policy.validate(bad)
+        with self.assertRaisesRegex(policy.PolicyError, "only to provider dependabot"):
+            policy.validate(policy.merge(DEFAULT, {"dependencies": {"dependabot": {}}}))
 
     def test_arrays_replace_instead_of_union(self):
         self.assertEqual(policy.merge({"a": [1, 2]}, {"a": [3]}), {"a": [3]})
