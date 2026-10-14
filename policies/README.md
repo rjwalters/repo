@@ -6,7 +6,14 @@ owner overrides. Both are read at the same default-branch commit. There is no
 registry of client repos to maintain, and no organization is changed merely
 because these files exist.
 
-For example, an organization choosing immediate security fixes would add
+**Decision (2026-10-13, #638):** Dependabot is the default provider, with a
+version-update `cooldown` (14 days routine; security updates are not delayed).
+Renovate is opt-in only (Mend-hosted terms; Silent-by-default, #636). Existing
+Renovate clients migrate in two PRs: add the rendered `dependabot.yml` first,
+remove `renovate.json` in a separate PR. The Renovate material below applies
+only to organizations that opt in with `"provider": "renovate"`.
+
+For example, an organization that opted in to Renovate and wants immediate security fixes would add
 `policies/organizations/example-org.json` containing:
 
 ```json

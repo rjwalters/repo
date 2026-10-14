@@ -128,8 +128,12 @@ the specific gap it could not close.
 
 ## Provider: Dependabot
 
-`dependencies.provider` is `renovate` (the default) or `dependabot`. An owner
-override switches with:
+`dependencies.provider` is `dependabot` (the default since 2026-10-13, #638)
+or `renovate` (opt-in; hosted Renovate is a Mend-hosted App and
+Silent-by-default, #636). The default policy already sets Dependabot with a
+14-day version-update cooldown. An owner override switches back to Renovate by
+setting `provider: "renovate"` with a `renovate` block, or states Dependabot
+explicitly with:
 
 ```json
 {"dependencies": {"provider": "dependabot", "dependabotSecurityUpdates": true,
@@ -149,7 +153,8 @@ override switches with:
 The organization PR then carries only `repo-policy.json` and **removes**
 `renovate-config.json` (only if it exists). No GitHub App is needed, so the
 plan skips the Renovate App check. Switching an organization from Renovate to
-Dependabot is one such PR; each client's `renovate.json` is then removed by
+Dependabot is one such PR (clients migrate in two PRs: `dependabot.yml` first,
+then `renovate.json` removed separately); each client's `renovate.json` is then removed by
 [[deps]] or the organization's own tooling, once that client's `dependabot.yml`
 is in place.
 

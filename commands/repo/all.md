@@ -323,12 +323,12 @@ Two currency checks run here, both report-first.
 itself, … against their sources. Report what's behind and offer to update.
 
 **Third-party dependencies** (see [[deps]]): run `[[deps]] --check`. Report the
-installed organization policy/source, detected provider (Renovate, Dependabot,
-or intentional mixed coverage), config/app status, vulnerability alerts,
+installed organization policy/source, detected provider (Dependabot by default;
+Renovate if opted in, or intentional mixed coverage), config/app status, vulnerability alerts,
 **open Dependabot alerts by severity**, security PR ownership, cooldown and
 automerge policy, and open dependency PRs.
 These are independent states: an intentionally disabled Dependabot security-PR
-flag is expected when Renovate owns fixes. Missing Dependabot config does not
+flag is expected only when an opted-in Renovate owns fixes. Missing Dependabot config does not
 mean automation is absent.
 
 **The alerting flag and the open-alert count are different findings — carry
