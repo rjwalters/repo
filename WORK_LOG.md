@@ -3,6 +3,14 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-14
+- **PR #662**: chore: bump version to 0.24.0 for Dependabot default flip (#654)
+- **PR #661**: docs: Dependabot-first commands and docs flip (#656)
+- **PR #660**: feat(org-policy): Renovate only behind explicit opt-in (#655)
+- **Issue #656** (closed): Dependabot default 4/5: commands and docs flip to Dependabot-first (#638)
+- **Issue #655** (closed): Dependabot default 3/5: repo-org-policy.py stops publishing Renovate by default (#638)
+- **Issue #654** (closed): Dependabot default 5/5: VERSION bump for provider default flip (#638)
+- **Issue #636** (closed): /repo:deps: Renovate setup must end active — detect Mend Silent mode (no Dependency Dashboard) and request mode=full
+- **Issue #622** (closed): Finish Dependabot→Renovate migration: disable Dependabot PR generation
 - **PR #658**: Dependabot default 2/5: Dependabot validator + CI job (#638)
 - **PR #657**: Dependabot default 1/5: policy model (provider=dependabot, cooldown) (#638)
 - **Issue #653** (closed): Dependabot default 2/5: Dependabot validator + CI job (#638)
