@@ -49,6 +49,8 @@ _None._
 
 Issues carrying `loom:curated`.
 
+- **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
+- **#654**: Dependabot default 5/5: VERSION bump for provider default flip (#638) *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -70,7 +72,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 1 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
