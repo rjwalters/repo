@@ -23,7 +23,7 @@ Repo is a collection of skills for keeping any git repository healthy and produc
 | `/repo:sudo` | Opt-in passwordless-sudo setup for a dev machine — install a `visudo`-validated `/etc/sudoers.d` drop-in (blanket `ALL` or a scoped command list) so an agent over SSH isn't blocked on password prompts; always confirmed, validated with rollback on failure |
 | `/repo:host-optimize` | Prepare a Mac (or Linux box) for heavy Loom/agent build use — audit Gatekeeper churn, backup-agent interference, build-tree bloat; apply safe fixes, gate consequential ones |
 | `/repo:update-tools` | Check installed tool packages (Loom, Anvil, …) against their sources and offer updates |
-| `/repo:deps` | Third-party dependency currency — reconcile organization policy, Renovate or Dependabot setup, and bot PRs; report-only under `--check` |
+| `/repo:deps` | Third-party dependency currency — reconcile organization policy, Dependabot-first setup with cooldown (Renovate opt-in), and bot PRs; report-only under `--check` |
 | `/repo:optimize-ci` | Audit GitHub Actions for wasted CI minutes — change-relevance path filtering (required-check safe), cache keys, superseded runs; ranked by measured savings, report-only unless `--apply` |
 | `/repo:org-policy` | Preview or deploy canonical rjwalters/repo preferences to the client's GitHub owner/.github repository through a policy PR |
 | `/repo:decide` | Put operator decisions to the operator as ranked options — best to worst, each with why — so they can answer with a number |
@@ -264,7 +264,7 @@ scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed 
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place
 scripts/repo/repo-optimize-ci.py  /repo:optimize-ci workflow audit, installed to the same place
 scripts/repo/repo-org-policy.py  /repo:org-policy plan/apply engine, installed to the same place
-policies/                    Canonical organization preferences (Renovate preset + validators) that
+policies/                    Canonical organization preferences (Dependabot-first policy + validators; Renovate opt-in) that
                              /repo:org-policy reads from GitHub — consumer-visible, not installed
 hooks/repo/guard-destructive.sh  PreToolUse guard hook installed to .claude/skills/repo/hooks/
 hooks/repo/session-start-handoff.sh  SessionStart handoff-note hook installed to the same place
