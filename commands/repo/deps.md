@@ -12,7 +12,8 @@ Keep the repo's **third-party dependencies** current: npm / pip / cargo / Go
 packages and GitHub Actions. Two halves, usually run together:
 
 1. **Resolve organization policy and verify the updater** — Dependabot by
-   default, Renovate only as an explicit opt-in, independently of GitHub vulnerability alerts and security PRs.
+   default, Renovate only as an explicit opt-in, independently of GitHub
+   vulnerability alerts and security PRs.
 2. **Triage dependency PRs** — actual changes, age eligibility, security
    relevance, CI coverage, and merge policy.
 
@@ -115,7 +116,8 @@ Report separately: deployed policy source/revision and drift, provider/config,
 **GitHub App installation status** (Renovate path only — see below), app
 operation, dependency graph, vulnerability alerts, security PR provider,
 effective release-age rules, automerge/required checks, and open bot PRs.
-`dependabotSecurityUpdates: false` is expected when Renovate owns security PRs;
+`dependabotSecurityUpdates: false` is expected only when an opted-in Renovate
+owns security PRs;
 it is not a finding that should be "fixed" by enabling a second provider.
 
 ### Fan-out survey — org-wide migration report (`--all-repos`)

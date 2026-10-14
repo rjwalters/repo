@@ -76,12 +76,15 @@ client: the helper fetches canonical JSON at one immutable GitHub commit.
    reconciliation, `ignorePaths` for installer-owned roots, and security-PR
    ownership). The same closing line appears on a no-op apply, saying no
    organization PR is pending.
-6. Every `plan` and `apply` invocation also prints a Renovate GitHub App
-   installation line (see "Renovate App installation check" below) — include
-   it verbatim in the final report. A published/merged policy proves nothing
-   about whether the App that reads it is actually installed on the target
-   organization/user; treat "policy published" and "policy published, app
-   NOT installed" as distinct outcomes, not the same success.
+6. When the provider is the opt-in `renovate` (not the Dependabot default;
+   see #655), every `plan` and `apply` invocation also prints a Renovate
+   GitHub App installation line (see "Renovate App installation check"
+   below) — include it verbatim in the final report. A Dependabot policy
+   needs no App, so no such line is printed. For Renovate, a
+   published/merged policy proves nothing about whether the App that reads
+   it is actually installed on the target organization/user; treat "policy
+   published" and "policy published, app NOT installed" as distinct
+   outcomes, not the same success.
 
 ```bash
 # Run from the client repository. Use a new directory so plan.json is absent.
