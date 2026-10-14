@@ -3,6 +3,27 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-13
+- **PR #648**: Remove Renovate config: Dependabot takes over
+- **PR #647**: Dependabot: render dependabot.yml from the org policy
+- **PR #646**: policy: the rjwalters account moves to Dependabot
+- **PR #645**: fix(guard): qualified and +refspec force pushes to the protected branch (#634)
+- **PR #644**: fix(org-policy): no Renovate App line after a dependabot apply (2AMLogic/2am#4351)
+- **PR #643**: fix(guard): look through command/env/nohup wrappers for force ops (#633)
+- **PR #642**: feat(org-policy): provider dependabot (2AMLogic/2am#4351)
+- **PR #641**: feat(repo-remote): stable name, alias cleanup on terminate, prune (#628)
+- **PR #640**: fix(guard): judge force-op reset by the --work-tree it rewrites (#632)
+- **PR #639**: fix(guard): treat zsh directory-stack cd (+N/-N, ~+/~-) as unknown cwd (#626)
+- **PR #631**: fix(guard): cd to a missing directory leaves the cwd unknown (#625)
+- **PR #630**: repo-remote: require a per-user GitHub App token (device flow) for attach (#627)
+- **PR #615**: guard: decode quoted force-op words and model --git-dir/--work-tree (#612)
+- **Issue #634** (closed): guard: qualified or +refspec force pushes to the protected branch (HEAD:refs/heads/<branch>) are not recognized
+- **Issue #633** (closed): guard: force ops behind command/env/nohup wrappers (command git reset --hard) are not parsed
+- **Issue #632** (closed): guard: git --work-tree <main> from a worktree rewrites the protected checkout and is allowed
+- **Issue #628** (closed): repo-remote: make it reliable & declarative — GC stale ssh-config aliases, consistent host naming, additive SG, sourced creds
+- **Issue #627** (closed): repo:remote: require a per-user GitHub App user access token (device flow) for VM sessions
+- **Issue #626** (closed): guard: zsh cd +N / -N (directory stack) and pushd/popd are misread as relative paths
+- **Issue #625** (closed): guard: a ;-chained write after a cd to a missing directory lands in the protected checkout
+- **Issue #612** (closed): guard: quoted git subcommand/flags and --git-dir/--work-tree hide force ops from parse_force_ops
 - **PR #611**: guard: cwd trackers see a cd behind a leading redirection and cd options (#604)
 - **Issue #604** (closed): guard: cwd trackers miss a cd behind a leading redirection (>/dev/null cd X) and cd options (cd -P/-- X)
 
