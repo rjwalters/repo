@@ -701,6 +701,41 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("/repo:deps in example/client", result)
         self.assertNotIn("--install", result)
 
+    def test_default_publishes_no_renovate_config_and_needs_no_app(self):
+        # Real canonical default, no owner override: the Renovate path is off.
+        self.api.source["policies/default.json"] = policy.dump(CANONICAL_DEFAULT)
+        plan = self.plan()
+        self.assertIsNone(plan["after"]["renovate-config.json"])
+        self.assertEqual(policy.provider_of(plan["after"]), "dependabot")
+        policy.apply_plan(self.api, plan)
+        tree = next(p for e, m, p in self.api.writes if e.endswith("/git/trees"))
+        self.assertEqual([entry["path"] for entry in tree["tree"]], ["repo-policy.json"])
+        self.assertFalse(any(e.endswith("/installations") for e, _, _ in self.api.calls))
+
+    OPT_IN = {"dependencies": {"provider": "renovate", "dependabotSecurityUpdates": False,
+                               "dependabot": None, "policySource": None,
+                               "renovate": DEFAULT["dependencies"]["renovate"]}}
+
+    def test_explicit_owner_opt_in_restores_the_renovate_path(self):
+        self.api.source["policies/default.json"] = policy.dump(CANONICAL_DEFAULT)
+        self.api.source["policies/organizations/example.json"] = policy.dump(self.OPT_IN)
+        plan = self.plan()
+        self.assertEqual(json.loads(plan["after"]["renovate-config.json"]),
+                         DEFAULT["dependencies"]["renovate"])
+        deps = json.loads(plan["after"]["repo-policy.json"])["dependencies"]
+        self.assertEqual(deps["renovatePreset"], "github>example/.github:renovate-config")
+        self.assertNotIn("dependabot", deps)
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            policy.show_plan(self.api, plan)
+        self.assertIn(policy.RENOVATE_INSTALL_URL, out.getvalue())
+
+    def test_existing_renovate_config_is_removed_by_default_and_kept_on_opt_in(self):
+        self.api.source["policies/default.json"] = policy.dump(CANONICAL_DEFAULT)
+        self.api.files["renovate-config.json"] = "{}\n"
+        self.assertIsNone(self.plan()["after"]["renovate-config.json"])
+        self.api.source["policies/organizations/example.json"] = policy.dump(self.OPT_IN)
+        self.assertIsNotNone(self.plan()["after"]["renovate-config.json"])
+
     def test_dependabot_provider_retry_reuses_the_branch(self):
         self.use_dependabot()
         self.api.files["renovate-config.json"] = "{}\n"

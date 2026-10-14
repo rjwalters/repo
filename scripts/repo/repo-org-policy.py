@@ -139,7 +139,9 @@ def validate(policy):
                 raise PolicyError("dependabot.cooldown values must be whole numbers of days")
         return
     for key in ("policySource", "dependabot"):
-        if key in deps:
+        # The canonical default is Dependabot, so an owner opting in to Renovate
+        # inherits these blocks and clears them with null.
+        if deps.get(key) is not None:
             raise PolicyError(f"dependencies.{key} applies only to provider dependabot")
     renovate = deps["renovate"]
     if not isinstance(renovate, dict):
@@ -201,6 +203,9 @@ def render(policy, source, owner):
     """Managed file name -> content; None means the file must not exist."""
     deps = copy.deepcopy(policy["dependencies"])
     renovate = deps.pop("renovate")
+    for key in ("policySource", "dependabot"):
+        if deps.get(key) is None:
+            deps.pop(key, None)
     if deps["provider"] == "dependabot":
         return {
             "renovate-config.json": None,
