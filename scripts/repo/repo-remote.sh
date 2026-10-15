@@ -131,6 +131,15 @@
 # settings out of the tree and set REPO_REMOTE_ENV_FILE. The primary checkout
 # is unaffected (no warning).
 #
+# Box name override (#664): the box identity (instance tag repo-remote=<name>,
+# SSH alias repo-remote-<name>, security-group names, SSH-ingress marker) is
+# normally the primary checkout's directory name. Set REPO_REMOTE_NAME=<name>
+# (environment, shared remote.env, or the per-repo env file) to target a
+# different box from the same checkout, e.g. a separate big-RAM "fit" box next
+# to the build/test box, each with its own remote-run lock. Allowed characters:
+# [A-Za-z0-9._-]; anything else exits 2 before any cloud call. Empty/unset
+# leaves the derived name unchanged.
+#
 # Cost gate (repo#52 — the highest-cost-of-being-wrong element): `up` (with or
 # without --yes) REQUIRES the provider, that provider's credentials, and
 # REPO_REMOTE_INSTANCE_TYPE to be present in config. Instance type is the
@@ -711,8 +720,16 @@ resolve_settings() {
   # lower-case the provider
   PROVIDER="$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')"
 
-  NAME="$(primary_checkout_name || true)"
-  [[ -n "$NAME" ]] || NAME="$(basename "${GIT_ROOT:-$PWD}")"
+  # REPO_REMOTE_NAME (#664) overrides the derived box name; empty/unset keeps
+  # the primary-checkout / basename behavior. Validated before any cloud call.
+  if [[ -n "${REPO_REMOTE_NAME:-}" ]]; then
+    [[ "$REPO_REMOTE_NAME" =~ ^[A-Za-z0-9._-]+$ ]] \
+      || die 2 "invalid REPO_REMOTE_NAME '${REPO_REMOTE_NAME}': use only letters, digits, '.', '_' and '-'"
+    NAME="$REPO_REMOTE_NAME"
+  else
+    NAME="$(primary_checkout_name || true)"
+    [[ -n "$NAME" ]] || NAME="$(basename "${GIT_ROOT:-$PWD}")"
+  fi
   CALLER="$(repo_remote_caller)"
 
   INSTANCE_TYPE="${REPO_REMOTE_INSTANCE_TYPE:-}"

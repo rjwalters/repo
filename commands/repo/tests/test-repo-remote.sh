@@ -1510,6 +1510,48 @@ write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- REPO_REMOTE_NAME overrides the box name (#664) --"
+# ---------------------------------------------------------------------------
+write_shared "REPO_REMOTE_PROVIDER=aws" "AWS_ACCESS_KEY_ID=AKIA" "AWS_SECRET_ACCESS_KEY=sk" "AWS_REGION=us-west-2"
+write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
+run_rr -- up --json
+assert_eq "name override: unset keeps the checkout name" "myrepo" "$(json_field "$RR_OUT" name)"
+run_rr REPO_REMOTE_NAME= -- up --json
+assert_eq "name override: empty keeps the checkout name" "myrepo" "$(json_field "$RR_OUT" name)"
+run_rr REPO_REMOTE_NAME=fit -- up --json
+assert_eq "name override: plan uses the override" "fit" "$(json_field "$RR_OUT" name)"
+run_rr REPO_REMOTE_NAME=fit MOCK_AWS_NEW_ID=i-0fit MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "name override: up succeeds" "0" "$RR_RC"
+assert_eq "name override: ssh alias uses the override" "repo-remote-fit" "$(json_field "$RR_OUT" ssh_alias)"
+assert_contains "name override: instance tagged repo-remote=fit" "$(cat "$MOCK_LOG")" "repo-remote,Value=fit"
+assert_not_contains "name override: checkout name not used for the tag" "$(cat "$MOCK_LOG")" "repo-remote,Value=myrepo"
+assert_contains "name override: SG named from the override" "$(cat "$MOCK_LOG")" "repo-remote-fit"
+run_rr REPO_REMOTE_NAME=build MOCK_AWS_NEW_ID=i-0build MOCK_AWS_STATE=None -- up --yes --json
+assert_eq "name override: second invocation gets a distinct alias" "repo-remote-build" "$(json_field "$RR_OUT" ssh_alias)"
+assert_contains "name override: second invocation gets a distinct tag" "$(cat "$MOCK_LOG")" "repo-remote,Value=build"
+assert_not_contains "name override: second invocation does not reuse the first name" "$(cat "$MOCK_LOG")" "Value=fit"
+for bad in "has space" "a/b" 'x;y'; do
+    run_rr REPO_REMOTE_NAME="$bad" -- up --yes --json
+    assert_eq "name override: invalid '$bad' exits 2" "2" "$RR_RC"
+    assert_contains "name override: invalid '$bad' names the variable" "$RR_ERR" "REPO_REMOTE_NAME"
+    assert_eq "name override: invalid '$bad' makes no cloud call" "0" "$(grep -c 'run-instances\|describe-' "$MOCK_LOG" 2>/dev/null)"
+done
+WT664="$SCRATCH/issue-664-wt"
+git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "fixture base 664" >/dev/null 2>&1 || true
+git -C "$REPO" worktree add -q --detach "$WT664" >/dev/null 2>&1
+if [[ -d "$WT664" ]]; then
+    WT664="$(cd "$WT664" && pwd -P)"
+    printf '%s\n' "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" >"$WT664/.env"
+    RR_CWD="$WT664" run_rr REPO_REMOTE_NAME=fit -- up --json
+    assert_eq "name override: wins over the primary-checkout name in a linked worktree" "fit" "$(json_field "$RR_OUT" name)"
+    git -C "$REPO" worktree remove --force "$WT664" >/dev/null 2>&1 || true
+else
+    no "name override worktree fixture: git worktree add failed"
+fi
+assert_contains "remote.md documents REPO_REMOTE_NAME" "$(cat "$REMOTE_MD")" "REPO_REMOTE_NAME"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- reuse: a running pinned instance is reused, not recreated --"
 # ---------------------------------------------------------------------------
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge" "REPO_REMOTE_INSTANCE_ID=i-0pinned"
