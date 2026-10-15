@@ -473,6 +473,33 @@ assert_eq       "guard uninstall: CLAUDE.md untouched" "$BEFORE11" "$(slurp "$T1
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- install.sh update path: CLAUDE.md is a symlink to AGENTS.md (2AMLogic/2am#4508) --"
+
+TS="$(new_target symlinked)"
+cat > "$TS/AGENTS.md" <<'EOF'
+Agent instructions.
+
+<!-- BEGIN REPO-SKILLS -->
+OLD repo skills content
+<!-- END REPO-SKILLS -->
+
+Trailing prose.
+EOF
+ln -s AGENTS.md "$TS/CLAUDE.md"
+OUTS="$(bash "$INSTALL_SH" -y "$TS" 2>&1)"; RCS=$?
+assert_eq       "symlinked: install exits 0" "0" "$RCS"
+if [[ -L "$TS/CLAUDE.md" && "$(readlink "$TS/CLAUDE.md")" == "AGENTS.md" ]]; then
+    ok "symlinked: CLAUDE.md is still a symlink to AGENTS.md"
+else
+    no "symlinked: CLAUDE.md is still a symlink to AGENTS.md" "$(ls -l "$TS/CLAUDE.md")"
+fi
+BODYS="$(slurp "$TS/AGENTS.md")"
+assert_contains "symlinked: the block was refreshed in the link target" "$BODYS" "Repo Skills](https://github.com/rjwalters/repo) v$VERSION"
+assert_not_contains "symlinked: stale block body is gone from the target" "$BODYS" "OLD repo skills content"
+assert_contains "symlinked: content outside the block survives" "$BODYS" "Trailing prose."
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

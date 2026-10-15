@@ -111,6 +111,27 @@ claude_md_block_rewrite() {  # <file> <begin> <end> [block-file]
   local content prefix suffix rest_of_line body backup tmp
 
   CLAUDE_MD_BLOCK_BACKUP=""
+  # A symlinked CLAUDE.md (commonly CLAUDE.md -> AGENTS.md) is rewritten
+  # THROUGH the link. The `mv` into place below would otherwise replace the
+  # link with a regular file, forking the instructions into two copies that
+  # drift apart (2AMLogic/2am#4508). Follow the chain to the real file, and
+  # refuse a dangling or looping one rather than guess.
+  local link hops=0
+  while [[ -L "$file" ]]; do
+    if ! link="$(readlink "$file")"; then
+      CLAUDE_MD_BLOCK_ERROR="could not read the symlink $file"
+      return 1
+    fi
+    case "$link" in
+      /*) file="$link" ;;
+      *)  file="$(dirname "$file")/$link" ;;
+    esac
+    hops=$((hops + 1))
+    if [[ $hops -gt 8 ]]; then
+      CLAUDE_MD_BLOCK_ERROR="symlink chain too deep (or looping) resolving CLAUDE.md"
+      return 1
+    fi
+  done
   claude_md_block_validate "$file" "$begin" "$end" || return 1
 
   _claude_md_slurp "$file"
