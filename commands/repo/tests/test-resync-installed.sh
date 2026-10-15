@@ -341,6 +341,31 @@ assert_file "resync restores a guard recorded as installed" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- release tag is recorded only when the source HEAD sits on one (repo#669) --"
+TTGT="$SCRATCH/tgt-tag"
+new_target "$TTGT"
+TMETA="$TTGT/.claude/skills/repo/install-metadata.json"
+TCMETA="$TTGT/.agents/skills/repo/install-metadata.json"
+do_install "$SRC" "$TTGT"
+assert_not_contains "an install from an untagged commit records no tag" "$(cat "$TMETA")" '"tag"'
+
+git -C "$SRC" -c user.email=t@example.com -c user.name=Test tag -a v97.0.0 -m "Release v97.0.0" HEAD
+run_resync "$TTGT"
+assert_eq "resync from a tagged source exits 0" "0" "$RS_RC"
+assert_contains "resync records the exact-match tag" "$(cat "$TMETA")" '"tag": "v97.0.0"'
+assert_contains "resync records the tag in the Codex metadata too" "$(cat "$TCMETA")" '"tag": "v97.0.0"'
+TAGGED_INSTALL="$SCRATCH/tgt-tag-install"
+new_target "$TAGGED_INSTALL"
+do_install "$SRC" "$TAGGED_INSTALL"
+assert_contains "install.sh records the exact-match tag" \
+    "$(cat "$TAGGED_INSTALL/.claude/skills/repo/install-metadata.json")" '"tag": "v97.0.0"'
+
+git -C "$SRC" tag -d v97.0.0 >/dev/null
+run_resync "$TTGT"
+assert_not_contains "resync drops the tag key once HEAD is no longer tagged" "$(cat "$TMETA")" '"tag"'
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- an explicit guard opt-out (guardHook:disabled) survives resync (repo#557) --"
 OTGT="$SCRATCH/tgt-guard-optout"
 new_target "$OTGT"
