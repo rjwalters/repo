@@ -73,6 +73,8 @@ confirm() {  # <prompt> <default: Y|N> — returns 0 to proceed; honors --yes, n
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SOURCE_ROOT/VERSION" 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# The release tag HEAD sits exactly on, if any (repo#669); empty otherwise.
+TAG="$(git -C "$SOURCE_ROOT" describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null || true)"
 
 MARKER_BEGIN='<!-- BEGIN REPO-SKILLS -->'
 MARKER_END='<!-- END REPO-SKILLS -->'
@@ -651,7 +653,7 @@ success "Installed $CMD_WRITTEN commands into .claude/commands/repo/$([[ "$CMD_P
 # shape — see that file for why one emitter matters here.
 metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
   "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
-  "$GUARD_POLICY" \
+  "$GUARD_POLICY" "$TAG" \
   >"$TARGET/.claude/skills/repo/install-metadata.json"
 success "Wrote install-metadata.json"
 
@@ -903,7 +905,7 @@ else
   # information.
   metadata_tracked_json "$VERSION" "$COMMIT" "$DEV" \
     "$([[ -n "$SKILLS_FILTER" ]] && echo true || echo false)" "$COMMANDS" "$GUARD_HOOK_INSTALLED" \
-    "$GUARD_POLICY" \
+    "$GUARD_POLICY" "$TAG" \
     >"$CODEX_SKILL_DIR/install-metadata.json"
   success "Wrote $CODEX_SKILL_REL/install-metadata.json"
   CODEX_HINT=" In Codex CLI the same workflows are the \`$CODEX_SKILL_SLUG\` skill (\`/skills\`, or type \`\$$CODEX_SKILL_SLUG\`)."
