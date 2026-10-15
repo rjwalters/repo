@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-15
+- **PR #671**: feat: tag and release each VERSION bump on main, record tag in install metadata
+- **Issue #669** (closed): VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1
 - **PR #665**: repo-remote: REPO_REMOTE_NAME overrides the box name
 - **Issue #664** (closed): repo-remote: allow overriding the box NAME (REPO_REMOTE_NAME / --name) so one checkout can drive a second dedicated box (e.g. a fit box separate from the build/test box)
 
