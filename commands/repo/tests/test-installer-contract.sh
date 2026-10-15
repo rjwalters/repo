@@ -170,6 +170,22 @@ else
 fi
 [[ "$C5_OK" == true ]] && C5=yes
 
+# repo#669: `tag` is recorded only when the source clone's HEAD is exactly on a
+# release tag, and is absent otherwise. Needs a private source clone so tagging
+# never touches the real repo.
+TAG_SRC="$SCRATCH/tag-src"; mkdir -p "$TAG_SRC"
+tar --exclude=.git -cf - -C "$REPO_ROOT" . | tar -xf - -C "$TAG_SRC"
+git -C "$TAG_SRC" init -q
+git -C "$TAG_SRC" add -A >/dev/null 2>&1
+git -C "$TAG_SRC" -c user.name=t -c user.email=t@example.com commit -qm fixture
+TAG_T1="$SCRATCH/tag-untagged"; new_target "$TAG_T1"
+HOME="$FAKE_HOME" bash "$TAG_SRC/install.sh" -y "$TAG_T1" >/dev/null 2>&1 </dev/null
+assert_not_contains "untagged source HEAD: metadata has no tag key" "$(cat "$TAG_T1/.claude/skills/repo/install-metadata.json")" '"tag"'
+git -C "$TAG_SRC" tag v9.9.9
+TAG_T2="$SCRATCH/tag-tagged"; new_target "$TAG_T2"
+HOME="$FAKE_HOME" bash "$TAG_SRC/install.sh" -y "$TAG_T2" >/dev/null 2>&1 </dev/null
+assert_contains "tagged source HEAD: metadata records the tag" "$(cat "$TAG_T2/.claude/skills/repo/install-metadata.json")" '"tag": "v9.9.9"'
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- C6: gitignored machine-local sidecar --"

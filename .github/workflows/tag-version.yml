@@ -1,0 +1,47 @@
+name: Tag VERSION bumps
+
+# Every VERSION bump that lands on main becomes an addressable release
+# (repo#669): annotated tag vX.Y.Z on the commit that set it, plus a GitHub
+# release. Idempotent — a push that leaves VERSION alone, or whose tag already
+# exists (e.g. cut by /repo:release), does nothing.
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag and release if VERSION changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          new="$(tr -d '[:space:]' < VERSION)"
+          # First push / force-push: `before` is all zeros or not in history.
+          if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            BEFORE="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          old=""
+          [[ -z "$BEFORE" ]] || old="$(git show "$BEFORE:VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+          if [[ "$old" == "$new" ]]; then
+            echo "VERSION unchanged ($new) — nothing to tag."; exit 0
+          fi
+          tag="v$new"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists — nothing to do."; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          gh release create "$tag" --verify-tag --title "$tag" --generate-notes

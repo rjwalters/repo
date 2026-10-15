@@ -28,7 +28,7 @@
 # exactly what the mismatch warning tells the operator.
 REPO_SKILLS_LAYOUT_VERSION=2
 
-# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list> [guard_hook_installed] [guard_hook_policy]
+# metadata_tracked_json <version> <commit> <dev> <filtered> <commands-newline-list> [guard_hook_installed] [guard_hook_policy] [tag]
 #
 # The TRACKED file. Every field here is a property of the release + the selected
 # command set (or, for `filtered`/`guardHookInstalled`, a deliberate decision
@@ -55,13 +55,20 @@ REPO_SKILLS_LAYOUT_VERSION=2
 # guard", which is re-evaluated on every install. Re-enabling is deleting this
 # one line from `.claude/skills/repo/install-metadata.json` and re-running
 # install.sh.
+#
+# `tag` (repo#669): the release tag (`vX.Y.Z`) the source clone's HEAD sits
+# exactly on, so a consumer can tell a released install from one taken from an
+# arbitrary main commit. Emitted only when non-empty, so it is purely additive:
+# an install from an untagged commit stays byte-identical to before. It is a
+# function of the commit alone, so it keeps the C5 machine-independence.
 metadata_tracked_json() {
   local version="$1" commit="$2" dev="$3" filtered="$4" commands="$5" \
-        guard_hook_installed="${6:-true}" guard_hook_policy="${7:-}" commands_json
+        guard_hook_installed="${6:-true}" guard_hook_policy="${7:-}" tag="${8:-}" commands_json
   commands_json="$(printf '%s\n' "$commands" | sed '/^$/d; s/.*/"&"/' | paste -sd, -)"
   echo "{"
   echo "  \"version\": \"$version\","
   echo "  \"commit\": \"$commit\","
+  [[ -n "$tag" ]] && echo "  \"tag\": \"$tag\","
   echo "  \"layout_version\": $REPO_SKILLS_LAYOUT_VERSION,"
   echo "  \"dev\": $dev,"
   echo "  \"filtered\": $filtered,"
