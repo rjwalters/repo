@@ -722,13 +722,16 @@ resolve_settings() {
 
   # REPO_REMOTE_NAME (#664) overrides the derived box name; empty/unset keeps
   # the primary-checkout / basename behavior. Validated before any cloud call.
+  # REPO_DIR is always the checkout's directory name (where the repo lives on
+  # the VM, ~/<REPO_DIR>); only NAME, the box identity, is overridable.
+  REPO_DIR="$(primary_checkout_name || true)"
+  [[ -n "$REPO_DIR" ]] || REPO_DIR="$(basename "${GIT_ROOT:-$PWD}")"
   if [[ -n "${REPO_REMOTE_NAME:-}" ]]; then
     [[ "$REPO_REMOTE_NAME" =~ ^[A-Za-z0-9._-]+$ ]] \
       || die 2 "invalid REPO_REMOTE_NAME '${REPO_REMOTE_NAME}': use only letters, digits, '.', '_' and '-'"
     NAME="$REPO_REMOTE_NAME"
   else
-    NAME="$(primary_checkout_name || true)"
-    [[ -n "$NAME" ]] || NAME="$(basename "${GIT_ROOT:-$PWD}")"
+    NAME="$REPO_DIR"
   fi
   CALLER="$(repo_remote_caller)"
 
@@ -3457,6 +3460,7 @@ attach_bootstrap() {
   [[ "$ATTACH_HAS_COMMAND" == true ]] && tty=0
   printf '%s\n' "# repo-remote attach bootstrap (repo#565): generated; carries no secret."
   printf 'rr_name=%s\n'    "$(sq "$NAME")"
+  printf 'rr_dir=%s\n'     "$(sq "${REPO_DIR:-$NAME}")"
   printf 'rr_mode=%s\n'    "$(sq "$ATTACH_MODE")"
   printf 'rr_tty=%s\n'     "$tty"
   printf 'rr_cmd=%s\n'     "$(sq "$ATTACH_COMMAND")"
@@ -3549,7 +3553,7 @@ if [ "$rr_use_ctr" = 1 ]; then
   if [ "$rr_tty" = 1 ]; then exec "$@" bash -l; fi
   exec "$@" bash -lc "$rr_cmd"
 fi
-cd "$HOME/$rr_name" 2>/dev/null || cd "$HOME" || exit 98
+cd "$HOME/$rr_dir" 2>/dev/null || cd "$HOME" || exit 98
 if [ "$rr_tty" = 1 ]; then exec "${SHELL:-/bin/sh}" -l; fi
 exec "${SHELL:-/bin/sh}" -lc "$rr_cmd"
 EOF

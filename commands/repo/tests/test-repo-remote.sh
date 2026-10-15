@@ -3346,6 +3346,17 @@ reset_mint
 run_rr MOCK_SSH_HOST_ID=i-0pinnedbox MOCK_VM_SHELL_RC=5 -- attach --host --command "false"
 assert_eq "--command: attach exits with the remote command's status" "5" "$RR_RC"
 
+# (d2) REPO_REMOTE_NAME (#664) renames the box, not the repo directory: the host
+#      shell must still land in ~/<checkout-name>, not fall back to $HOME.
+mkdir -p "$VM_HOME/myrepo"
+reset_mint
+run_rr MOCK_SSH_HOST_ID=i-0pinnedbox -- attach --host
+assert_eq "--host: lands in ~/<checkout-name>" "$VM_HOME/myrepo" "$(cat "$MOCK_VM_LOG.shellpwd" 2>/dev/null)"
+reset_mint
+run_rr REPO_REMOTE_NAME=fit MOCK_SSH_HOST_ID=i-0pinnedbox -- attach --host
+assert_eq "--host with REPO_REMOTE_NAME: exit 0" "0" "$RR_RC"
+assert_eq "--host with REPO_REMOTE_NAME: still lands in ~/<checkout-name>, not \$HOME" "$VM_HOME/myrepo" "$(cat "$MOCK_VM_LOG.shellpwd" 2>/dev/null)"
+
 # (e) Static token (repo#627): refused (exit 2, before connecting) without the
 #     break-glass opt-out, naming the device flow as the replacement. With
 #     REPO_REMOTE_ALLOW_STATIC_GH_TOKEN=1 it is delivered the same way, under
