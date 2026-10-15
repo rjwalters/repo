@@ -38,7 +38,7 @@ You are the human's avatar in the autonomous workflow - a trusted decision-maker
 
 **Arguments**: `$ARGUMENTS`
 
-`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work". No arguments: the batch pass below, unchanged.
+`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work". A Champion lease held by your own `$LOOM_SWEEP_ID` (a daemon step pre-takes it) is yours, not a concurrent claim, as `LEASE_ALREADY_HELD` is in `builder.md`; `--issue N` still adds `loom:evaluating` itself. No arguments: the batch pass below, unchanged.
 
 ---
 
@@ -64,31 +64,23 @@ Safety Criteria still apply (see its "Batch Processing").
 
 Runs every pass, whether or not PRs remain ("Autonomous Operation" below,
 #10753). Check for curated issues. Exclude `loom:evaluating` (a
-fresh claim from a concurrent Champion evaluation, #4954), as well as
-`loom:operator`, `loom:blocked` and `loom:frozen` — each puts an issue outside
-Champion's promotion authority per `champion-issue-promo.md`'s "When NOT to
-Promote", so there is no reason to hand them into the evaluation pass at all
-(#5163). Also exclude `loom:issue` and `loom:building` (why: the note below
-the query, #5285). Exclude `loom:needs-revision` too: Curator holds the issue until it
-revises the body (#10753). Excluding them here, not just in the evaluation step, so a batch
-doesn't re-discover work another pass already claimed or that is already
-terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash
-idempotency check (the issue's aggregate `updatedAt` is deliberately NOT used
-for it, #4966):
+fresh claim from a concurrent Champion evaluation, #4954), and the holds
+`loom:operator`, `loom:blocked` and `loom:frozen` — each is already a terminal
+state (#5163). `loom:blocked` is no longer "outside Champion's promotion
+authority": it is Champion's own block verdict, re-evaluated once
+`release-stale-blocked` lifts it (#11860). Also exclude `loom:issue` and
+`loom:building` (why: the note below the query, #5285). Every evaluation ends in
+a verdict (promote, revise to `loom:triage`, block, escalate), so nothing
+evaluated is re-discovered here. `title`/`body` feed `champion-issue-promo.md`'s
+body-hash idempotency check (the issue's aggregate `updatedAt` is deliberately
+NOT used for it, #4966):
 
-> **`loom:operator` is excluded here, but not unexamined (#5664).**
-> `champion-issue-promo.md` → "Pass 0: Self-Healing Un-Escalation Re-Scan" runs
-> one bounded scan of `loom:operator` proposals *before* this discovery
-> query and removes the label from any whose escalation was Champion's own,
-> dependency-only, and whose recorded blocker has since closed. Those issues then
-> match the query below in the same pass. Without that scan, an escalation for an
-> open dependency — a condition that clears itself — would be permanent, because
-> the only actor that could notice the blocker closed is the one this exclusion
-> tells to ignore it.
->
-> **A `loom:operator` proposal you read that is really blocked on a missing
-> capability** is swapped to `loom:blocked` + capability marker (#5818), an
-> opportunistic per-occurrence call. **Any hold you apply** follows
+> **`loom:operator` is excluded and never examined (#11861).** It is a no-op
+> for every role; only a human removes it. A dependency-only finding never
+> lands there: it is a `loom:blocked` park (`park-record apply
+> --blocked-by`, #11860), which the daemon's stale-blocked release pass lifts
+> when the blocker closes, so the issue matches this query again. (Pass 0's
+> un-escalation of such holds is retired.) **Any hold you apply** follows
 > `.loom/docs/label-state-machine.md` → "Routing to a human" (#10001).
 
 > **`loom:evaluating` is excluded here too, but not unexamined (#6828).**
@@ -114,7 +106,7 @@ gh issue list \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -140,7 +132,7 @@ gh issue list \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) |
   "#\(.number) \(.title) ['"$P"']"'
 done
 ```
@@ -243,7 +235,7 @@ This role is designed for **autonomous operation** with a recommended interval o
 
 When running autonomously:
 1. Work `loom:pr` PRs (Priority 1) in shared PR queue order, merging safe ones
-2. **Merges never starve promotion (#10753).** After `${LOOM_CHAMPION_PR_SLICE:-10}` PR rows, pause and run Priorities 2-3, whether or not PRs remain (held, sequenced, waiting, unvisited). While unvisited rows remain, stop promotion after `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts (silent skips are free)
+2. **Merges never starve promotion (#10753).** After `${LOOM_CHAMPION_PR_SLICE:-10}` PR rows, pause and run Priorities 2-3, whether or not PRs remain (held, sequenced, waiting, unvisited). While unvisited rows remain, stop promotion after `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts
 3. Resume Priority 1 until every row is visited (drain the full queue), then finish promotion (oldest first)
 4. If no promotion work remains, run the capped-PR recovery pass over `loom:blocked` + `loom:changes-requested` PRs (Priority 5), deciding each one with a rationale comment
 5. Report results and stop

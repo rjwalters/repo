@@ -690,7 +690,8 @@ covers created → curated, curated → `loom:issue`, building → review reques
 and review requested → merged. Beside the per-label counts, `stage_items` has
 queue states from one ETag-cached open-items walk per repo (#11847):
 `triage`, `unlabeled`, `curated_not_promoted`, `issue_open_pr`,
-`issue_no_pr`, `parked` and `pr_held`. They are absent, not `0`, for a repo
+`issue_no_pr`, `parked`, `pr_held` and `pr_champion_held` (the Champion-hold
+label shape, `loom:pr` + `loom:blocked`, #11905; it reads no marker, so markerless parks count too). They are absent, not `0`, for a repo
 whose walk did not complete. `stage_items` is per repo, so a per-host total is `sum by (state)`, and the
 states overlap, so never sum across them. It reads ETag-cached stage listings every 5
 minutes plus at most 8 per-item reads per sample, never per tick. With
@@ -749,9 +750,15 @@ the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`,
 `write_scope` (#9548) — so
 "which hold is this repo under" is filterable straight from the span, no
 join needed. The attribute is absent on a cause-less legacy row (a
-pre-#9017 caller); the `loom.dispatch.tick`-span join
-(`loom.dispatch.result="halted_main_red"` through `parentSpanID`) remains
-the fallback there.
+pre-#9017 caller); the fallback there is the `loom.dispatch.tick`-span join
+through `parentSpanID`, reading the tick's `loom.dispatch.halt_causes`
+(comma-separated tokens). Do not key that join on
+`loom.dispatch.result="halted_main_red"`: since #11857 the result names a
+hold only when it covered the tick's work, so a tick that held one root
+beside healthy roots with candidates carries its per-candidate result
+(`all_skipped`, `no_eligible_work`, ...). `loom.dispatch.halt_causes` is
+still emitted on such a partial hold, and `loom.dispatch.held_roots` counts
+the held roots.
 
 A runnable copy of the "why hasn't `owner/repo#N` started" query is query 5 of
 `defaults/observability/signoz/queue-dwell.sql` — that file's other four
