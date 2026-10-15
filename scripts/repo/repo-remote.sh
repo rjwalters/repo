@@ -131,6 +131,15 @@
 # settings out of the tree and set REPO_REMOTE_ENV_FILE. The primary checkout
 # is unaffected (no warning).
 #
+# Box name override (#664): the box identity (instance tag repo-remote=<name>,
+# SSH alias repo-remote-<name>, security-group names, SSH-ingress marker) is
+# normally the primary checkout's directory name. Set REPO_REMOTE_NAME=<name>
+# (environment, shared remote.env, or the per-repo env file) to target a
+# different box from the same checkout, e.g. a separate big-RAM "fit" box next
+# to the build/test box, each with its own remote-run lock. Allowed characters:
+# [A-Za-z0-9._-]; anything else exits 2 before any cloud call. Empty/unset
+# leaves the derived name unchanged.
+#
 # Cost gate (repo#52 — the highest-cost-of-being-wrong element): `up` (with or
 # without --yes) REQUIRES the provider, that provider's credentials, and
 # REPO_REMOTE_INSTANCE_TYPE to be present in config. Instance type is the
@@ -711,8 +720,19 @@ resolve_settings() {
   # lower-case the provider
   PROVIDER="$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')"
 
-  NAME="$(primary_checkout_name || true)"
-  [[ -n "$NAME" ]] || NAME="$(basename "${GIT_ROOT:-$PWD}")"
+  # REPO_REMOTE_NAME (#664) overrides the derived box name; empty/unset keeps
+  # the primary-checkout / basename behavior. Validated before any cloud call.
+  # REPO_DIR is always the checkout's directory name (where the repo lives on
+  # the VM, ~/<REPO_DIR>); only NAME, the box identity, is overridable.
+  REPO_DIR="$(primary_checkout_name || true)"
+  [[ -n "$REPO_DIR" ]] || REPO_DIR="$(basename "${GIT_ROOT:-$PWD}")"
+  if [[ -n "${REPO_REMOTE_NAME:-}" ]]; then
+    [[ "$REPO_REMOTE_NAME" =~ ^[A-Za-z0-9._-]+$ ]] \
+      || die 2 "invalid REPO_REMOTE_NAME '${REPO_REMOTE_NAME}': use only letters, digits, '.', '_' and '-'"
+    NAME="$REPO_REMOTE_NAME"
+  else
+    NAME="$REPO_DIR"
+  fi
   CALLER="$(repo_remote_caller)"
 
   INSTANCE_TYPE="${REPO_REMOTE_INSTANCE_TYPE:-}"
@@ -3440,6 +3460,7 @@ attach_bootstrap() {
   [[ "$ATTACH_HAS_COMMAND" == true ]] && tty=0
   printf '%s\n' "# repo-remote attach bootstrap (repo#565): generated; carries no secret."
   printf 'rr_name=%s\n'    "$(sq "$NAME")"
+  printf 'rr_dir=%s\n'     "$(sq "${REPO_DIR:-$NAME}")"
   printf 'rr_mode=%s\n'    "$(sq "$ATTACH_MODE")"
   printf 'rr_tty=%s\n'     "$tty"
   printf 'rr_cmd=%s\n'     "$(sq "$ATTACH_COMMAND")"
@@ -3532,7 +3553,7 @@ if [ "$rr_use_ctr" = 1 ]; then
   if [ "$rr_tty" = 1 ]; then exec "$@" bash -l; fi
   exec "$@" bash -lc "$rr_cmd"
 fi
-cd "$HOME/$rr_name" 2>/dev/null || cd "$HOME" || exit 98
+cd "$HOME/$rr_dir" 2>/dev/null || cd "$HOME" || exit 98
 if [ "$rr_tty" = 1 ]; then exec "${SHELL:-/bin/sh}" -l; fi
 exec "${SHELL:-/bin/sh}" -lc "$rr_cmd"
 EOF

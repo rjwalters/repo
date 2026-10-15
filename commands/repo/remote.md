@@ -191,6 +191,19 @@ recommending `REPO_REMOTE_ENV_FILE`. The read/write still happens; the primary
 checkout never warns. When operating by hand from a linked worktree, say the
 same thing to the user rather than silently updating that file.
 
+**Naming a second box (`REPO_REMOTE_NAME`).** A box's identity (the
+`repo-remote=<name>` tag, the `repo-remote-<name>` SSH alias, the security-group
+names and the SSH-ingress marker) defaults to the primary checkout's directory
+name, so one checkout drives one box. Set `REPO_REMOTE_NAME=<name>` (process
+environment, shared `remote.env`, or the per-repo file) to use a different name
+and therefore a fully distinct box. The typical use is a **build/test box** (the
+default, fast pre-CI builds) plus a separate **fit box** (big-RAM, long-running
+jobs) for the same repo: the per-box `remote-run` lock then no longer serializes
+the two. Give the second box its own `REPO_REMOTE_ENV_FILE` so it pins its own
+instance id and sizing. Only `[A-Za-z0-9._-]` is allowed; anything else exits 2
+before any cloud call. Empty or unset keeps the derived name. It also overrides
+the name in a linked worktree.
+
 Variables are namespaced `REPO_REMOTE_*` so they don't collide with the app's
 own vars; the provisioning credentials use their standard cloud names. Either
 file may set any variable — the split below is the recommended home for each,
