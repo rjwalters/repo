@@ -186,8 +186,18 @@ claude_md_block_rewrite() {  # <file> <begin> <end> [block-file]
   fi
   CLAUDE_MD_BLOCK_BACKUP="$backup"
 
-  if ! tmp="$(mktemp)"; then
-    CLAUDE_MD_BLOCK_ERROR="could not create a temporary file"
+  # The temporary file sits next to the real target, so the `mv` below is a
+  # same-directory (atomic) rename. It is seeded with `cp -p` so it carries the
+  # target's mode: a bare mktemp file is 0600, and the rename would otherwise
+  # leave CLAUDE.md (or the file it links to) readable by its owner only.
+  # Writing the new content truncates the copy, keeping that mode.
+  if ! tmp="$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX")"; then
+    CLAUDE_MD_BLOCK_ERROR="could not create a temporary file next to $file"
+    return 1
+  fi
+  if ! cp -p "$file" "$tmp"; then
+    rm -f "$tmp"
+    CLAUDE_MD_BLOCK_ERROR="could not prepare the temporary file $tmp"
     return 1
   fi
   if ! printf '%s' "$content" >"$tmp"; then
