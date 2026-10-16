@@ -402,7 +402,7 @@ fi
 # ---------------------------------------------------------------------------
 PLAN_SRC=(); PLAN_DST=(); PLAN_EXEC=(); PLAN_XFORM=()
 
-plan() {  # <source-rel> <dest-rel> <exec:0|1> [transform: render|codex-skill]
+plan() {  # <source-rel> <dest-rel> <exec:0|1> [transform: render|codex-skill|codex-command]
   PLAN_SRC+=("$1"); PLAN_DST+=("$2"); PLAN_EXEC+=("$3"); PLAN_XFORM+=("${4:-render}")
 }
 
@@ -458,6 +458,15 @@ if [[ "$CODEX_EMITTER" == true ]] && codex_skill_is_managed "$TARGET/$CODEX_SKIL
   while IFS= read -r cmd; do
     [[ -n "$cmd" ]] || continue
     plan "commands/repo/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md" 0
+    # The native per-command skill ($repo-<verb>). A same-named directory whose
+    # SKILL.md lacks the marker is someone else's skill: never planned, so never
+    # written over.
+    cmd_skill_rel="$CODEX_SKILLS_ROOT_REL/$(codex_command_slug "$cmd")/SKILL.md"
+    if [[ -f "$TARGET/$cmd_skill_rel" ]] && ! codex_skill_is_managed "$TARGET/$cmd_skill_rel"; then
+      warn "$cmd_skill_rel is not managed by Repo Skills — left alone"
+    else
+      plan "commands/repo/$cmd.md" "$cmd_skill_rel" 0 codex-command
+    fi
   done <<<"$COMMANDS"
 fi
 
@@ -485,6 +494,7 @@ report() {  # <verb> <colour> <dest-rel> [detail]
 emit() {
   case "$2" in
     codex-skill) codex_skill_render "$1" "$COMMANDS" ;;
+    codex-command) codex_command_skill_render "$1" ;;
     *)           render <"$1" ;;
   esac
 }
@@ -697,7 +707,13 @@ done
 # ---------------------------------------------------------------------------
 ORPHANS=()
 ORPHAN_DIRS=("$TARGET/.claude/commands/repo" "$SKILL_ROOT" "$SKILL_ROOT/hooks" "$SKILL_ROOT/scripts")
-[[ -n "$CODEX_ROOT" ]] && ORPHAN_DIRS+=("$CODEX_ROOT" "$CODEX_ROOT/references")
+if [[ -n "$CODEX_ROOT" ]]; then
+  ORPHAN_DIRS+=("$CODEX_ROOT" "$CODEX_ROOT/references")
+  # Managed per-command skill dirs only: a foreign repo-* skill is not ours to report.
+  for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG"-*/; do
+    [[ -d "$d" ]] && codex_skill_is_managed "$d/SKILL.md" && ORPHAN_DIRS+=("${d%/}")
+  done
+fi
 for d in "${ORPHAN_DIRS[@]}"; do
   [[ -d "$d" ]] || continue
   for f in "$d"/*; do
@@ -742,7 +758,12 @@ resync_ignore_warn_dead_pins
 # ---------------------------------------------------------------------------
 if [[ "$GITIGNORE_CHECK_AVAILABLE" == true ]]; then
   GITIGNORE_SWEEP_DIRS=("$SKILL_ROOT" "$TARGET/.claude/commands/repo")
-  [[ -n "$CODEX_ROOT" ]] && GITIGNORE_SWEEP_DIRS+=("$CODEX_ROOT")
+  if [[ -n "$CODEX_ROOT" ]]; then
+    GITIGNORE_SWEEP_DIRS+=("$CODEX_ROOT")
+    for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG"-*/; do
+      [[ -d "$d" ]] && codex_skill_is_managed "$d/SKILL.md" && GITIGNORE_SWEEP_DIRS+=("${d%/}")
+    done
+  fi
   warn_gitignored_payload "$TARGET" "${GITIGNORE_SWEEP_DIRS[@]}"
 fi
 

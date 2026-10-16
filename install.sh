@@ -392,6 +392,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $TARGET/$CODEX_SKILL_REL/install-metadata.json"
     while IFS= read -r cmd; do
       echo "  $TARGET/$CODEX_REFERENCES_REL/$cmd.md"
+      echo "  $TARGET/$CODEX_SKILLS_ROOT_REL/$(codex_command_slug "$cmd")/SKILL.md (native Codex skill \$$(codex_command_slug "$cmd"))"
     done <<<"$COMMANDS"
   fi
   if [[ "$DEV" == true ]]; then
@@ -863,6 +864,42 @@ else
     fi
   done <<<"$COMMANDS"
   success "Installed $CODEX_REF_WRITTEN command procedures into $CODEX_REFERENCES_REL/$([[ "$CODEX_REF_PINNED" -gt 0 ]] && echo " ($CODEX_REF_PINNED pinned as repo-owned, left alone)")"
+
+  # One native Codex skill per command ($repo-<verb>), generated from the same
+  # commands/repo/<verb>.md. Generated, never symlinked (frontmatter differs), and
+  # ownership is proven per directory: `.agents/skills/repo-<verb>/` may be
+  # someone else's skill. A filtered install also retires managed repo-<verb>/
+  # directories for verbs it no longer includes, so install stays idempotent.
+  CODEX_CMD_WRITTEN=0
+  while IFS= read -r cmd; do
+    [[ -n "$cmd" ]] || continue
+    cmd_rel="$CODEX_SKILLS_ROOT_REL/$(codex_command_slug "$cmd")/SKILL.md"
+    if [[ -f "$TARGET/$cmd_rel" ]] && ! codex_skill_is_managed "$TARGET/$cmd_rel"; then
+      warning "$cmd_rel exists but carries no Repo Skills marker; leaving it untouched."
+    elif resync_ignore_is_pinned "$cmd_rel"; then
+      info "Pinned (repo-owned, left alone): $cmd_rel"
+    else
+      mkdir -p "$TARGET/$(dirname "$cmd_rel")"
+      CODEX_CMD_TMP="$(mktemp)"
+      if codex_command_skill_render "$SOURCE_ROOT/commands/repo/$cmd.md" >"$CODEX_CMD_TMP"; then
+        assert_no_placeholders "$CODEX_CMD_TMP" "$cmd_rel"
+        mv "$CODEX_CMD_TMP" "$TARGET/$cmd_rel"
+        CODEX_CMD_WRITTEN=$((CODEX_CMD_WRITTEN + 1))
+      else
+        rm -f "$CODEX_CMD_TMP"
+        error "Could not render $cmd_rel: commands/repo/$cmd.md has no 'description' in its frontmatter."
+      fi
+    fi
+  done <<<"$COMMANDS"
+  success "Installed $CODEX_CMD_WRITTEN native Codex command skills ($CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG-<verb>/)"
+  for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG"-*/; do
+    [[ -d "$d" ]] || continue
+    v="$(basename "$d")"; v="${v#"$CODEX_SKILL_SLUG"-}"
+    if ! grep -qxF "$v" <<<"$COMMANDS" && codex_skill_is_managed "$d/SKILL.md"; then
+      rm -rf "$d"
+      info "Removed stale Codex command skill $CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG-$v/ (not in this install)"
+    fi
+  done
   CODEX_INSTALLED=true
 
   # Same tracked-metadata emitter and same C5 guarantees as the Claude surface,
@@ -976,6 +1013,15 @@ if [[ "$DEV" == true ]]; then
       echo "$CODEX_SKILL_REL/"; } >>"$GITIGNORE"
     success "Added $CODEX_SKILL_REL/ to .gitignore"
   fi
+  # The per-command skills are machine-local in dev mode too. A glob scoped to
+  # the repo- prefix, so foreign skills in .agents/skills/ stay visible to git.
+  if [[ "$CODEX" == true ]] && ! codex_target_is_foreign \
+    && { [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG-*/" "$GITIGNORE"; }; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
+      echo "# Repo Skills dev-mode Codex command skills (machine-local, do not commit)"
+      echo "$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG-*/"; } >>"$GITIGNORE"
+    success "Added $CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG-*/ to .gitignore"
+  fi
   reconcile_orphaned_block
   echo ""
   success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code.$CODEX_HINT"
@@ -1022,7 +1068,13 @@ dest_is_gitignored() {
 # installed content (repo#425).
 run_gitignore_sweep() {
   local -a payload_dirs=("$TARGET/.claude/skills/repo" "$TARGET/.claude/commands/repo")
-  [[ "$CODEX_INSTALLED" == true ]] && payload_dirs+=("$CODEX_SKILL_DIR")
+  if [[ "$CODEX_INSTALLED" == true ]]; then
+    payload_dirs+=("$CODEX_SKILL_DIR")
+    local d
+    for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG"-*/; do
+      [[ -d "$d" ]] && payload_dirs+=("${d%/}")
+    done
+  fi
   warn_gitignored_payload "$TARGET" "${payload_dirs[@]}"
 }
 

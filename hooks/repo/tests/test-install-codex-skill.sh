@@ -446,6 +446,88 @@ assert_eq "dev: re-installing does not duplicate the .gitignore entry" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- one native Codex skill per command (repo#676, part a) --"
+# File checks only. A fresh Codex session selecting $repo-<verb> is a runtime
+# receipt this shell suite cannot produce; it is recorded manually in the PR.
+
+AGENTS_REL=".agents/skills"
+EXPECTED_VERBS="$(cd "$REPO_ROOT/commands/repo" && ls *.md | sed 's/\.md$//' | LC_ALL=C sort)"
+discovered() {  # <target> -> sorted skill dir names under .agents/skills
+    ( cd "$1/$AGENTS_REL" 2>/dev/null && for d in */; do [[ -f "${d}SKILL.md" ]] && echo "${d%/}"; done | LC_ALL=C sort )
+}
+
+T20="$(new_target percmd)"
+install_into "$T20" >/dev/null
+WANT="$( { echo repo; sed 's/^/repo-/' <<<"$EXPECTED_VERBS"; } | LC_ALL=C sort)"
+assert_eq "percmd: discovered skill set is {repo, repo-<verb>...}" "$WANT" "$(discovered "$T20")"
+
+NAMES=""; BAD=""
+for d in "$T20/$AGENTS_REL"/repo-*/; do
+    n="$(basename "$d")"; f="$d/SKILL.md"
+    [[ "$(fm "$f" name)" == "$n" ]] || BAD+=" name!=dir:$n"
+    [[ -n "$(fm "$f" description)" ]] || BAD+=" no-description:$n"
+    [[ "$n" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#n} -le 64 ]] || BAD+=" bad-slug:$n"
+    grep -qF "$MARKER" "$f" || BAD+=" no-marker:$n"
+    grep -qE '^(type|user-invocable):' "$f" && BAD+=" claude-keys:$n"
+    NAMES+="$(fm "$f" name)"$'\n'
+done
+assert_eq "percmd: every skill has name==dir, description, slug, marker, no Claude keys" "" "$BAD"
+assert_eq "percmd: names are unique" "" "$(printf '%s' "$NAMES" | sort | uniq -d)"
+assert_eq "percmd: description is the command's own description" \
+          "$(fm "$REPO_ROOT/commands/repo/audit.md" description)" "$(fm "$T20/$AGENTS_REL/repo-audit/SKILL.md" description)"
+assert_eq "percmd: no leaked /repo:<verb> cross-references in the Codex skills" "" \
+          "$(sed '/^> Codex invocation/d' "$T20"/$AGENTS_REL/repo-*/SKILL.md | grep -E '/repo:[a-z]' | head -3)"
+assert_contains "percmd: umbrella points at the native skills" \
+          "$(cat "$T20/$CODEX_REL/SKILL.md")" '$repo-audit'
+
+FP20="$(fingerprint "$T20/$AGENTS_REL")"
+install_into "$T20" >/dev/null
+assert_eq "percmd: re-install changes nothing" "$FP20" "$(fingerprint "$T20/$AGENTS_REL")"
+
+# Resync: no phantom drift, and a drifted per-command skill is repaired.
+RS20="$T20/.claude/skills/repo/scripts/resync-installed.sh"
+assert_contains "percmd: resync of a fresh install reports no drift" \
+                "$(HOME="$FAKE_HOME" bash "$RS20" --target "$T20" 2>&1)" "Already in sync"
+echo "tampered" >> "$T20/$AGENTS_REL/repo-audit/SKILL.md"
+HOME="$FAKE_HOME" bash "$RS20" --target "$T20" >/dev/null 2>&1
+assert_eq "percmd: resync repairs a drifted command skill" "$FP20" "$(fingerprint "$T20/$AGENTS_REL")"
+
+# Filtered install, then widening and narrowing.
+T21="$(new_target percmd-filtered)"
+install_into "$T21" --skills=tidy,audit >/dev/null
+assert_eq "percmd: --skills= installs the selected command skills (+ help, always included)" \
+          "$(printf 'repo\nrepo-audit\nrepo-help\nrepo-tidy')" "$(discovered "$T21")"
+install_into "$T21" --skills=tidy >/dev/null
+assert_eq "percmd: narrowing the filter retires the dropped managed skill" \
+          "$(printf 'repo\nrepo-help\nrepo-tidy')" "$(discovered "$T21")"
+
+# --no-codex writes none; --dev gitignores the glob without hiding foreign skills.
+T22="$(new_target percmd-nocodex)"
+install_into "$T22" --no-codex >/dev/null
+assert_absent "percmd: --no-codex writes no .agents/skills" "$T22/$AGENTS_REL"
+T23="$(new_target percmd-dev)"
+install_into "$T23" --dev >/dev/null
+assert_file "percmd: --dev writes the command skills" "$T23/$AGENTS_REL/repo-decide/SKILL.md"
+assert_contains "percmd: --dev ignores the repo-* glob" "$(cat "$T23/.gitignore")" "$AGENTS_REL/repo-*/"
+
+# Ownership + uninstall: foreign skills and an unmarked repo-<verb> survive.
+T24="$(new_target percmd-foreign)"
+mkdir -p "$T24/$AGENTS_REL/foo" "$T24/$AGENTS_REL/repo-decide"
+printf 'mine\n' > "$T24/$AGENTS_REL/foo/SKILL.md"
+printf 'mine too\n' > "$T24/$AGENTS_REL/repo-decide/SKILL.md"
+OUT24="$(install_into "$T24")"
+assert_eq "percmd: an unmarked repo-decide is not overwritten" "mine too" "$(cat "$T24/$AGENTS_REL/repo-decide/SKILL.md")"
+assert_contains "percmd: install warns about the unmarked skill" "$OUT24" "repo-decide/SKILL.md exists but carries no Repo Skills marker"
+assert_file "percmd: the other command skills still install" "$T24/$AGENTS_REL/repo-audit/SKILL.md"
+HOME="$FAKE_HOME" bash "$T24/.claude/skills/repo/scripts/resync-installed.sh" --target "$T24" >/dev/null 2>&1
+assert_eq "percmd: resync leaves the unmarked skill alone" "mine too" "$(cat "$T24/$AGENTS_REL/repo-decide/SKILL.md")"
+HOME="$FAKE_HOME" bash "$UNINSTALL_SH" -y "$T24" >/dev/null 2>&1
+assert_eq "percmd: uninstall keeps the foreign and unmarked skills only" \
+          "$(printf 'foo\nrepo-decide')" "$(discovered "$T24")"
+assert_absent "percmd: uninstall removed a managed command skill" "$T24/$AGENTS_REL/repo-audit"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

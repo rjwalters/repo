@@ -133,7 +133,18 @@ codex_dir_is_ours() {
   [[ -d "$CODEX_SKILL_DIR" ]] && codex_skill_is_managed "$CODEX_SKILL_MD"
 }
 
+# The per-command skills ($repo-<verb>), each proven ours by its own marker. A
+# hand-made repo-<verb>/ without the marker is never listed.
+codex_command_dirs_ours() {
+  local d
+  for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_SKILL_SLUG"-*/; do
+    [[ -d "$d" ]] && codex_skill_is_managed "$d/SKILL.md" && printf '%s\n' "${d%/}"
+  done
+  return 0
+}
+
 [[ -d "$TARGET/.claude/skills/repo" || -d "$TARGET/.claude/commands/repo" ]] || codex_dir_is_ours \
+  || [[ -n "$(codex_command_dirs_ours)" ]] \
   || { info "No Repo Skills install found in $TARGET"; exit 0; }
 
 echo "Will remove from $TARGET:"
@@ -145,6 +156,9 @@ elif [[ -d "$CODEX_SKILL_DIR" ]]; then
   echo "Will NOT remove (present but not marked as installed by Repo Skills):"
   echo "  $CODEX_SKILL_REL/"
 fi
+while IFS= read -r d; do
+  [[ -n "$d" ]] && echo "  $CODEX_SKILLS_ROOT_REL/$(basename "$d")/ (native Codex command skill)"
+done < <(codex_command_dirs_ours)
 grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md" 2>/dev/null && echo "  CLAUDE.md REPO-SKILLS block"
 if [[ -f "$TARGET/.claude/settings.json" ]] && \
    jq -e --arg c "$HOOK_CMD" '(.hooks.PreToolUse // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
@@ -195,6 +209,13 @@ elif [[ -d "$CODEX_SKILL_DIR" ]]; then
   warning "Left $CODEX_SKILL_REL/ in place: its SKILL.md carries no Repo Skills marker,"
   warning "so it was authored elsewhere. Remove it by hand if you do want it gone."
 fi
+
+while IFS= read -r d; do
+  [[ -n "$d" ]] || continue
+  rm -rf "$d"
+  success "Removed $CODEX_SKILLS_ROOT_REL/$(basename "$d")/"
+done < <(codex_command_dirs_ours)
+rmdir "$TARGET/$CODEX_SKILLS_ROOT_REL" "$TARGET/$(dirname "$CODEX_SKILLS_ROOT_REL")" 2>/dev/null || true
 
 # Remove the settings.json hook entry BEFORE pruning empty .claude dirs, so the
 # rmdir below can clean up an empty .claude if settings.json was the only file.
