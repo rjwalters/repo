@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-15
+- **PR #671**: feat: tag and release each VERSION bump on main, record tag in install metadata
+- **Issue #669** (closed): VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1
 - **PR #665**: repo-remote: REPO_REMOTE_NAME overrides the box name
 - **Issue #664** (closed): repo-remote: allow overriding the box NAME (REPO_REMOTE_NAME / --name) so one checkout can drive a second dedicated box (e.g. a fit box separate from the build/test box)
 
@@ -21,6 +23,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #652** (closed): Dependabot default 1/5: policy model (provider=dependabot, cooldown) (#638)
 
 ### 2026-10-13
+- **Issue #140** (closed): README: embed the fleet burndown chart (one line)
 - **PR #651**: fix(guard): anchor scratch-clone exemption family on CLAUDE_PROJECT_DIR (#635)
 - **PR #650**: Dependabot: render dependabot.yml from the org policy
 - **PR #648**: Remove Renovate config: Dependabot takes over
@@ -76,12 +79,14 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #597** (closed): Write-confinement: treat same-command NAME=$(mktemp -d /tmp/<prefix>.XXXX) as proven /tmp-rooted
 
 ### 2026-10-09
+- **Issue #159** (closed): T1 item 11: declare ties[] in the array supply spec, re-run klt erc, and cite the ERC and LVS reports together
 - **PR #595**: Guard: reconcile Loom environment, service, stash and index rules (#585)
 - **Issue #585** (closed): Guard: reconcile Loom environment service stash and index rules
 - **PR #594**: guard: port Loom read-only fast path pipelines, reserved extras, tiered config (#584)
 - **Issue #584** (closed): Guard: reconcile Loom read-only fast path and configuration precedence
 
 ### 2026-10-08
+- **Issue #150** (closed): Guard-decision review: rm-scope-unresolved-var never got its own #3898 review, propose keep-flagged
 - **PR #592**: Guard: reconcile Loom write confinement and managed worktree rules (#582)
 - **PR #591**: Guard: port cargo clean scope while preserving tmpfs target-dir resolution
 - **Issue #583** (closed): Guard: port cargo clean scope while preserving tmpfs target-dir resolution
@@ -110,6 +115,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #559** (closed): repo-remote (AWS): root volume launches as gp2 (default) — burst credits drain under sustained builds/tests and the box crawls; launch gp3 and expose REPO_REMOTE_VOLUME_TYPE/IOPS/THROUGHPUT
 - **Issue #556** (closed): /repo:followups: write a <!-- loom:requested-by login=… via=… --> marker naming who asked
 ### 2026-10-03
+- **Issue #144** (closed): Guard telemetry review 2026-09-28: all four logged patterns confirmed correct denials (keep flagged)
+- **Issue #126** (closed): OPERATOR: bronze (T1) grant decision — 10/10 read since 2026-08-22, all holes closed, item 11 now outstanding
 - **PR #555**: fix(guard): single-quoted spans inert in vendored qsplit() (#447)
 - **Issue #447** (closed): Upstream the repo#443 single-quoted-span inertness fix to Loom's vendored guard
 ### 2026-10-02
@@ -121,6 +128,7 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #551** (closed): deps --check (and /repo:all) does not report open Dependabot security alerts
 - **Issue #548** (closed): guard: an escaped \" in a double-quoted span hides a write into the main checkout
 ### 2026-09-30
+- **Issue #141** (closed): loom:curating claim label stuck on PR #139 for 2+ days — Curator dispatch mismatched a PR number for an issue
 - **PR #549**: fix(guard): make subst_depth() quote-aware inside an open $( ) substitution
 - **PR #547**: fix(guard): port the repo#436/#437 separator-inside-$( ) fixes to Loom's vendored guard
 - **PR #546**: fix(guard): port repo#439 subst_heads() into Loom's vendored guard
@@ -151,6 +159,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **Issue #439** (closed): Worktree-write-confinement: a quoted single-command $( ) substitution writes into the main checkout in both guards
 
 ### 2026-09-29
+- **Issue #153** (closed): Consolidate duplicated PVT corner-matrix constants: compare_records.py should reuse render_signoff_table's CORNER_ORDER
+- **Issue #149** (closed): Remove duplicated latest_mc_record_for_claim: reuse signoff.latest_record_for_claim
 - **Issue #524** (closed): test: hooks/repo/tests fixtures are not hermetic against inherited core.hooksPath (git-fixture.sh header claims they are)
 - **PR #525**: test: remove stray `.` line and mojibake left by the #518 adoption commit
 - **Issue #518** (closed): test-changelog-merged-work-check.sh fails under Loom dispatch: provenance-hook trailers leak into fixture commits
@@ -235,6 +245,13 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - **PR #452**: fix: scope single-quoted-span inertness to the top level of ml_segment()
 - **Issue #443** (closed): rmScope guard denies rm inside a remote command string (ssh host '…') — classify remote deletions separately and default them to ask
 - **PR #446**: fix(guard): treat single-quoted spans as inert in ml_segment() (#443)
+
+### 2026-09-21
+- **Issue #133** (closed): layout/reports/README.md's array-level LVS section is stale: documents mismatch, lvs-array.json now reads match
+- **Issue #128** (closed): Machine-gradeable T1 rows: re-mint LVS input provenance, a klt sim envelope, and repo-relative MC yield records so signoff items 4-6 can verify
+- **Issue #127** (closed): Guard-decision review: scratch-var exemption misses the klt/KLayout layout cold-start idiom (inline ./layout/verify.sh reproduction denied), propose extending the #65 exemption
+- **Issue #125** (closed): Commit a klt signoff block manifest so this block's T1 state is graded, not hand-read
+- **Issue #124** (closed): T1 item 11 (power delivery, structural): no klt erc supply spec or report in this repo
 
 ### 2026-09-19
 - **Issue #438** (closed): test-guard-equivalence.sh cannot see worktree-write-confinement divergences: every case runs from a cwd with no sibling worktree
