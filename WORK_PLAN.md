@@ -7,7 +7,6 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 
 ## Very Important
@@ -44,7 +43,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 
 ## Proposed
@@ -67,13 +65,13 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 1 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
+| Approved PRs awaiting merge | 1 |
 | Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
