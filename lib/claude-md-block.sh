@@ -111,6 +111,27 @@ claude_md_block_rewrite() {  # <file> <begin> <end> [block-file]
   local content prefix suffix rest_of_line body backup tmp
 
   CLAUDE_MD_BLOCK_BACKUP=""
+  # A symlinked CLAUDE.md (commonly CLAUDE.md -> AGENTS.md) is rewritten
+  # THROUGH the link. The `mv` into place below would otherwise replace the
+  # link with a regular file, forking the instructions into two copies that
+  # drift apart (2AMLogic/2am#4508). Follow the chain to the real file, and
+  # refuse a dangling or looping one rather than guess.
+  local link hops=0
+  while [[ -L "$file" ]]; do
+    if ! link="$(readlink "$file")"; then
+      CLAUDE_MD_BLOCK_ERROR="could not read the symlink $file"
+      return 1
+    fi
+    case "$link" in
+      /*) file="$link" ;;
+      *)  file="$(dirname "$file")/$link" ;;
+    esac
+    hops=$((hops + 1))
+    if [[ $hops -gt 8 ]]; then
+      CLAUDE_MD_BLOCK_ERROR="symlink chain too deep (or looping) resolving CLAUDE.md"
+      return 1
+    fi
+  done
   claude_md_block_validate "$file" "$begin" "$end" || return 1
 
   _claude_md_slurp "$file"
@@ -165,8 +186,18 @@ claude_md_block_rewrite() {  # <file> <begin> <end> [block-file]
   fi
   CLAUDE_MD_BLOCK_BACKUP="$backup"
 
-  if ! tmp="$(mktemp)"; then
-    CLAUDE_MD_BLOCK_ERROR="could not create a temporary file"
+  # The temporary file sits next to the real target, so the `mv` below is a
+  # same-directory (atomic) rename. It is seeded with `cp -p` so it carries the
+  # target's mode: a bare mktemp file is 0600, and the rename would otherwise
+  # leave CLAUDE.md (or the file it links to) readable by its owner only.
+  # Writing the new content truncates the copy, keeping that mode.
+  if ! tmp="$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX")"; then
+    CLAUDE_MD_BLOCK_ERROR="could not create a temporary file next to $file"
+    return 1
+  fi
+  if ! cp -p "$file" "$tmp"; then
+    rm -f "$tmp"
+    CLAUDE_MD_BLOCK_ERROR="could not prepare the temporary file $tmp"
     return 1
   fi
   if ! printf '%s' "$content" >"$tmp"; then
