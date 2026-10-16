@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Each command is also its own Codex skill, `$repo-<verb>` (#676, part 1).** `install.sh` now writes `.agents/skills/repo-<verb>/SKILL.md` for every selected command (name equals directory, the command's own description, ownership marker, `/repo:<verb>` cross-references rewritten to `$repo-<verb>`), `uninstall.sh` removes only marked `repo-*` directories, and `resync-installed.sh` repairs them and drops marked ones whose verb left the install. Unmarked `repo-*` directories are never overwritten or removed. Dev-mode installs gitignore `.agents/skills/repo-*/`. The umbrella `repo` skill and `references/` are unchanged in this release. 18 new test cases.
+
 - **The rjwalters account moves to Dependabot.** New owner override `policies/organizations/rjwalters.json`: `provider: dependabot`, security updates on, `renovate: null`. `/repo:org-policy --install` for an rjwalters client now removes `rjwalters/.github`'s `renovate-config.json` and records Dependabot in `repo-policy.json`. Other owners keep the Renovate default.
 
 - **`/repo:org-policy apply` no longer reports the Renovate App for a Dependabot organization (2AMLogic/2am#4351).** After publishing a `provider: dependabot` plan, the CLI still printed the Renovate App line, which for an organization with no App read "NOT installed — policy published, but no PRs will be raised until it is". That is false for Dependabot. The line is now printed only for a Renovate plan, as `show_plan` already did. One new test.

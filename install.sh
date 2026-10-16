@@ -6,7 +6,7 @@
 #
 # Options:
 #   --skills=a,b,c    Install only these commands (default: all)
-#   --no-codex        Skip the Codex-side skill surface (.agents/skills/repo/)
+#   --no-codex        Skip the Codex-side skill surface (.agents/skills/repo/ + repo-<verb>/)
 #                     and install only the Claude Code surface. Default: both
 #   --no-guard        Do not copy or wire the Repo Skills destructive-command
 #                     guard (hooks/guard-destructive.sh + its PreToolUse entry
@@ -390,6 +390,7 @@ if [[ "$DRY_RUN" == true ]]; then
   else
     echo "  $TARGET/$CODEX_SKILL_REL/SKILL.md (Codex skill: canonical body, Codex-native frontmatter)"
     echo "  $TARGET/$CODEX_SKILL_REL/install-metadata.json"
+    echo "  $TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX<verb>/SKILL.md (one Codex skill per command)"
     while IFS= read -r cmd; do
       echo "  $TARGET/$CODEX_REFERENCES_REL/$cmd.md"
     done <<<"$COMMANDS"
@@ -865,6 +866,36 @@ else
   success "Installed $CODEX_REF_WRITTEN command procedures into $CODEX_REFERENCES_REL/$([[ "$CODEX_REF_PINNED" -gt 0 ]] && echo " ($CODEX_REF_PINNED pinned as repo-owned, left alone)")"
   CODEX_INSTALLED=true
 
+  # Per-command skills (repo#676): each selected command is also its own
+  # `repo-<verb>` skill so Codex lists the verbs individually. Generated (never
+  # symlinked) like SKILL.md. Ownership is per directory: a `repo-<verb>` dir
+  # whose SKILL.md carries no marker is someone else's and is left alone.
+  CODEX_CMD_WRITTEN=0
+  CODEX_CMD_LEFT=0
+  while IFS= read -r cmd; do
+    [[ -n "$cmd" ]] || continue
+    cmd_rel="$(codex_command_skill_rel "$cmd")"
+    cmd_md="$TARGET/$cmd_rel/SKILL.md"
+    if [[ -f "$cmd_md" ]] && ! codex_skill_is_managed "$cmd_md"; then
+      warning "$cmd_rel/SKILL.md exists but carries no Repo Skills marker; leaving it untouched"
+      CODEX_CMD_LEFT=$((CODEX_CMD_LEFT + 1))
+    elif resync_ignore_is_pinned "$cmd_rel/SKILL.md"; then
+      CODEX_CMD_LEFT=$((CODEX_CMD_LEFT + 1))
+    else
+      CODEX_CMD_TMP="$(mktemp)"
+      if codex_command_skill_render "$SOURCE_ROOT/commands/repo/$cmd.md" >"$CODEX_CMD_TMP"; then
+        assert_no_placeholders "$CODEX_CMD_TMP" "$cmd_rel/SKILL.md"
+        mkdir -p "$TARGET/$cmd_rel"
+        mv "$CODEX_CMD_TMP" "$cmd_md"
+        CODEX_CMD_WRITTEN=$((CODEX_CMD_WRITTEN + 1))
+      else
+        rm -f "$CODEX_CMD_TMP"
+        error "Could not render $cmd_rel/SKILL.md: commands/repo/$cmd.md needs a 'description' in its frontmatter and a valid skill name."
+      fi
+    fi
+  done <<<"$COMMANDS"
+  success "Installed $CODEX_CMD_WRITTEN per-command Codex skills ($CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/)$([[ "$CODEX_CMD_LEFT" -gt 0 ]] && echo " ($CODEX_CMD_LEFT left alone: pinned or not ours)")"
+
   # Same tracked-metadata emitter and same C5 guarantees as the Claude surface,
   # so the Codex surface is self-describing and the resync can tell an install
   # that predates it from one the operator declined with --no-codex. There is
@@ -976,6 +1007,13 @@ if [[ "$DEV" == true ]]; then
       echo "$CODEX_SKILL_REL/"; } >>"$GITIGNORE"
     success "Added $CODEX_SKILL_REL/ to .gitignore"
   fi
+  if [[ "$CODEX" == true ]] && ! codex_target_is_foreign \
+    && { [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/" "$GITIGNORE"; }; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
+      echo "# Repo Skills dev-mode per-command Codex skills (machine-local, do not commit)"
+      echo "$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/"; } >>"$GITIGNORE"
+    success "Added $CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/ to .gitignore"
+  fi
   reconcile_orphaned_block
   echo ""
   success "Repo Skills v$VERSION dev-installed (symlinked). Edits to source are live. Try /repo:help in Claude Code.$CODEX_HINT"
@@ -1023,6 +1061,12 @@ dest_is_gitignored() {
 run_gitignore_sweep() {
   local -a payload_dirs=("$TARGET/.claude/skills/repo" "$TARGET/.claude/commands/repo")
   [[ "$CODEX_INSTALLED" == true ]] && payload_dirs+=("$CODEX_SKILL_DIR")
+  if [[ "$CODEX_INSTALLED" == true ]]; then
+    local d
+    for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX"*/; do
+      [[ -f "${d}SKILL.md" ]] && codex_skill_is_managed "${d}SKILL.md" && payload_dirs+=("${d%/}")
+    done
+  fi
   warn_gitignored_payload "$TARGET" "${payload_dirs[@]}"
 }
 
