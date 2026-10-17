@@ -446,6 +446,80 @@ assert_eq "dev: re-installing does not duplicate the .gitignore entry" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- per-command skills: one repo-<verb> skill per command (repo#676) --"
+
+T12="$(new_target percmd)"
+install_into "$T12" >/dev/null
+VERBS="$(ls "$REPO_ROOT/commands/repo"/*.md | xargs -n1 basename | sed 's/\.md$//')"
+EXPECT_SET="$( { echo repo; for v in $VERBS; do echo "repo-$v"; done; } | LC_ALL=C sort)"
+ACTUAL_SET="$(ls "$T12/.agents/skills" | LC_ALL=C sort)"
+assert_eq "the discovered skill set is {repo, repo-<verb>...}" "$EXPECT_SET" "$ACTUAL_SET"
+
+BAD=""
+SEEN_NAMES=""
+for d in "$T12"/.agents/skills/*/; do
+    d="${d%/}"; base="$(basename "$d")"
+    n="$(fm "$d/SKILL.md" name)"; ds="$(fm "$d/SKILL.md" description)"
+    [[ "$n" == "$base" ]] || BAD+=" name!=dir:$base"
+    [[ "$n" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#n} -le 64 ]] || BAD+=" slug:$base"
+    [[ -n "$ds" ]] || BAD+=" nodesc:$base"
+    grep -qF "$MARKER" "$d/SKILL.md" || BAD+=" nomarker:$base"
+    [[ -z "$(fm "$d/SKILL.md" type)$(fm "$d/SKILL.md" user-invocable)" ]] || BAD+=" claude-keys:$base"
+    SEEN_NAMES+="$n"$'\n'
+done
+assert_eq "every skill: name==dir, valid slug, description, marker, no Claude-only keys" "" "$BAD"
+assert_eq "skill names are unique" "" "$(printf '%s' "$SEEN_NAMES" | sort | uniq -d)"
+assert_contains "cross-references are rewritten to \$repo-<verb>" \
+                "$(cat "$T12/.agents/skills/repo-help/SKILL.md")" '$repo-help'
+assert_not_contains "no /repo:<verb> cross-references remain in the body" \
+                    "$(sed -n '/^# /,$p' "$T12/.agents/skills/repo-help/SKILL.md")" '/repo:help'
+
+FP_A="$(fingerprint "$T12/.agents/skills")"
+install_into "$T12" >/dev/null
+assert_eq "re-install leaves the per-command skills byte-identical" "$FP_A" "$(fingerprint "$T12/.agents/skills")"
+
+T13="$(new_target percmd-filtered)"
+install_into "$T13" --skills=tidy,reset >/dev/null
+assert_eq "--skills= installs only the selected per-command skills" \
+          "$(printf 'repo\nrepo-help\nrepo-reset\nrepo-tidy\n')" "$(ls "$T13/.agents/skills" | LC_ALL=C sort)"
+
+T14="$(new_target percmd-nocodex)"
+install_into "$T14" --no-codex >/dev/null
+assert_absent "--no-codex writes no per-command skills" "$T14/.agents"
+
+# Ownership: an unmarked repo-decide/ and a hand-made foo/ survive install,
+# resync and uninstall.
+T15="$(new_target percmd-foreign)"
+mkdir -p "$T15/.agents/skills/repo-decide" "$T15/.agents/skills/foo"
+printf '%s\n' 'mine' > "$T15/.agents/skills/repo-decide/SKILL.md"
+printf '%s\n' 'foo' > "$T15/.agents/skills/foo/SKILL.md"
+install_into "$T15" >/dev/null
+assert_eq "install does not overwrite an unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+bash "$T15/.claude/skills/repo/scripts/resync-installed.sh" --target "$T15" >/dev/null 2>&1
+assert_eq "resync does not overwrite an unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+HOME="$FAKE_HOME" bash "$UNINSTALL_SH" -y "$T15" >/dev/null 2>&1
+assert_eq "uninstall keeps the unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+assert_eq "uninstall keeps the hand-made foo/"       "foo"  "$(cat "$T15/.agents/skills/foo/SKILL.md")"
+assert_absent "uninstall removed our repo-tidy/"     "$T15/.agents/skills/repo-tidy"
+assert_absent "uninstall removed the umbrella repo/" "$T15/.agents/skills/repo"
+
+# Resync: no phantom drift, repairs drift, drops stale verbs after a filtered install.
+bash "$T12/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T12" >/dev/null 2>&1
+assert_eq "resync reports no phantom drift for per-command skills" "0" "$?"
+printf '%s\n' 'drifted' >> "$T12/.agents/skills/repo-tidy/SKILL.md"
+DRIFT2="$(bash "$T12/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T12" 2>&1)"
+assert_contains "resync names a drifted per-command skill" "$DRIFT2" "would sync .agents/skills/repo-tidy/SKILL.md"
+
+# Narrow an installed set by hand-editing the recorded filter: easier to
+# simulate "verb no longer in the install" with a stray marked dir.
+mkdir -p "$T13/.agents/skills/repo-retired"
+cp "$T13/.agents/skills/repo-tidy/SKILL.md" "$T13/.agents/skills/repo-retired/SKILL.md"
+bash "$T13/.claude/skills/repo/scripts/resync-installed.sh" --target "$T13" >/dev/null 2>&1
+assert_absent "resync removes a marked per-command skill whose verb left the install" "$T13/.agents/skills/repo-retired"
+assert_file   "resync keeps the selected per-command skills" "$T13/.agents/skills/repo-tidy/SKILL.md"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"
