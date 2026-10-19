@@ -445,6 +445,46 @@ assert_deny "Block DELETE FROM without WHERE" \
 assert_allow "Allow DELETE FROM with WHERE" \
     "psql -c 'DELETE FROM users WHERE id = 5;'"
 
+# DELETE-without-WHERE scan: inert search/text-data arguments (#688)
+assert_allow "Allow git log -S with DELETE FROM text" \
+    "git log -S 'DELETE FROM t;' --oneline"
+
+assert_allow "Allow git log --grep with DELETE FROM text" \
+    "git log --grep=\"DELETE FROM t\" --oneline"
+
+assert_allow "Allow git -C dir log -G with DELETE FROM text" \
+    "git -C /tmp/x log -G 'DELETE FROM t' --oneline"
+
+assert_allow "Allow jq --arg with DELETE FROM text" \
+    "jq -n --arg query 'DELETE FROM t;' '\$query'"
+
+assert_deny "Block sqlite3 with DELETE FROM" \
+    "sqlite3 example.db \"DELETE FROM t;\""
+
+assert_deny "Block DELETE FROM carried by command substitution" \
+    "sqlite3 db \"\$(echo 'DELETE FROM t;')\""
+
+assert_deny "Block DELETE FROM carried by backtick substitution" \
+    "psql -c \"\`echo DELETE FROM t\`\""
+
+assert_deny "Block sh -c DELETE FROM payload" \
+    "sh -c 'sqlite3 db \"DELETE FROM t;\"'"
+
+assert_deny "Block eval DELETE FROM payload" \
+    "eval 'sqlite3 db \"DELETE FROM t;\"'"
+
+assert_deny "Block echo DELETE FROM piped to sqlite3" \
+    "echo 'DELETE FROM t;' | sqlite3 db"
+
+assert_deny "Block git log -S chained with executed DELETE FROM" \
+    "git log -S x; sqlite3 db \"DELETE FROM t\""
+
+assert_deny "Block git log -S piped into sqlite3 with DELETE FROM" \
+    "git log -S 'DELETE FROM t' | sqlite3 db"
+
+assert_deny "Block sudo-wrapped git log -S with DELETE FROM (unprovable)" \
+    "sudo git log -S 'DELETE FROM t'"
+
 echo ""
 
 # =========================================================================

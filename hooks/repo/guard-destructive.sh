@@ -4783,6 +4783,63 @@ extract_rm_targets() {
     }'
 }
 
+# =============================================================================
+# INERT SEARCH-ARGUMENT MASK (#688) — feeds the DELETE-without-WHERE scan only.
+#
+# `git log -S 'DELETE FROM t;'` searches history for a string; the quoted value
+# is data to git, never SQL handed to an engine. mask_inert_search_args() blanks
+# (1:1 with "X") the QUOTED value of git -S / -G / --grep / -e and of
+# `jq --arg|--argjson NAME`, and only when ALL of:
+#   1. the whole command is exactly ONE top-level segment (ml_segment()) — so a
+#      chain (`git log -S x; sqlite3 db "DELETE FROM t"`) or a pipeline
+#      (`git log -S x | sqlite3 db`) is never masked and keeps denying;
+#   2. that segment's command word is statically `jq`, or `git` (optionally
+#      followed by `--no-pager` / `-C <dir>`) then log|diff|show|grep — no
+#      sudo/env/VAR= wrapper, no substitution in command-word position (fail closed);
+#   3. the segment carries no live `$(`/backtick (has_live_subst()).
+# Anything unprovable returns the input unchanged. It never masks a DB-client
+# argument (`sqlite3 db "DELETE ..."`, `psql -c '...'`), an `sh -c`/`eval`
+# payload, or an executing pipeline. Only the DELETE scan reads the result.
+# =============================================================================
+mask_inert_search_args() {
+    case "$1" in
+        *git*-[SGe]*|*git*--grep*|*jq*--arg*) ;;
+        *) printf '%s' "$1"; return 0 ;;
+    esac
+    printf '%s' "$1" | awk "$_ESCAPE_AWK$_HASLIVESUBST_AWK$_ML_QSPLIT_AWK"'
+    BEGIN { buf = "" }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        out = buf
+        segc = ml_segment(buf, segs)
+        seg = segs[1]
+        kind = ""
+        if (segc == 1 && !has_live_subst(seg)) {
+            if (seg ~ /^[ \t]*git([ \t]+--no-pager|[ \t]+-C[ \t]+[^ \t]+)*[ \t]+(log|diff|show|grep)[ \t]/) kind = "git"
+            else if (seg ~ /^[ \t]*jq[ \t]/) kind = "jq"
+        }
+        if (kind != "") {
+            Q1 = sprintf("%c", 39)
+            qv = "(" Q1 "[^" Q1 "]*" Q1 "|\"[^\"]*\")"
+            if (kind == "git") re = "(^|[ \t])(-S|-G|--grep|-e)[ \t=]*" qv
+            else re = "(^|[ \t])(--arg|--argjson)[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+" qv
+            rest = seg
+            res = ""
+            while (match(rest, re)) {
+                rs = RSTART; rl = RLENGTH
+                tok = substr(rest, rs, rl)
+                q = match(tok, "[" Q1 "\"]")
+                body = substr(tok, q + 1, length(tok) - q - 1)
+                gsub(/[^\n]/, "X", body)
+                res = res substr(rest, 1, rs - 1 + q) body substr(tok, length(tok), 1)
+                rest = substr(rest, rs + rl)
+            }
+            out = res rest
+        }
+        printf "%s", out
+    }'
+}
+
 normalize_abs_path() {
     # Lexically normalize an ABSOLUTE path without touching the filesystem:
     #   - collapse duplicate slashes    (//etc        -> /etc)
@@ -9708,8 +9765,16 @@ fi
 # guards.sqlDdl:false or LOOM_GUARD_SQL=0. sql_guard_enabled() is consulted only
 # after the DELETE-FROM-without-WHERE match, keeping the config read off the hot
 # path for non-SQL commands.
-if echo "$COMMAND_NO_COMMENT" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
-   ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+'; then
+#
+# Scans COMMAND_NO_COMMENT through mask_inert_search_args() (#688), which blanks
+# only the provably inert value of `git log -S '…'` / `jq --arg q '…'`. It
+# deliberately does NOT read COMMAND_ASK_SCAN: that copy also redacts echo/printf
+# data sinks, which would let `echo 'DELETE FROM t;' | sqlite3 db` through.
+# Executed SQL (`sqlite3 db "…"`, `psql -c '…'`, substitutions, sh -c/eval,
+# pipelines) is never masked and still denies.
+_DELETE_SCAN=$(mask_inert_search_args "$COMMAND_NO_COMMENT")
+if echo "$_DELETE_SCAN" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
+   ! echo "$_DELETE_SCAN" | grep -qiE 'WHERE[[:space:]]+'; then
     sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause" "sql-delete-no-where"
 fi
 
