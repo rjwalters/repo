@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-20
+- **PR #700**: feat: confine mkdir/touch/ln/install writes into the main checkout
+- **Issue #693** (closed): guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5)
 - **PR #689**: chore(deps): bump actions/checkout from 4 to 7 in the github-actions group across 1 directory
 - **PR #698**: feat: record HEAD sha and dirty flag on the box in /repo:remote step 5
 - **PR #695**: docs: record owner review of guard-confinement evidence cases
