@@ -783,7 +783,7 @@ guard_cfg_array() {
 # exists to read. Extend _POSITIONAL_MASK_NEVER whenever a new deny-tier
 # consumer of COMMAND_ASK_SCAN is added with a recognizable command word.
 # =============================================================================
-_POSITIONAL_MASK_NEVER='grep egrep fgrep rg cp mv tee sed'
+_POSITIONAL_MASK_NEVER='grep egrep fgrep rg cp mv tee sed mkdir touch ln install'
 _POSITIONAL_MASK_CMDRE_CACHE=""
 _POSITIONAL_MASK_CMDRE_DONE=""
 positional_mask_cmdre() {
@@ -8013,6 +8013,82 @@ extract_write_targets() {
         if (dq % 2 != 0) return ""
         return out
     }
+    # creator_targets() -- destination extraction for the directory/file
+    # CREATORS mkdir, touch, ln and install (#693, owner ruling option 1 on
+    # the #692 case-E5 review). It reads the segment tokens (toks[]/m and the
+    # stdin_redir/stdout_redir marks) as globals, like the tee/sed/cp/mv
+    # branches, and prints one "cwd SEP target" line per CREATED path so the
+    # downstream containment loop is reused unchanged. Only the path being
+    # created is a write: ln referents, touch -r/-d/-t values, install
+    # sources and every option value (-m MODE, -o OWNER, -S SUFFIX, ...) are
+    # read-only data and are never printed.
+    #   mkdir   every operand.
+    #   touch   every operand.
+    #   ln      -t DIR / --target-directory DIR, else the LAST operand (the
+    #           link, or the directory that receives the links); a lone
+    #           operand creates a link in the cwd.
+    #   install -d: every operand; else -t DIR, else the LAST operand.
+    # Best effort, not a shell parser: abbreviated long options, command
+    # substitution, brace expansion and glob operands are not understood; an
+    # unresolved $VAR operand still fails closed in the shell layer.
+    function creator_targets(cmd,   j, k, p, t, c, rest, val, name, nf, ops, tdir, hasd, dd, shortv, longv) {
+        shortv = (cmd == "mkdir") ? "m" : (cmd == "touch") ? "rdt" : (cmd == "ln") ? "tS" : "mogSt"
+        longv = (cmd == "mkdir") ? " mode " : (cmd == "touch") ? " reference date time " : \
+                (cmd == "ln") ? " target-directory suffix " : \
+                " mode owner group suffix target-directory strip-program "
+        nf = 0; tdir = ""; hasd = 0; dd = 0
+        for (j = 2; j <= m; j++) {
+            if (j in stdin_redir || j in stdout_redir) continue
+            t = toks[j]
+            if (t == "") continue
+            if (!dd && t == "--") { dd = 1; continue }
+            if (!dd && t ~ /^--[^=]+$/) {
+                name = substr(t, 3)
+                if (index(longv, " " name " ") > 0) {
+                    k = j + 1
+                    while (k <= m && (toks[k] == "" || (k in stdin_redir) || (k in stdout_redir))) k++
+                    if (k <= m && name == "target-directory") tdir = toks[k]
+                    j = k
+                }
+                continue
+            }
+            if (!dd && t ~ /^--[^=]+=/) {
+                if (t ~ /^--target-directory=/) tdir = substr(t, index(t, "=") + 1)
+                continue
+            }
+            if (!dd && t ~ /^-[^-]/) {
+                for (p = 2; p <= length(t); p++) {
+                    c = substr(t, p, 1)
+                    if (index(shortv, c) > 0) {
+                        rest = substr(t, p + 1)
+                        if (rest != "") {
+                            val = rest
+                        } else {
+                            k = j + 1
+                            while (k <= m && (toks[k] == "" || (k in stdin_redir) || (k in stdout_redir))) k++
+                            val = (k <= m) ? toks[k] : ""
+                            j = k
+                        }
+                        if (c == "t" && (cmd == "ln" || cmd == "install")) tdir = val
+                        break
+                    }
+                    if (c == "d" && cmd == "install") hasd = 1
+                }
+                continue
+            }
+            nf++
+            ops[nf] = t
+        }
+        if (cmd == "mkdir" || cmd == "touch" || (cmd == "install" && hasd)) {
+            for (j = 1; j <= nf; j++) print curcwd SEP resolve_var(ops[j])
+        } else if (tdir != "") {
+            print curcwd SEP resolve_var(tdir)
+        } else if (nf >= 2) {
+            print curcwd SEP resolve_var(ops[nf])
+        } else if (nf == 1 && cmd == "ln") {
+            print curcwd SEP "."
+        }
+    }
     function resolve_var_core(tok,   vname, rest, vv) {
         if (substr(tok, 1, 1) != "$") return tok
         if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
@@ -8606,6 +8682,8 @@ extract_write_targets() {
                     nfargs[nf] = toks[j]
                 }
                 if (nf >= 2) print curcwd SEP resolve_var(nfargs[nf])
+            } else if (toks[1] == "mkdir" || toks[1] == "touch" || toks[1] == "ln" || toks[1] == "install") {
+                creator_targets(toks[1])
             }
 
             # >/>>  redirection — token-boundary detection only (never a
@@ -9072,7 +9150,9 @@ _wt_dist_scratch_path() {
 if worktree_isolation_guard_enabled && \
    { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
      [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
-     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]] || [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; }; then
+     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]] || [[ "$COMMAND_ASK_SCAN" == *"<<"* ]] || \
+     [[ "$COMMAND_ASK_SCAN" == *"mkdir"* ]] || [[ "$COMMAND_ASK_SCAN" == *"touch"* ]] || \
+     [[ "$COMMAND_ASK_SCAN" == *"ln "* ]] || [[ "$COMMAND_ASK_SCAN" == *"install"* ]]; }; then
     _WT_WRITE_BASE=""
     _WT_WRITE_BASE_DONE=""
 
@@ -9752,7 +9832,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv/mkdir/touch/ln/install — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. ${_WT_OPTOUT_HINT} (#4178)" "worktree-write-confinement" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
         fi
     done <<< "$WRITE_TARGETS"
 fi
