@@ -36,6 +36,10 @@ scratch symlink to `issue-2`) and ran the guard with cwd per the fixture.
 - The Edit/Write-tool chain (F3-F5) is `guard-worktree-paths.sh`, which is
   Loom-owned and not in this repo; those cases were not run.
 - Review basis: `origin/main` @ `e8c7e61`.
+- Peer-worktree separation (2026-10-20 follow-up below) is an accidental-interference
+  guard only: hook-only substring parsing, not complete shell parsing; an
+  environment variable is not authentication of who is acting; it is not a
+  malicious-agent sandbox. The Edit/Write chain (F3-F5) remains Loom's.
 
 ## Case mapping
 
@@ -99,6 +103,29 @@ was authorized to change behavior here:
   into the main checkout be a confinement write idiom?
 - #694, F1/F2: should writes into another agent's linked worktree be confined, given
   the guard has no per-agent identity without `LOOM_WORKTREE_PATH`?
+
+## Follow-up 2026-10-20: F1/F2 under a valid pin (#694)
+
+Owner ruling 2026-10-19 (option 1): F1/F2 now **deny only when a valid inherited
+`LOOM_WORKTREE_PATH` identifies the acting session's worktree**. The table above is
+unchanged and still describes the unpinned behavior (allow).
+
+- **valid** pin: absolute, resolves to a directory, and its physical path equals the
+  root of a real linked worktree in `git worktree list` (never the main root or an
+  ancestor). Recognized Bash writes (redirect, `tee`, `cp`, `mv`, `sed -i`, any symlink
+  or `..` spelling) into a *peer* worktree then deny, tag `worktree-write-confinement-peer`.
+  A nested unmanaged worktree under main still allows; one inside the pinned worktree
+  is own; one inside a peer belongs to that peer.
+- **unset** or **invalid** (relative, nonexistent, plain directory, a path inside a
+  worktree, main root/ancestor, `/`): behavior unchanged, no new deny.
+- Identity is only the hook process's own inherited variable. A command-local
+  `LOOM_WORKTREE_PATH=...`, `export ...;` or `env ...` never counts. cwd is never used.
+- Same `guards.worktreeIsolation` toggle as the rest of the confinement; turning it off
+  also drops main-checkout protection (unchanged coupling).
+- **Handoffs:** use git (commit/push, the other session fetches), a forge comment, or a
+  scratch file. A direct Bash write into another session's worktree is what now denies.
+  If a launcher ever exports one pin for a process that legitimately writes to several
+  worktrees it will see denies; the launcher is Loom's and was not traced here.
 
 ## Follow-up note, 2026-10-20 (#693)
 

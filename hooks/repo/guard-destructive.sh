@@ -9458,6 +9458,118 @@ if worktree_isolation_guard_enabled && \
         return 1
     }
 
+    # ---------------------------------------------------------------------
+    # Peer-worktree separation (#694). Owner ruling 2026-10-19: when a VALID
+    # inherited LOOM_WORKTREE_PATH identifies the acting session's assigned
+    # worktree, a recognized Bash write into ANOTHER linked worktree denies.
+    # This is an accidental-interference guard, not authentication: an env
+    # var proves nothing about who set it, and this is hook-only substring
+    # parsing, not a sandbox against a malicious agent.
+    #
+    # Identity states (nothing else is ever consulted -- not cwd, not the
+    # sentinel's contents, not the command text):
+    #   valid   -- the hook's own inherited pin passes _wt_env_pin_resolve()
+    #              AND its physical path equals a root of a real linked
+    #              worktree in `git worktree list` (own `.git` file; never the
+    #              main root or an ancestor of it).
+    #   unset / invalid (relative, nonexistent, plain directory, a path INSIDE
+    #              a worktree, main root, `/`) -- no enforcement, no new deny.
+    # ---------------------------------------------------------------------
+    _WT_PIN_VALID=""
+    _WT_PIN_DONE=""
+    _wt_pin_valid() {
+        local _root _rp
+        if [[ -z "$_WT_PIN_DONE" ]]; then
+            _WT_PIN_DONE=1
+            _wt_env_pin_resolve
+            if [[ -n "$_WT_ENV_WT" ]]; then
+                _wt_registered_worktree_roots
+                while IFS= read -r _root; do
+                    [[ -n "$_root" ]] || continue
+                    if [[ "$_root" == "$_WT_ENV_WT" ]]; then
+                        _WT_PIN_VALID=1
+                        break
+                    fi
+                    _rp=$(_wt_physical_form "$_root")
+                    if [[ -n "$_rp" && "$_rp" == "$_WT_ENV_WT" ]]; then
+                        _WT_PIN_VALID=1
+                        break
+                    fi
+                done <<< "$_WT_REG_ROOTS"
+            fi
+        fi
+        [[ -n "$_WT_PIN_VALID" ]]
+    }
+
+    # Directory of the NEAREST `.loom-managed` sentinel at or above $1 (same
+    # walk and 64-hop cap as _in_any_managed_worktree). Prints nothing when
+    # there is none. Always returns 0.
+    _wt_nearest_sentinel_dir() {
+        local _d="$1" _i=0
+        [[ -n "$_d" ]] || return 0
+        [[ -d "$_d" ]] || { _d="${_d%/*}"; [[ -z "$_d" ]] && _d="/"; }
+        while [[ $_i -lt 64 ]]; do
+            if [[ -f "$_d/.loom-managed" ]]; then
+                printf '%s' "$_d"
+                return 0
+            fi
+            [[ "$_d" == "/" ]] && break
+            _d="${_d%/*}"
+            [[ -z "$_d" ]] && _d="/"
+            _i=$((_i + 1))
+        done
+        return 0
+    }
+
+    # True if registered root $1 is the supported nested UNMANAGED case (#582
+    # (d)): under the main checkout, outside the configured worktree base,
+    # outside every sentinel-managed tree. Such a root is not a "peer".
+    _wt_root_is_nested_unmanaged() {
+        local _r="$1" _under=""
+        case "$_r" in
+            "$_WT_MAIN_ROOT"/*|"$_WT_MAIN_ROOT_LOGICAL"/*) _under=1 ;;
+        esac
+        [[ -n "$_under" ]] || return 1
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if [[ -n "$_WT_WRITE_BASE" ]]; then
+            case "$_r" in
+                "$_WT_WRITE_BASE"|"$_WT_WRITE_BASE"/*) return 1 ;;
+            esac
+        fi
+        _in_any_managed_worktree "$_r" && return 1
+        return 0
+    }
+
+    # True if $1 (absolute, normalized, ONE spelling) lands in a PEER of the
+    # pinned worktree: not under the pin, and either inside another registered
+    # linked worktree (minus the nested-unmanaged case) or under another
+    # sentinel-managed tree. Under-the-pin wins first, so a nested worktree
+    # inside the pin is own; a nested worktree inside a peer is the peer's.
+    _wt_in_peer_worktree() {
+        local _p="$1" _root _sd _sp
+        [[ -n "$_p" ]] || return 1
+        _wt_under_env_worktree "$_p" && return 1
+        _wt_registered_worktree_roots
+        while IFS= read -r _root; do
+            [[ -n "$_root" ]] || continue
+            [[ "$_p" == "$_root" || "$_p" == "$_root"/* ]] || continue
+            _wt_under_env_worktree "$_root" && continue
+            _wt_root_is_nested_unmanaged "$_root" && continue
+            return 0
+        done <<< "$_WT_REG_ROOTS"
+        _sd=$(_wt_nearest_sentinel_dir "$_p")
+        if [[ -n "$_sd" ]]; then
+            _wt_under_env_worktree "$_sd" && return 1
+            _sp=$(cd "$_sd" 2>/dev/null && pwd -P) || _sp=""
+            [[ -n "$_sp" ]] && _wt_under_env_worktree "$_sp" && return 1
+            return 0
+        fi
+        return 1
+    }
+
     # Same-command mktemp output admission for a root-unknown write target.
     # wt_write_mktemp_same_command_safe() supplies the shared proof; this adds
     # the two checks that need this block's protected-area roots:
@@ -9761,6 +9873,34 @@ if worktree_isolation_guard_enabled && \
         # this gap. Resolved once per target and only when it differs.
         _wabsp=$(_wt_physical_form "$_wabs")
         [[ "$_wabsp" == "$_wabs" ]] && _wabsp=""
+
+        # (#694) Peer-worktree separation, ONLY under a valid inherited pin.
+        # Runs before the sentinel allow and the main-root gate so a peer
+        # relocated outside the main checkout is still denied. A `..` raw
+        # spelling is judged on every spelling (lexical, physical, and the
+        # kernel's own physical `..` resolution): denied if ANY lands in a
+        # peer. Otherwise only the physical form (where the kernel writes).
+        if _wt_pin_valid; then
+            _wpeer=""
+            if _wt_no_dotdot "$_wraw"; then
+                _wj="$_wabs"
+                [[ -n "$_wabsp" ]] && _wj="$_wabsp"
+                _wt_in_peer_worktree "$_wj" && _wpeer="$_wj"
+            else
+                _wrp=""
+                _wrd="${_wraw%/*}"
+                [[ -n "$_wrd" ]] || _wrd="/"
+                _wrp=$(cd -P "$_wrd" 2>/dev/null && pwd -P) || _wrp=""
+                [[ -n "$_wrp" ]] && _wrp="${_wrp%/}/${_wraw##*/}"
+                for _wj in "$_wabs" "$_wabsp" "$_wrp"; do
+                    [[ -n "$_wj" ]] || continue
+                    if _wt_in_peer_worktree "$_wj"; then _wpeer="$_wj"; break; fi
+                done
+            fi
+            if [[ -n "$_wpeer" ]]; then
+                deny "BLOCKED: Bash-tool write to '${_wabs}' lands in '${_wpeer}', a worktree that is NOT this session's assigned worktree ('${_WT_ENV_WT}', from the inherited LOOM_WORKTREE_PATH). Writing into a sibling worktree can silently clobber another session's work (#694). Hand work off through git (commit/push, the other session fetches), a forge comment, or a /tmp scratch file instead. This is an accidental-interference guard, not authentication of who you are. ${_WT_OPTOUT_HINT} (opting out also drops main-checkout protection.)" "worktree-write-confinement-peer" "$(_wt_confinement_context "$_wabs" "$_wabsp")"
+            fi
+        fi
 
         # (a) Already inside some managed worktree -> allow. This is exactly
         # where a builder is supposed to write. Checked against both spellings
