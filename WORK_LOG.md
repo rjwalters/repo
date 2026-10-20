@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-20
+- **PR #701**: feat: deny Bash writes into peer worktrees under a valid LOOM_WORKTREE_PATH pin
+- **Issue #694** (closed): guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2)
 - **PR #700**: feat: confine mkdir/touch/ln/install writes into the main checkout
 - **Issue #693** (closed): guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5)
 - **PR #689**: chore(deps): bump actions/checkout from 4 to 7 in the github-actions group across 1 directory
