@@ -3,6 +3,12 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-20
+- **PR #698**: feat: record HEAD sha and dirty flag on the box in /repo:remote step 5
+- **PR #695**: docs: record owner review of guard-confinement evidence cases
+- **PR #679**: docs(gitignore): explain tracked files matching an ignore rule
+- **Issue #697** (closed): /repo:remote step 5: record SHA on the box, opt-in refuse dirty tracked tree
+- **Issue #692** (closed): Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214
+- **Issue #678** (closed): audit/gitignore: 'tracked files match an ignore rule' advice recommends dropping rules that only hide new untracked files
 - **PR #686**: docs(update-tools): use Loom's recognized resync commit subject for Loom updates
 - **Issue #683** (closed): update-tools: the Loom commit subject it prescribes isn't recognized by Loom's resync guard, so later resyncs block pristine files
 
