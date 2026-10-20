@@ -71,6 +71,7 @@ Issues carrying `loom:curated`.
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
 - **#693**: guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5) *(curated)*
 - **#694**: guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2) *(curated)*
+- **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -91,7 +92,7 @@ _None._
 | In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 6 |
-| Curated | 8 |
+| Curated | 9 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
