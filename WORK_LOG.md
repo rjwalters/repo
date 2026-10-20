@@ -2,6 +2,17 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-19
+- **PR #690**: fix(guard): inert git-search and jq string args no longer trip DELETE-without-WHERE (#688)
+- **PR #682**: docs: add remote-exec provenance requirement/owner/gap map
+- **Issue #688** (closed): Guard: DELETE-without-WHERE scan denies inert git-search and jq string arguments
+
+### 2026-10-18
+- **PR #687**: chore(loom): resync vendored Loom to v0.19.1180
+
+### 2026-10-16
+- **PR #667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
+
 ### 2026-10-15
 - **PR #671**: feat: tag and release each VERSION bump on main, record tag in install metadata
 - **Issue #669** (closed): VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1
