@@ -9,9 +9,9 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **#677**: feat(codex): install each command as its own repo-<verb> skill
-- **#679**: docs(gitignore): explain tracked files matching an ignore rule
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
-- **#689**: chore(deps): bump actions/checkout from 4 to 7 in the github-actions group across 1 directory
+- **#700**: feat: confine mkdir/touch/ln/install writes into the main checkout
+- **#701**: feat: deny Bash writes into peer worktrees under a valid LOOM_WORKTREE_PATH pin
 
 ## Very Important
 
@@ -37,15 +37,15 @@ Issues currently being built (`loom:building`).
 
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
 - **#676**: Codex: register each repo command as a discoverable native skill
-- **#678**: audit/gitignore: 'tracked files match an ignore rule' advice recommends dropping rules that only hide new untracked files
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
-- **#692**: Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214
+- **#693**: guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5)
+- **#694**: guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#695**: docs: record owner review of guard-confinement evidence cases
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -53,9 +53,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **#677**: feat(codex): install each command as its own repo-<verb> skill
-- **#679**: docs(gitignore): explain tracked files matching an ignore rule
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
-- **#689**: chore(deps): bump actions/checkout from 4 to 7 in the github-actions group across 1 directory
+- **#700**: feat: confine mkdir/touch/ln/install writes into the main checkout
+- **#701**: feat: deny Bash writes into peer worktrees under a valid LOOM_WORKTREE_PATH pin
 
 ## Proposed
 
@@ -65,9 +65,11 @@ Issues carrying `loom:curated`.
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored *(curated)*
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
-- **#678**: audit/gitignore: 'tracked files match an ignore rule' advice recommends dropping rules that only hide new untracked files *(curated)*
+- **#681**: Adopt one canonical remote-exec with provenance-by-construction (2run?) — retire hand-managed box clones *(curated)*
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
-- **#692**: Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214 *(curated)*
+- **#693**: guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5) *(curated)*
+- **#694**: guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2) *(curated)*
+- **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -86,9 +88,9 @@ _None._
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 5 |
-| Curated | 7 |
+| Curated | 9 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

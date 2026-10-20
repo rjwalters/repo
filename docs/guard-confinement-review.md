@@ -126,3 +126,12 @@ unchanged and still describes the unpinned behavior (allow).
   scratch file. A direct Bash write into another session's worktree is what now denies.
   If a launcher ever exports one pin for a process that legitimately writes to several
   worktrees it will see denies; the launcher is Loom's and was not traced here.
+
+## Follow-up note, 2026-10-20 (#693)
+
+The owner selected option 1 for E5: `mkdir`, `touch`, `ln` and `install` destinations
+are now write-confinement idioms in `hooks/repo/guard-destructive.sh`
+(`creator_targets()`), so E5 now denies with `worktree-write-confinement`. The E5 row
+and the pinned-hash table above are dated evidence of `e8c7e61` and are unchanged.
+Limits: hook-only; abbreviated long options, command substitution, brace expansion and
+globs are not parsed; not a shell sandbox. #694 is unaffected.

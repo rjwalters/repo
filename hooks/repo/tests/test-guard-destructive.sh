@@ -4774,8 +4774,8 @@ for _c601 in "$WTC_MAIN" "$WTC_WT"; do
     # && after the directory change: the follow-up runs only when it ran.
     assert_deny_tag "write-confinement (#601, cwd=$_w601): true || cd /tmp && redirect (runs in the original cwd)" \
         'true || cd /tmp && echo hi > out.log' "$_c601" "$_U601"
-    assert_deny_tag "write-confinement (#601, cwd=$_w601): mkdir -p d && cd d; redirect (the cd may have been skipped)" \
-        'mkdir -p d && cd /tmp; echo hi > out.log' "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): test -d d && cd d; redirect (the cd may have been skipped)" \
+        'test -d d && cd /tmp; echo hi > out.log' "$_c601" "$_U601"
     assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp && true; redirect (a leading cd is trusted like cd /tmp;)" \
         'cd /tmp && true; echo hi > out.log' "$_c601"
     assert_deny_tag "write-confinement (#601, cwd=$_w601): cd /tmp && true || redirect" \
@@ -5062,6 +5062,80 @@ mkdir -p "$WTC_TOGGLE_OFF_WT/.claude/skills/repo"
 printf '%s' '{"guards":{"worktreeIsolation":false}}' > "$WTC_TOGGLE_OFF_WT/.claude/skills/repo/config.json"
 assert_allow "write-confinement: repo config guards.worktreeIsolation:false disables the category" \
     "echo x > $WTC_TOGGLE_OFF_MAIN/evil.sh" "$WTC_TOGGLE_OFF_WT"
+
+# ---- Creator commands mkdir / touch / ln / install (#693, #692 case E5) ----
+# Only the path being CREATED is a write; read/source operands (ln referent,
+# touch -r, install sources) and option values are not. Disposable fixtures
+# only (WTC_MAIN / WTC_WT) -- nothing runs, the guard only parses.
+assert_deny_tag "creators (#693): E5 reproducer mkdir -p into main checkout denies" \
+    "mkdir -p $WTC_MAIN/.loom/sweep-checkpoint-inert" "$WTC_WT" "worktree-write-confinement"
+assert_deny "creators (#693): mkdir -m 755 -p into main denies" \
+    "mkdir -m 755 -p $WTC_MAIN/newdir" "$WTC_WT"
+assert_deny "creators (#693): mkdir --mode=755 into main denies" \
+    "mkdir --mode=755 $WTC_MAIN/newdir" "$WTC_WT"
+assert_deny "creators (#693): mkdir with one of several operands in main denies" \
+    "mkdir -p /tmp/wtc-a $WTC_MAIN/b" "$WTC_WT"
+assert_deny "creators (#693): mkdir quoted main path denies" \
+    "mkdir -p \"$WTC_MAIN/quoted\"" "$WTC_WT"
+assert_deny "creators (#693): mkdir relative after cd main denies" \
+    "cd $WTC_MAIN && mkdir -p sub" "$WTC_WT"
+assert_deny "creators (#693): touch into main denies" \
+    "touch $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): touch -r REF into main denies (target is the written file)" \
+    "touch -r /tmp/ref $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): ln -s with link path in main denies" \
+    "ln -s /tmp/x $WTC_MAIN/link" "$WTC_WT"
+assert_deny "creators (#693): ln -sf with link path in main denies" \
+    "ln -sf /tmp/x $WTC_MAIN/link" "$WTC_WT"
+assert_deny "creators (#693): ln -s x -t main denies" \
+    "ln -s x -t $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): ln -s --target-directory main denies" \
+    "ln -s x --target-directory $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): ln -s TARGET... DIR(main) denies" \
+    "ln -s /tmp/a /tmp/b $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): hard link into main denies" \
+    "ln /tmp/a $WTC_MAIN/hard" "$WTC_WT"
+assert_deny "creators (#693): install -m 644 SRC main/dest denies" \
+    "install -m 644 /tmp/src $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): install -d main/dir denies" \
+    "install -d $WTC_MAIN/d" "$WTC_WT"
+assert_deny "creators (#693): install -t main SRC denies" \
+    "install -t $WTC_MAIN /tmp/src" "$WTC_WT"
+assert_deny "creators (#693): install -Dm644 attached mode into main denies" \
+    "install -Dm644 /tmp/src $WTC_MAIN/f" "$WTC_WT"
+
+assert_allow "creators (#693): mkdir cwd-relative inside worktree allows" \
+    "mkdir -p src/new-dir" "$WTC_WT"
+assert_allow "creators (#693): mkdir absolute worktree path allows" \
+    "mkdir -p $WTC_WT/out/dir" "$WTC_WT"
+assert_allow "creators (#693): mkdir /tmp scratch allows" \
+    "mkdir -p /tmp/wtc-scratch/a" "$WTC_WT"
+assert_allow "creators (#693): mkdir -m MODE value is not a path" \
+    "mkdir -m $WTC_MAIN/not-a-path -p /tmp/wtc-scratch" "$WTC_WT"
+assert_allow "creators (#693): mkdir with no operand allows" \
+    "mkdir --help" "$WTC_WT"
+assert_allow "creators (#693): touch in worktree allows" \
+    "touch $WTC_WT/f" "$WTC_WT"
+assert_allow "creators (#693): touch -r main-ref into /tmp (main only read) allows" \
+    "touch -r $WTC_MAIN/ref /tmp/wtc-f" "$WTC_WT"
+assert_allow "creators (#693): ln -s referent in main, link in worktree allows" \
+    "ln -s $WTC_MAIN/file ./link-in-wt" "$WTC_WT"
+assert_allow "creators (#693): ln -s referent in main, link absolute in worktree allows" \
+    "ln -s $WTC_MAIN/file $WTC_WT/link" "$WTC_WT"
+assert_allow "creators (#693): ln -s x -t worktree dir allows" \
+    "ln -s $WTC_MAIN/file -t $WTC_WT" "$WTC_WT"
+assert_allow "creators (#693): install main source into worktree dest allows" \
+    "install $WTC_MAIN/src ./dest" "$WTC_WT"
+assert_allow "creators (#693): install -m 644 -o -g values are not paths" \
+    "install -m 644 -o $WTC_MAIN/x -g y /tmp/src /tmp/dest" "$WTC_WT"
+assert_allow "creators (#693): install -d /tmp scratch allows" \
+    "install -d /tmp/wtc-scratch/d" "$WTC_WT"
+assert_allow_env "creators (#693): E5 command allows with REPO_GUARD_WORKTREE_ISOLATION=0" \
+    "REPO_GUARD_WORKTREE_ISOLATION=0" "mkdir -p $WTC_MAIN/.loom/sweep-checkpoint-inert" "$WTC_WT"
+assert_allow "creators (#693): E5 command allows when no managed worktree exists" \
+    "mkdir -p $WTC_NOWT/.loom/sweep-checkpoint-inert" "$WTC_NOWT"
+assert_allow "creators (#693): generic mkdir outside any repo still allows" \
+    "mkdir -p src/new-dir" "$REPO_ROOT"
 
 # ---- Symlinked main-checkout path (#4495): a repo reached through a
 # ---- symlinked ancestor (a /tmp checkout on macOS, a symlinked home, a
