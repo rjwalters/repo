@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-20
+- **PR #686**: docs(update-tools): use Loom's recognized resync commit subject for Loom updates
+- **Issue #683** (closed): update-tools: the Loom commit subject it prescribes isn't recognized by Loom's resync guard, so later resyncs block pristine files
+
 ### 2026-10-19
 - **PR #690**: fix(guard): inert git-search and jq string args no longer trip DELETE-without-WHERE (#688)
 - **PR #682**: docs: add remote-exec provenance requirement/owner/gap map
