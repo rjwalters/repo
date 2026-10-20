@@ -4756,6 +4756,25 @@ assert_contains "remote.md documents terminate removing the alias" "$MD628" "dow
 HELP628="$(bash "$RR" --help 2>&1)"
 assert_contains "--help documents prune" "$HELP628" "repo-remote prune|--prune"
 
+# Step 5 records the code identity on the box (#697).
+STEP5_697="$(awk '/^### 5\. Get the repo onto the instance/{f=1;next} /^### 6\./{f=0} f' "$REMOTE_MD")"
+assert_contains "step 5 resolves the local HEAD sha" "$STEP5_697" 'SHA=$(git rev-parse HEAD)'
+assert_contains "step 5 computes a tracked-only dirty flag" "$STEP5_697" "git status --porcelain --untracked-files=no"
+assert_contains "step 5 writes the marker file on the box" "$STEP5_697" ".repo-remote-sha"
+assert_contains "step 5 documents the opt-in clean refusal" "$STEP5_697" "clean run"
+assert_contains "step 5 keeps syncing a dirty tree by default" "$STEP5_697" "is **not** refused"
+assert_contains "step 5 reports the sha and dirty flag" "$STEP5_697" "Report the recorded SHA"
+# The marker must be written after the rsync, or --delete removes it.
+RSYNC_PAT_697="rsync -az*"
+MARKER_PAT_697="printf 'sha:*"
+RSYNC_POS_697="${STEP5_697%%$RSYNC_PAT_697}"
+MARKER_POS_697="${STEP5_697%%$MARKER_PAT_697}"
+if [[ ${#MARKER_POS_697} -gt ${#RSYNC_POS_697} ]]; then
+    ok "step 5 writes the marker after the rsync"
+else
+    no "step 5 writes the marker after the rsync"
+fi
+
 # install.sh must ship the script to consumer repos (packaging path).
 INSTALL_SH="$REPO_ROOT/install.sh"
 if [[ -f "$INSTALL_SH" ]]; then
