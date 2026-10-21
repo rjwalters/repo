@@ -1185,7 +1185,7 @@ included) and on `down`.
 Opt-in and off by default; with it off the user-data is unchanged. When set to
 `1`, a newly created AWS box's user-data installs rustup system-wide
 (`/opt/rust`, minimal profile, stable toolchain; plus `build-essential` if there
-is no C compiler) and symlinks `cargo`, `rustc` and `rustup` into
+is no C compiler) and puts `cargo`, `rustc` and `rustup` wrapper scripts (which set `RUSTUP_HOME`) in
 `/usr/local/bin`, so `ssh box cargo --version` works non-interactively. The
 fragment runs last and is non-fatal: a failed install leaves ssh keys, host
 identity and the idle guard intact (log: `/var/log/repo-remote-rust.log`).
@@ -1193,7 +1193,7 @@ identity and the idle guard intact (log: `/var/log/repo-remote-rust.log`).
 - **Wait for the marker.** User-data runs asynchronously after ssh is
   reachable, so `up` returning does not mean Rust is ready. The file
   `/var/lib/repo-remote/rust-ready` appears only after `cargo` and `rustc`
-  ran successfully; poll for it before an on-box `cargo install`.
+  ran successfully with `RUSTUP_HOME`/`CARGO_HOME` unset (as over ssh); poll for it before an on-box `cargo install`.
 - **Existing boxes are not retrofitted.** `up` never re-attaches user-data to a
   reused instance, so recreate the box (or install Rust by hand once).
 - GCP is not covered.

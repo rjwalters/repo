@@ -2107,8 +2107,14 @@ rust_userdata() {
   command -v curl >/dev/null 2>&1 || { apt-get update -y && apt-get install -y curl; }
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
-  && for b in cargo rustc rustup; do ln -sf /opt/rust/cargo/bin/$b /usr/local/bin/$b; done \
-  && cargo --version && rustc --version \
+  && for b in cargo rustc rustup; do
+    # A wrapper, not a symlink: the rustup proxy finds its toolchain via
+    # RUSTUP_HOME, which a non-interactive ssh session does not have set.
+    printf '#!/bin/sh\nexport RUSTUP_HOME=/opt/rust/rustup\nexec /opt/rust/cargo/bin/%s "$@"\n' "$b" \
+      >/usr/local/bin/$b && chmod 755 /usr/local/bin/$b || exit 1
+  done \
+  && env -u RUSTUP_HOME -u CARGO_HOME HOME=/root PATH=/usr/local/bin:$PATH cargo --version \
+  && env -u RUSTUP_HOME -u CARGO_HOME HOME=/root PATH=/usr/local/bin:$PATH rustc --version \
   && touch /var/lib/repo-remote/rust-ready
 ) >>/var/log/repo-remote-rust.log 2>&1 || true
 EOF
