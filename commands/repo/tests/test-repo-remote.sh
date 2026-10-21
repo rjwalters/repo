@@ -2557,6 +2557,26 @@ run_rr MOCK_AWS_NEW_ID=i-0altmarker MOCK_AWS_PUBLIC_IP=203.0.113.83 \
   MOCK_SSH_HOST_ID=i-0altmarker REPO_REMOTE_HOST_ID_FILE=/opt/rr-id -- up --yes --json
 assert_contains "user-data honors REPO_REMOTE_HOST_ID_FILE" "$(cat "$MOCK_LOG.userdata" 2>/dev/null)" "/opt/rr-id"
 
+# (p) Opt-in Rust toolchain (repo#708): off by default, byte-identical user-data.
+run_rr MOCK_AWS_NEW_ID=i-0norust MOCK_AWS_PUBLIC_IP=203.0.113.84 MOCK_SSH_HOST_ID=i-0norust -- up --yes --json
+UD_OFF="$(cat "$MOCK_LOG.userdata" 2>/dev/null)"
+assert_not_contains "Rust off (default): no rustup in user-data" "$UD_OFF" "rustup"
+assert_not_contains "Rust off (default): no readiness marker" "$UD_OFF" "rust-ready"
+run_rr MOCK_AWS_NEW_ID=i-0rust MOCK_AWS_PUBLIC_IP=203.0.113.85 MOCK_SSH_HOST_ID=i-0rust \
+  REPO_REMOTE_RUST=1 -- up --yes --json
+UD_ON="$(cat "$MOCK_LOG.userdata" 2>/dev/null)"
+assert_contains "Rust on: user-data installs via rustup" "$UD_ON" "sh.rustup.rs"
+assert_contains "Rust on: system-wide CARGO_HOME" "$UD_ON" "CARGO_HOME=/opt/rust/cargo"
+assert_contains "Rust on: wrappers on the non-interactive PATH" "$UD_ON" "/usr/local/bin/\$b"
+assert_contains "Rust on: wrappers export RUSTUP_HOME themselves" "$UD_ON" "export RUSTUP_HOME=/opt/rust/rustup\\nexec /opt/rust/cargo/bin/%s"
+assert_contains "Rust on: readiness check runs with RUSTUP_HOME/CARGO_HOME scrubbed" "$UD_ON" "env -u RUSTUP_HOME -u CARGO_HOME HOME=/root PATH=/usr/local/bin:\$PATH cargo --version"
+assert_contains "Rust on: readiness marker written" "$UD_ON" "/var/lib/repo-remote/rust-ready"
+assert_contains "Rust on: authorized_keys fragment still present" "$UD_ON" "authorized_keys"
+assert_contains "Rust on: host identity still present" "$UD_ON" "/etc/repo-remote-instance-id"
+assert_contains "Rust on: idle guard still present" "$UD_ON" "repo-remote-idle-check"
+assert_eq "Rust on: user-data minus Rust fragment equals the off output" \
+  "$UD_OFF" "$(printf '%s\n' "$UD_ON" | sed '/^# repo-remote Rust toolchain/,$d')"
+
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
