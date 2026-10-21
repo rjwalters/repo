@@ -10,7 +10,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **#677**: feat(codex): install each command as its own repo-<verb> skill
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
-- **#709**: feat: opt-in Rust toolchain in AWS box user-data
 
 ## Very Important
 
@@ -37,7 +36,6 @@ Issues currently being built (`loom:building`).
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
 - **#676**: Codex: register each repo command as a discoverable native skill
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
-- **#708**: repo-remote: bake Rust/cargo (or a prebuilt 2run) into the fit-box bootstrap so on-box 2run install works (retire onbox_2run:off)
 
 ## PRs Awaiting Review
 
@@ -52,7 +50,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **#677**: feat(codex): install each command as its own repo-<verb> skill
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
-- **#709**: feat: opt-in Rust toolchain in AWS box user-data
 
 ## Proposed
 
@@ -65,7 +62,6 @@ Issues carrying `loom:curated`.
 - **#681**: Adopt one canonical remote-exec with provenance-by-construction (2run?) — retire hand-managed box clones *(curated)*
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
 - **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
-- **#708**: repo-remote: bake Rust/cargo (or a prebuilt 2run) into the fit-box bootstrap so on-box 2run install works (retire onbox_2run:off) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -79,14 +75,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 4 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 4 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 8 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

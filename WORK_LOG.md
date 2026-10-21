@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-21
+- **PR #709**: feat: opt-in Rust toolchain in AWS box user-data
+- **Issue #708** (closed): repo-remote: bake Rust/cargo (or a prebuilt 2run) into the fit-box bootstrap so on-box 2run install works (retire onbox_2run:off)
+
 ### 2026-10-20
 - **PR #701**: feat: deny Bash writes into peer worktrees under a valid LOOM_WORKTREE_PATH pin
 - **Issue #694** (closed): guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2)
