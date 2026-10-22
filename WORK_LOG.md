@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-22
+- **Issue #681** (closed): Adopt one canonical remote-exec with provenance-by-construction (2run?) — retire hand-managed box clones
+- **Issue #680** (closed): remote-run: refuse dirty tracked tree + record/stamp the synced HEAD SHA (remote-exec provenance)
+
 ### 2026-10-21
 - **PR #709**: feat: opt-in Rust toolchain in AWS box user-data
 - **Issue #708** (closed): repo-remote: bake Rust/cargo (or a prebuilt 2run) into the fit-box bootstrap so on-box 2run install works (retire onbox_2run:off)
