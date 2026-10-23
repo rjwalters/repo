@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-23
+- **PR #714**: fix(security): pin patched Node workflow runtimes
+- **Issue #713** (closed): Pin workflow Node runtime to October security releases
+
 ### 2026-10-22
 - **Issue #681** (closed): Adopt one canonical remote-exec with provenance-by-construction (2run?) — retire hand-managed box clones
 - **Issue #680** (closed): remote-run: refuse dirty tracked tree + record/stamp the synced HEAD SHA (remote-exec provenance)
