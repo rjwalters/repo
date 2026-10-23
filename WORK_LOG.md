@@ -2,6 +2,44 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-23
+- **PR #714**: fix(security): pin patched Node workflow runtimes
+- **Issue #713** (closed): Pin workflow Node runtime to October security releases
+
+### 2026-10-22
+- **Issue #681** (closed): Adopt one canonical remote-exec with provenance-by-construction (2run?) — retire hand-managed box clones
+- **Issue #680** (closed): remote-run: refuse dirty tracked tree + record/stamp the synced HEAD SHA (remote-exec provenance)
+
+### 2026-10-21
+- **PR #709**: feat: opt-in Rust toolchain in AWS box user-data
+- **Issue #708** (closed): repo-remote: bake Rust/cargo (or a prebuilt 2run) into the fit-box bootstrap so on-box 2run install works (retire onbox_2run:off)
+
+### 2026-10-20
+- **PR #701**: feat: deny Bash writes into peer worktrees under a valid LOOM_WORKTREE_PATH pin
+- **Issue #694** (closed): guard: Bash writes into another agent's linked worktree are allowed (gf180-opamp #214 cases F1/F2)
+- **PR #700**: feat: confine mkdir/touch/ln/install writes into the main checkout
+- **Issue #693** (closed): guard: mkdir into the main checkout is not a write-confinement idiom (gf180-opamp #214 case E5)
+- **PR #689**: chore(deps): bump actions/checkout from 4 to 7 in the github-actions group across 1 directory
+- **PR #698**: feat: record HEAD sha and dirty flag on the box in /repo:remote step 5
+- **PR #695**: docs: record owner review of guard-confinement evidence cases
+- **PR #679**: docs(gitignore): explain tracked files matching an ignore rule
+- **Issue #697** (closed): /repo:remote step 5: record SHA on the box, opt-in refuse dirty tracked tree
+- **Issue #692** (closed): Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214
+- **Issue #678** (closed): audit/gitignore: 'tracked files match an ignore rule' advice recommends dropping rules that only hide new untracked files
+- **PR #686**: docs(update-tools): use Loom's recognized resync commit subject for Loom updates
+- **Issue #683** (closed): update-tools: the Loom commit subject it prescribes isn't recognized by Loom's resync guard, so later resyncs block pristine files
+
+### 2026-10-19
+- **PR #690**: fix(guard): inert git-search and jq string args no longer trip DELETE-without-WHERE (#688)
+- **PR #682**: docs: add remote-exec provenance requirement/owner/gap map
+- **Issue #688** (closed): Guard: DELETE-without-WHERE scan denies inert git-search and jq string arguments
+
+### 2026-10-18
+- **PR #687**: chore(loom): resync vendored Loom to v0.19.1180
+
+### 2026-10-16
+- **PR #667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
+
 ### 2026-10-15
 - **PR #671**: feat: tag and release each VERSION bump on main, record tag in install metadata
 - **Issue #669** (closed): VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1

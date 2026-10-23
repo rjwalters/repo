@@ -55,6 +55,12 @@ psql -c 'DROP TABLE users'
 mysql -e 'TRUNCATE TABLE logs'
 psql -c 'DELETE FROM users'
 psql -c 'DELETE FROM users WHERE id = 1'
+git log -S 'DELETE FROM t;' --oneline
+jq -n --arg query 'DELETE FROM t;' '$query'
+sqlite3 example.db "DELETE FROM t;"
+echo 'DELETE FROM t;' | sqlite3 db
+git log -S x; sqlite3 db "DELETE FROM t"
+git log -S 'DELETE FROM t' | sqlite3 db
 
 # ── ask tier ──────────────────────────────────────────────────────────────
 git push --force
