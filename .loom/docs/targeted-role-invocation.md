@@ -139,6 +139,8 @@ A missing line on an unchanged item is `failed` with reason `unclassified`.
 | `verdict` | `pr_opened`, `parked`, `closed` | Builder | `create-pr.sh`; `park-record apply`; "Issues Are Suggestions" |
 | `verdict` | `curated`, `parked`, `closed` | Curator | Decision Tree; Routing to a human; Admission keep-or-close |
 | `noop` | `already_judged`, `ci_pending`, `fallback_skip` | Judge | gate 2; Primary Queue step 2b; `judge-fallback-guard.sh` exit 10/11/12 |
+| `verdict` | `fixed` | Doctor | a pushed fix; the PR returns to review |
+| `noop` | `no_fix_needed` | Doctor | the PR needed no change |
 | `noop` | `no_changes_needed` | Builder | the `.no-changes-needed` marker |
 | `noop` | `nothing_to_add` | Curator | the issue already meets the Quality Checklist and was curated before |
 | `refused` | `target_is_pr`, `target_is_issue` | issue roles, PR roles | gate 2 |
@@ -192,8 +194,9 @@ without a sweep around it gets neither unless the engine does both.
   `LOOM_STEP_OUTCOME` and `CHAMPION-STEP`, applies the post-state rule
   (`classify`) and maps each class to its effect. The step spawn (#11906)
   reads a step's last `LOOM_STEP_OUTCOME` line from its log into its end
-  record and role-tick capture. Computing each role's post-state from the
-  forge is still to do, as is the Builder no-op release above.
+  record and role-tick capture. The work finder's step tick computes each
+  role's post-state from the claim release's own read, before its restore
+  write (`step_dispatch/step_end.rs`, #11909).
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR
   Fix Mode has no kind probe: it should take gate 2 of the Judge row.
 - **The Judge lane assigner** hands fallback rows to `/loom:judge <PR>`. The

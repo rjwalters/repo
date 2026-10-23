@@ -445,6 +445,46 @@ assert_deny "Block DELETE FROM without WHERE" \
 assert_allow "Allow DELETE FROM with WHERE" \
     "psql -c 'DELETE FROM users WHERE id = 5;'"
 
+# DELETE-without-WHERE scan: inert search/text-data arguments (#688)
+assert_allow "Allow git log -S with DELETE FROM text" \
+    "git log -S 'DELETE FROM t;' --oneline"
+
+assert_allow "Allow git log --grep with DELETE FROM text" \
+    "git log --grep=\"DELETE FROM t\" --oneline"
+
+assert_allow "Allow git -C dir log -G with DELETE FROM text" \
+    "git -C /tmp/x log -G 'DELETE FROM t' --oneline"
+
+assert_allow "Allow jq --arg with DELETE FROM text" \
+    "jq -n --arg query 'DELETE FROM t;' '\$query'"
+
+assert_deny "Block sqlite3 with DELETE FROM" \
+    "sqlite3 example.db \"DELETE FROM t;\""
+
+assert_deny "Block DELETE FROM carried by command substitution" \
+    "sqlite3 db \"\$(echo 'DELETE FROM t;')\""
+
+assert_deny "Block DELETE FROM carried by backtick substitution" \
+    "psql -c \"\`echo DELETE FROM t\`\""
+
+assert_deny "Block sh -c DELETE FROM payload" \
+    "sh -c 'sqlite3 db \"DELETE FROM t;\"'"
+
+assert_deny "Block eval DELETE FROM payload" \
+    "eval 'sqlite3 db \"DELETE FROM t;\"'"
+
+assert_deny "Block echo DELETE FROM piped to sqlite3" \
+    "echo 'DELETE FROM t;' | sqlite3 db"
+
+assert_deny "Block git log -S chained with executed DELETE FROM" \
+    "git log -S x; sqlite3 db \"DELETE FROM t\""
+
+assert_deny "Block git log -S piped into sqlite3 with DELETE FROM" \
+    "git log -S 'DELETE FROM t' | sqlite3 db"
+
+assert_deny "Block sudo-wrapped git log -S with DELETE FROM (unprovable)" \
+    "sudo git log -S 'DELETE FROM t'"
+
 echo ""
 
 # =========================================================================
@@ -4734,8 +4774,8 @@ for _c601 in "$WTC_MAIN" "$WTC_WT"; do
     # && after the directory change: the follow-up runs only when it ran.
     assert_deny_tag "write-confinement (#601, cwd=$_w601): true || cd /tmp && redirect (runs in the original cwd)" \
         'true || cd /tmp && echo hi > out.log' "$_c601" "$_U601"
-    assert_deny_tag "write-confinement (#601, cwd=$_w601): mkdir -p d && cd d; redirect (the cd may have been skipped)" \
-        'mkdir -p d && cd /tmp; echo hi > out.log' "$_c601" "$_U601"
+    assert_deny_tag "write-confinement (#601, cwd=$_w601): test -d d && cd d; redirect (the cd may have been skipped)" \
+        'test -d d && cd /tmp; echo hi > out.log' "$_c601" "$_U601"
     assert_allow "write-confinement (#601, cwd=$_w601): cd /tmp && true; redirect (a leading cd is trusted like cd /tmp;)" \
         'cd /tmp && true; echo hi > out.log' "$_c601"
     assert_deny_tag "write-confinement (#601, cwd=$_w601): cd /tmp && true || redirect" \
@@ -5022,6 +5062,80 @@ mkdir -p "$WTC_TOGGLE_OFF_WT/.claude/skills/repo"
 printf '%s' '{"guards":{"worktreeIsolation":false}}' > "$WTC_TOGGLE_OFF_WT/.claude/skills/repo/config.json"
 assert_allow "write-confinement: repo config guards.worktreeIsolation:false disables the category" \
     "echo x > $WTC_TOGGLE_OFF_MAIN/evil.sh" "$WTC_TOGGLE_OFF_WT"
+
+# ---- Creator commands mkdir / touch / ln / install (#693, #692 case E5) ----
+# Only the path being CREATED is a write; read/source operands (ln referent,
+# touch -r, install sources) and option values are not. Disposable fixtures
+# only (WTC_MAIN / WTC_WT) -- nothing runs, the guard only parses.
+assert_deny_tag "creators (#693): E5 reproducer mkdir -p into main checkout denies" \
+    "mkdir -p $WTC_MAIN/.loom/sweep-checkpoint-inert" "$WTC_WT" "worktree-write-confinement"
+assert_deny "creators (#693): mkdir -m 755 -p into main denies" \
+    "mkdir -m 755 -p $WTC_MAIN/newdir" "$WTC_WT"
+assert_deny "creators (#693): mkdir --mode=755 into main denies" \
+    "mkdir --mode=755 $WTC_MAIN/newdir" "$WTC_WT"
+assert_deny "creators (#693): mkdir with one of several operands in main denies" \
+    "mkdir -p /tmp/wtc-a $WTC_MAIN/b" "$WTC_WT"
+assert_deny "creators (#693): mkdir quoted main path denies" \
+    "mkdir -p \"$WTC_MAIN/quoted\"" "$WTC_WT"
+assert_deny "creators (#693): mkdir relative after cd main denies" \
+    "cd $WTC_MAIN && mkdir -p sub" "$WTC_WT"
+assert_deny "creators (#693): touch into main denies" \
+    "touch $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): touch -r REF into main denies (target is the written file)" \
+    "touch -r /tmp/ref $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): ln -s with link path in main denies" \
+    "ln -s /tmp/x $WTC_MAIN/link" "$WTC_WT"
+assert_deny "creators (#693): ln -sf with link path in main denies" \
+    "ln -sf /tmp/x $WTC_MAIN/link" "$WTC_WT"
+assert_deny "creators (#693): ln -s x -t main denies" \
+    "ln -s x -t $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): ln -s --target-directory main denies" \
+    "ln -s x --target-directory $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): ln -s TARGET... DIR(main) denies" \
+    "ln -s /tmp/a /tmp/b $WTC_MAIN" "$WTC_WT"
+assert_deny "creators (#693): hard link into main denies" \
+    "ln /tmp/a $WTC_MAIN/hard" "$WTC_WT"
+assert_deny "creators (#693): install -m 644 SRC main/dest denies" \
+    "install -m 644 /tmp/src $WTC_MAIN/f" "$WTC_WT"
+assert_deny "creators (#693): install -d main/dir denies" \
+    "install -d $WTC_MAIN/d" "$WTC_WT"
+assert_deny "creators (#693): install -t main SRC denies" \
+    "install -t $WTC_MAIN /tmp/src" "$WTC_WT"
+assert_deny "creators (#693): install -Dm644 attached mode into main denies" \
+    "install -Dm644 /tmp/src $WTC_MAIN/f" "$WTC_WT"
+
+assert_allow "creators (#693): mkdir cwd-relative inside worktree allows" \
+    "mkdir -p src/new-dir" "$WTC_WT"
+assert_allow "creators (#693): mkdir absolute worktree path allows" \
+    "mkdir -p $WTC_WT/out/dir" "$WTC_WT"
+assert_allow "creators (#693): mkdir /tmp scratch allows" \
+    "mkdir -p /tmp/wtc-scratch/a" "$WTC_WT"
+assert_allow "creators (#693): mkdir -m MODE value is not a path" \
+    "mkdir -m $WTC_MAIN/not-a-path -p /tmp/wtc-scratch" "$WTC_WT"
+assert_allow "creators (#693): mkdir with no operand allows" \
+    "mkdir --help" "$WTC_WT"
+assert_allow "creators (#693): touch in worktree allows" \
+    "touch $WTC_WT/f" "$WTC_WT"
+assert_allow "creators (#693): touch -r main-ref into /tmp (main only read) allows" \
+    "touch -r $WTC_MAIN/ref /tmp/wtc-f" "$WTC_WT"
+assert_allow "creators (#693): ln -s referent in main, link in worktree allows" \
+    "ln -s $WTC_MAIN/file ./link-in-wt" "$WTC_WT"
+assert_allow "creators (#693): ln -s referent in main, link absolute in worktree allows" \
+    "ln -s $WTC_MAIN/file $WTC_WT/link" "$WTC_WT"
+assert_allow "creators (#693): ln -s x -t worktree dir allows" \
+    "ln -s $WTC_MAIN/file -t $WTC_WT" "$WTC_WT"
+assert_allow "creators (#693): install main source into worktree dest allows" \
+    "install $WTC_MAIN/src ./dest" "$WTC_WT"
+assert_allow "creators (#693): install -m 644 -o -g values are not paths" \
+    "install -m 644 -o $WTC_MAIN/x -g y /tmp/src /tmp/dest" "$WTC_WT"
+assert_allow "creators (#693): install -d /tmp scratch allows" \
+    "install -d /tmp/wtc-scratch/d" "$WTC_WT"
+assert_allow_env "creators (#693): E5 command allows with REPO_GUARD_WORKTREE_ISOLATION=0" \
+    "REPO_GUARD_WORKTREE_ISOLATION=0" "mkdir -p $WTC_MAIN/.loom/sweep-checkpoint-inert" "$WTC_WT"
+assert_allow "creators (#693): E5 command allows when no managed worktree exists" \
+    "mkdir -p $WTC_NOWT/.loom/sweep-checkpoint-inert" "$WTC_NOWT"
+assert_allow "creators (#693): generic mkdir outside any repo still allows" \
+    "mkdir -p src/new-dir" "$REPO_ROOT"
 
 # ---- Symlinked main-checkout path (#4495): a repo reached through a
 # ---- symlinked ancestor (a /tmp checkout on macOS, a symlinked home, a
@@ -7684,6 +7798,62 @@ assert_wc deny "#582 pin: relative pin is ignored" "$WC_MAIN" "LOOM_WORKTREE_PAT
 assert_wc deny "#582 pin: .. out of the pinned dir denies" "$WC_MAIN" "LOOM_WORKTREE_PATH=$WC_PIN" "cp /tmp/a $WC_PIN/../src/f"
 assert_wc deny "#582 pin: an inline LOOM_WORKTREE_PATH= assignment in the command does not pin" "$WC_MAIN" "" "LOOM_WORKTREE_PATH=$WC_PIN cp /tmp/a $WC_PIN/f"
 assert_wc deny "#582 pin: an exported LOOM_WORKTREE_PATH in the command does not pin" "$WC_MAIN" "" "export LOOM_WORKTREE_PATH=$WC_PIN; cp /tmp/a $WC_PIN/f"
+
+# -- peer-worktree separation under a VALID inherited pin (#694) --
+# Disposable fixtures only; payloads go to the hook on stdin, never executed.
+WC_NEST_IN1="$WC_WT/sub-wt"
+WC_NEST_IN2="$WC_WT2/sub-wt"
+WC_OUT="$WC_BASE/outside-wt"
+_wc_git -C "$WC_MAIN" worktree add -q -b nested/in1 "$WC_NEST_IN1" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b nested/in2 "$WC_NEST_IN2" >/dev/null 2>&1
+_wc_git -C "$WC_MAIN" worktree add -q -b relocated/out "$WC_OUT" >/dev/null 2>&1
+printf '# Loom-managed worktree marker\n# Issue: 9\n' > "$WC_OUT/.loom-managed"
+mkdir -p "$WC_WT2/src" "$WC_WT/src"
+ln -s "$WC_WT2" "$WC_BASE/peer-link"
+ln -s "$WC_WT" "$WC_BASE/own-link"
+ln -s "$WC_WT2/src" "$WC_WT/link-to-peer-src"
+P1="LOOM_WORKTREE_PATH=$WC_WT"
+assert_wc allow "#694 pin: own-worktree redirect allows" "$WC_WT" "$P1" "echo x > $WC_WT/f"
+assert_wc allow "#694 pin: own-worktree cp allows" "$WC_WT" "$P1" "cp /tmp/a $WC_WT/src/f"
+assert_wc allow "#694 pin: relative redirect in own cwd allows" "$WC_WT" "$P1" "echo x > f"
+assert_wc allow "#694 pin: write via a symlink to the own worktree allows" "$WC_WT" "$P1" "echo x > $WC_BASE/own-link/f"
+assert_wc allow "#694 pin: scratch /tmp write allows" "$WC_WT" "$P1" "echo x > /tmp/scratch-694.txt"
+assert_wc allow "#694 pin: nested unmanaged worktree under main allows" "$WC_WT" "$P1" "cp /tmp/a $WC_NEST/src/f"
+assert_wc allow "#694 pin: nested worktree INSIDE the pinned worktree allows" "$WC_WT" "$P1" "echo x > $WC_NEST_IN1/f"
+assert_wc deny "#694 pin: redirect into a peer worktree denies" "$WC_WT" "$P1" "echo x > $WC_WT2/verdict.md"
+assert_wc deny "#694 pin: cp into a peer worktree denies" "$WC_WT" "$P1" "cp /tmp/a $WC_WT2/src/f"
+assert_wc deny "#694 pin: tee into a peer worktree denies" "$WC_WT" "$P1" "echo x | tee $WC_WT2/f"
+assert_wc deny "#694 pin: sed -i in a peer worktree denies" "$WC_WT" "$P1" "sed -i s/a/b/ $WC_WT2/f"
+assert_wc deny "#694 pin: mv into a peer worktree denies" "$WC_WT" "$P1" "mv /tmp/a $WC_WT2/f"
+assert_wc deny "#694 pin: cd peer && redirect denies" "$WC_WT" "$P1" "cd $WC_WT2 && echo x > f"
+assert_wc deny "#694 pin: symlink spelling of a peer denies" "$WC_WT" "$P1" "echo x > $WC_BASE/peer-link/f"
+assert_wc deny "#694 pin: symlink inside own tree pointing into a peer denies" "$WC_WT" "$P1" "echo x > $WC_WT/link-to-peer-src/f"
+assert_wc deny "#694 pin: nested worktree INSIDE a peer denies (peer wins)" "$WC_WT" "$P1" "echo x > $WC_NEST_IN2/f"
+assert_wc deny "#694 pin: peer relocated outside the main checkout denies" "$WC_WT" "$P1" "echo x > $WC_OUT/f"
+assert_wc deny "#694 pin: .. spelling that lands in a peer denies" "$WC_WT" "$P1" "echo x > $WC_WT/../issue-2/f"
+assert_wc deny "#694 pin: .. through a symlink into a peer denies" "$WC_WT" "$P1" "echo x > $WC_WT/link-to-peer-src/../f"
+assert_wc deny "#694 pin: pin via symlinked spelling still enforces" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_BASE/own-link" "echo x > $WC_WT2/f"
+assert_wc_reason "#694 pin: peer path-component boundary (issue-2-x) is judged as main checkout, not a peer" "$WC_WT" "$P1" "echo x > $WC_MAIN/.loom/worktrees/issue-2-x/f" "resolves to the main repository checkout"
+assert_wc deny "#694 pin: main-checkout deny still holds" "$WC_WT" "$P1" "cp /tmp/a $WC_MAIN/src/f"
+assert_wc_reason "#694 pin: deny names the peer tag-family message" "$WC_WT" "$P1" "echo x > $WC_WT2/f" "NOT this session's assigned worktree"
+assert_wc_reason "#694 pin: deny names the opt-out" "$WC_WT" "$P1" "echo x > $WC_WT2/f" "guards.worktreeIsolation"
+# command-local identity never counts
+assert_wc deny "#694 spoof: inline env prefix does not exempt a peer write" "$WC_WT" "$P1" "LOOM_WORKTREE_PATH=$WC_WT2 cp /tmp/a $WC_WT2/f"
+assert_wc deny "#694 spoof: export in the command does not exempt a peer write" "$WC_WT" "$P1" "export LOOM_WORKTREE_PATH=$WC_WT2; cp /tmp/a $WC_WT2/f"
+assert_wc deny "#694 spoof: unexported assignment statement does not exempt a peer write" "$WC_WT" "$P1" "LOOM_WORKTREE_PATH=$WC_WT2; echo x > $WC_WT2/f"
+assert_wc allow "#694 spoof: no inherited pin, inline prefix stays fallback (allow)" "$WC_WT" "" "LOOM_WORKTREE_PATH=$WC_WT2 cp /tmp/a $WC_WT2/f"
+# unset / invalid pin keeps today's behavior (peer write allowed)
+assert_wc allow "#694 fallback: unset pin, peer redirect allows" "$WC_WT" "" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: unset pin, peer symlink spelling allows" "$WC_WT" "" "echo x > $WC_BASE/peer-link/f"
+assert_wc allow "#694 fallback: pin to a plain (unregistered) dir, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_PIN" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: relative pin, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=issue-1" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: nonexistent pin, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_MAIN/no-such" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: pin at main root, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_MAIN" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: pin at main ancestor, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_BASE" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: pin at /, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=/" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: pin INSIDE a worktree (not its root), peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_WT/src" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: pin at a stale (deleted) registered entry, peer allows" "$WC_WT" "LOOM_WORKTREE_PATH=$WC_MAIN/.claude/worktrees/gone" "echo x > $WC_WT2/f"
+assert_wc allow "#694 fallback: toggle off allows a peer write under a valid pin" "$WC_WT" "$P1 REPO_GUARD_WORKTREE_ISOLATION=0" "echo x > $WC_WT2/f"
 
 # -- read-only-role dist/ scratch exemption --
 assert_wc allow "#582 role: auditor cp into <main>/dist allows" "$WC_MAIN" "LOOM_ROLE=auditor" "cp /tmp/a $WC_MAIN/dist/loom-daemon-x86"
