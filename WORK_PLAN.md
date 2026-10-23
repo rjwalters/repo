@@ -38,12 +38,13 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#677**: feat(codex): install each command as its own repo-<verb> skill
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#677**: feat(codex): install each command as its own repo-<verb> skill
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
 
 ## Proposed
@@ -73,8 +74,8 @@ _None._
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 2 |
 | Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
