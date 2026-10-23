@@ -36,12 +36,13 @@ Issues currently being built (`loom:building`).
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
 - **#676**: Codex: register each repo command as a discoverable native skill
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
+- **#713**: Pin workflow Node runtime to October security releases
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#714**: fix(security): pin patched Node workflow runtimes
 
 ## Approved (Awaiting Merge)
 
@@ -78,8 +79,8 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 3 |
 | Curated | 6 |
 | Architect / Hermit proposals | 0 |
