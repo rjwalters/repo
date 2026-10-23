@@ -473,6 +473,108 @@ assert_eq       "guard uninstall: CLAUDE.md untouched" "$BEFORE11" "$(slurp "$T1
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- install.sh update path: CLAUDE.md is a symlink to AGENTS.md (2AMLogic/2am#4508) --"
+
+TS="$(new_target symlinked)"
+cat > "$TS/AGENTS.md" <<'EOF'
+Agent instructions.
+
+<!-- BEGIN REPO-SKILLS -->
+OLD repo skills content
+<!-- END REPO-SKILLS -->
+
+Trailing prose.
+EOF
+ln -s AGENTS.md "$TS/CLAUDE.md"
+OUTS="$(bash "$INSTALL_SH" -y "$TS" 2>&1)"; RCS=$?
+assert_eq       "symlinked: install exits 0" "0" "$RCS"
+if [[ -L "$TS/CLAUDE.md" && "$(readlink "$TS/CLAUDE.md")" == "AGENTS.md" ]]; then
+    ok "symlinked: CLAUDE.md is still a symlink to AGENTS.md"
+else
+    no "symlinked: CLAUDE.md is still a symlink to AGENTS.md" "$(ls -l "$TS/CLAUDE.md")"
+fi
+BODYS="$(slurp "$TS/AGENTS.md")"
+assert_contains "symlinked: the block was refreshed in the link target" "$BODYS" "Repo Skills](https://github.com/rjwalters/repo) v$VERSION"
+assert_not_contains "symlinked: stale block body is gone from the target" "$BODYS" "OLD repo skills content"
+assert_contains "symlinked: content outside the block survives" "$BODYS" "Trailing prose."
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- claude_md_block_rewrite: link chains it refuses, and the file mode it keeps --"
+
+# Run the rewrite in a subshell so the library's globals stay out of this
+# script. Prints "<rc>|<error>" so a test can check both.
+lib_rewrite() {  # <file> [block-file]
+    (
+        # shellcheck source=/dev/null
+        source "$REPO_ROOT/lib/claude-md-block.sh"
+        claude_md_block_rewrite "$1" "<!-- BEGIN REPO-SKILLS -->" "<!-- END REPO-SKILLS -->" ${2:+"$2"}
+        printf '%s|%s' "$?" "$CLAUDE_MD_BLOCK_ERROR"
+    )
+}
+mode_of() {  # <file> -> its permission string, e.g. -rw-r--r--
+    # `ls -l` rather than `stat`, whose flags differ between BSD and GNU.
+    # shellcheck disable=SC2012
+    ls -lL "$1" | awk '{print substr($1, 1, 10)}'
+}
+BLOCKFILE="$SCRATCH/lib-block.md"
+printf '<!-- BEGIN REPO-SKILLS -->\nNEW body\n<!-- END REPO-SKILLS -->\n' > "$BLOCKFILE"
+make_marked() {  # <file>
+    printf 'Intro.\n\n<!-- BEGIN REPO-SKILLS -->\nOLD body\n<!-- END REPO-SKILLS -->\n\nOutro.\n' > "$1"
+}
+
+# A two-link loop is refused, and nothing is written.
+TL="$(new_target link-loop)"
+ln -s b.md "$TL/a.md"
+ln -s a.md "$TL/b.md"
+ln -s a.md "$TL/CLAUDE.md"
+RL="$(lib_rewrite "$TL/CLAUDE.md" "$BLOCKFILE")"
+assert_eq       "link loop: rewrite refuses (rc 1)" "1" "${RL%%|*}"
+assert_contains "link loop: error names the chain" "${RL#*|}" "symlink chain too deep (or looping)"
+if [[ -L "$TL/CLAUDE.md" && -L "$TL/a.md" && -L "$TL/b.md" ]]; then
+    ok "link loop: every link is left as it was"
+else
+    no "link loop: every link is left as it was" "$(ls -l "$TL")"
+fi
+
+# Eight hops resolve; a ninth is refused with the target untouched.
+TD="$(new_target link-depth)"
+make_marked "$TD/REAL.md"
+ln -s REAL.md "$TD/h1"
+for i in 2 3 4 5 6 7 8 9; do ln -s "h$((i - 1))" "$TD/h$i"; done
+BEFORED="$(slurp "$TD/REAL.md")"
+RD9="$(lib_rewrite "$TD/h9" "$BLOCKFILE")"
+assert_eq       "9 hops: rewrite refuses (rc 1)" "1" "${RD9%%|*}"
+assert_contains "9 hops: error names the chain" "${RD9#*|}" "symlink chain too deep (or looping)"
+assert_eq       "9 hops: target is byte-for-byte untouched" "$BEFORED" "$(slurp "$TD/REAL.md")"
+RD8="$(lib_rewrite "$TD/h8" "$BLOCKFILE")"
+assert_eq       "8 hops: rewrite succeeds" "0|" "$RD8"
+assert_contains "8 hops: the target got the new block" "$(slurp "$TD/REAL.md")" "NEW body"
+if [[ -L "$TD/h8" && -L "$TD/h1" ]]; then
+    ok "8 hops: the chain is still links"
+else
+    no "8 hops: the chain is still links" "$(ls -l "$TD")"
+fi
+
+# The rewrite keeps the target's mode: a bare mktemp file is 0600, and the
+# rename used to carry that onto the link target and onto a plain CLAUDE.md.
+TM="$(new_target mode-kept)"
+make_marked "$TM/AGENTS.md"
+chmod 644 "$TM/AGENTS.md"
+ln -s AGENTS.md "$TM/CLAUDE.md"
+RM1="$(lib_rewrite "$TM/CLAUDE.md" "$BLOCKFILE")"
+assert_eq "mode: rewrite through the link succeeds" "0|" "$RM1"
+assert_eq "mode: link target keeps 0644" "-rw-r--r--" "$(mode_of "$TM/AGENTS.md")"
+make_marked "$TM/PLAIN.md"
+chmod 664 "$TM/PLAIN.md"
+RM2="$(lib_rewrite "$TM/PLAIN.md")"
+assert_eq "mode: removal from a plain file succeeds" "0|" "$RM2"
+assert_eq "mode: plain file keeps 0664" "-rw-rw-r--" "$(mode_of "$TM/PLAIN.md")"
+LEFT="$(find "$TM" -name '.*.md.*' -print)"
+assert_eq "mode: no temporary file is left next to the target" "" "$LEFT"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

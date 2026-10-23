@@ -5,9 +5,11 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 <!-- guide:plan-body:start -->
 ## Operator Attention: Merge-Risk-Hold Pileup
 
-Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
+Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
+- **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
+- **#677**: feat(codex): install each command as its own repo-<verb> skill
+- **#685**: fix(repo): treat a failed git status as unknown, not clean
 
 ## Very Important
 
@@ -25,26 +27,30 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#669**: VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1
+_None._
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
+- **#676**: Codex: register each repo command as a discoverable native skill
+- **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
+- **#713**: Pin workflow Node runtime to October security releases
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#671**: feat: tag and release each VERSION bump on main, record tag in install metadata
-- **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
+- **#714**: fix(security): pin patched Node workflow runtimes
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#667**: fix(install): rewrite a symlinked CLAUDE.md through the link, not over it
+- **#672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
+- **#677**: feat(codex): install each command as its own repo-<verb> skill
+- **#685**: fix(repo): treat a failed git status as unknown, not clean
 
 ## Proposed
 
@@ -52,8 +58,10 @@ Issues carrying `loom:curated`.
 
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
-- **#669**: VERSION has moved to 0.24.x but there are no tags or releases since v0.16.1 *(curated)*
 - **#670**: Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored *(curated)*
+- **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
+- **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
+- **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -67,14 +75,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 0 |
-| Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 4 |
+| Ready (`loom:issue`) | 0 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->

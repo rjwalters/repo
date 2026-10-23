@@ -385,6 +385,35 @@ printf '*.log\n' >"$R7/sub/.gitignore"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- tracked file matching a rule: unaffected by it; the rule hides only new files --"
+# ---------------------------------------------------------------------------
+# The shape from repo#678: `output/renders/` is ignored, one render was committed
+# anyway (force-added), a sibling render was never committed.
+R8="$SCRATCH/tracked-ignored"
+git_fixture_init "$R8" -b main
+mkdir -p "$R8/output/renders"
+printf 'output/renders/\n' >"$R8/.gitignore"
+printf 'v1\n' >"$R8/output/renders/a.png"
+git -C "$R8" add .gitignore
+git -C "$R8" add -f output/renders/a.png
+git -C "$R8" -c user.name=t -c user.email=t@example.com commit -q -m fixture
+printf 'new\n' >"$R8/output/renders/b.png"
+
+assert_eq "ls-files -ci lists the committed render" "output/renders/a.png" \
+    "$(git -C "$R8" -c core.excludesFile=/dev/null ls-files -ci --exclude-standard)"
+printf 'v2\n' >"$R8/output/renders/a.png"
+assert_contains "a re-render of the tracked file still shows as modified" \
+    "$(git -C "$R8" status --porcelain)" "M output/renders/a.png"
+assert_eq "the untracked sibling is hidden by the rule" "output/renders/b.png" \
+    "$(ipaths "$R8" output/renders/)"
+rm -f "$R8/.gitignore"
+assert_contains "removing the rule un-ignores the untracked sibling" \
+    "$(git -C "$R8" status --porcelain -uall)" "?? output/renders/b.png"
+assert_eq "the tracked file stays tracked" "output/renders/a.png" \
+    "$(git -C "$R8" ls-files output/renders/a.png)"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: gitignore.md documents the anchoring rule --"
 # ---------------------------------------------------------------------------
 # Prose assertions run against the whitespace-flattened file (flatten(), repo#363)
@@ -509,6 +538,31 @@ assert_matches "it says a mid-pattern \`**\` stays anchored" \
 assert_contains "it points at gitignore.md's gate" "$AU" "before/after gate"
 assert_contains "it keeps audit.md read-only (candidate redundancy only)" \
     "$AU" "candidate* redundancy"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- doc drift: tracked-but-ignored guidance (repo#678) --"
+# ---------------------------------------------------------------------------
+assert_contains "gitignore.md has the tracked-files subsection" \
+    "$GI" "#### Tracked files that match an ignore rule"
+assert_contains "it states tracked files are unaffected by the rule" \
+    "$GI" "the tracked files are unaffected by the rule"
+assert_contains "it states the rule only hides new untracked files" \
+    "$GI" "The rule only hides **new, untracked** files"
+assert_contains "it lists hidden untracked files before removal, in ipaths() form" \
+    "$GI" "ls-files --others --ignored --exclude-standard -- <pattern>"
+assert_contains "it prefers keeping the rule when that list is non-empty" \
+    "$GI" "prefer **keeping** the rule"
+assert_contains "it tells the reader to note that new files need git add -f" \
+    "$GI" "new ones need \`git add -f\`"
+assert_contains "removal is optional tidying, not a fix" \
+    "$GI" "optional tidying, not a fix"
+assert_contains "audit.md points at the subsection instead of copying it" \
+    "$AU" 'see [[gitignore]] ("Tracked files that match an ignore rule")'
+assert_contains "audit.md states tracked files are unaffected" \
+    "$AU" "Tracked files that match an ignore rule are unaffected by it"
+assert_contains "audit.md says to list hidden untracked files first and keep the rule" \
+    "$AU" "list those before suggesting removal and prefer keeping the rule"
 
 # ---------------------------------------------------------------------------
 echo ""
