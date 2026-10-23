@@ -408,7 +408,7 @@ if [[ "$DRY_RUN" == true ]]; then
       echo "  $TARGET/CLAUDE.md (skipped — install destination is gitignored)"
     fi
   else
-    echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry)"
+    echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry$([[ "$CODEX" == true ]] && ! codex_target_is_foreign && echo " + $CODEX_SKILL_REL/.install-local.json entry"))"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
   fi
   if resync_ignore_active; then
@@ -717,6 +717,22 @@ if [[ "$DEV" != true ]] \
   fi
 fi
 
+# The Codex surface never gets a sidecar from this installer (INSTALLER-CONTRACT
+# C6), but a legacy `.agents/` mirror from an older/other writer may hold one. Keep
+# a leftover from being committable. Dev mode ignores .agents/skills/repo/
+# wholesale in step 4, and a foreign skill is not ours to add ignore lines for.
+CODEX_SIDECAR_IGNORE="$CODEX_SKILL_REL/.install-local.json"
+if [[ "$DEV" != true && "$CODEX" == true ]] && ! codex_target_is_foreign \
+  && ! git -C "$TARGET" check-ignore -q "$CODEX_SIDECAR_IGNORE" 2>/dev/null; then
+  GITIGNORE="$TARGET/.gitignore"
+  if [[ ! -f "$GITIGNORE" ]] || ! grep -qxF "$CODEX_SIDECAR_IGNORE" "$GITIGNORE"; then
+    { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""
+      echo "# Repo Skills Codex-side machine-local install metadata (never committed)"
+      echo "$CODEX_SIDECAR_IGNORE"; } >>"$GITIGNORE"
+    success "Added $CODEX_SIDECAR_IGNORE to .gitignore"
+  fi
+fi
+
 # 3b. Destructive-command guard hook + settings.json wiring.
 # Colocated under the skill's own directory so uninstall's `rm -rf
 # .claude/skills/repo` removes the script for free; only the settings.json entry
@@ -826,6 +842,21 @@ success_installed ".claude/skills/repo/scripts/resync-installed.sh"
 # point of the Codex copy is frontmatter a symlink to the source would not have.
 # The references/ files follow the normal install_file rules, so --dev still
 # gives live per-command edits.
+# A legacy `.agents/` mirror of the .claude/ tree (an older/other writer) is warned
+# about, never migrated or deleted — the layout is unverifiable, so it is the
+# operator's call.
+if [[ "$CODEX" == true ]]; then
+  LEGACY_AGENTS_PATHS=()
+  for _legacy in ".agents/commands/repo" "$CODEX_SKILL_REL/hooks"; do
+    [[ -e "$TARGET/$_legacy" ]] && LEGACY_AGENTS_PATHS+=("$_legacy/")
+  done
+  if [[ ${#LEGACY_AGENTS_PATHS[@]} -gt 0 ]]; then
+    warning "Found a legacy .agents/ mirror layout: ${LEGACY_AGENTS_PATHS[*]}"
+    warning "The installer does not migrate or delete it. If $CODEX_SKILL_REL/SKILL.md has no"
+    warning "Repo Skills marker the Codex surface is left untouched. To get the canonical"
+    warning "layout, move the legacy .agents/ mirror aside and re-run this installer."
+  fi
+fi
 if [[ "$CODEX" != true ]]; then
   info "Skipping the Codex skill surface at $CODEX_SKILL_REL/ (--no-codex)"
 elif codex_target_is_foreign; then
