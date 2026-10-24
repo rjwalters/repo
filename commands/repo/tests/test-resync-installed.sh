@@ -244,8 +244,20 @@ assert_not_contains "config.json is not reported as an orphan" "$RS_OUT" "config
 # juggles more than one temp file at once.
 RESYNC_BODY="$(grep -nE '(^|[^[:alnum:]_])(rm|unlink)[[:space:]]' "$RESYNC_SRC" \
     | grep -v '^[0-9]*:#' | grep -v 'rm -f "\$tmp"' | grep -v 'rm -rf "\$SCRATCH"' \
-    | grep -v 'rm -f "\$block_file"' | grep -v 'rm -f "\$CLAUDE_MD_BLOCK_BACKUP"')"
+    | grep -v 'rm -f "\$block_file"' | grep -v 'rm -f "\$CLAUDE_MD_BLOCK_BACKUP"' \
+    | grep -v 'rm -rf -- "\$_d"')"
 assert_eq "no rm/unlink targets anything but this script's own temp files" "" "$RESYNC_BODY"
+
+# The one deliberate exception (repo#676): the stale per-command Codex skill
+# removal. It must stay narrow — a single `rm -rf -- "$_d"`, reached only for a
+# repo-<verb>/ dir under the Codex skills root that carries our managed marker.
+assert_eq "exactly one rm -rf -- \"\$_d\" (the stale Codex skill removal)" "1" \
+    "$(grep -cF 'rm -rf -- "$_d"' "$RESYNC_SRC")"
+STALE_LOOP="$(grep -B12 -F 'rm -rf -- "$_d"' "$RESYNC_SRC")"
+assert_contains "the stale removal only walks repo-<verb> dirs under the Codex skills root" \
+    "$STALE_LOOP" '"$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX"*/'
+assert_contains "the stale removal skips any dir without our managed marker" \
+    "$STALE_LOOP" 'codex_skill_is_managed "$_d/SKILL.md" || continue'
 
 # ---------------------------------------------------------------------------
 echo ""
