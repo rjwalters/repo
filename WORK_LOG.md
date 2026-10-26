@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-10-23
+- **PR #672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
+- **Issue #670** (closed): Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
 - **PR #714**: fix(security): pin patched Node workflow runtimes
 - **Issue #713** (closed): Pin workflow Node runtime to October security releases
 

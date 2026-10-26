@@ -446,6 +446,56 @@ assert_eq "dev: re-installing does not duplicate the .gitignore entry" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- legacy .agents mirror: warn, ignore the sidecar path, never delete (#670) --"
+
+SIDE_REL="$CODEX_REL/.install-local.json"
+
+T12="$(new_target legacy)"
+mkdir -p "$T12/.agents/commands/repo" "$T12/$CODEX_REL/hooks"
+printf '%s\n' 'legacy' > "$T12/.agents/commands/repo/x.md"
+printf '%s\n' 'legacy' > "$T12/$CODEX_REL/hooks/h.sh"
+printf '%s\n' '---' 'name: repo' '---' 'no marker' > "$T12/$CODEX_REL/SKILL.md"
+OUT12="$(install_into "$T12")"; RC12=$?
+assert_eq       "legacy: install exits 0" "0" "$RC12"
+assert_contains "legacy: warns about the legacy commands path" "$OUT12" ".agents/commands/repo/"
+assert_contains "legacy: warns about the legacy hooks path" "$OUT12" "$CODEX_REL/hooks/"
+assert_file     "legacy: .agents/commands file is not deleted" "$T12/.agents/commands/repo/x.md"
+assert_file     "legacy: .agents hooks file is not deleted" "$T12/$CODEX_REL/hooks/h.sh"
+assert_eq       "legacy: foreign SKILL.md gets no sidecar ignore line" \
+                "0" "$(grep -cxF "$SIDE_REL" "$T12/.gitignore")"
+
+# Same legacy layout but the SKILL.md is ours: sidecar path ignored exactly once.
+T13="$(new_target legacy-managed)"
+install_into "$T13" >/dev/null
+mkdir -p "$T13/.agents/commands/repo"
+printf '%s\n' 'legacy' > "$T13/.agents/commands/repo/x.md"
+OUT13="$(install_into "$T13")"
+assert_contains "legacy-managed: warns on re-install" "$OUT13" "legacy .agents/ mirror"
+install_into "$T13" >/dev/null
+assert_eq       "legacy-managed: sidecar ignore line appears exactly once across runs" \
+                "1" "$(grep -cxF "$SIDE_REL" "$T13/.gitignore")"
+printf '%s\n' '{}' > "$T13/$SIDE_REL"
+if git -C "$T13" check-ignore -q "$SIDE_REL" 2>/dev/null; then
+    ok "legacy-managed: git check-ignore covers the .agents sidecar path"
+else
+    no "legacy-managed: git check-ignore covers the .agents sidecar path"
+fi
+
+T14="$(new_target legacy-nocodex)"
+mkdir -p "$T14/.agents/commands/repo"
+OUT14="$(install_into "$T14" --no-codex)"
+assert_eq       "legacy --no-codex: no sidecar ignore line" \
+                "0" "$(grep -cxF "$SIDE_REL" "$T14/.gitignore" 2>/dev/null)"
+assert_not_contains "legacy --no-codex: no legacy-layout warning" "$OUT14" "legacy .agents/ mirror"
+
+T15="$(new_target fresh)"
+OUT15="$(install_into "$T15")"
+assert_not_contains "fresh install: no legacy-layout warning" "$OUT15" "legacy .agents/ mirror"
+assert_eq       "fresh install: sidecar ignore line present once" \
+                "1" "$(grep -cxF "$SIDE_REL" "$T15/.gitignore")"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"
