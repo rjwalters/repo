@@ -133,7 +133,25 @@ codex_dir_is_ours() {
   [[ -d "$CODEX_SKILL_DIR" ]] && codex_skill_is_managed "$CODEX_SKILL_MD"
 }
 
-[[ -d "$TARGET/.claude/skills/repo" || -d "$TARGET/.claude/commands/repo" ]] || codex_dir_is_ours \
+# Per-command skills (repo#676): every `.agents/skills/repo-*/` whose SKILL.md
+# carries the marker. Unmarked ones (hand-made, or another tool's) are foreign.
+codex_command_dirs() {  # <managed|foreign>
+  local d
+  for d in "$TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX"*/; do
+    [[ -d "$d" ]] || continue
+    d="${d%/}"
+    if codex_skill_is_managed "$d/SKILL.md"; then
+      [[ "$1" == managed ]] && echo "$d"
+    else
+      [[ "$1" == foreign ]] && echo "$d"
+    fi
+  done
+  return 0
+}
+CODEX_CMD_OURS="$(codex_command_dirs managed)"
+CODEX_CMD_FOREIGN="$(codex_command_dirs foreign)"
+
+[[ -d "$TARGET/.claude/skills/repo" || -d "$TARGET/.claude/commands/repo" ]] || codex_dir_is_ours || [[ -n "$CODEX_CMD_OURS" ]] \
   || { info "No Repo Skills install found in $TARGET"; exit 0; }
 
 echo "Will remove from $TARGET:"
@@ -144,6 +162,13 @@ if codex_dir_is_ours; then
 elif [[ -d "$CODEX_SKILL_DIR" ]]; then
   echo "Will NOT remove (present but not marked as installed by Repo Skills):"
   echo "  $CODEX_SKILL_REL/"
+fi
+if [[ -n "$CODEX_CMD_OURS" ]]; then
+  echo "  $CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/ ($(printf '%s\n' "$CODEX_CMD_OURS" | wc -l | tr -d ' ') per-command Codex skills)"
+fi
+if [[ -n "$CODEX_CMD_FOREIGN" ]]; then
+  echo "Will NOT remove (not marked as installed by Repo Skills):"
+  while IFS= read -r _d; do echo "  ${_d#"$TARGET"/}/"; done <<<"$CODEX_CMD_FOREIGN"
 fi
 grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md" 2>/dev/null && echo "  CLAUDE.md REPO-SKILLS block"
 if [[ -f "$TARGET/.claude/settings.json" ]] && \
@@ -187,6 +212,10 @@ success "Removed skill and command directories"
 # `.agents/skills/` itself, which other tools' skills share — and only when the
 # marker proves it is ours. The parents are pruned with rmdir, not rm -rf, so a
 # sibling skill keeps its home.
+if [[ -n "$CODEX_CMD_OURS" ]]; then
+  while IFS= read -r _d; do rm -rf -- "$_d"; done <<<"$CODEX_CMD_OURS"
+  success "Removed per-command Codex skills ($CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX*/)"
+fi
 if codex_dir_is_ours; then
   rm -rf "$CODEX_SKILL_DIR"
   success "Removed $CODEX_SKILL_REL/"
