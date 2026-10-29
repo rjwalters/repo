@@ -446,53 +446,127 @@ assert_eq "dev: re-installing does not duplicate the .gitignore entry" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- per-command skills: one repo-<verb> skill per command (repo#676) --"
+
+T12="$(new_target percmd)"
+install_into "$T12" >/dev/null
+VERBS="$(ls "$REPO_ROOT/commands/repo"/*.md | xargs -n1 basename | sed 's/\.md$//')"
+EXPECT_SET="$( { echo repo; for v in $VERBS; do echo "repo-$v"; done; } | LC_ALL=C sort)"
+ACTUAL_SET="$(ls "$T12/.agents/skills" | LC_ALL=C sort)"
+assert_eq "the discovered skill set is {repo, repo-<verb>...}" "$EXPECT_SET" "$ACTUAL_SET"
+
+BAD=""
+SEEN_NAMES=""
+for d in "$T12"/.agents/skills/*/; do
+    d="${d%/}"; base="$(basename "$d")"
+    n="$(fm "$d/SKILL.md" name)"; ds="$(fm "$d/SKILL.md" description)"
+    [[ "$n" == "$base" ]] || BAD+=" name!=dir:$base"
+    [[ "$n" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#n} -le 64 ]] || BAD+=" slug:$base"
+    [[ -n "$ds" ]] || BAD+=" nodesc:$base"
+    grep -qF "$MARKER" "$d/SKILL.md" || BAD+=" nomarker:$base"
+    [[ -z "$(fm "$d/SKILL.md" type)$(fm "$d/SKILL.md" user-invocable)" ]] || BAD+=" claude-keys:$base"
+    SEEN_NAMES+="$n"$'\n'
+done
+assert_eq "every skill: name==dir, valid slug, description, marker, no Claude-only keys" "" "$BAD"
+assert_eq "skill names are unique" "" "$(printf '%s' "$SEEN_NAMES" | sort | uniq -d)"
+assert_contains "cross-references are rewritten to \$repo-<verb>" \
+                "$(cat "$T12/.agents/skills/repo-help/SKILL.md")" '$repo-help'
+assert_not_contains "no /repo:<verb> cross-references remain in the body" \
+                    "$(sed -n '/^# /,$p' "$T12/.agents/skills/repo-help/SKILL.md")" '/repo:help'
+
+FP_A="$(fingerprint "$T12/.agents/skills")"
+install_into "$T12" >/dev/null
+assert_eq "re-install leaves the per-command skills byte-identical" "$FP_A" "$(fingerprint "$T12/.agents/skills")"
+
+T13="$(new_target percmd-filtered)"
+install_into "$T13" --skills=tidy,reset >/dev/null
+assert_eq "--skills= installs only the selected per-command skills" \
+          "$(printf 'repo\nrepo-help\nrepo-reset\nrepo-tidy\n')" "$(ls "$T13/.agents/skills" | LC_ALL=C sort)"
+
+T14="$(new_target percmd-nocodex)"
+install_into "$T14" --no-codex >/dev/null
+assert_absent "--no-codex writes no per-command skills" "$T14/.agents"
+
+# Ownership: an unmarked repo-decide/ and a hand-made foo/ survive install,
+# resync and uninstall.
+T15="$(new_target percmd-foreign)"
+mkdir -p "$T15/.agents/skills/repo-decide" "$T15/.agents/skills/foo"
+printf '%s\n' 'mine' > "$T15/.agents/skills/repo-decide/SKILL.md"
+printf '%s\n' 'foo' > "$T15/.agents/skills/foo/SKILL.md"
+install_into "$T15" >/dev/null
+assert_eq "install does not overwrite an unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+bash "$T15/.claude/skills/repo/scripts/resync-installed.sh" --target "$T15" >/dev/null 2>&1
+assert_eq "resync does not overwrite an unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+HOME="$FAKE_HOME" bash "$UNINSTALL_SH" -y "$T15" >/dev/null 2>&1
+assert_eq "uninstall keeps the unmarked repo-decide/" "mine" "$(cat "$T15/.agents/skills/repo-decide/SKILL.md")"
+assert_eq "uninstall keeps the hand-made foo/"       "foo"  "$(cat "$T15/.agents/skills/foo/SKILL.md")"
+assert_absent "uninstall removed our repo-tidy/"     "$T15/.agents/skills/repo-tidy"
+assert_absent "uninstall removed the umbrella repo/" "$T15/.agents/skills/repo"
+
+# Resync: no phantom drift, repairs drift, drops stale verbs after a filtered install.
+bash "$T12/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T12" >/dev/null 2>&1
+assert_eq "resync reports no phantom drift for per-command skills" "0" "$?"
+printf '%s\n' 'drifted' >> "$T12/.agents/skills/repo-tidy/SKILL.md"
+DRIFT2="$(bash "$T12/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T12" 2>&1)"
+assert_contains "resync names a drifted per-command skill" "$DRIFT2" "would sync .agents/skills/repo-tidy/SKILL.md"
+
+# Narrow an installed set by hand-editing the recorded filter: easier to
+# simulate "verb no longer in the install" with a stray marked dir.
+mkdir -p "$T13/.agents/skills/repo-retired"
+cp "$T13/.agents/skills/repo-tidy/SKILL.md" "$T13/.agents/skills/repo-retired/SKILL.md"
+bash "$T13/.claude/skills/repo/scripts/resync-installed.sh" --target "$T13" >/dev/null 2>&1
+assert_absent "resync removes a marked per-command skill whose verb left the install" "$T13/.agents/skills/repo-retired"
+assert_file   "resync keeps the selected per-command skills" "$T13/.agents/skills/repo-tidy/SKILL.md"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- legacy .agents mirror: warn, ignore the sidecar path, never delete (#670) --"
 
 SIDE_REL="$CODEX_REL/.install-local.json"
 
-T12="$(new_target legacy)"
-mkdir -p "$T12/.agents/commands/repo" "$T12/$CODEX_REL/hooks"
-printf '%s\n' 'legacy' > "$T12/.agents/commands/repo/x.md"
-printf '%s\n' 'legacy' > "$T12/$CODEX_REL/hooks/h.sh"
-printf '%s\n' '---' 'name: repo' '---' 'no marker' > "$T12/$CODEX_REL/SKILL.md"
-OUT12="$(install_into "$T12")"; RC12=$?
+T16="$(new_target legacy)"
+mkdir -p "$T16/.agents/commands/repo" "$T16/$CODEX_REL/hooks"
+printf '%s\n' 'legacy' > "$T16/.agents/commands/repo/x.md"
+printf '%s\n' 'legacy' > "$T16/$CODEX_REL/hooks/h.sh"
+printf '%s\n' '---' 'name: repo' '---' 'no marker' > "$T16/$CODEX_REL/SKILL.md"
+OUT12="$(install_into "$T16")"; RC12=$?
 assert_eq       "legacy: install exits 0" "0" "$RC12"
 assert_contains "legacy: warns about the legacy commands path" "$OUT12" ".agents/commands/repo/"
 assert_contains "legacy: warns about the legacy hooks path" "$OUT12" "$CODEX_REL/hooks/"
-assert_file     "legacy: .agents/commands file is not deleted" "$T12/.agents/commands/repo/x.md"
-assert_file     "legacy: .agents hooks file is not deleted" "$T12/$CODEX_REL/hooks/h.sh"
+assert_file     "legacy: .agents/commands file is not deleted" "$T16/.agents/commands/repo/x.md"
+assert_file     "legacy: .agents hooks file is not deleted" "$T16/$CODEX_REL/hooks/h.sh"
 assert_eq       "legacy: foreign SKILL.md gets no sidecar ignore line" \
-                "0" "$(grep -cxF "$SIDE_REL" "$T12/.gitignore")"
+                "0" "$(grep -cxF "$SIDE_REL" "$T16/.gitignore")"
 
 # Same legacy layout but the SKILL.md is ours: sidecar path ignored exactly once.
-T13="$(new_target legacy-managed)"
-install_into "$T13" >/dev/null
-mkdir -p "$T13/.agents/commands/repo"
-printf '%s\n' 'legacy' > "$T13/.agents/commands/repo/x.md"
-OUT13="$(install_into "$T13")"
+T17="$(new_target legacy-managed)"
+install_into "$T17" >/dev/null
+mkdir -p "$T17/.agents/commands/repo"
+printf '%s\n' 'legacy' > "$T17/.agents/commands/repo/x.md"
+OUT13="$(install_into "$T17")"
 assert_contains "legacy-managed: warns on re-install" "$OUT13" "legacy .agents/ mirror"
-install_into "$T13" >/dev/null
+install_into "$T17" >/dev/null
 assert_eq       "legacy-managed: sidecar ignore line appears exactly once across runs" \
-                "1" "$(grep -cxF "$SIDE_REL" "$T13/.gitignore")"
-printf '%s\n' '{}' > "$T13/$SIDE_REL"
-if git -C "$T13" check-ignore -q "$SIDE_REL" 2>/dev/null; then
+                "1" "$(grep -cxF "$SIDE_REL" "$T17/.gitignore")"
+printf '%s\n' '{}' > "$T17/$SIDE_REL"
+if git -C "$T17" check-ignore -q "$SIDE_REL" 2>/dev/null; then
     ok "legacy-managed: git check-ignore covers the .agents sidecar path"
 else
     no "legacy-managed: git check-ignore covers the .agents sidecar path"
 fi
 
-T14="$(new_target legacy-nocodex)"
-mkdir -p "$T14/.agents/commands/repo"
-OUT14="$(install_into "$T14" --no-codex)"
+T18="$(new_target legacy-nocodex)"
+mkdir -p "$T18/.agents/commands/repo"
+OUT14="$(install_into "$T18" --no-codex)"
 assert_eq       "legacy --no-codex: no sidecar ignore line" \
-                "0" "$(grep -cxF "$SIDE_REL" "$T14/.gitignore" 2>/dev/null)"
+                "0" "$(grep -cxF "$SIDE_REL" "$T18/.gitignore" 2>/dev/null)"
 assert_not_contains "legacy --no-codex: no legacy-layout warning" "$OUT14" "legacy .agents/ mirror"
 
-T15="$(new_target fresh)"
-OUT15="$(install_into "$T15")"
+T19="$(new_target fresh)"
+OUT15="$(install_into "$T19")"
 assert_not_contains "fresh install: no legacy-layout warning" "$OUT15" "legacy .agents/ mirror"
 assert_eq       "fresh install: sidecar ignore line present once" \
-                "1" "$(grep -cxF "$SIDE_REL" "$T15/.gitignore")"
+                "1" "$(grep -cxF "$SIDE_REL" "$T19/.gitignore")"
 
 # ---------------------------------------------------------------------------
 echo ""
