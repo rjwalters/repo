@@ -32,6 +32,7 @@ _None._
 Issues currently being built (`loom:building`).
 
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
+- **#721**: guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL
 
 ## PRs Awaiting Review
 
@@ -54,6 +55,7 @@ Issues carrying `loom:curated`.
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
 - **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
+- **#721**: guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -71,10 +73,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 5 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
