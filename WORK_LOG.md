@@ -2,6 +2,9 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-29
+- **PR #677**: feat(codex): install each command as its own repo-<verb> skill
+
 ### 2026-10-23
 - **PR #672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **Issue #670** (closed): Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
