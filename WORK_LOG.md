@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-10-31
+- **PR #724**: fix: skip SQL DDL scan of heredoc bodies fed to inert consumers
+- **Issue #721** (closed): guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL
+
 ### 2026-10-29
 - **PR #677**: feat(codex): install each command as its own repo-<verb> skill
 
