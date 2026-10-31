@@ -25,21 +25,19 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#722**: worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
-- **#721**: guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#685**: fix(repo): treat a failed git status as unknown, not clean
-- **#724**: fix: skip SQL DDL scan of heredoc bodies fed to inert consumers
 - **#725**: fix(guard): accurate deny for opaque interpreter-heredoc writes (#722)
 
 ## Approved (Awaiting Merge)
@@ -57,7 +55,6 @@ Issues carrying `loom:curated`.
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
 - **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
-- **#721**: guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL *(curated)*
 - **#722**: worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -75,11 +72,11 @@ _None._
 | Operator merge-risk holds | 0 |
 | Very important | 0 |
 | Important | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 3 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 7 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
