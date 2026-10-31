@@ -4654,7 +4654,10 @@ SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
 #     `;`, `&&`, `||` or `&` (fd dups like `2>&1` excepted) — `cat <<EOF | duckdb`
 #     pipes the body into an arbitrary, unlisted client, so any onward command
 #     keeps the body visible (allowlist shape, not a client denylist);
-#   - the opener line's consumer is cat/tee/gh/git AND names no SQL client or
+#   - the command owning the heredoc is positional: nothing precedes the marker
+#     but one simple command whose FIRST word is cat/tee/gh/git (no `|`, `;`,
+#     `&` before it), so `cat x | duckdb <<EOF` / `git log && client <<EOF`
+#     keep the body visible; AND the line names no SQL client or
 #     interpreter (psql/mysql/sqlite3/wrangler/turso/bash/sh/python/xargs/...),
 #     kept as a second layer;
 #   - the block is CLOSED (delimiter line found) — unterminated stays visible;
@@ -4679,7 +4682,10 @@ _sql_scan_mask_heredocs() {
             after = substr(rest, RLENGTH + 1)
             gsub(/[0-9]*>&[0-9-]*/, "", after)
             if (after ~ /[|;&]/) continue
-            if (line !~ /(^|[;&|(` \t])(cat|tee|gh|git)[ \t]/) continue
+            before = substr(line, 1, p - 1)
+            gsub(/[0-9]*>&[0-9-]*/, "", before)
+            if (before ~ /[|;&]/) continue
+            if (before !~ /^[ \t]*(cat|tee|gh|git)([ \t]|$)/) continue
             if (line ~ /(^|[^A-Za-z0-9_.-])(psql|mysql|sqlite3|wrangler|turso|bash|zsh|sh|dash|ksh|python[0-9.]*|perl|ruby|node|xargs|eval|source)([ \t;&|)]|$)/) continue
             closeat = 0
             for (j = i + 1; j <= nl; j++) {

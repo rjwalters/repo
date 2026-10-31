@@ -9104,6 +9104,12 @@ assert_deny "#721: cat <<EOF && onward command with DDL in body is denied" \
     "cat <<'EOF' && clickhouse-client"$'\n'"$_H_DDL users;"$'\n'"EOF"
 assert_deny "#721: cat <<EOF ; onward command with DDL in body is denied" \
     "cat <<'EOF'; sqlcmd"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat x | duckdb <<EOF (client after earlier cat) is denied" \
+    "cat x | duckdb <<'EOF'"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: git log && clickhouse-client <<EOF is denied" \
+    "git log && clickhouse-client <<'EOF'"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat > f <<EOF | duckdb is denied" \
+    "cat > /tmp/f <<'EOF' | duckdb"$'\n'"$_H_DDL users;"$'\n'"EOF"
 assert_allow "#721: cat <<EOF > file 2>&1 (fd dup) with DDL prose is allowed" \
     "cat <<'EOF' > /tmp/b.md 2>&1"$'\n'"$_H_DDL x"$'\n'"EOF"
 assert_deny "#721: unterminated heredoc keeps denying" \
