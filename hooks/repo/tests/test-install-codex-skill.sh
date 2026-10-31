@@ -155,7 +155,8 @@ OUT1="$(install_into "$T1")"; RC1=$?
 assert_eq   "install exits 0" "0" "$RC1"
 assert_file "SKILL.md lands at the Codex-scanned path" "$T1/$CODEX_REL/SKILL.md"
 assert_contains "install reports the Codex SKILL.md" "$OUT1" "Installed $CODEX_REL/SKILL.md"
-assert_contains "install reports the command procedures" "$OUT1" "command procedures into $CODEX_REFS_REL/"
+assert_contains "install reports the per-command skills" "$OUT1" "per-command Codex skills"
+assert_absent   "no umbrella references/ directory is installed" "$T1/$CODEX_REFS_REL"
 
 CODEX_MD="$T1/$CODEX_REL/SKILL.md"
 NAME="$(fm "$CODEX_MD" name)"
@@ -208,15 +209,8 @@ echo "-- one canonical procedure body, packaged twice (not duplicated) --"
 
 assert_eq "the Codex body is the canonical SKILL.md body" \
           "$(body_of "$T1/.claude/skills/repo/SKILL.md")" \
-          "$(body_of "$CODEX_MD" | sed '/^## Command procedures$/,$d' | sed -e :a -e '/^$/{$d;N;ba' -e '}')"
+          "$(body_of "$CODEX_MD" | sed '/^## Command skills$/,$d' | sed -e :a -e '/^$/{$d;N;ba' -e '}')"
 
-REF_MISMATCH=""
-for c in help tidy reset followups; do
-    if ! cmp -s "$T1/$CODEX_REFS_REL/$c.md" "$T1/.claude/commands/repo/$c.md"; then
-        REF_MISMATCH="$REF_MISMATCH $c"
-    fi
-done
-assert_eq "reference procedures are byte-identical to the Claude command files" "" "$REF_MISMATCH"
 
 # The reference files hold the procedures; SKILL.md points at them. If a verb's
 # procedure text were inlined into SKILL.md too, that would be the duplication
@@ -228,13 +222,12 @@ if [[ -n "$TIDY_MARKER" ]]; then
 else
     no "a verb's procedure is not inlined into SKILL.md" "could not derive a probe line from tidy.md"
 fi
-assert_contains "SKILL.md points at the reference files instead" \
-                "$(cat "$CODEX_MD")" '`references/tidy.md`'
+assert_contains "SKILL.md routes to the per-command skill instead" \
+                "$(cat "$CODEX_MD")" '`$repo-tidy`'
+assert_contains "per-command skill points at the sibling umbrella by relative path" \
+                "$(cat "$T1/.agents/skills/repo-tidy/SKILL.md")" '`../repo/SKILL.md`'
 
 CMD_COUNT="$(find "$REPO_ROOT/commands/repo" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
-REF_COUNT="$(find "$T1/$CODEX_REFS_REL" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
-assert_eq "every command ships a reference procedure" "$CMD_COUNT" "$REF_COUNT"
-
 assert_file "the Codex surface carries its own tracked metadata" "$T1/$CODEX_REL/install-metadata.json"
 META1="$(cat "$T1/$CODEX_REL/install-metadata.json" 2>/dev/null)"
 assert_contains "metadata records the version"      "$META1" '"version"'
@@ -258,13 +251,11 @@ echo "-- --skills= installs a subset, --no-codex installs none --"
 
 T2="$(new_target filtered)"
 install_into "$T2" --skills=tidy,reset >/dev/null
-assert_file   "filtered: the selected verb ships"      "$T2/$CODEX_REFS_REL/tidy.md"
-assert_file   "filtered: help always ships"            "$T2/$CODEX_REFS_REL/help.md"
-assert_absent "filtered: an unselected verb does not"  "$T2/$CODEX_REFS_REL/followups.md"
-assert_eq     "filtered: exactly the selected verbs" "3" \
-              "$(find "$T2/$CODEX_REFS_REL" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+assert_file   "filtered: the selected verb ships"      "$T2/.agents/skills/repo-tidy/SKILL.md"
+assert_file   "filtered: help always ships"            "$T2/.agents/skills/repo-help/SKILL.md"
+assert_absent "filtered: an unselected verb does not"  "$T2/.agents/skills/repo-followups"
 assert_not_contains "filtered: SKILL.md does not advertise an unselected verb" \
-                    "$(cat "$T2/$CODEX_REL/SKILL.md")" '`references/followups.md`'
+                    "$(cat "$T2/$CODEX_REL/SKILL.md")" '`$repo-followups`'
 
 T3="$(new_target no-codex)"
 OUT3="$(install_into "$T3" --no-codex)"
@@ -282,7 +273,7 @@ OUT4="$(HOME="$FAKE_HOME" bash "$INSTALL_SH" --dry-run "$T4" 2>&1)"; RC4=$?
 assert_eq       "--dry-run exits 0" "0" "$RC4"
 assert_contains "--dry-run names the SKILL.md destination"  "$OUT4" "$T4/$CODEX_REL/SKILL.md"
 assert_contains "--dry-run names the metadata destination"  "$OUT4" "$T4/$CODEX_REL/install-metadata.json"
-assert_contains "--dry-run names a reference destination"   "$OUT4" "$T4/$CODEX_REFS_REL/tidy.md"
+assert_contains "--dry-run names a per-command destination"  "$OUT4" "$T4/.agents/skills/repo-<verb>/SKILL.md"
 assert_eq       "--dry-run leaves the target byte-identical" "$FP4" "$(fingerprint "$T4")"
 assert_absent   "--dry-run creates no .agents directory"     "$T4/.agents"
 
@@ -386,11 +377,11 @@ bash "$RESYNC" --dry-run --target "$T9" >/dev/null 2>&1
 assert_eq "a fresh install reports no drift (exit 0)" "0" "$?"
 
 printf '%s\n' 'drifted' >> "$T9/$CODEX_REL/SKILL.md"
-rm -f "$T9/$CODEX_REFS_REL/tidy.md"
+rm -f "$T9/.agents/skills/repo-tidy/SKILL.md"
 DRIFT_OUT="$(bash "$RESYNC" --dry-run --target "$T9" 2>&1)"; DRIFT_RC=$?
 assert_eq       "--dry-run exits 2 when the Codex surface drifted" "2" "$DRIFT_RC"
 assert_contains "--dry-run names the drifted SKILL.md"   "$DRIFT_OUT" "would sync $CODEX_REL/SKILL.md"
-assert_contains "--dry-run names the missing reference"  "$DRIFT_OUT" "would add $CODEX_REFS_REL/tidy.md"
+assert_contains "--dry-run names the missing per-command skill"  "$DRIFT_OUT" "would add .agents/skills/repo-tidy/SKILL.md"
 if grep -qF 'drifted' "$T9/$CODEX_REL/SKILL.md"; then
     ok "--dry-run repaired nothing"
 else
@@ -400,7 +391,7 @@ fi
 APPLY_OUT="$(bash "$RESYNC" --target "$T9" 2>&1)"; APPLY_RC=$?
 assert_eq       "applying the resync exits 0"           "0" "$APPLY_RC"
 assert_contains "the resync repaired the SKILL.md"      "$APPLY_OUT" "synced    $CODEX_REL/SKILL.md"
-assert_contains "the resync restored the reference"     "$APPLY_OUT" "added     $CODEX_REFS_REL/tidy.md"
+assert_contains "the resync restored the per-command skill" "$APPLY_OUT" "added     .agents/skills/repo-tidy/SKILL.md"
 assert_not_contains "the repaired SKILL.md lost the drift" \
                     "$(cat "$T9/$CODEX_REL/SKILL.md")" "drifted"
 bash "$RESYNC" --dry-run --target "$T9" >/dev/null 2>&1
@@ -422,7 +413,7 @@ assert_file     "resync left that file in place" "$T9/$CODEX_REL/NOTES.md"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- --dev: SKILL.md is generated, references stay live symlinks --"
+echo "-- --dev: Codex skills are generated, never symlinked --"
 
 T11="$(new_target dev)"
 OUT11="$(install_into "$T11" --dev)"; RC11=$?
@@ -433,11 +424,13 @@ if [[ -f "$T11/$CODEX_REL/SKILL.md" && ! -L "$T11/$CODEX_REL/SKILL.md" ]]; then
 else
     no "dev: SKILL.md is generated, not symlinked (its frontmatter is rendered)"
 fi
-if [[ -L "$T11/$CODEX_REFS_REL/tidy.md" ]]; then
-    ok "dev: reference procedures are symlinks into the source clone"
+if [[ -f "$T11/.agents/skills/repo-tidy/SKILL.md" && ! -L "$T11/.agents/skills/repo-tidy/SKILL.md" ]] \
+   && grep -qF "$MARKER" "$T11/.agents/skills/repo-tidy/SKILL.md"; then
+    ok "dev: per-command skill is generated (marked, not symlinked)"
 else
-    no "dev: reference procedures are symlinks into the source clone"
+    no "dev: per-command skill is generated (marked, not symlinked)"
 fi
+assert_absent "dev: no umbrella references/ directory" "$T11/$CODEX_REFS_REL"
 assert_contains "dev: the machine-local Codex surface is gitignored" \
                 "$(cat "$T11/.gitignore" 2>/dev/null)" "$CODEX_REL/"
 install_into "$T11" --dev >/dev/null
@@ -570,6 +563,40 @@ assert_eq       "fresh install: sidecar ignore line present once" \
 
 # ---------------------------------------------------------------------------
 echo ""
+echo ""
+echo "-- migration: legacy umbrella references/ (repo#676) --"
+
+mk_legacy() {  # <target>
+    mkdir -p "$1/$CODEX_REFS_REL"; echo old > "$1/$CODEX_REFS_REL/tidy.md"
+}
+T13="$(new_target migrate-install)"
+install_into "$T13" >/dev/null
+mk_legacy "$T13"
+install_into "$T13" >/dev/null
+assert_absent "install removes legacy references/ when SKILL.md is marked" "$T13/$CODEX_REFS_REL"
+install_into "$T13" >/dev/null
+assert_absent "re-run stays migrated (idempotent)" "$T13/$CODEX_REFS_REL"
+
+T14="$(new_target migrate-resync)"
+install_into "$T14" >/dev/null
+mk_legacy "$T14"
+bash "$T14/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T14" >/dev/null 2>&1
+assert_file   "resync --dry-run keeps legacy references/" "$T14/$CODEX_REFS_REL/tidy.md"
+bash "$T14/.claude/skills/repo/scripts/resync-installed.sh" --target "$T14" >/dev/null 2>&1
+assert_absent "resync removes legacy references/" "$T14/$CODEX_REFS_REL"
+EXPECT14="$( { echo repo; for v in $VERBS; do echo "repo-$v"; done; } | LC_ALL=C sort)"
+assert_eq "post-migration discovered set is {repo, repo-<verb>...}" "$EXPECT14" "$(ls "$T14/.agents/skills" | LC_ALL=C sort)"
+bash "$T14/.claude/skills/repo/scripts/resync-installed.sh" --dry-run --target "$T14" >/dev/null 2>&1
+assert_eq "post-migration resync reports no drift" "0" "$?"
+
+T15="$(new_target migrate-foreign)"
+install_into "$T15" >/dev/null
+mk_legacy "$T15"
+sed -i "/$MARKER/d" "$T15/$CODEX_REL/SKILL.md"
+bash "$T15/.claude/skills/repo/scripts/resync-installed.sh" --target "$T15" >/dev/null 2>&1
+install_into "$T15" >/dev/null
+assert_file "unmarked repo/ keeps its references/ through resync and install" "$T15/$CODEX_REFS_REL/tidy.md"
+
 echo "========================================="
 echo "  Total:  $TOTAL"
 printf "  ${GREEN}Passed${NC}: %s\n" "$PASS"

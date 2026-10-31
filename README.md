@@ -98,14 +98,14 @@ Both blocks are installed, previewed, backed up, and removed together under the 
 Every install writes a second, Codex-native copy of the same workflows alongside the Claude Code one:
 
 ```
-.agents/skills/repo/SKILL.md              # the skill Codex discovers
-.agents/skills/repo/references/<verb>.md  # one procedure per command
+.agents/skills/repo/SKILL.md              # `$repo`: thin router to the per-command skills
+.agents/skills/repo-<verb>/SKILL.md       # `$repo-<verb>`: one skill per command
 .agents/skills/repo/install-metadata.json # version/commit, same shape as the Claude side
 ```
 
 Codex CLI scans `.agents/skills` in every directory from your working directory up to the repository root and loads each `SKILL.md` it finds, using the open [Agent Skills](https://agentskills.io) format. So this is a plain repo-scoped install: **no config file, no manifest registration, and nothing written outside the target repo.** After installing, `/skills` (or typing `$repo`) in Codex shows the skill, and Codex can also select it on its own when a request matches its `description`. Skip it with `./install.sh --no-codex <repo>`.
 
-**One canonical body, two runtime wrappers.** The Codex `SKILL.md` body *is* [`skills/repo/SKILL.md`](skills/repo/SKILL.md), and each `references/<verb>.md` *is* the same `commands/repo/<verb>.md` file Claude Code registers as `/repo:<verb>` — copied, not rewritten. Only the frontmatter is generated, because the two runtimes want different frontmatter:
+**One canonical body, two runtime wrappers.** The Codex `SKILL.md` body *is* [`skills/repo/SKILL.md`](skills/repo/SKILL.md), and each `repo-<verb>` skill is rendered from the same `commands/repo/<verb>.md` file Claude Code registers as `/repo:<verb>` — one procedure, not a second copy. Only the frontmatter is generated, because the two runtimes want different frontmatter:
 
 | Frontmatter | Claude Code copy | Codex copy | Why |
 |---|---|---|---|
@@ -114,7 +114,11 @@ Codex CLI scans `.agents/skills` in every directory from your working directory 
 | `domain` | top-level key | under `metadata:` | An inert grouping tag this repo invented; the spec has a `metadata` map for exactly that, so it goes there instead of as an unknown top-level key |
 | `type`, `user-invocable` | present | dropped | These name Claude Code's own two install targets (`.claude/skills/` vs `.claude/commands/`) and mean nothing to Codex's discovery — see [`skills/README.md`](skills/README.md) § "Frontmatter field reference" |
 
-**One skill per command (`$repo-<verb>`).** Codex lists skills by name and description, so each command is also installed as its own skill, `.agents/skills/repo-<verb>/SKILL.md` (`name: repo-<verb>`, matching its directory), whose description is that command's own. The body is the command's body, with `/repo:<verb>` cross-references rewritten to `$repo-<verb>` at render time, so `/repo:tidy` in Claude Code is `$repo-tidy` in Codex. `--skills=` installs only the selected verbs, `--no-codex` writes none, and `.claude/skills/repo/scripts/resync-installed.sh` repairs them and removes marked ones whose verb left the install. Paths such as `.claude/skills/repo/scripts/…` and `.claude/handoff.md` in a command are relative to the repository root and exist when the Claude Code surface is installed too. The umbrella `repo` skill and its `references/` are kept as a router for now.
+**One skill per command (`$repo-<verb>`).** Codex lists skills by name and description, so each command is also installed as its own skill, `.agents/skills/repo-<verb>/SKILL.md` (`name: repo-<verb>`, matching its directory), whose description is that command's own. The body is the command's body, with `/repo:<verb>` cross-references rewritten to `$repo-<verb>` at render time, so `/repo:tidy` in Claude Code is `$repo-tidy` in Codex. `--skills=` installs only the selected verbs, `--no-codex` writes none, and `.claude/skills/repo/scripts/resync-installed.sh` repairs them and removes marked ones whose verb left the install. Paths such as `.claude/skills/repo/scripts/…` and `.claude/handoff.md` in a command are relative to the repository root and exist when the Claude Code surface is installed too. Each per-command skill points at the sibling umbrella (`../repo/SKILL.md`, relative to the skill directory) for the shared safety and confirmation rules; that text is not copied.
+
+**`$repo` is a router.** The umbrella skill keeps the canonical help body and a list of the `$repo-<verb>` skills; it no longer carries per-verb procedure copies.
+
+**Migration (one-time).** Installs from before this change have `.agents/skills/repo/references/`. Re-running `install.sh`, or `resync-installed.sh`, deletes that directory — only when `.agents/skills/repo/SKILL.md` carries the Repo Skills marker; an unmarked `repo/` is left untouched. Re-runs are no-ops. If you had pinned a `references/` file in `.repo/resync-ignore`, re-point the pin at `.agents/skills/repo-<verb>/SKILL.md`.
 
 **Ownership.** Unlike `.claude/skills/repo/`, the `.agents/skills/` namespace is *shared* — Codex loads every skill any tool or person puts there. So the installer writes only `.agents/skills/repo/`, marks what it wrote, and refuses to overwrite a same-named skill it did not write; `uninstall.sh` applies the same test before removing anything, prunes the shared parent directories only when it emptied them, and leaves sibling skills alone. `.claude/skills/repo/scripts/resync-installed.sh` refreshes the Codex surface too and reports drift in it — but only when it is already installed, so a repo that declined it never has it added behind the operator's back.
 
@@ -207,7 +211,7 @@ comments and blank lines ignored, a trailing `/` pinning a whole subtree:
 ```
 # keep our allowlist-drift wiring in /repo:scrub
 .claude/commands/repo/scrub.md
-.agents/skills/repo/references/scrub.md
+.agents/skills/repo-scrub/SKILL.md
 ```
 
 `install.sh` and `resync-installed.sh` read the same list through
@@ -244,7 +248,7 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
-- `.agents/skills/repo/` — the Codex skill: `SKILL.md`, `references/<verb>.md` (one per command), and its own `install-metadata.json`. Written by default, skipped with `--no-codex`; only this directory is touched, never a sibling skill under the shared `.agents/skills/` namespace, and never a same-named skill this installer did not write. See "Codex packaging" above
+- `.agents/skills/repo/` — the Codex skill: `SKILL.md` (the `$repo` router) and its own `install-metadata.json`; the per-command skills are the sibling `.agents/skills/repo-<verb>/` directories. Written by default, skipped with `--no-codex`; only this directory is touched, never a sibling skill under the shared `.agents/skills/` namespace, and never a same-named skill this installer did not write. See "Codex packaging" above
 - `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
@@ -260,7 +264,7 @@ skills/README.md             Frontmatter/structure contract for skills/*/SKILL.m
 skills/repo/SKILL.md         Domain overview installed to .claude/skills/repo/ (Claude Code) and,
                              with Codex-native frontmatter, to .agents/skills/repo/ (Codex CLI)
 commands/repo/*.md           Command files installed to .claude/commands/repo/ and, unchanged,
-                             to .agents/skills/repo/references/
+                             to .agents/skills/repo-<verb>/
 scripts/repo/repo-remote.sh  Headless /repo:remote provisioning entry point, installed to .claude/skills/repo/scripts/
 scripts/repo/resync-installed.sh  Consumer-side resync (contract C7), installed to .claude/skills/repo/scripts/
 scripts/repo/repo-scrub-forks.sh  /repo:scrub fork-network sweep, installed to the same place

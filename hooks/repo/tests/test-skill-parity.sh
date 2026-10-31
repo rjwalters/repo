@@ -83,7 +83,7 @@ SRC_FOLLOWUPS="$REPO_ROOT/commands/repo/followups.md"
 SRC_SKILL="$REPO_ROOT/skills/repo/SKILL.md"
 
 CLAUDE_REL=".claude/commands/repo/followups.md"
-CODEX_REL=".agents/skills/repo/references/followups.md"
+CODEX_REL=".agents/skills/repo-followups/SKILL.md"
 CODEX_SKILL_REL=".agents/skills/repo/SKILL.md"
 
 # Assertion helpers (ok/no/skip/assert_eq/assert_contains/assert_not_contains/
@@ -192,61 +192,52 @@ echo ""
 echo "-- 4. install: the Codex-side skill body points at its own resolved file --"
 
 assert_file "Codex's skill index (SKILL.md) is installed" "$T1/$CODEX_SKILL_REL"
-assert_file "Codex's followups reference procedure is installed" "$T1/$CODEX_REL"
+assert_file "Codex's per-command followups skill is installed" "$T1/$CODEX_REL"
 
-# This is Codex's OWN documented resolution step, not an install-time
-# assumption: the installed SKILL.md's rendered body carries the
-# "Command procedures" pointer lib/codex-skill.sh's codex_skill_render()
-# writes, naming the exact reference file to open for the followups verb.
-assert_contains "installed SKILL.md's body points Codex at references/followups.md" \
-    "$(cat "$T1/$CODEX_SKILL_REL")" '`references/followups.md`'
+# Codex's OWN resolution step (repo#676): the umbrella SKILL.md routes to the
+# `$repo-followups` skill, which Codex lists as its own entry.
+assert_contains "installed SKILL.md's body routes Codex to \$repo-followups" \
+    "$(cat "$T1/$CODEX_SKILL_REL")" '`$repo-followups`'
+
+# The Codex file is a rendered form of the command (own frontmatter, a short
+# header, and /repo:<verb> -> $repo-<verb> rewriting), so parity is "the command
+# body, modulo that rewrite, is the tail of the Codex file".
+body_only() { awk 'NR==1&&$0!="---"{print;f=1;next} f{print;next} NR==1{i=1;next} i&&$0=="---"{i=0;s=1;next} i{next} s{print}' "$1"; }
+codex_tail_matches() {  # <claude-file> <codex-file>
+    local want n
+    want="$(body_only "$1" | sed -E 's#/repo:([a-z][a-z0-9]*(-[a-z0-9]+)*)#$repo-\1#g')"
+    n="$(printf '%s\n' "$want" | wc -l | tr -d ' ')"
+    [[ "$(tail -n "$n" "$2")" == "$want" ]]
+}
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- 5. parity: both runtimes' resolved files are the SAME workflow body --"
+echo "-- 5. parity: both runtimes' resolved files carry the SAME workflow body --"
 
-# The actual parity claim: what /repo:followups resolves to for Claude, and
-# what the skill body's own pointer resolves to for Codex, are byte-identical
-# to each other AND to the one canonical source — not two independently
-# maintained copies that happen to agree today.
-assert_bytes_eq "Claude-resolved file == Codex-resolved file" \
-    "$T1/$CLAUDE_REL" "$T1/$CODEX_REL"
 assert_bytes_eq "Claude-resolved file == canonical source (commands/repo/followups.md)" \
     "$T1/$CLAUDE_REL" "$SRC_FOLLOWUPS"
-assert_bytes_eq "Codex-resolved file == canonical source (commands/repo/followups.md)" \
-    "$T1/$CODEX_REL" "$SRC_FOLLOWUPS"
-
-# Same claim again via content hash (the issue's alternate acceptable form of
-# "point at the same underlying file/content").
-HASH_CLAUDE="$(sha "$T1/$CLAUDE_REL")"
-HASH_CODEX="$(sha "$T1/$CODEX_REL")"
-HASH_SRC="$(sha "$SRC_FOLLOWUPS")"
-assert_eq "sha256(Claude-resolved) == sha256(Codex-resolved)" "$HASH_CLAUDE" "$HASH_CODEX"
-assert_eq "sha256(Claude-resolved) == sha256(canonical source)" "$HASH_SRC" "$HASH_CLAUDE"
+if codex_tail_matches "$T1/$CLAUDE_REL" "$T1/$CODEX_REL"; then
+    ok "Codex-resolved skill body == Claude command body (modulo cross-reference rewrite)"
+else
+    no "Codex-resolved skill body == Claude command body (modulo cross-reference rewrite)"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- 6. generalization: the same parity holds for every installed verb --"
 
-# followups is the verb this issue names, but the resolution mechanism
-# (sections 1/3 for Claude, section 4 for Codex) is identical for every
-# commands/repo/*.md file, and install.sh copies all of them through the same
-# code path (a single loop over $COMMANDS for each surface — see install.sh
-# "2. Command files" and "3f. Codex-side skill surface"). Loop over every
-# verb actually shipped in $T1 so a future verb that broke parity would be
-# caught here even if nobody thought to name it in this suite by hand.
 MISMATCH=""
 CHECKED=0
 for claude_file in "$T1/.claude/commands/repo/"*.md; do
     [[ -f "$claude_file" ]] || continue
     verb="$(basename "$claude_file" .md)"
-    codex_file="$T1/.agents/skills/repo/references/$verb.md"
+    codex_file="$T1/.agents/skills/repo-$verb/SKILL.md"
     CHECKED=$((CHECKED + 1))
-    if [[ ! -f "$codex_file" ]] || ! cmp -s "$claude_file" "$codex_file"; then
+    if [[ ! -f "$codex_file" ]] || ! codex_tail_matches "$claude_file" "$codex_file"; then
         MISMATCH="$MISMATCH $verb"
     fi
 done
-assert_eq "every installed verb's Claude/Codex copies are byte-identical (checked $CHECKED)" \
+assert_eq "every installed verb's Claude/Codex bodies match (checked $CHECKED)" \
     "" "$MISMATCH"
 
 # ===========================================================================
