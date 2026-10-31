@@ -4669,7 +4669,7 @@ _sql_scan_mask_heredocs() {
             if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/) == 0) continue
             delim = substr(rest, 1, RLENGTH)
             if (line !~ /(^|[;&|(` \t])(cat|tee|gh|git)[ \t]/) continue
-            if (line ~ /(^|[^A-Za-z0-9_.\/-])(psql|mysql|sqlite3|wrangler|turso|bash|zsh|sh|dash|ksh|python[0-9.]*|perl|ruby|node|xargs|eval|source)([ \t;&|)]|$)/) continue
+            if (line ~ /(^|[^A-Za-z0-9_.-])(psql|mysql|sqlite3|wrangler|turso|bash|zsh|sh|dash|ksh|python[0-9.]*|perl|ruby|node|xargs|eval|source)([ \t;&|)]|$)/) continue
             closeat = 0
             for (j = i + 1; j <= nl; j++) {
                 t = lines[j]; sub(/^\t+/, "", t)

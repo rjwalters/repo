@@ -9092,6 +9092,12 @@ assert_deny "#721: cat <<EOF | psql with DDL in body is denied" \
     "cat <<EOF | psql"$'\n'"$_H_DDL users;"$'\n'"EOF"
 assert_deny "#721: bash <<EOF with DDL in body is denied" \
     "bash <<'EOF'"$'\n'"psql -c '$_H_DDL users'"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /usr/bin/psql with DDL in body is denied" \
+    "cat <<'EOF' | /usr/bin/psql"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /bin/sh with DDL in body is denied" \
+    "cat <<'EOF' | /bin/sh"$'\n'"psql -c '$_H_DDL users'"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /usr/local/bin/sqlite3 with DDL in body is denied" \
+    "cat <<'EOF' | /usr/local/bin/sqlite3 db"$'\n'"$_H_DDL users;"$'\n'"EOF"
 assert_deny "#721: unterminated heredoc keeps denying" \
     "cat > /tmp/b.md <<'EOF'"$'\n'"$_H_DDL users"
 assert_deny "#721: unquoted heredoc with command substitution keeps denying" \
