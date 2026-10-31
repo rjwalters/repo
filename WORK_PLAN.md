@@ -7,7 +7,7 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-_None._
+- **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 
 ## Very Important
 
@@ -31,6 +31,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#676**: Codex: register each repo command as a discoverable native skill
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
 
 ## PRs Awaiting Review
@@ -44,7 +45,7 @@ PRs waiting on Judge (`loom:review-requested`).
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 
 ## Proposed
 
@@ -69,13 +70,13 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 1 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 0 |
+| Approved PRs awaiting merge | 1 |
 | Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
