@@ -475,7 +475,7 @@ fi
 # Cross-runtime skill-INVOCATION parity (repo#286): distinct from the
 # install-PLACEMENT suite above — asserts that Claude's `/repo:followups`
 # alias mechanism (frontmatter + fixed discovery path) and Codex's skill-body
-# "Command procedures" pointer both resolve to the identical
+# "Command skills" router both resolve to the identical
 # skills/repo/SKILL.md-derived workflow body, not just that install.sh wrote
 # matching bytes. Same delegation shape as every suite above.
 echo
