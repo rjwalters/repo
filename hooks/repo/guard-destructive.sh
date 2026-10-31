@@ -4650,10 +4650,18 @@ SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
 # Self-contained awk (the shared heredoc lexer, _MASKHEREDOC_AWK, is defined
 # further down this file, after this straight-line check runs). A body is
 # blanked ONLY when ALL hold, so this can only narrow a deny in the clear case:
+#   - nothing is chained after the heredoc marker on the opener line: no `|`,
+#     `;`, `&&`, `||` or `&` (fd dups like `2>&1` excepted) — `cat <<EOF | duckdb`
+#     pipes the body into an arbitrary, unlisted client, so any onward command
+#     keeps the body visible (allowlist shape, not a client denylist);
 #   - the opener line's consumer is cat/tee/gh/git AND names no SQL client or
-#     interpreter (psql/mysql/sqlite3/wrangler/turso/bash/sh/python/xargs/...);
+#     interpreter (psql/mysql/sqlite3/wrangler/turso/bash/sh/python/xargs/...),
+#     kept as a second layer;
 #   - the block is CLOSED (delimiter line found) — unterminated stays visible;
 #   - the body has no `$(` or backtick (an unquoted delimiter would expand it).
+# LIMITATION: the guard does not follow file contents. Write-then-execute
+# (`cat > x.sql <<EOF ... EOF` followed by `psql -f x.sql`) is allowed; this
+# mask must not be read as covering that case.
 _sql_scan_mask_heredocs() {
     printf '%s' "$1" | awk '
     { lines[NR] = $0 }
@@ -4668,6 +4676,9 @@ _sql_scan_mask_heredocs() {
             sub(/^["\047]/, "", rest)
             if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/) == 0) continue
             delim = substr(rest, 1, RLENGTH)
+            after = substr(rest, RLENGTH + 1)
+            gsub(/[0-9]*>&[0-9-]*/, "", after)
+            if (after ~ /[|;&]/) continue
             if (line !~ /(^|[;&|(` \t])(cat|tee|gh|git)[ \t]/) continue
             if (line ~ /(^|[^A-Za-z0-9_.-])(psql|mysql|sqlite3|wrangler|turso|bash|zsh|sh|dash|ksh|python[0-9.]*|perl|ruby|node|xargs|eval|source)([ \t;&|)]|$)/) continue
             closeat = 0

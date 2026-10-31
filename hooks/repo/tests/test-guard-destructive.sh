@@ -9098,6 +9098,14 @@ assert_deny "#721: cat <<EOF | /bin/sh with DDL in body is denied" \
     "cat <<'EOF' | /bin/sh"$'\n'"psql -c '$_H_DDL users'"$'\n'"EOF"
 assert_deny "#721: cat <<EOF | /usr/local/bin/sqlite3 with DDL in body is denied" \
     "cat <<'EOF' | /usr/local/bin/sqlite3 db"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | duckdb (unlisted client) with DDL in body is denied" \
+    "cat <<'EOF' | duckdb"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF && onward command with DDL in body is denied" \
+    "cat <<'EOF' && clickhouse-client"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF ; onward command with DDL in body is denied" \
+    "cat <<'EOF'; sqlcmd"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_allow "#721: cat <<EOF > file 2>&1 (fd dup) with DDL prose is allowed" \
+    "cat <<'EOF' > /tmp/b.md 2>&1"$'\n'"$_H_DDL x"$'\n'"EOF"
 assert_deny "#721: unterminated heredoc keeps denying" \
     "cat > /tmp/b.md <<'EOF'"$'\n'"$_H_DDL users"
 assert_deny "#721: unquoted heredoc with command substitution keeps denying" \
