@@ -5437,6 +5437,65 @@ WTC331_OUTER_EOF
 assert_deny "#331 safety floor: python heredoc with shutil.rmtree(...) still denies" \
     "$WTC331_SHUTIL_RMTREE_CMD" "$WTC331_MAIN"
 
+# ---- #722: an interpreter heredoc with a write marker from the primary
+# ---- checkout still denies (fail closed), but the diagnosis names the opaque
+# ---- heredoc write, not a redirection/tee/cp bypass.
+WTC722_PY_CMD=$(cat <<'WTC722_OUTER_EOF'
+M=/home/someone/notes
+python3 - <<'EOF'
+open(f"{M}/a.md", "w").write("x")
+EOF
+WTC722_OUTER_EOF
+)
+WTC722_PERL_CMD=$(cat <<'WTC722_OUTER_EOF'
+perl - <<'EOF'
+unlink("evil.txt");
+EOF
+WTC722_OUTER_EOF
+)
+WTC722_DASH_CMD=$(cat <<'WTC722_OUTER_EOF'
+python3 - <<-'EOF'
+	open("a.md", "w").write("x")
+	EOF
+WTC722_OUTER_EOF
+)
+WTC722_NOWRITE_CMD=$(cat <<'WTC722_OUTER_EOF'
+M=/home/someone/notes
+python3 - <<'EOF'
+print(f"{M}/a.md")
+EOF
+WTC722_OUTER_EOF
+)
+WTC722_REDIR_CMD="$(printf '%s\n' "python3 - <<'EOF'" 'print(1)' 'EOF') > src/file"
+wtc722_check() { # desc cmd cwd expect-pattern expect-reason-substr reject-reason-substr
+    TOTAL=$((TOTAL + 1))
+    local log out
+    log=$(mktemp -d 2>/dev/null)/decisions.log
+    out=$(make_input "$2" "$3" | env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$log" "$GUARD" 2>/dev/null) || true
+    if [[ "$(tail -1 "$log" 2>/dev/null | jq -r '.pattern' 2>/dev/null)" == "$4" ]] && \
+       [[ "$out" == *"$5"* ]] && [[ "$out" != *"$6"* ]] && \
+       [[ "$(tail -1 "$log" | jq -r '.context' 2>/dev/null)" == *"target=$WTC_MAIN_PHYS"* ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $1"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $1"
+        echo -e "       Got: $(tail -1 "$log" 2>/dev/null)"
+    fi
+    rm -rf "$(dirname "$log")"
+}
+wtc722_check "#722: python heredoc write marker from primary checkout denies as opaque-heredoc" \
+    "$WTC722_PY_CMD" "$WTC_MAIN" worktree-write-confinement-opaque-heredoc "cannot determine" "redirection/tee"
+wtc722_check "#722: perl heredoc write marker produces the same opaque-heredoc deny" \
+    "$WTC722_PERL_CMD" "$WTC_MAIN" worktree-write-confinement-opaque-heredoc "cannot determine" "redirection/tee"
+wtc722_check "#722: <<- heredoc write marker produces the same opaque-heredoc deny" \
+    "$WTC722_DASH_CMD" "$WTC_MAIN" worktree-write-confinement-opaque-heredoc "cannot determine" "redirection/tee"
+assert_allow "#722: heredoc without write marker (leading M=<dir> assignment) from primary checkout allows" \
+    "$WTC722_NOWRITE_CMD" "$WTC_MAIN"
+assert_allow "#722: heredoc with write marker from the issue worktree cwd allows" \
+    "$WTC722_PY_CMD" "$WTC_WT"
+assert_deny "#722: heredoc with explicit '> src/file' redirect from primary checkout still denies" \
+    "$WTC722_REDIR_CMD" "$WTC_MAIN"
+
+
 WTC331_PERL_UNLINK_CMD=$(cat <<'WTC331_OUTER_EOF'
 perl - <<'PYEOF'
 unlink("evil.txt");
