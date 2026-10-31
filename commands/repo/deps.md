@@ -737,7 +737,8 @@ value, or a slot in one entry's plural `directories:` list, see below):
 | `github-actions` | `.github/workflows/*.yml`, `.github/actions/*/action.yml` |
 | `npm` | `package.json` (`pnpm-lock.yaml` / `yarn.lock` / `package-lock.json`) |
 | `cargo` | `Cargo.toml` |
-| `pip` | `requirements*.txt`, `pyproject.toml`, `Pipfile` |
+| `uv` | `uv.lock` beside a `pyproject.toml` (preferred over `pip` for that directory) |
+| `pip` | `requirements*.txt`, `pyproject.toml`, `Pipfile` — only when no `uv.lock` sits beside the manifest |
 | `gomod` | `go.mod` |
 | `bundler` | `Gemfile` |
 | `composer` | `composer.json` |
@@ -747,7 +748,7 @@ value, or a slot in one entry's plural `directories:` list, see below):
 ```bash
 git ls-files '.github/workflows/*' '.github/actions/*' \
   '*package.json' '*Cargo.toml' '*go.mod' '*requirements*.txt' '*pyproject.toml' \
-  '*Pipfile' '*Gemfile' '*composer.json' '.gitmodules' '*Dockerfile' \
+  '*uv.lock' '*Pipfile' '*Gemfile' '*composer.json' '.gitmodules' '*Dockerfile' \
   '*docker-compose.yml'
 ```
 
@@ -807,7 +808,7 @@ MANIFESTS
 |--------------------------|-----------|---------------------------------------------------|
 | pyproject.toml (root)   | pip       | repo-owned                                       |
 | .anvil/pyproject.toml   | pip       | installer-owned (anvil); use /repo:update-tools  |
-| .anvil/uv.lock          | pip       | installer-owned (anvil); use /repo:update-tools  |
+| .anvil/uv.lock          | uv        | installer-owned (anvil); use /repo:update-tools  |
 | package.json (root)     | npm       | repo-owned — but dependency-free (see below)     |
 ```
 
@@ -908,7 +909,7 @@ PR is how a risk-bearing dependency slips through unreviewed.
 | Ecosystem | Policy | Why |
 |---|---|---|
 | `github-actions` | group everything, majors included | low-risk, individually reviewing them is noise |
-| package ecosystems (`npm`, `cargo`, `pip`, …) | group minor + patch; **majors ungrouped** | a breaking change deserves its own reviewable PR |
+| package ecosystems (`npm`, `cargo`, `pip`, `uv`, …) | group minor + patch; **majors ungrouped** | a breaking change deserves its own reviewable PR |
 
 **Ask which dependencies are risk-bearing** rather than applying one policy to
 everything — deps coupled to an external binary or service (e.g.
@@ -949,6 +950,18 @@ updates:
       npm-minor-patch:
         patterns: ["*"]
         exclude-patterns: ["playwright-core"]   # risk-bearing → its own PR
+        update-types: ["minor", "patch"]
+    # majors are deliberately ungrouped: one reviewable PR each
+
+  - package-ecosystem: "uv"          # pyproject.toml + uv.lock (not "pip")
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    groups:
+      uv-minor-patch:
+        patterns: ["*"]
         update-types: ["minor", "patch"]
     # majors are deliberately ungrouped: one reviewable PR each
 ```
