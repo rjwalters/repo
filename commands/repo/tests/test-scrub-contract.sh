@@ -326,8 +326,15 @@ assert_contains "stash guard is toggleable" "$(cat "$GUARD_SH")" \
     "REPO_GUARD_STASH_SCOPE"
 # The four checks that must scan the literal-redacted copy, not the raw command.
 GUARD_TXT="$(cat "$GUARD_SH")"
+# The SQL scan input is _SQL_SCAN: it must start from COMMAND_ASK_SCAN (never
+# raw $COMMAND), optionally heredoc-masked from that same copy, and the DDL
+# grep must read _SQL_SCAN.
+assert_contains "SQL DDL scan input is seeded from the redacted working copy" "$GUARD_TXT" \
+    '_SQL_SCAN="$COMMAND_ASK_SCAN"'
+assert_contains "SQL DDL heredoc masking derives from the redacted working copy" "$GUARD_TXT" \
+    '_SQL_SCAN=$(_sql_scan_mask_heredocs "$COMMAND_ASK_SCAN")'
 assert_contains "SQL DDL scans the redacted working copy" "$GUARD_TXT" \
-    'echo "$COMMAND_ASK_SCAN" | grep -qiE "$SQL_DDL_PATTERN"'
+    'echo "$_SQL_SCAN" | grep -qiE "$SQL_DDL_PATTERN"'
 assert_contains "cloud-CLI ask scans the redacted working copy" "$GUARD_TXT" \
     'echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && cloud_guard_enabled'
 assert_contains "force-op parse reads the redacted working copy" "$GUARD_TXT" \
