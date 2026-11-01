@@ -529,6 +529,46 @@ merge_settings_hook() {
   fi
 }
 
+# Deferral heal (repo#733). When another guard-destructive.sh is wired and we
+# defer to it (GUARD_HOOK_INSTALLED=false), our OWN entry from an earlier
+# install must not stay behind: it would keep running a copy this run no longer
+# refreshes, and doubles the guard. Remove only our exact $HOOK_CMD entry (other
+# hooks sharing the Bash matcher are kept; a matcher block is dropped only if
+# our removal emptied it) and delete the script/symlink, so the recorded
+# guardHookInstalled:false matches the tree. No-op when neither is present, so
+# a second run changes nothing. (The --no-guard branch deliberately does NOT
+# call this: opt-out leftovers stay an explicit operator action, repo#557.)
+unwire_own_guard() {
+  local settings="$SETTINGS_JSON" cmd="$HOOK_CMD" script="$TARGET/$HOOK_INSTALL_REL" tmp
+  if [[ -f "$settings" ]]; then
+    if ! jq -e . "$settings" >/dev/null 2>&1; then
+      warning "Skipping guard unwiring: $settings is not valid JSON (remove the Repo Skills guard entry by hand)"
+    elif jq -e --arg c "$cmd" '
+          (.hooks.PreToolUse // []) | any(.[]?;
+            (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c)))
+        ' "$settings" >/dev/null 2>&1; then
+      tmp="$(mktemp)"
+      if jq --arg c "$cmd" '
+            .hooks.PreToolUse |= [.[]
+              | if (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c))
+                then (.hooks |= map(select(.command != $c)))
+                     | if (.hooks | length) == 0 then empty else . end
+                else . end]
+          ' "$settings" >"$tmp"; then
+        mv "$tmp" "$settings"
+        success "Removed duplicate Repo Skills guard entry from .claude/settings.json (another guard is wired)"
+      else
+        rm -f "$tmp"
+        warning "Failed to update $settings — left unchanged"
+      fi
+    fi
+  fi
+  if [[ -e "$script" || -L "$script" ]]; then
+    rm -f "$script"
+    info "Removed stale .claude/skills/repo/hooks/guard-destructive.sh (another guard is wired)"
+  fi
+}
+
 # Idempotently wire session-start-handoff.sh into the target's
 # .claude/settings.json under hooks.SessionStart, once per managed source
 # matcher. Same discipline as merge_settings_hook above: refuse to touch
@@ -763,8 +803,8 @@ elif [[ "$GUARD_POLICY" == disabled ]]; then
     warning "entry). The opt-out does not remove it; delete it by hand (or run uninstall.sh) if wanted."
   fi
 else
-  info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it)"
-  merge_settings_hook
+  info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it) — deferring to it"
+  unwire_own_guard
 fi
 
 # 3c. SessionStart handoff hook + settings.json wiring. Same colocation and
