@@ -391,9 +391,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $TARGET/$CODEX_SKILL_REL/SKILL.md (Codex skill: canonical body, Codex-native frontmatter)"
     echo "  $TARGET/$CODEX_SKILL_REL/install-metadata.json"
     echo "  $TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX<verb>/SKILL.md (one Codex skill per command)"
-    while IFS= read -r cmd; do
-      echo "  $TARGET/$CODEX_REFERENCES_REL/$cmd.md"
-    done <<<"$COMMANDS"
+    [[ -d "$TARGET/$CODEX_REFERENCES_REL" ]] && echo "  (migration: removes $TARGET/$CODEX_REFERENCES_REL/ — now redundant with the repo-<verb> skills)"
   fi
   if [[ "$DEV" == true ]]; then
     echo "  $TARGET/.gitignore (.claude/ entry$([[ "$CODEX" == true ]] && ! codex_target_is_foreign && echo " + $CODEX_SKILL_REL/ entry"); CLAUDE.md skipped in dev mode)"
@@ -827,21 +825,18 @@ success_installed ".claude/skills/repo/scripts/resync-installed.sh"
 
 # 3f. Codex-side skill surface (.agents/skills/repo/). Codex CLI discovers
 # skills by scanning `.agents/skills` from the cwd up to the repo root, in the
-# open Agent Skills format — a directory holding SKILL.md plus optional
-# references/ — so this is a repo-scoped install that needs no config file and
+# open Agent Skills format — a directory holding SKILL.md — so this is a repo-scoped install that needs no config file and
 # no write outside the target. lib/codex-skill.sh's header records how that
 # format was confirmed and which single adaptation it forces (the `name` must be
 # a lowercase slug matching its directory, which "Repo Skills" is not).
 #
-# The BODY is the canonical skills/repo/SKILL.md, and the references/ files are
-# the same commands/repo/*.md Claude Code registers as /repo:<verb> — one
-# procedure body per workflow, packaged for a second runtime rather than
-# rewritten for it.
+# The BODY is the canonical skills/repo/SKILL.md (a thin router), and each
+# repo-<verb> skill is rendered from the same commands/repo/*.md Claude Code
+# registers as /repo:<verb> — one procedure body per workflow, packaged for a
+# second runtime rather than rewritten for it.
 #
 # SKILL.md is generated (never symlinked) even under --dev, because the whole
 # point of the Codex copy is frontmatter a symlink to the source would not have.
-# The references/ files follow the normal install_file rules, so --dev still
-# gives live per-command edits.
 # A legacy `.agents/` mirror of the .claude/ tree (an older/other writer) is warned
 # about, never migrated or deleted — the layout is unverifiable, so it is the
 # operator's call.
@@ -883,18 +878,11 @@ else
     fi
   fi
 
-  CODEX_REF_WRITTEN=0
-  CODEX_REF_PINNED=0
-  while IFS= read -r cmd; do
-    install_file "$SOURCE_ROOT/commands/repo/$cmd.md" \
-      "$TARGET/$CODEX_REFERENCES_REL/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md"
-    if [[ "$INSTALL_FILE_SKIPPED" == true ]]; then
-      CODEX_REF_PINNED=$((CODEX_REF_PINNED + 1))
-    else
-      CODEX_REF_WRITTEN=$((CODEX_REF_WRITTEN + 1))
-    fi
-  done <<<"$COMMANDS"
-  success "Installed $CODEX_REF_WRITTEN command procedures into $CODEX_REFERENCES_REL/$([[ "$CODEX_REF_PINNED" -gt 0 ]] && echo " ($CODEX_REF_PINNED pinned as repo-owned, left alone)")"
+  # Migration (repo#676): the umbrella no longer carries references/. Only
+  # removed once SKILL.md is proven ours (codex_target_is_foreign was false above).
+  if [[ -n "$(codex_migrate_references "$TARGET")" ]]; then
+    success "Removed legacy $CODEX_REFERENCES_REL/ (the command procedures are now the repo-<verb> skills)"
+  fi
   CODEX_INSTALLED=true
 
   # Per-command skills (repo#676): each selected command is also its own
@@ -1022,8 +1010,8 @@ if [[ "$DEV" == true ]]; then
     { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""; echo "# Repo Skills dev-mode symlinks (machine-local, do not commit)"; echo ".claude/"; } >>"$GITIGNORE"
     success "Added .claude/ to .gitignore"
   fi
-  # The Codex surface is half symlinks too (references/), so it is machine-local
-  # in dev mode for the same reason and gets the same treatment. Scoped to this
+  # The Codex surface is machine-local in dev mode too (it records the source
+  # clone), so it gets the same treatment. Scoped to this
   # package's own directory rather than all of .agents/skills/, which other tools
   # and the consumer share.
   #
