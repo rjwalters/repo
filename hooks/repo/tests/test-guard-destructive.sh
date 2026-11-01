@@ -9076,6 +9076,52 @@ unset _c608 _w608 _F608_ESC_MAIN _F608_PROT _F608_UNK _F608_DET
 echo ""
 
 # =========================================================================
+# #721: SQL DDL phrase inside a heredoc body fed to an inert consumer
+# =========================================================================
+echo "--- #721: SQL DDL heredoc bodies ---"
+_H_DDL="DR""OP TA""BLE"
+assert_allow "#721: cat > file <<'EOF' with DDL prose is allowed" \
+    "cat > /tmp/b.md <<'EOF'"$'\n'"On the $_H_DDL migration: rollback plan"$'\n'"EOF"
+assert_allow "#721: gh --body-file - <<EOF with DDL prose is allowed" \
+    "gh pr comment 5 --body-file - <<'EOF'"$'\n'"note about $_H_DDL users"$'\n'"EOF"
+assert_allow "#721: cat <<-EOF (tab-stripped) with DDL prose is allowed" \
+    "cat > /tmp/b.md <<-EOF"$'\n'"$_H_DDL x"$'\n'"EOF"
+assert_deny "#721: psql <<'EOF' with DDL in body is denied" \
+    "psql <<'EOF'"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | psql with DDL in body is denied" \
+    "cat <<EOF | psql"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: bash <<EOF with DDL in body is denied" \
+    "bash <<'EOF'"$'\n'"psql -c '$_H_DDL users'"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /usr/bin/psql with DDL in body is denied" \
+    "cat <<'EOF' | /usr/bin/psql"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /bin/sh with DDL in body is denied" \
+    "cat <<'EOF' | /bin/sh"$'\n'"psql -c '$_H_DDL users'"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | /usr/local/bin/sqlite3 with DDL in body is denied" \
+    "cat <<'EOF' | /usr/local/bin/sqlite3 db"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF | duckdb (unlisted client) with DDL in body is denied" \
+    "cat <<'EOF' | duckdb"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF && onward command with DDL in body is denied" \
+    "cat <<'EOF' && clickhouse-client"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat <<EOF ; onward command with DDL in body is denied" \
+    "cat <<'EOF'; sqlcmd"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat x | duckdb <<EOF (client after earlier cat) is denied" \
+    "cat x | duckdb <<'EOF'"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: git log && clickhouse-client <<EOF is denied" \
+    "git log && clickhouse-client <<'EOF'"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_deny "#721: cat > f <<EOF | duckdb is denied" \
+    "cat > /tmp/f <<'EOF' | duckdb"$'\n'"$_H_DDL users;"$'\n'"EOF"
+assert_allow "#721: cat <<EOF > file 2>&1 (fd dup) with DDL prose is allowed" \
+    "cat <<'EOF' > /tmp/b.md 2>&1"$'\n'"$_H_DDL x"$'\n'"EOF"
+assert_deny "#721: unterminated heredoc keeps denying" \
+    "cat > /tmp/b.md <<'EOF'"$'\n'"$_H_DDL users"
+assert_deny "#721: unquoted heredoc with command substitution keeps denying" \
+    "cat > /tmp/b.md <<EOF"$'\n'"\$(psql -c '$_H_DDL users')"$'\n'"EOF"
+assert_deny "#721: wrangler d1 execute --command DDL is denied" \
+    "wrangler d1 execute DB --command \"$_H_DDL users\""
+assert_deny "#721: heredoc DDL on a non-masked line outside body is denied" \
+    "cat > /tmp/b.md <<'EOF'"$'\n'"ok"$'\n'"EOF"$'\n'"psql -c '$_H_DDL users'"
+
+# =========================================================================
 # Summary
 # =========================================================================
 

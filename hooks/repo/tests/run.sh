@@ -49,6 +49,7 @@
 # commands/repo/tests/test-git-fixture-hermeticity.sh,
 # commands/repo/tests/test-deps-security-updates-paused.sh,
 # commands/repo/tests/test-deps-dependabot-alerts.sh,
+# commands/repo/tests/test-deps-no-ci.sh,
 # commands/repo/tests/test-handoff-preflight.sh, and
 # commands/repo/tests/test_optimize_ci.py.
 #
@@ -1805,6 +1806,42 @@ else
     PASS=$((PASS + DA_PASS))
     FAIL=$((FAIL + DA_FAIL))
     record_suite "test-deps-dependabot-alerts.sh" "$DA_PASS" "$DA_FAIL" "deps open Dependabot alerts"
+fi
+
+# /repo:deps steps 8/9's CI value `none` — a repo with no workflows produced
+# none of green/red/pending, the agent improvised a local build, and the
+# summary read as plain green; one of three majors did not compile (repo#731).
+# Also pins step 2's uv ecosystem row (repo#730). Same delegation shape as
+# every suite above.
+echo
+echo "-- deps CI none and uv ecosystem (delegated suite) --"
+DN_TEST="$TESTS_DIR/../../../commands/repo/tests/test-deps-no-ci.sh"
+if [[ ! -f "$DN_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-deps-no-ci.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-deps-no-ci.sh" "$DN_TEST"
+else
+    DN_OUT="$(bash "$DN_TEST" 2>&1)"
+    DN_STATUS=$?
+    DN_PASS="$(suite_count Passed "$DN_OUT")"
+    DN_FAIL="$(suite_count Failed "$DN_OUT")"
+    if ! [[ "$DN_PASS" =~ ^[0-9]+$ && "$DN_FAIL" =~ ^[0-9]+$ ]]; then
+        DN_PASS=0
+        DN_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-deps-no-ci.sh" "$DN_STATUS"
+        strip_ansi "$DN_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$DN_STATUS" -ne 0 || "$DN_FAIL" -ne 0 ]]; then
+        [[ "$DN_FAIL" -eq 0 ]] && DN_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-deps-no-ci.sh" "$DN_PASS" "$DN_FAIL" "$DN_STATUS"
+        strip_ansi "$DN_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-deps-no-ci.sh" "$DN_PASS"
+    fi
+    PASS=$((PASS + DN_PASS))
+    FAIL=$((FAIL + DN_FAIL))
+    record_suite "test-deps-no-ci.sh" "$DN_PASS" "$DN_FAIL" "deps CI none and uv ecosystem"
 fi
 
 # /repo:handoff's step-0 reader preflight — the command writes .claude/handoff.md

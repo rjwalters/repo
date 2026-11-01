@@ -61,6 +61,7 @@ sqlite3 example.db "DELETE FROM t;"
 echo 'DELETE FROM t;' | sqlite3 db
 git log -S x; sqlite3 db "DELETE FROM t"
 git log -S 'DELETE FROM t' | sqlite3 db
+wrangler d1 execute DB --command "DROP TABLE users"
 
 # ── ask tier ──────────────────────────────────────────────────────────────
 git push --force

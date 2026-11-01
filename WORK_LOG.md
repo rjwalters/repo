@@ -2,6 +2,18 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-11-01
+- **PR #735**: deps: CI value `none` with a local-check substitute (#731); uv ecosystem row and scaffold (#730)
+- **Issue #730** (closed): deps: ecosystem detection table lacks Dependabot's dedicated uv ecosystem
+- **Issue #731** (closed): deps: define the evidence bar for PR review when the repo has no CI
+
+### 2026-10-31
+- **PR #724**: fix: skip SQL DDL scan of heredoc bodies fed to inert consumers
+- **Issue #721** (closed): guards.sqlDdl blocks a gh comment or issue body whose prose contains a DDL phrase; match only commands that can execute SQL
+
+### 2026-10-29
+- **PR #677**: feat(codex): install each command as its own repo-<verb> skill
+
 ### 2026-10-23
 - **PR #672**: fix(install): warn on legacy .agents mirror and ignore its sidecar
 - **Issue #670** (closed): Installing over a legacy .agents mirror layout gives a non-canonical tree and leaves .install-local.json un-ignored
