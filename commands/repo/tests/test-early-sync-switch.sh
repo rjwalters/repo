@@ -93,7 +93,14 @@ early_sync_eligible() {
     [ -n "$current" ] || { echo INELIGIBLE; return; }        # detached HEAD
     [ -n "$default" ] || { echo INELIGIBLE; return; }        # no origin/HEAD
     [ "$current" != "$default" ] || { echo INELIGIBLE; return; }
-    [ -z "$(git -C "$r" status --porcelain)" ] || { echo INELIGIBLE; return; }
+    # Three-valued cleanliness (repo#684): a failed `git status` prints nothing,
+    # which `-z` would read as clean. Mirrors all.md's `wt_clean` computation.
+    local rc=0 wt_status wt_clean
+    wt_status=$(git -C "$r" status --porcelain 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then wt_clean=unknown
+    elif [ -z "$wt_status" ]; then wt_clean=yes
+    else wt_clean=no; fi
+    [ "$wt_clean" = yes ] || { echo INELIGIBLE; return; }
 
     # "Fully pushed" = HEAD has an upstream AND is not ahead of it.
     if git -C "$r" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
@@ -125,7 +132,14 @@ diverged_on_default() {
     [ -n "$current" ] || { echo NOT_DIVERGED; return; }
     [ -n "$default" ] || { echo NOT_DIVERGED; return; }
     [ "$current" = "$default" ] || { echo NOT_DIVERGED; return; }
-    [ -z "$(git -C "$r" status --porcelain)" ] || { echo NOT_DIVERGED; return; }
+    # Three-valued cleanliness (repo#684): a failed `git status` prints nothing,
+    # which `-z` would read as clean. Mirrors all.md's `wt_clean` computation.
+    local rc=0 wt_status wt_clean
+    wt_status=$(git -C "$r" status --porcelain 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then wt_clean=unknown
+    elif [ -z "$wt_status" ]; then wt_clean=yes
+    else wt_clean=no; fi
+    [ "$wt_clean" = yes ] || { echo NOT_DIVERGED; return; }
 
     ahead_of_origin_default=$(git -C "$r" rev-list --count "origin/$default..HEAD")
     behind_origin_default=$(git -C "$r" rev-list --count "HEAD..origin/$default")
@@ -261,6 +275,52 @@ assert_not_contains "stale branch-only content is gone from the checkout" "$FRES
 # Nothing was pruned: the pruning half has not run.
 assert_eq "no branch was deleted by the sync half" "1" \
     "$(git -C "$C" for-each-ref --format='%(refname:short)' refs/heads/feature | grep -c .)"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- a failed \`git status\` is unknown, never clean (repo#684) --"
+# ---------------------------------------------------------------------------
+# break_status <repo>  — add a gitlink whose submodule .git file points at a
+# missing directory, so `git status` exits non-zero and prints nothing on stdout.
+break_status() {
+    local r="$1" sha
+    sha="$(git -C "$r" rev-parse HEAD)"
+    git -C "$r" update-index --add --cacheinfo "160000,$sha,broken-sub" >/dev/null 2>&1
+    mkdir -p "$r/broken-sub"
+    printf 'gitdir: %s/no-such-gitdir\n' "$SCRATCH" > "$r/broken-sub/.git"
+}
+
+# Case A: behind-default feature branch that would be ELIGIBLE if status worked.
+C="$(new_clone broken-status-feature)"
+git_quiet "$C" checkout -b feature/broken
+git_quiet "$C" push -u origin feature/broken
+advance_default 2
+git_quiet "$C" fetch origin
+assert_eq "control: ELIGIBLE before the status is broken" "ELIGIBLE" "$(early_sync_eligible "$C")"
+break_status "$C"
+git -C "$C" status --porcelain >/dev/null 2>&1
+BROKEN_RC=$?
+if [[ "$BROKEN_RC" -ne 0 ]]; then
+    ok "fixture really fails: git status exits non-zero ($BROKEN_RC)"
+    assert_eq "failed git status -> INELIGIBLE, not eligible" "INELIGIBLE" "$(early_sync_eligible "$C")"
+else
+    no "fixture really fails: git status exits non-zero" "git status exited 0"
+fi
+
+# Case B: on the default branch, diverged, with a broken status.
+C="$(new_clone broken-status-default)"
+printf 'local only\n' >> "$C/README.md"
+git_quiet "$C" add -A
+git_quiet "$C" commit -m "local unpushed"
+advance_default 1
+git_quiet "$C" fetch origin
+assert_eq "control: DIVERGED before the status is broken" "DIVERGED" "$(diverged_on_default "$C")"
+break_status "$C"
+if ! git -C "$C" status --porcelain >/dev/null 2>&1; then
+    assert_eq "failed git status -> NOT_DIVERGED (fail closed)" "NOT_DIVERGED" "$(diverged_on_default "$C")"
+else
+    no "fixture really fails (default branch): git status exits non-zero" "git status exited 0"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -496,7 +556,7 @@ assert_contains "all.md treats a never-pushed branch as ineligible" \
 assert_contains "all.md spells out the no-upstream rule in prose" \
     "$ALL" 'never pushed** has no upstream and is **not** eligible'
 assert_contains "all.md requires a clean working tree" \
-    "$ALL" 'Working tree clean (`git status --porcelain` empty)'
+    "$ALL" 'Working tree clean (`git status --porcelain` exits 0 **and** is empty)'
 assert_contains "all.md requires the branch to be behind the default" \
     "$ALL" 'behind `origin/<default>` by at least one commit'
 assert_contains "all.md excludes an already-default checkout" \
@@ -607,6 +667,10 @@ assert_contains "all.md names the second detection as independent, not a change 
     "$ALL" 'A second, independent detection'
 assert_contains "all.md's eligibility table gains a row for the diverged-on-default shape" \
     "$ALL" 'Already on the default branch, and diverged from `origin/<default>`'
+assert_contains "all.md computes a three-valued wt_clean from the status exit code" \
+    "$ALL" 'wt_status=$(git status --porcelain 2>/dev/null) || rc=$?'
+assert_contains "all.md's eligibility table says a non-zero git status is not clean" \
+    "$ALL" 'A `git status` that exits non-zero is `unknown`, not clean'
 assert_contains "all.md reports the divergence before Docs runs, even without --ask" \
     "$ALL" 'Report it before Docs runs, even under the default (non-`--ask`) form'
 assert_contains "all.md's diverged-on-default report names the invisible upstream commits" \
@@ -615,6 +679,8 @@ assert_contains "all.md's --ask resolution for diverged-on-default reuses reset.
     "$ALL" 'report the divergence (`git log --oneline @{u}..HEAD` and `HEAD..@{u}`) and ask how to proceed. Do not rebase or force anything on your own.'
 
 RESET="$(flatten "$RESET_MD")"
+assert_contains "reset.md stops on a non-zero git status instead of reading it as clean" \
+    "$RESET" 'If `git status --porcelain` **exits non-zero**, stop and report the error'
 assert_contains "reset.md names the two halves" \
     "$RESET" '## Two halves'
 assert_contains "reset.md maps the reversible half to steps 1 and 4" \
