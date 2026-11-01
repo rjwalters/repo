@@ -347,6 +347,12 @@ stale PRs. Use [[deps]]' base-manifest **and lockfile** comparison; a permissive
 manifest range alone cannot establish that a lockfile security update is stale.
 Full diff/CI triage remains with `/repo:deps --review`.
 
+**A repo with no workflows gets a `no CI` clause on the line, not a bare PR
+count.** [[deps]] step 8 reports CI as `none` there and substitutes a local
+check of each merge candidate's head; the `Deps:` line has to say so, because
+`3 open PRs (0 majors)` otherwise reads as three PRs that passed checks the
+repo does not have.
+
 This stage is always report-only, including under `--ask`: it does not deploy
 organization policy, change client files/settings, or merge PRs. Refer policy
 drift to [[org-policy]] and client adoption to [[deps]]. If origin is not GitHub,
@@ -407,6 +413,13 @@ Deps:         …, alerts ON, 0 open alerts, security PRs: …
 Deps:         …, alerts ON, 2 open alerts (1 high, 1 medium — 1 with no open fix PR), security PRs: …
 Deps:         …, alerts ON, open alerts UNKNOWN (needs security_events read), security PRs: …
 Deps:         …, alerts OFF, open alerts n/a (alerts disabled), security PRs: …
+```
+
+When the repo has no workflows, the PR clause carries `no CI` the same way —
+a PR count without it reads as checked PRs, and there were no checks:
+
+```
+Deps:         …, 3 open PRs (2 majors, no CI — local checks substituted; add a workflow)
 ```
 
 Name the uncovered packages in the line itself when there are only one or two
