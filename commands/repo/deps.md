@@ -1094,6 +1094,31 @@ merged on a green check that had built nothing. Re-check this note against
 the workflow files each run rather than trusting this parenthetical, since
 either side of it can drift.)
 
+#### CI `none` — the repo has no workflows at all
+
+**CI status** takes four values: `green`, `red`, `pending`, and **`none`**.
+`none` means the repo has **no workflows** (`git ls-files '.github/workflows/*'`
+is empty — the same detection step 2 uses), so every bot PR shows "no checks
+reported". It is **distinct from `pending`**: pending is a check that will
+report; `none` is a check that never will. A repo that *has* workflows which
+simply don't cover a PR's ecosystem is **not** `none` — it stays under the
+"green but unverifiable by this repo's checks" caveat above.
+
+For a `none` PR that is a merge candidate, the substitute evidence is a local
+check: fetch the PR head into a temporary worktree, run the ecosystem's
+build/check command there, and remove the worktree. Run it only for PRs
+proposed for merge, never for every open PR.
+
+| Ecosystem | Local check |
+|---|---|
+| cargo | `cargo check` |
+| uv / pip | `uv sync --locked && python -m compileall .` |
+| npm | `npm ci && npm run build` |
+
+Other ecosystems use their equivalent build or check command. Record the result
+in the `CI` column as `none; local <command> ok` or `none; local <command>
+failed` — never as plain `green`, so the table cannot read as if CI had passed.
+
 #### Stale check — compare actual dependency state on the current base
 
 Inspect every targeted manifest **and lockfile** from the current remote base
@@ -1194,6 +1219,7 @@ OPEN DEPENDENCY PRs
 | #14 | npm            | playwright-core 1.4 → 2.0  | MAJOR | red   | browser binary coupling           |
 | #15 | npm            | @biomejs/biome 2.5.5 → 2.5.6 | patch | green | stale — base lockfile already resolves 2.5.7 |
 | #16 | npm            | wrangler ^4.136.1 + sharp    | minor | green | superseded by #13 — close, don't merge      |
+| #17 | cargo          | serde 1.0.200 → 1.0.201    | patch | none; local cargo check ok | repo has no workflows |
 ```
 
 Summarize the split explicitly below the table so callers (including
@@ -1219,6 +1245,13 @@ Propose a merge set and get explicit approval. **Never** merge a major without
 its own separate confirmation, and never merge a PR whose CI is red or pending.
 Every PR classified **superseded by a sibling** in step 8 is proposed for
 closure with a cross-reference, not for merge.
+
+A PR whose CI is `none` (step 8) is **never merged on its title alone**: a
+passing local check (`none; local <command> ok`) is the minimum, a `failed`
+one is treated like red CI, and majors still get their own separate
+confirmation on top of it. The report also recommends adding CI to the repo and
+can point at a minimal workflow for the detected ecosystems (it does not write
+or commit one).
 
 #### A lockfile-bearing ecosystem merges one PR at a time
 

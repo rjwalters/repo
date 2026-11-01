@@ -409,6 +409,14 @@ Deps:         …, alerts ON, open alerts UNKNOWN (needs security_events read), 
 Deps:         …, alerts OFF, open alerts n/a (alerts disabled), security PRs: …
 ```
 
+The `Deps:` line also carries a **`no CI` caveat** when the repo has no
+workflows (CI `none` in `/repo:deps` step 8), so open PRs are not read as
+CI-verified:
+
+```
+Deps:         …, 3 open PRs (0 majors, 0 stale), no CI — bot PRs need a local check before merge
+```
+
 Name the uncovered packages in the line itself when there are only one or two
 (`1 with no open fix PR: lodash (npm) → 4.17.21`); with more, carry the count
 here and leave the per-package table to the stage output, the same way tracked
