@@ -8,6 +8,8 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
+- **#734**: deps: define the evidence bar for PR review when the repo has no CI
+- **#736**: fix: unwire our own guard entry when install defers to another guard
 
 ## Very Important
 
@@ -33,6 +35,9 @@ Issues currently being built (`loom:building`).
 
 - **#676**: Codex: register each repo command as a discoverable native skill
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
+- **#730**: deps: ecosystem detection table lacks Dependabot's dedicated uv ecosystem
+- **#731**: deps: define the evidence bar for PR review when the repo has no CI
+- **#733**: install.sh: deferring to another guard leaves Repo Skills' own guard hook wired but unrefreshed, and records guardHookInstalled=false against a tree that still runs it
 
 ## PRs Awaiting Review
 
@@ -46,17 +51,23 @@ PRs waiting on Judge (`loom:review-requested`).
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
+- **#732**: docs(deps): add Dependabot uv ecosystem to detection and scaffold
+- **#734**: deps: define the evidence bar for PR review when the repo has no CI
+- **#736**: fix: unwire our own guard entry when install defers to another guard
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
+- **#478**: Live-verify org-policy's absent/inaccessible heuristic against a real organization *(curated)*
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
 - **#684**: branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree *(curated)*
 - **#703**: repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable *(curated)*
 - **#722**: worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root *(curated)*
+- **#730**: deps: ecosystem detection table lacks Dependabot's dedicated uv ecosystem *(curated)*
+- **#731**: deps: define the evidence bar for PR review when the repo has no CI *(curated)*
+- **#733**: install.sh: deferring to another guard leaves Repo Skills' own guard hook wired but unrefreshed, and records guardHookInstalled=false against a tree that still runs it *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -70,14 +81,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 6 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 9 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
