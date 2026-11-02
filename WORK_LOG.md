@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-11-02
+- **PR #741**: fix(repo-remote): keep recently-authorized SSH ingress rules for alternating egress IPs
+- **Issue #703** (closed): repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable
+
 ### 2026-11-01
 - **PR #685**: fix(repo): treat a failed git status as unknown, not clean
 - **Issue #684** (closed): branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
