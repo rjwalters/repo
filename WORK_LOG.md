@@ -3,6 +3,8 @@
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
 ### 2026-11-01
+- **PR #685**: fix(repo): treat a failed git status as unknown, not clean
+- **Issue #684** (closed): branches: a failed git status (e.g. broken submodule gitfile) reads as a clean worktree
 - **PR #735**: deps: CI value `none` with a local-check substitute (#731); uv ecosystem row and scaffold (#730)
 - **Issue #730** (closed): deps: ecosystem detection table lacks Dependabot's dedicated uv ecosystem
 - **Issue #731** (closed): deps: define the evidence bar for PR review when the repo has no CI
