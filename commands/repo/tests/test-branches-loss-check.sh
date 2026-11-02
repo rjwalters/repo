@@ -679,6 +679,40 @@ assert_not_contains "a unique-work tag never reads as landed" "$UNIQUE_TAG" "lan
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- worktree removal: a failed git status is KEEP, never clean (repo#684) --"
+# ---------------------------------------------------------------------------
+# Transcription of the branches.md step 5 worktree gate. Echoes the verdict and
+# removes the worktree only on CLEAN.
+wt_gate() {  # <path> -> KEEP | SKIP | REMOVED
+    local path="$1" rc=0 wt_status
+    wt_status=$(git -C "$path" status --porcelain 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then echo KEEP
+    elif [ -n "$wt_status" ]; then echo SKIP
+    else git -C "$REPO" worktree remove "$path" >/dev/null 2>&1 && echo REMOVED; fi
+}
+
+WT_CLEAN="$(dirname "$REPO")/wt-clean-684"
+WT_BROKEN="$(dirname "$REPO")/wt-broken-684"
+git -C "$REPO" worktree add -q -b wt/clean-684 "$WT_CLEAN" main >/dev/null 2>&1
+git -C "$REPO" worktree add -q -b wt/broken-684 "$WT_BROKEN" main >/dev/null 2>&1
+# Break status: a gitlink whose submodule .git file points at a missing dir.
+git -C "$WT_BROKEN" update-index --add --cacheinfo "160000,$(git -C "$REPO" rev-parse main),broken-sub" >/dev/null 2>&1
+mkdir -p "$WT_BROKEN/broken-sub"
+printf 'gitdir: %s/no-such-gitdir\n' "$(dirname "$REPO")" > "$WT_BROKEN/broken-sub/.git"
+
+git -C "$WT_BROKEN" status --porcelain >/dev/null 2>&1
+if [[ $? -ne 0 ]]; then
+    ok "fixture really fails: git status exits non-zero in the broken worktree"
+    assert_eq "broken-status worktree classifies KEEP" "KEEP" "$(wt_gate "$WT_BROKEN")"
+    if [[ -d "$WT_BROKEN" ]]; then ok "broken-status worktree was not removed"
+    else no "broken-status worktree was not removed" "directory is gone"; fi
+else
+    no "fixture really fails: git status exits non-zero in the broken worktree" "git status exited 0"
+fi
+assert_eq "control: a clean worktree is still removed" "REMOVED" "$(wt_gate "$WT_CLEAN")"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- doc drift: branches.md still specifies what this suite implements --"
 # ---------------------------------------------------------------------------
 # Every `git log` invocation in the file must use EXACTLY ONE `--not`. A second
@@ -715,6 +749,10 @@ assert_contains "branches.md explains why --not must not be doubled" \
     "$MD" '`--not` is a **toggle**'
 assert_contains "branches.md fixes the failure direction to KEEP" \
     "$MD" 'UNKNOWN / KEEP'
+assert_contains "branches.md treats a non-zero git status as unverifiable, not clean" \
+    "$(printf '%s' "$MD" | tr '\n' ' ' | tr -s ' ')" 'A `git status` that **exits non-zero**'
+assert_contains "branches.md keeps a worktree whose git status failed" \
+    "$MD" 'KEEP <path>: unverifiable: git status failed'
 assert_contains "branches.md states errors are never SAFE" \
     "$MD" '**Never SAFE.**'
 
