@@ -219,8 +219,19 @@ case "$1 $2" in
       # marker. MOCK_AWS_SG_OWNED_CIDRS is a space-separated list; unset means
       # "this group has no rule this tooling owns" (the common case: a freshly
       # created group, or one whose only rules an operator added by hand).
+      # rjwalters/repo#703: the real query now returns `CidrIp<TAB>Description`.
+      # Each entry is `<cidr>` (Description dated 2000-01-01, i.e. long stale) or
+      # `<cidr>=<date>` (date may be `today` or `nodate`), prefixed with the
+      # marker taken from the query itself.
       if [[ -n "${MOCK_AWS_SG_OWNED_CIDRS:-}" ]]; then
-        printf '%s\n' "${MOCK_AWS_SG_OWNED_CIDRS}"
+        opfx="$(printf '%s' "$*" | sed -E "s/.*starts_with\(Description, '([^']*)'.*/\1/")"
+        for oent in ${MOCK_AWS_SG_OWNED_CIDRS}; do
+          ocidr="${oent%%=*}"; odate="2000-01-01"
+          [[ "$oent" == *=* ]] && odate="${oent#*=}"
+          [[ "$odate" == today ]] && odate="$(date -u +%Y-%m-%d)"
+          if [[ "$odate" == nodate ]]; then odate="oops"; fi
+          printf '%s\t%s%s\n' "$ocidr" "$opfx" "$odate"
+        done
       else
         printf 'None\n'
       fi
@@ -1114,6 +1125,57 @@ assert_eq   "a 20-prefixed caller id leaves up succeeding" "0" "$RR_RC"
 assert_not_contains "a per-caller rule with a 20-prefixed caller id is not flagged as legacy" \
   "$RR_ERR" "legacy-format SSH ingress rule(s)"
 
+# (g) rjwalters/repo#703: a tool-owned rule for ANOTHER address that was
+#     authorized within REPO_REMOTE_SSH_STALE_DAYS is KEPT (a caller whose
+#     egress alternates between two IPs must not lock itself out), with a log
+#     line saying so. The current address is still authorized.
+run_rr MOCK_AWS_NEW_ID=i-0keeprecent MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32=today MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a recent other-address rule leaves up succeeding" "0" "$RR_RC"
+assert_eq   "a rule dated within the TTL is not revoked" "0" \
+  "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "keeping the recent rule is logged" "$RR_ERR" "keeping this tooling's other SSH ingress rule"
+assert_contains "the current address is still authorized" "$(cat "$MOCK_LOG")" "CidrIp=104.7.12.215/32"
+
+# (h) A rule dated beyond the TTL is revoked (default window is 7 days).
+run_rr MOCK_AWS_NEW_ID=i-0revokeold MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32=2020-01-01 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "an expired other-address rule leaves up succeeding" "0" "$RR_RC"
+assert_contains "a rule older than the TTL is revoked" "$(cat "$MOCK_LOG")" "revoke-security-group-ingress --group-id sg-0existing"
+
+# (i) REPO_REMOTE_SSH_STALE_DAYS=0 restores the immediate-revoke behaviour.
+run_rr MOCK_AWS_NEW_ID=i-0stale0 MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32=today REPO_REMOTE_SSH_STALE_DAYS=0 \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "STALE_DAYS=0 run succeeds" "0" "$RR_RC"
+assert_contains "STALE_DAYS=0 revokes even a rule dated today" "$(cat "$MOCK_LOG")" "CidrIp=52.119.115.124/32"
+assert_contains "STALE_DAYS=0 reports the revoke" "$RR_ERR" "revoked this tooling's stale SSH ingress rule"
+
+# (j) A Description with an unparseable date is kept, with a log line.
+run_rr MOCK_AWS_NEW_ID=i-0nodate MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_SG_OWNED_CIDRS=52.119.115.124/32=nodate MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a date-less rule leaves up succeeding" "0" "$RR_RC"
+assert_eq   "a date-less rule is not revoked" "0" \
+  "$(grep -c 'revoke-security-group-ingress' "$MOCK_LOG" 2>/dev/null)"
+assert_contains "the date-less rule is reported as kept" "$RR_ERR" "no parseable date"
+
+# (k) When the current address's rule already exists (Duplicate) and is ours,
+#     its Description date is refreshed so an in-use address never ages out.
+run_rr MOCK_AWS_NEW_ID=i-0refresh MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_INGRESS_DUP=1 MOCK_AWS_SG_OWNED_CIDRS=104.7.12.215/32=2020-01-01 \
+  MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a duplicate current-address rule leaves up succeeding" "0" "$RR_RC"
+assert_contains "the existing tool-owned rule's date is refreshed" \
+  "$(cat "$MOCK_LOG")" "update-security-group-rule-descriptions-ingress --group-id sg-0existing"
+
+# (l) A duplicate rule that is NOT ours (no marker; the owned query is empty)
+#     is never rewritten.
+run_rr MOCK_AWS_NEW_ID=i-0norefresh MOCK_AWS_STATE=None MOCK_AWS_SG_FIND=sg-0existing \
+  MOCK_AWS_INGRESS_DUP=1 MOCK_CURL_IP=104.7.12.215 -- up --yes --json
+assert_eq   "a duplicate foreign rule leaves up succeeding" "0" "$RR_RC"
+assert_not_contains "a foreign-marker duplicate rule is never rewritten" \
+  "$(cat "$MOCK_LOG")" "update-security-group-rule-descriptions-ingress"
+
 write_repo_env "REPO_REMOTE_INSTANCE_TYPE=m5.2xlarge"
 
 # ---------------------------------------------------------------------------
@@ -1198,6 +1260,7 @@ assert_contains "failure names the reachability check" "$RR_ERR" "SSH reachabili
 assert_contains "failure names the configured wait window" "$RR_ERR" "within 2s"
 assert_contains "failure points at the tunable" "$RR_ERR" "REPO_REMOTE_SSH_READY_TIMEOUT"
 assert_contains "failure still names the ingress/key/user knobs" "$RR_ERR" "REPO_REMOTE_SSH_CIDR"
+assert_contains "failure first logs the SG ingress set (repo#703)" "$RR_ERR" "diagnostic:"
 # It retried (more than the single pre-#449 attempt) before giving up.
 [[ "$(ssh_probe_count)" -ge 2 ]] \
   && ok "the window was actually retried before dying ($(ssh_probe_count) attempts)" \
