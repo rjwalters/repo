@@ -2,6 +2,11 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-11-04
+
+- **PR #725**: fix(guard): accurate deny for opaque interpreter-heredoc writes (#722)
+- **Issue #722** (closed): worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root
+
 ### 2026-11-02
 - **PR #741**: fix(repo-remote): keep recently-authorized SSH ingress rules for alternating egress IPs
 - **Issue #703** (closed): repo-remote: SSH ingress flip-flops between a host's two egress IPs (revokes the other as 'stale'), leaving boxes unreachable
