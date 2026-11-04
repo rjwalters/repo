@@ -50,7 +50,8 @@
 # commands/repo/tests/test-deps-security-updates-paused.sh,
 # commands/repo/tests/test-deps-dependabot-alerts.sh,
 # commands/repo/tests/test-deps-no-ci.sh,
-# commands/repo/tests/test-handoff-preflight.sh, and
+# commands/repo/tests/test-handoff-preflight.sh,
+# commands/repo/tests/test-update-tools-squad.sh, and
 # commands/repo/tests/test_optimize_ci.py.
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
@@ -1877,6 +1878,40 @@ else
     PASS=$((PASS + HP_PASS))
     FAIL=$((FAIL + HP_FAIL))
     record_suite "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "handoff step-0 reader preflight"
+fi
+
+# update-tools / followups squad release-install guidance (repo#744): doc-
+# contract pins for the squad slug rule, update commands and adoption
+# signature. Same delegation shape as every suite above.
+echo
+echo "-- update-tools squad guidance (delegated suite) --"
+US_TEST="$TESTS_DIR/../../../commands/repo/tests/test-update-tools-squad.sh"
+if [[ ! -f "$US_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-update-tools-squad.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-update-tools-squad.sh" "$US_TEST"
+else
+    US_OUT="$(bash "$US_TEST" 2>&1)"
+    US_STATUS=$?
+    US_PASS="$(suite_count Passed "$US_OUT")"
+    US_FAIL="$(suite_count Failed "$US_OUT")"
+    if ! [[ "$US_PASS" =~ ^[0-9]+$ && "$US_FAIL" =~ ^[0-9]+$ ]]; then
+        US_PASS=0
+        US_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-update-tools-squad.sh" "$US_STATUS"
+        strip_ansi "$US_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$US_STATUS" -ne 0 || "$US_FAIL" -ne 0 ]]; then
+        [[ "$US_FAIL" -eq 0 ]] && US_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-update-tools-squad.sh" "$US_PASS" "$US_FAIL" "$US_STATUS"
+        strip_ansi "$US_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-update-tools-squad.sh" "$US_PASS"
+    fi
+    PASS=$((PASS + US_PASS))
+    FAIL=$((FAIL + US_FAIL))
+    record_suite "test-update-tools-squad.sh" "$US_PASS" "$US_FAIL" "update-tools squad guidance"
 fi
 
 # git-fixture hermeticity (repo#518): pins that lib/git-fixture.sh keeps the

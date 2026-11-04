@@ -36,6 +36,7 @@ has "followups states release-path rule"          "$FOLLOWUPS_MD" 'package: @rjw
 has "followups infers slug from package name"     "$FOLLOWUPS_MD" '`@scope/name` → `scope/name`'
 
 echo ""
-echo "Passed: $PASS  Failed: $FAIL"
+echo "Passed: $PASS"
+echo "Failed: $FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
 echo "ALL TESTS PASSED"
