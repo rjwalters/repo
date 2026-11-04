@@ -5469,12 +5469,16 @@ WTC722_OUTER_EOF
 WTC722_REDIR_CMD="$(printf '%s\n' "python3 - <<'EOF'" 'print(1)' 'EOF') > src/file"
 wtc722_check() { # desc cmd cwd expect-pattern expect-reason-substr reject-reason-substr
     TOTAL=$((TOTAL + 1))
-    local log out
+    local log out ctx
     log=$(mktemp -d 2>/dev/null)/decisions.log
     out=$(make_input "$2" "$3" | env REPO_GUARD_DECISION_LOG=1 REPO_GUARD_DECISION_LOG_FILE="$log" "$GUARD" 2>/dev/null) || true
     if [[ "$(tail -1 "$log" 2>/dev/null | jq -r '.pattern' 2>/dev/null)" == "$4" ]] && \
        [[ "$out" == *"$5"* ]] && [[ "$out" != *"$6"* ]] && \
-       [[ "$(tail -1 "$log" | jq -r '.context' 2>/dev/null)" == *"target=$WTC_MAIN_PHYS"* ]]; then
+       { ctx=$(tail -1 "$log" | jq -r '.context' 2>/dev/null)
+         # The guard omits targetPhysical= when it equals target= (Linux); on
+         # macOS (/var -> /private/var) target= is logical and targetPhysical=
+         # carries the physical path. Accept the physical path in either field.
+         [[ "$ctx" == *"target=$WTC_MAIN_PHYS"* || "$ctx" == *"targetPhysical=$WTC_MAIN_PHYS"* ]]; }; then
         PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $1"
     else
         FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $1"
