@@ -154,7 +154,9 @@ default_branch_requires_pr() {
     if [[ "$legacy" =~ ^[0-9]+$ && "$legacy" -gt 0 ]]; then
         echo "protected:legacy branch protection (PR reviews / status checks required)"; return
     fi
-    echo "unprotected"
+    # forge definitively answered "no rules"; docs.md only consults this function
+    # once the repo is Loom-managed, whose merge contract is PR-only.
+    echo "protected:Loom-managed: merges only via merge-pr.sh (no forge protection reported)"
 }
 
 # stage_line <stage> <count> <destination> <detail>
@@ -246,8 +248,8 @@ assert_contains "required_status_checks ruleset -> protected" \
     "$(default_branch_requires_pr github yes ok 'required_status_checks' 0)" "protected:ruleset rule(s): required_status_checks"
 assert_contains "no ruleset but legacy protection -> protected" \
     "$(default_branch_requires_pr github yes ok 'creation' 2)" "protected:legacy branch protection"
-assert_eq "forge definitively answers 'no rules' -> unprotected" \
-    "unprotected" "$(default_branch_requires_pr github yes ok 'creation' 0)"
+assert_contains "forge definitively answers 'no rules' -> still protected (Loom-managed)" \
+    "$(default_branch_requires_pr github yes ok 'creation' 0)" "protected:Loom-managed: merges only via merge-pr.sh"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -363,8 +365,10 @@ assert_contains "docs.md names the hygiene branch shape" \
     "$DOCS_MD" 'chore/repo-hygiene-<date>'
 assert_contains "docs.md branches off origin/<default>, not local" \
     "$DOCS_MD" 'in a worktree off `origin/<default>`'
-assert_contains "docs.md fires the arm on protection OR an operator ask" \
-    "$DOCS_MD" 'either the default branch is PR-protected or the operator'
+assert_contains "docs.md fires the arm on protection, Loom-managed, OR an operator ask" \
+    "$DOCS_MD" 'either the default branch is PR-protected, or the repo is'
+assert_contains "docs.md names the Loom-managed PR-only contract as a trigger" \
+    "$DOCS_MD" 'Loom-managed: merges only via merge-pr.sh'
 assert_contains "docs.md mirrors rather than sources the detector" \
     "$DOCS_MD" 'mirroring — never sourcing —'
 assert_contains "docs.md names the function it mirrors" \
