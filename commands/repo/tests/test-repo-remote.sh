@@ -4737,6 +4737,50 @@ assert_eq "prune parse-check failure: exit 4" "4" "$RR_RC"
 assert_eq "prune parse-check failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
 assert_eq "prune parse-check failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
 
+# (d1) awk failures while stripping never empty or alter the config. Shim awks
+# sit first on PATH and wrap the real one; they only misbehave for the strip
+# program (it is the only one using `drop[`), so prune's own scanning is intact.
+REAL_AWK628="$(command -v awk)"
+AWKSHIM628="$SCRATCH/awkshim"
+mkdir -p "$AWKSHIM628/bsd" "$AWKSHIM628/fail"
+# BSD awk emulation: a newline inside a -v value is a fatal error (exit 2).
+cat >"$AWKSHIM628/bsd/awk" <<MOCK
+#!/usr/bin/env bash
+prev=""
+for a in "\$@"; do
+  if [[ "\$prev" == "-v" && "\$a" == *\$'\n'* ]]; then echo "awk: newline in string" >&2; exit 2; fi
+  prev="\$a"
+done
+exec "$REAL_AWK628" "\$@"
+MOCK
+# Strip program always fails.
+cat >"$AWKSHIM628/fail/awk" <<MOCK
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == *'drop['* ]]; then echo "awk: boom" >&2; exit 2; fi
+done
+exec "$REAL_AWK628" "\$@"
+MOCK
+chmod +x "$AWKSHIM628/bsd/awk" "$AWKSHIM628/fail/awk"
+
+# 2+ stale aliases under BSD-awk semantics: correctly stripped, never empty.
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr PATH="$AWKSHIM628/bsd:$MOCK_BIN:$PATH" REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --yes
+assert_eq "prune BSD-awk shim: exit 0" "0" "$RR_RC"
+assert_eq "prune BSD-awk shim: config not emptied" "yes" "$([[ -s "$CFG628" ]] && echo yes)"
+assert_not_contains "prune BSD-awk shim: stale IP block removed" "$(cat "$CFG628")" "Host repo-remote-pr-11132"
+assert_not_contains "prune BSD-awk shim: stale ssm block removed" "$(cat "$CFG628")" "Host repo-remote-ssm-gone"
+assert_eq "prune BSD-awk shim: everything else byte-identical" "$EXPECT628" "$(cat "$CFG628")"
+
+# A failing strip leaves the config byte-identical, prune fails, lock released.
+write_cfg628; BEFORE628="$(cat "$CFG628")"
+run_rr PATH="$AWKSHIM628/fail:$MOCK_BIN:$PATH" REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --yes
+assert_eq "prune awk failure: exit 4" "4" "$RR_RC"
+assert_eq "prune awk failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
+assert_eq "prune awk failure: no lock dir left behind" "" "$( [[ -e "$CFG628.lock" ]] && echo present )"
+assert_eq "prune awk failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+write_cfg628
+
 # (d2) an indented / trailing-space Host header is judged AND stripped the same
 # way: prune's scanner matches on fields, so removal must too (otherwise --yes
 # would report the block "removed" and leave it in place).
