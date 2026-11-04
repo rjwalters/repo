@@ -1022,6 +1022,36 @@ assert_deny "rmScope default: rm -rf outside-repo /Users path denied (NEW defaul
 assert_allow "rmScope default: rm -rf under repo root allowed" \
     "rm -rf $REPO_ROOT/.loom/tmp/x" "$REPO_ROOT"
 
+# ---- guards.rmAllowDirs (#747): narrow allowlist, rmScope stays repo. ----
+RMALLOW_REPO=$(make_sql_repo '{"guards":{"rmAllowDirs":["/srv/clones/"]}}')
+assert_allow "rmAllowDirs: rm -rf under listed dir allowed" \
+    "rm -rf /srv/clones/x" "$RMALLOW_REPO"
+assert_allow "rmAllowDirs: listed dir itself allowed (trailing slash entry)" \
+    "rm -rf /srv/clones" "$RMALLOW_REPO"
+assert_deny "rmAllowDirs: other outside dir still denied" \
+    "rm -rf /srv/other/x" "$RMALLOW_REPO"
+assert_deny "rmAllowDirs: sibling with shared prefix denied (boundary)" \
+    "rm -rf /srv/clones-other/x" "$RMALLOW_REPO"
+assert_deny "rmAllowDirs: .. escape denied" \
+    "rm -rf /srv/clones/../etc/x" "$RMALLOW_REPO"
+assert_deny "rmAllowDirs: default-deny /opt case unchanged" \
+    "rm -rf /opt/vendor/thing" "$RMALLOW_REPO"
+assert_deny "rmAllowDirs: catastrophic floor unaffected" \
+    "rm -rf /srv" "$RMALLOW_REPO"
+RMALLOW_BAD=$(make_sql_repo '{"guards":{"rmAllowDirs":["/","/var","relative/dir","$HOME","/srv/../etc/x","/srv/$D/y",5]}}')
+assert_deny "rmAllowDirs: ignored entries admit nothing (/var/lib/x)" \
+    "rm -rf /var/lib/x" "$RMALLOW_BAD"
+assert_deny "rmAllowDirs: ignored entries admit nothing (/etc/x/z)" \
+    "rm -rf /etc/x/z" "$RMALLOW_BAD"
+assert_deny "rmAllowDirs: ignored entries admit nothing (relative)" \
+    "rm -rf /relative/dir/z" "$RMALLOW_BAD"
+for _cfg in '{"guards":{"rmAllowDirs":[]}}' '{"guards":{"rmAllowDirs":"/srv/clones"}}' \
+            '{"guards":{"rmAllowDirs":{"a":"/srv/clones"}}}' '{not json'; do
+    _r=$(make_sql_repo "$_cfg")
+    assert_deny "rmAllowDirs: malformed/empty config reads as empty ($_cfg)" \
+        "rm -rf /srv/clones/x" "$_r"
+done
+
 # ---- Explicit opt-out block: guards.rmScope:"off"/"permissive" restores the
 # ---- OLD permissive behaviour (outside-repo deep rm allowed again). ----
 RMSCOPE_OFF_REPO=$(make_sql_repo '{"guards":{"rmScope":"off"}}')
