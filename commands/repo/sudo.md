@@ -18,7 +18,7 @@ once, safely, so agent-driven remote sessions can finish end-to-end.
 
 This is **machine-global, consequential setup**: the drop-in grants anyone
 holding the user's SSH key effective root on this box. It is therefore in the
-same **always-confirm-first** class as `/repo:remote`, `/repo:followups`, and
+same **always-confirm-first** class as `/repo:followups` and
 `/repo:update-tools` — it shows the **exact file contents** it will write and
 **never applies silently**, even without `--ask`. There is nothing to opt into;
 confirmation is the only mode. The reasonable trade this makes — passwordless

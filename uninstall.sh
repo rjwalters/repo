@@ -155,7 +155,7 @@ CODEX_CMD_FOREIGN="$(codex_command_dirs foreign)"
   || { info "No Repo Skills install found in $TARGET"; exit 0; }
 
 echo "Will remove from $TARGET:"
-[[ -d "$TARGET/.claude/skills/repo" ]]   && echo "  .claude/skills/repo/ (incl. hooks/guard-destructive.sh, hooks/session-start-handoff.sh, scripts/repo-remote.sh, scripts/repo-optimize-ci.py, scripts/resync-installed.sh)"
+[[ -d "$TARGET/.claude/skills/repo" ]]   && echo "  .claude/skills/repo/ (incl. hooks/guard-destructive.sh, hooks/session-start-handoff.sh, scripts/repo-optimize-ci.py, scripts/resync-installed.sh)"
 [[ -d "$TARGET/.claude/commands/repo" ]] && echo "  .claude/commands/repo/"
 if codex_dir_is_ours; then
   echo "  $CODEX_SKILL_REL/ (the Codex skill: SKILL.md, install-metadata.json, references/)"

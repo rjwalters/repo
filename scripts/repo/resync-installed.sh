@@ -33,7 +33,6 @@
 #     at install time never had this file, and a resync must not start adding it
 #     — and never when the operator opted out with `install.sh --no-guard`,
 #     recorded as "guardHook": "disabled" and preserved on every re-stamp, repo#557)
-#   .claude/skills/repo/scripts/repo-remote.sh          <- scripts/repo/repo-remote.sh
 #   .claude/skills/repo/scripts/repo-scrub-forks.sh     <- scripts/repo/repo-scrub-forks.sh
 #   .claude/skills/repo/scripts/resync-installed.sh     <- scripts/repo/resync-installed.sh
 #   .claude/commands/repo/<cmd>.md                      <- commands/repo/<cmd>.md
@@ -418,7 +417,6 @@ if [[ "$GUARD_HOOK_INSTALLED" == true ]]; then
   plan "hooks/repo/guard-destructive.sh"      ".claude/skills/repo/hooks/guard-destructive.sh"  1
 fi
 plan "hooks/repo/session-start-handoff.sh"  ".claude/skills/repo/hooks/session-start-handoff.sh" 1
-plan "scripts/repo/repo-remote.sh"          ".claude/skills/repo/scripts/repo-remote.sh"      1
 plan "scripts/repo/repo-scrub-forks.sh"     ".claude/skills/repo/scripts/repo-scrub-forks.sh" 1
 plan "scripts/repo/repo-org-policy.py"      ".claude/skills/repo/scripts/repo-org-policy.py" 1
 plan "scripts/repo/repo-optimize-ci.py"     ".claude/skills/repo/scripts/repo-optimize-ci.py" 1
@@ -718,6 +716,20 @@ if [[ -n "$CODEX_ROOT" ]]; then
   done
 fi
 
+# Retired files (repo#765): paths this tool installed under fixed names and no
+# longer ships (lib/retired-files.sh) are removed by name — the one exception to
+# "never uninstalls", because they are ours, not the consumer's. Pins are honored.
+N_RETIRED=0
+if [[ -f "$SOURCE_ROOT/lib/retired-files.sh" ]]; then
+  # shellcheck source=../../lib/retired-files.sh
+  source "$SOURCE_ROOT/lib/retired-files.sh"
+  while IFS=$'\t' read -r _v _p; do
+    [[ -n "$_p" ]] || continue
+    N_RETIRED=$((N_RETIRED + 1))
+    report "$_v" "$YELLOW" "$_p" "retired"
+  done < <(retire_installed_files "$TARGET" "$DRY_RUN")
+fi
+
 # ---------------------------------------------------------------------------
 # Report what was LEFT ALONE. This is the visible half of "never uninstalls":
 # an installed file with no source counterpart is named, not removed.
@@ -825,7 +837,7 @@ stamp_sidecar() {
   mv -f "$tmp" "$SIDECAR" 2>/dev/null || { rm -f "$tmp"; warn "Could not update the sidecar — last_resync not recorded"; }
 }
 
-CHANGED=$((N_CREATED + N_UPDATED))
+CHANGED=$((N_CREATED + N_UPDATED + N_RETIRED))
 
 if [[ "$DRY_RUN" != true && "$N_FAILED" -eq 0 ]]; then
   stamp_metadata
@@ -837,6 +849,7 @@ SUMMARY="$(printf '%s synced, %s added, %s unchanged, %s skipped' "$N_UPDATED" "
 # pin list is noise, and --quiet exists precisely because this one line is all a
 # fleet-wide driver reads.
 [[ "$N_PINNED" -gt 0 ]] && SUMMARY="$SUMMARY, $N_PINNED pinned"
+[[ "$N_RETIRED" -gt 0 ]] && SUMMARY="$SUMMARY, $N_RETIRED retired"
 [[ "$N_FAILED" -gt 0 ]] && SUMMARY="$SUMMARY, $N_FAILED FAILED"
 say ""
 

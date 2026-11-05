@@ -5,7 +5,7 @@
 # Usage: ./commands/repo/tests/test-resync-installed.sh
 # Exit code 0 = all tests pass, 1 = failures detected.
 #
-# Structured like commands/repo/tests/test-repo-remote.sh: pure bash, no
+# Structured like commands/repo/tests/test-repo-scrub-forks.sh: pure bash, no
 # framework, PASS/FAIL/TOTAL counters and a summary block. `pnpm test` delegates
 # to this file via hooks/repo/tests/run.sh.
 #
@@ -676,6 +676,83 @@ if [[ -f "$CONTRACT" ]]; then
     assert_contains "the contract forbids uninstalling" "$CT" "**MUST NOT** uninstall"
     assert_contains "the contract says why" "$CT" "refresh that can delete"
 fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- retired files (repo#765: /repo:remote removed) --"
+RSRC="$SCRATCH/ret-src"; RTGT="$SCRATCH/ret-tgt"
+new_source "$RSRC"; new_target "$RTGT"
+do_install "$RSRC" "$RTGT"
+# shellcheck source=../../../lib/codex-skill.sh
+CODEX_MARK="$(source "$REPO_ROOT/lib/codex-skill.sh" >/dev/null 2>&1; printf '%s' "$CODEX_MANAGED_MARKER")"
+seed_retired() {  # <target> — plant the four paths an old install left behind
+    local t="$1"
+    mkdir -p "$t/.agents/skills/repo/references" "$t/.agents/skills/repo-remote"
+    echo old >"$t/.claude/commands/repo/remote.md"
+    echo old >"$t/.claude/skills/repo/scripts/repo-remote.sh"
+    echo old >"$t/.agents/skills/repo/references/remote.md"
+    printf -- '---\nname: repo-remote\n---\n%s\n' "$CODEX_MARK" >"$t/.agents/skills/repo-remote/SKILL.md"
+}
+if [[ -n "$CODEX_MARK" ]]; then ok "found the Codex managed marker"; else no "found the Codex managed marker"; fi
+seed_retired "$RTGT"
+
+BEFORE="$(tree_fingerprint "$RTGT")"
+run_resync "$RTGT" --dry-run
+AFTER="$(tree_fingerprint "$RTGT")"
+assert_eq "dry-run with retired files present exits 2 (drift)" "2" "$RS_RC"
+assert_contains "dry-run reports would drop" "$RS_OUT" "would drop"
+assert_contains "dry-run names the retired command" "$RS_OUT" ".claude/commands/repo/remote.md"
+assert_eq "dry-run deleted nothing" "$BEFORE" "$AFTER"
+
+run_resync "$RTGT"
+assert_eq "apply exits 0" "0" "$RS_RC"
+for f in .claude/commands/repo/remote.md .claude/skills/repo/scripts/repo-remote.sh \
+         .agents/skills/repo/references/remote.md .agents/skills/repo-remote; do
+    if [[ -e "$RTGT/$f" ]]; then no "resync removed $f"; else ok "resync removed $f"; fi
+done
+run_resync "$RTGT"
+assert_eq "second apply exits 0" "0" "$RS_RC"
+assert_contains "second apply reports in sync" "$RS_OUT" "Already in sync"
+
+# A consumer that never had the files: no error, nothing reported.
+run_resync "$RTGT" --dry-run
+assert_eq "no retired files present: dry-run exits 0" "0" "$RS_RC"
+assert_not_contains "no retired files present: nothing reported" "$RS_OUT" "retired"
+
+# An unmarked (user-authored) repo-remote Codex skill is left alone.
+mkdir -p "$RTGT/.agents/skills/repo-remote"
+echo "my own skill" >"$RTGT/.agents/skills/repo-remote/SKILL.md"
+run_resync "$RTGT"
+assert_file "an unmarked repo-remote skill survives resync" "$RTGT/.agents/skills/repo-remote/SKILL.md"
+
+# A pinned retired path is the consumer's and stays.
+echo old >"$RTGT/.claude/commands/repo/remote.md"
+echo ".claude/commands/repo/remote.md" >"$RTGT/.claude/skills/repo/resync-ignore"
+run_resync "$RTGT"
+assert_file "a pinned retired path survives resync" "$RTGT/.claude/commands/repo/remote.md"
+
+# Reinstall (install.sh) retires the same paths; its dry-run only lists them.
+ITGT="$SCRATCH/ret-reinstall"; new_target "$ITGT"
+do_install "$RSRC" "$ITGT"
+seed_retired "$ITGT"
+DRY="$( cd "$ITGT" && HOME="$FAKE_HOME" bash "$RSRC/install.sh" -y --dry-run "$ITGT" 2>&1 )"
+assert_contains "install --dry-run lists the retired script for removal" "$DRY" "Would remove"
+assert_file "install --dry-run removed nothing" "$ITGT/.claude/skills/repo/scripts/repo-remote.sh"
+do_install "$RSRC" "$ITGT"
+for f in .claude/commands/repo/remote.md .claude/skills/repo/scripts/repo-remote.sh \
+         .agents/skills/repo/references/remote.md .agents/skills/repo-remote; do
+    if [[ -e "$ITGT/$f" ]]; then no "reinstall removed $f"; else ok "reinstall removed $f"; fi
+done
+
+# --dev install: a retired symlink goes, the file it points at stays.
+DSRC="$SCRATCH/dev-src"; DTGT="$SCRATCH/dev-tgt"
+new_source "$DSRC"; new_target "$DTGT"
+do_install "$DSRC" "$DTGT" --dev
+ln -sf "$DSRC/VERSION" "$DTGT/.claude/commands/repo/remote.md"
+run_resync "$DTGT"
+if [[ -e "$DTGT/.claude/commands/repo/remote.md" || -L "$DTGT/.claude/commands/repo/remote.md" ]]; then
+    no "dev install: retired symlink removed"; else ok "dev install: retired symlink removed"; fi
+assert_file "dev install: the symlink target in the source clone is untouched" "$DSRC/VERSION"
 
 # ---------------------------------------------------------------------------
 echo ""
