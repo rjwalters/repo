@@ -4,6 +4,10 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-11-04
 
+- **PR #745**: docs(repo): teach update-tools and followups about squad release installs
+- **Issue #744** (closed): update-tools/followups: support squad (release-path source has no git remote; document update path; legacy adoption)
+- **PR #749**: docs: treat Loom-managed default branch as PR-only in /repo:docs ladder
+- **Issue #748** (closed): docs destination ladder: treat Loom-managed default branch as PR-only even when unprotected
 - **PR #725**: fix(guard): accurate deny for opaque interpreter-heredoc writes (#722)
 - **Issue #722** (closed): worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root
 
