@@ -1108,13 +1108,8 @@ workflows actually build/run that ecosystem's artifact (`grep` the
 `terraform plan`, …). If they don't, report the PR's CI as **green but
 unverifiable by this repo's checks** rather than plain "green" — e.g. a
 `docker`-ecosystem PR when no workflow runs `docker build` against the
-Dockerfile it touches. (As of this writing this repo's own `docker` entry —
-the root `Dockerfile` — is covered: `.github/workflows/docker-build.yml` runs
-`docker build .` on any PR/push touching it, `paths:`-filtered off unrelated
-PRs — added in response to issue #231, after the first docker Dependabot PR
-merged on a green check that had built nothing. Re-check this note against
-the workflow files each run rather than trusting this parenthetical, since
-either side of it can drift.)
+Dockerfile it touches. (This repo has no `Dockerfile` of its own, so its
+`docker` entry is inert here; the rule matters for consumer repos.)
 
 #### CI `none` — the repo has no workflows at all
 

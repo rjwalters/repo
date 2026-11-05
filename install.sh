@@ -161,6 +161,8 @@ source "$SOURCE_ROOT/lib/gitignore-check.sh"
 # undoes it on its next run. See lib/resync-ignore.sh (repo#511).
 # shellcheck source=lib/resync-ignore.sh
 source "$SOURCE_ROOT/lib/resync-ignore.sh"
+# shellcheck source=lib/retired-files.sh
+source "$SOURCE_ROOT/lib/retired-files.sh"
 
 INSTALL_DATE="$(date -u +%Y-%m-%d)"
 REPO_OWNER="OWNER"
@@ -372,7 +374,6 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $TARGET/.claude/skills/repo/hooks/guard-destructive.sh"
   fi
   echo "  $TARGET/.claude/skills/repo/hooks/session-start-handoff.sh"
-  echo "  $TARGET/.claude/skills/repo/scripts/repo-remote.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-scrub-forks.sh"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-org-policy.py"
   echo "  $TARGET/.claude/skills/repo/scripts/repo-optimize-ci.py"
@@ -410,6 +411,11 @@ if [[ "$DRY_RUN" == true ]]; then
   else
     echo "  $TARGET/.gitignore (.claude/skills/repo/.install-local.json entry$([[ "$CODEX" == true ]] && ! codex_target_is_foreign && echo " + $CODEX_SKILL_REL/.install-local.json entry"))"
     echo "  $TARGET/CLAUDE.md (marker-bounded REPO-SKILLS block)"
+  fi
+  _dry_run_retired="$(retire_installed_files "$TARGET" true)"
+  if [[ -n "$_dry_run_retired" ]]; then
+    echo "Would remove (retired by this tool):"
+    while IFS=$'\t' read -r _v _p; do echo "  $TARGET/$_p"; done <<<"$_dry_run_retired"
   fi
   if resync_ignore_active; then
     echo "Pinned as repo-owned in $RESYNC_IGNORE_REL — NOT written (C10):"
@@ -778,21 +784,10 @@ chmod +x "$TARGET/.claude/skills/repo/hooks/session-start-handoff.sh" 2>/dev/nul
 success_installed ".claude/skills/repo/hooks/session-start-handoff.sh"
 merge_settings_sessionstart_hook
 
-# 3d. Headless provisioning script for /repo:remote. Same colocation + chmod
-# rationale as the hooks above: it lives inside .claude/skills/repo/ so
-# uninstall's `rm -rf` removes it for free, and render+copy drops the exec bit
-# so we re-set it. This is the non-interactive entry point the interactive
-# skill delegates to and that a caller (e.g. loom's `fleet add-worker`) invokes
-# directly — without this copy step the script would ship in the source repo
-# but never reach a consumer repo (repo#52).
 mkdir -p "$TARGET/.claude/skills/repo/scripts"
-install_file "$SOURCE_ROOT/scripts/repo/repo-remote.sh" \
-  "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" "scripts/repo/repo-remote.sh"
-chmod +x "$TARGET/.claude/skills/repo/scripts/repo-remote.sh" 2>/dev/null || true
-success_installed ".claude/skills/repo/scripts/repo-remote.sh"
 
 # 3d-2. Fork-network sweep script for /repo:scrub --forks. Same colocation +
-# chmod rationale as repo-remote.sh above: SKILL.md, README.md, and
+# chmod rationale as the hooks above: SKILL.md, README.md, and
 # commands/repo/scrub.md all document it as installed to
 # .claude/skills/repo/scripts/, so it must actually ship there (repo#298).
 install_file "$SOURCE_ROOT/scripts/repo/repo-scrub-forks.sh" \
@@ -824,6 +819,13 @@ install_file "$SOURCE_ROOT/scripts/repo/resync-installed.sh" \
   "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" "scripts/repo/resync-installed.sh"
 chmod +x "$TARGET/.claude/skills/repo/scripts/resync-installed.sh" 2>/dev/null || true
 success_installed ".claude/skills/repo/scripts/resync-installed.sh"
+
+# 3e-2. Retire paths earlier versions installed under fixed names and this one no
+# longer ships (lib/retired-files.sh, repo#765). Runs on every install so a
+# reinstall — not only a resync — cleans the consumer.
+while IFS=$'\t' read -r _v _p; do
+  [[ -n "$_p" ]] && success "Removed retired $_p"
+done < <(retire_installed_files "$TARGET" false)
 
 # 3f. Codex-side skill surface (.agents/skills/repo/). Codex CLI discovers
 # skills by scanning `.agents/skills` from the cwd up to the repo root, in the

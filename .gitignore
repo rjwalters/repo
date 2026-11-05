@@ -8,7 +8,7 @@ __pycache__/
 # Repo Skills dev-mode symlinks — machine-local, refreshed by install; do not commit
 .claude/
 
-# repo:remote per-repo config (may hold overrides; never commit)
+# Per-repo local environment config (may hold secrets; never commit)
 .env
 
 # Guard hook diagnostic logs (runtime artifact, never committed)

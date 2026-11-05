@@ -7,7 +7,7 @@
 # Usage: ./commands/repo/tests/test-repo-scrub-forks.sh
 # Exit code 0 = all tests pass, 1 = failures detected.
 #
-# Structured like commands/repo/tests/test-repo-remote.sh: pure bash, no
+# Structured like commands/repo/tests/test-resync-installed.sh: pure bash, no
 # framework, PASS/FAIL/TOTAL counters and a summary block. `pnpm test`
 # delegates to this file via hooks/repo/tests/run.sh.
 #
