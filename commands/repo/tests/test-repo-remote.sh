@@ -4779,6 +4779,15 @@ assert_eq "prune awk failure: exit 4" "4" "$RR_RC"
 assert_eq "prune awk failure: config byte-identical" "$BEFORE628" "$(cat "$CFG628")"
 assert_eq "prune awk failure: no lock dir left behind" "" "$( [[ -e "$CFG628.lock" ]] && echo present )"
 assert_eq "prune awk failure: no known_hosts removal" "0" "$(grep -c '^ssh-keygen' "$MOCK_LOG")"
+
+# A config holding ONLY stale alias blocks (fresh machine) legitimately strips
+# to an empty file: prune must succeed and leave it empty, not refuse.
+rm -f "$CFG628" "$CFG628.lock"
+printf '%s\n' 'Host repo-remote-ssm-gone' '    HostName i-0gone' '    User ubuntu' >"$CFG628"
+run_rr REPO_REMOTE_SSH_CONFIG="$CFG628" MOCK_AWS_FIND="$LIVE628" -- prune --yes
+assert_eq "prune alias-only config: exit 0" "0" "$RR_RC"
+assert_eq "prune alias-only config: left empty/whitespace-only" "" "$(tr -d '[:space:]' <"$CFG628")"
+assert_eq "prune alias-only config: no lock dir left behind" "" "$( [[ -e "$CFG628.lock" ]] && echo present )"
 write_cfg628
 
 # (d2) an indented / trailing-space Host header is judged AND stripped the same

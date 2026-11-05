@@ -3087,11 +3087,6 @@ remove_ssh_alias_blocks() {  # <alias>...
     rm -f "$tmp"; release_ssh_alias_lock "$cfg"
     return 1
   fi
-  if [[ -s "$cfg" && ! -s "$tmp" ]]; then
-    log "refusing to replace a non-empty ${cfg} with an empty file -- leaving it untouched"
-    rm -f "$tmp"; release_ssh_alias_lock "$cfg"
-    return 1
-  fi
   if cmp -s "$cfg" "$tmp"; then
     rm -f "$tmp"; release_ssh_alias_lock "$cfg"; return 0
   fi
