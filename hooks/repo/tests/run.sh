@@ -41,6 +41,7 @@
 # commands/repo/tests/test-followups-requested-by.sh,
 # commands/repo/tests/test-all-orphans-stage.sh,
 # commands/repo/tests/test-check-label-descriptions.sh,
+# commands/repo/tests/test-changelog-version-heading.sh,
 # commands/repo/tests/test-json-escape-parity.sh,
 # commands/repo/tests/test-release-notes-extraction.sh,
 # commands/repo/tests/test-tidy-mcp-dist-demotion.sh,
@@ -1735,6 +1736,40 @@ else
     PASS=$((PASS + VB_PASS))
     FAIL=$((FAIL + VB_FAIL))
     record_suite "test-check-installed-surface-version-bump.sh" "$VB_PASS" "$VB_FAIL" "installed-surface VERSION-bump gate"
+fi
+
+# CHANGELOG heading per VERSION (#769): scripts/check-changelog-version.sh and
+# the Unreleased -> `## <new> (date)` cut in scripts/version.sh. Same delegation
+# shape as every suite above.
+echo
+echo "-- CHANGELOG heading per VERSION (delegated suite) --"
+CL_TEST="$TESTS_DIR/../../../commands/repo/tests/test-changelog-version-heading.sh"
+if [[ ! -f "$CL_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-changelog-version-heading.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-changelog-version-heading.sh" "$CL_TEST"
+else
+    CL_OUT="$(bash "$CL_TEST" 2>&1)"
+    CL_STATUS=$?
+    CL_PASS="$(suite_count Passed "$CL_OUT")"
+    CL_FAIL="$(suite_count Failed "$CL_OUT")"
+    if ! [[ "$CL_PASS" =~ ^[0-9]+$ && "$CL_FAIL" =~ ^[0-9]+$ ]]; then
+        CL_PASS=0
+        CL_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-changelog-version-heading.sh" "$CL_STATUS"
+        strip_ansi "$CL_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$CL_STATUS" -ne 0 || "$CL_FAIL" -ne 0 ]]; then
+        [[ "$CL_FAIL" -eq 0 ]] && CL_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-changelog-version-heading.sh" "$CL_PASS" "$CL_FAIL" "$CL_STATUS"
+        strip_ansi "$CL_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-changelog-version-heading.sh" "$CL_PASS"
+    fi
+    PASS=$((PASS + CL_PASS))
+    FAIL=$((FAIL + CL_FAIL))
+    record_suite "test-changelog-version-heading.sh" "$CL_PASS" "$CL_FAIL" "CHANGELOG heading per VERSION"
 fi
 
 # /repo:deps step 1's three-state security-updates read — GET

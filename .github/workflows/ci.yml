@@ -132,3 +132,8 @@ jobs:
           ./scripts/check-installed-surface-version-bump.sh \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}"
+
+      # VERSION must have a matching CHANGELOG.md heading (#769) — the same
+      # shape /repo:release Phase 1.5 checks. scripts/version.sh bump cuts it.
+      - name: Check CHANGELOG heading for VERSION
+        run: ./scripts/check-changelog-version.sh
