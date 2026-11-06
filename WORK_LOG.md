@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-11-04
 
+- **PR #761**: docs(repo): point /repo:decide at loom:operator + decision block
+- **Issue #756** (closed): /repo:decide points at the loom:operator-decision label, which Loom 0.19.1263 retires
 - **PR #745**: docs(repo): teach update-tools and followups about squad release installs
 - **Issue #744** (closed): update-tools/followups: support squad (release-path source has no git remote; document update path; legacy adoption)
 - **PR #749**: docs: treat Loom-managed default branch as PR-only in /repo:docs ladder
