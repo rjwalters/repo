@@ -4,7 +4,6 @@
   "description": "General-purpose repository skills for Claude Code",
   "private": true,
   "scripts": {
-    "worktree:return": "./.loom/scripts/worktree-return.sh",
     "check:ci": "pnpm test",
     "check:all": "pnpm test",
     "test": "./hooks/repo/tests/run.sh",
