@@ -2,6 +2,24 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-11-06
+
+- **PR #762**: fix(repo-remote): stop prune emptying ssh config under BSD awk
+- **Issue #754** (closed): repo-remote prune --yes empties the whole SSH config on macOS when removing 2+ aliases (BSD awk rejects newline in -v)
+- **PR #753**: chore(loom): resync installed Loom to v0.19.1263
+- **PR #752**: chore: repo hygiene fixes (2026-11-04)
+- **PR #736**: fix: unwire our own guard entry when install defers to another guard
+- **Issue #733** (closed): install.sh: deferring to another guard leaves Repo Skills' own guard hook wired but unrefreshed, and records guardHookInstalled=false against a tree that still runs it
+
+### 2026-11-05
+
+- **PR #763**: fix(tests): make #722 opaque-heredoc target assertion macOS-portable
+- **Issue #755** (closed): test-guard-destructive.sh: three #722 opaque-heredoc cases fail on macOS (target= logical vs physical /private/var path)
+- **PR #760**: docs: add docs/ index and link design records from README
+- **Issue #758** (closed): docs/: add a README indexing the design/review records
+- **PR #751**: feat(guard): add guards.rmAllowDirs (#747)
+- **Issue #747** (closed): guard-destructive.sh: allow cleanup outside the repo, and stop parsing quoted/heredoc text as write targets
+
 ### 2026-11-04
 
 - **PR #761**: docs(repo): point /repo:decide at loom:operator + decision block
