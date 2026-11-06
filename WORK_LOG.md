@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 
 ### 2026-11-06
 
+- **PR #776**: Fail pnpm test on undelegated test files (#774)
+- **Issue #774** (closed): Wire test-update-tools-squad.sh into pnpm test and fail on any undelegated test suite
 - **PR #762**: fix(repo-remote): stop prune emptying ssh config under BSD awk
 - **Issue #754** (closed): repo-remote prune --yes empties the whole SSH config on macOS when removing 2+ aliases (BSD awk rejects newline in -v)
 - **PR #753**: chore(loom): resync installed Loom to v0.19.1263
