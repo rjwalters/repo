@@ -106,3 +106,6 @@ hooks/logs/
 
 # squad runtime state — live SQLite db + WAL/SHM (machine-local, never commit)
 .squad/
+
+# Repo Skills dev-mode per-command Codex skills (machine-local, do not commit)
+.agents/skills/repo-*/
