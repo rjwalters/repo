@@ -54,6 +54,10 @@
 # commands/repo/tests/test-update-tools-squad.sh, and
 # commands/repo/tests/test_optimize_ci.py.
 #
+# A completeness check at the end fails the run for any test-*.sh / test_*.py under
+# commands/repo/tests/ or hooks/repo/tests/ that is neither delegated here nor
+# named in a .github/workflows/*.yml file (#774).
+#
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
 #
@@ -1994,6 +1998,29 @@ fi
 PASS=$((PASS + OC_PASS)); FAIL=$((FAIL + OC_FAIL))
 record_suite "test_optimize_ci.py" "$OC_PASS" "$OC_FAIL" "optimize-ci workflow audit"
 printf '  optimize-ci: %s passed, %s failed\n' "$OC_PASS" "$OC_FAIL"
+# Completeness guard (#774): every test file must be wired into the gate.
+# Enumerate the suites and require each basename to appear either in this
+# file's CODE (comment lines stripped, so the header list alone cannot satisfy
+# it) or in a CI workflow. An unwired file counts one failure naming its path.
+# lib/ helpers are not enumerated.
+REPO_TOP="$(cd "$TESTS_DIR/../../.." && pwd)"
+RUN_SH_CODE="$(grep -v '^[[:space:]]*#' "${BASH_SOURCE[0]}")"
+WF_TEXT="$(cat "$REPO_TOP"/.github/workflows/*.yml 2>/dev/null || true)"
+WIRE_PASS=0; WIRE_FAIL=0
+for wf_path in "$REPO_TOP"/commands/repo/tests/test-*.sh \
+               "$REPO_TOP"/commands/repo/tests/test_*.py \
+               "$REPO_TOP"/hooks/repo/tests/test-*.sh; do
+    [[ -f "$wf_path" ]] || continue
+    wf_base="${wf_path##*/}"
+    if [[ "$RUN_SH_CODE" == *"$wf_base"* || "$WF_TEXT" == *"$wf_base"* ]]; then
+        WIRE_PASS=$((WIRE_PASS + 1))
+    else
+        WIRE_FAIL=$((WIRE_FAIL + 1))
+        echo "FAIL: test file not wired into run.sh or a workflow: ${wf_path#"$REPO_TOP"/}"
+    fi
+done
+PASS=$((PASS + WIRE_PASS)); FAIL=$((FAIL + WIRE_FAIL))
+record_suite "test-file wiring check" "$WIRE_PASS" "$WIRE_FAIL" "every test file delegated or in CI"
 echo
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
