@@ -116,7 +116,7 @@ Codex CLI scans `.agents/skills` in every directory from your working directory 
 
 **One skill per command (`$repo-<verb>`).** Codex lists skills by name and description, so each command is also installed as its own skill, `.agents/skills/repo-<verb>/SKILL.md` (`name: repo-<verb>`, matching its directory), whose description is that command's own. The body is the command's body, with `/repo:<verb>` cross-references rewritten to `$repo-<verb>` at render time, so `/repo:tidy` in Claude Code is `$repo-tidy` in Codex. `--skills=` installs only the selected verbs, `--no-codex` writes none, and `.claude/skills/repo/scripts/resync-installed.sh` repairs them and removes marked ones whose verb left the install. Paths such as `.claude/skills/repo/scripts/…` and `.claude/handoff.md` in a command are relative to the repository root and exist when the Claude Code surface is installed too. The umbrella `repo` skill and its `references/` are kept as a router for now.
 
-**Ownership.** Unlike `.claude/skills/repo/`, the `.agents/skills/` namespace is *shared* — Codex loads every skill any tool or person puts there. So the installer writes only `.agents/skills/repo/`, marks what it wrote, and refuses to overwrite a same-named skill it did not write; `uninstall.sh` applies the same test before removing anything, prunes the shared parent directories only when it emptied them, and leaves sibling skills alone. `.claude/skills/repo/scripts/resync-installed.sh` refreshes the Codex surface too and reports drift in it — but only when it is already installed, so a repo that declined it never has it added behind the operator's back.
+**Ownership.** Unlike `.claude/skills/repo/`, the `.agents/skills/` namespace is *shared* — Codex loads every skill any tool or person puts there. So the installer writes only `.agents/skills/repo/` and its own `.agents/skills/repo-<verb>/` directories, marks what it wrote, and refuses to overwrite a same-named skill it did not write; `uninstall.sh` applies the same test before removing anything, prunes the shared parent directories only when it emptied them, and leaves sibling skills alone. `.claude/skills/repo/scripts/resync-installed.sh` refreshes the Codex surface too and reports drift in it — but only when it is already installed, so a repo that declined it never has it added behind the operator's back.
 
 ## Installation
 
@@ -234,7 +234,7 @@ before there was any way to say "this file is ours".
 The installer is designed to coexist with whatever already lives in the consumer repo (including Anvil and Loom installs):
 
 - `.claude/skills/repo/` — the domain skill file plus install metadata
-- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall). **Conditional**: skipped entirely when another destructive-command guard is already wired in `.claude/settings.json` (e.g. an existing Loom install) — the same coexistence check the `.claude/settings.json` bullet below describes decides both whether to wire the hook *and* whether to even copy the script, so a deferred install never ships a copy of the ~6,700-line script nothing would run. The decision is recorded in `install-metadata.json`'s `guardHookInstalled` field so `resync-installed.sh` keeps respecting it on every later refresh. Also skipped (along with its `settings.json` entry) under an explicit `--no-guard` opt-out, persisted as `guardHook: "disabled"` — see "Opting out of the guard" above
+- `.claude/skills/repo/hooks/guard-destructive.sh` — the PreToolUse guard hook (colocated under the skill dir; removed with it on uninstall). **Conditional**: skipped entirely when another destructive-command guard is already wired in `.claude/settings.json` (e.g. an existing Loom install) — the same coexistence check the `.claude/settings.json` bullet below describes decides both whether to wire the hook *and* whether to even copy the script, so a deferred install never ships a copy of the ~12,600-line script nothing would run. The decision is recorded in `install-metadata.json`'s `guardHookInstalled` field so `resync-installed.sh` keeps respecting it on every later refresh. Also skipped (along with its `settings.json` entry) under an explicit `--no-guard` opt-out, persisted as `guardHook: "disabled"` — see "Opting out of the guard" above
 - `.claude/skills/repo/hooks/session-start-handoff.sh` — the SessionStart handoff-note hook (same colocation, same uninstall behavior)
 - `.claude/skills/repo/scripts/repo-remote.sh` — the headless provisioning entry point for `/repo:remote` (the interactive skill delegates to it; a caller such as loom's `fleet add-worker` invokes it directly). Same colocation, removed with the skill dir on uninstall
 - `.claude/skills/repo/scripts/resync-installed.sh` — the consumer-side resync (see "Updating an existing install" above). Same colocation, removed with the skill dir on uninstall
@@ -244,7 +244,8 @@ The installer is designed to coexist with whatever already lives in the consumer
 - `.claude/commands/repo/` — one file per command, namespaced under `repo/` so nothing else is touched
 - `.claude/settings.json` — a single `PreToolUse` → `Bash` hook entry is **merged in** (never wholesale-copied): existing hooks, permissions, and unrelated entries are preserved, re-installs don't duplicate, and if another guard is already wired the installer defers instead. `uninstall.sh` removes only the entry it owns and prunes empty containers
 - `.claude/settings.json` — two `SessionStart` entries (`startup` and `resume`) are merged the same way for the handoff-note hook. A pre-existing `SessionStart` hook from another tool is preserved rather than clobbered, and uninstall removes only the two entries it owns
-- `.agents/skills/repo/` — the Codex skill: `SKILL.md`, `references/<verb>.md` (one per command), and its own `install-metadata.json`. Written by default, skipped with `--no-codex`; only this directory is touched, never a sibling skill under the shared `.agents/skills/` namespace, and never a same-named skill this installer did not write. See "Codex packaging" above
+- `.agents/skills/repo/` — the Codex skill: `SKILL.md`, `references/<verb>.md` (one per command), and its own `install-metadata.json`. Written by default, skipped with `--no-codex`; only this directory and the per-command `repo-<verb>` skills below are touched, never a sibling skill under the shared `.agents/skills/` namespace, and never a same-named skill this installer did not write. See "Codex packaging" above
+- `.agents/skills/repo-<verb>/SKILL.md` — one Codex skill per selected command (`$repo-<verb>`), each carrying the ownership marker. Written with the umbrella skill, skipped with `--no-codex`, limited by `--skills=`; `uninstall.sh` removes only marked `repo-*` directories and `resync-installed.sh` repairs them
 - `CLAUDE.md` — one lightweight marker-bounded block (`<!-- BEGIN REPO-SKILLS --> … <!-- END REPO-SKILLS -->`) appended after your existing content; re-installs replace it in place. The block is deliberately just a pointer to `/repo:help` and `.claude/skills/repo/SKILL.md` — it does not inline the command list, so it never goes stale
 
 Nothing else in the target repository is read or modified.
@@ -274,7 +275,8 @@ hooks/repo/tests/run.sh      Test entry point (bash, no framework needed): inlin
                              plus every delegated suite below. `pnpm test` runs it
 hooks/repo/tests/test-*.sh   Hook suites — guard regression, handoff hook, CLAUDE.md
                              markers, sidecar untracking, Codex skill surface,
-                             claude + codex shell wrappers, Claude/Codex skill parity
+                             claude + codex shell wrappers, Claude/Codex skill parity,
+                             install guard coexistence
 commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, repo-remote
                              provisioning, verify-after-write, early sync-and-switch, tidy
                              KEEP tiers, C7 resync, C10 repo-owned pins, installer contract,
@@ -287,7 +289,15 @@ commands/repo/tests/test-*.sh  Command-contract suites — branches loss check, 
                              followups pre-filing scrub step, /repo:all orphan-stage
                              ownership, CHANGELOG merged-work and version-citation
                              checks, label-description lint, json_escape parity,
-                             version.sh, and the installed-surface VERSION-bump gate
+                             version.sh, the installed-surface VERSION-bump gate, and
+                             per-command contracts (deps, followups, handoff, tidy,
+                             update-tools, release notes, gitignore, fixtures). The
+                             full delegated list is in hooks/repo/tests/run.sh's header
+commands/repo/tests/test_*.py  Python suites for repo-optimize-ci.py, repo-org-policy.py and the
+                             Dependabot policy validator
+commands/repo/tests/lib/     Shared test helpers (assertion counters, git fixtures)
+docs/                        Design and review records (remote-exec provenance, guard
+                             confinement review)
 INSTALLER-CONTRACT.md        Normative tool-package installer contract (C1-C10), owned by this repo
 install.sh                   Installer
 uninstall.sh                 Uninstaller

@@ -19,7 +19,7 @@ sanity checks worth re-running before relying on any claim here, since the
 family this repo belongs to is under active packaging work:
 
 ```bash
-git ls-files '*SKILL.md'          # confirm this is still the only SKILL.md
+git ls-files 'skills/*SKILL.md'  # confirm this is still the only SKILL.md under skills/
 ls commands/repo/                 # confirm the command roster hasn't shifted
 ```
 
@@ -38,7 +38,7 @@ user-invocable: false
 ```
 
 Every file under `commands/repo/*.md` carries the same four keys with
-`type: command` and `user-invocable: true` instead (verified: all 20 command
+`type: command` and `user-invocable: true` instead (verified: all 24 command
 files use exactly this five-key shape — `name`, `description`, `domain`,
 `type`, `user-invocable` — no file in this repo adds or omits a key).
 
@@ -86,7 +86,7 @@ generalizes to a second runtime:
   per runtime (the destructive-command guard hook, the handoff-note hook,
   configuration toggles). This content exists exactly once in the whole repo.
 - **Each `commands/repo/<verb>.md` holds that one verb's actual procedure** —
-  e.g. `commands/repo/followups.md` is 289 lines of concrete steps, not a
+  e.g. `commands/repo/followups.md` is hundreds of lines of concrete steps, not a
   pointer. It is still the "thin" half of the pair, but "thin" describes its
   *reason for existing*, not its length: Claude Code's slash-command discovery
   requires a dedicated file at a fixed path

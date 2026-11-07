@@ -7,10 +7,8 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#725**: fix(guard): accurate deny for opaque interpreter-heredoc writes (#722)
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
-- **#734**: deps: define the evidence bar for PR review when the repo has no CI
-- **#736**: fix: unwire our own guard entry when install defers to another guard
+- **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
 
 ## Very Important
 
@@ -28,39 +26,44 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#676**: Codex: register each repo command as a discoverable native skill
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#676**: Codex: register each repo command as a discoverable native skill
-- **#733**: install.sh: deferring to another guard leaves Repo Skills' own guard hook wired but unrefreshed, and records guardHookInstalled=false against a tree that still runs it
+- **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills
+- **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one
+- **#771**: CI: exercise repo-remote.sh tests on macOS (BSD awk) runner
+- **#774**: Wire test-update-tools-squad.sh into pnpm test and fail on any undelegated test suite
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#772**: ci: run repo-remote.sh suite on macOS with BSD awk
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#725**: fix(guard): accurate deny for opaque interpreter-heredoc writes (#722)
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
-- **#734**: deps: define the evidence bar for PR review when the repo has no CI
-- **#736**: fix: unwire our own guard entry when install defers to another guard
+- **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
 - **#478**: Live-verify org-policy's absent/inaccessible heuristic against a real organization *(curated)*
+- **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
-- **#722**: worktree-isolation guard blocks a stdin heredoc whose only writes are outside the repository, reporting a write to the repo root *(curated)*
-- **#733**: install.sh: deferring to another guard leaves Repo Skills' own guard hook wired but unrefreshed, and records guardHookInstalled=false against a tree that still runs it *(curated)*
+- **#759**: .loom/resync-ignore: guard-destructive-generic.sh pin no longer matches anything (resync warns 'pin had no effect') *(curated)*
+- **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills *(curated)*
+- **#767**: package.json: drop dangling worktree:return script after Loom resync removed worktree-return.sh *(curated)*
+- **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one *(curated)*
+- **#771**: CI: exercise repo-remote.sh tests on macOS (BSD awk) runner *(curated)*
+- **#774**: Wire test-update-tools-squad.sh into pnpm test and fail on any undelegated test suite *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -74,14 +77,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 4 |
+| Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 5 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 10 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
