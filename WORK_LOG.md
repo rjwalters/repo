@@ -2,6 +2,13 @@
 
 Chronological record of merged PRs and closed issues, maintained automatically by the Guide triage agent.
 
+### 2026-11-07
+
+- **PR #780**: docs: document pin-had-no-effect false positive for guard-destructive-generic pin
+- **Issue #759** (closed): .loom/resync-ignore: guard-destructive-generic.sh pin no longer matches anything (resync warns 'pin had no effect')
+- **PR #779**: fix: make dependabot.yml locally owned and drop review label
+- **Issue #757** (closed): .github/dependabot.yml claims fleet-gitops ownership and adds loom:review-requested; rjwalters policy declares no source
+
 ### 2026-11-06
 
 - **PR #776**: Fail pnpm test on undelegated test files (#774)
