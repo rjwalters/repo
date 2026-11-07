@@ -142,7 +142,7 @@ run_rr() {
         TMPDIR="$RR_TMPDIR" \
         MOCK_VM_HOME="$VM_HOME" MOCK_VM_BIN="$VM_BIN" MOCK_VM_DOCKER_BIN="$VM_DOCKER_BIN" \
         MOCK_VM_LOG="$MOCK_VM_LOG" MINT_DIR="$MINT_DIR" MINT_COUNT="$MINT_DIR/count" \
-        "${envs[@]}" \
+        ${envs[@]+"${envs[@]}"} \
         bash ${RR_BASH_X:+-x} "$RR" "$@" 2>"$errf")"
     RR_RC=$?
     RR_ERR="$(cat "$errf")"; rm -f "$errf"
