@@ -900,7 +900,7 @@ elif codex_target_is_foreign; then
   warning "it untouched — the Claude Code surface installed normally. Move or rename that"
   warning "skill and re-run to install the Codex surface too, or pass --no-codex to silence this."
 else
-  mkdir -p "$TARGET/$CODEX_REFERENCES_REL"
+  mkdir -p "$TARGET/$CODEX_SKILL_REL"
   # Not an install_file() call (it is generated, never symlinked), so the C10 pin
   # has to be consulted explicitly here — a pin honored on the Claude surface but
   # not the Codex one would be a pin only half the time.
