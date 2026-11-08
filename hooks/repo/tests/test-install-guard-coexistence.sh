@@ -344,6 +344,67 @@ echo "-- default installs stay byte-compatible (no policy field emitted) --"
 assert_not_contains "a default install does not emit guardHook" "$(cat "$T2/$META")" '"guardHook"'
 
 # ---------------------------------------------------------------------------
+# repo#733: BOTH our own guard entry and a foreign guard are wired (Loom
+# installed after Repo Skills). The deferral must unwire ours so the recorded
+# guardHookInstalled:false matches the tree.
+echo ""
+echo "-- both guards wired: deferral unwires our own entry (repo#733) --"
+
+T7="$(new_target both-wired)"
+mkdir -p "$T7/.claude" "$T7/.claude/skills/repo/hooks"
+printf '#!/bin/sh\n' >"$T7/$GUARD_DEST"
+cat >"$T7/$SETTINGS" <<'EOF2'
+{
+  "permissions": { "allow": ["Bash(ls:*)"] },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh" },
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh" },
+          { "type": "command", "command": "/opt/third-party/audit.sh" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh" }
+        ]
+      },
+      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "/opt/x.sh" } ] }
+    ]
+  }
+}
+EOF2
+OUT7="$(bash "$INSTALL_SH" -y "$T7" 2>&1)"; RC7=$?
+assert_eq "install exits 0" "0" "$RC7"
+S7="$(cat "$T7/$SETTINGS")"
+assert_eq "exactly one guard-destructive.sh entry remains" "1" \
+    "$(printf '%s' "$S7" | grep -c 'guard-destructive\.sh')"
+assert_contains "the foreign (Loom) guard is kept" "$S7" '.loom/hooks/guard-destructive.sh'
+assert_not_contains "our own entry is removed" "$S7" '.claude/skills/repo/hooks/guard-destructive.sh'
+assert_contains "third-party hook sharing the matcher is kept" "$S7" '/opt/third-party/audit.sh'
+assert_contains "unrelated hooks are kept" "$S7" '/opt/x.sh'
+assert_contains "permissions are kept" "$S7" 'Bash(ls:*)'
+assert_eq "the matcher block our removal emptied is dropped" "2" \
+    "$(printf '%s' "$S7" | jq '.hooks.PreToolUse | length')"
+if [[ ! -e "$T7/$GUARD_DEST" ]]; then
+    ok "stale guard-destructive.sh copy is deleted"
+else
+    no "stale guard-destructive.sh copy is deleted" "file still exists"
+fi
+assert_contains "metadata records guardHookInstalled:false" "$(cat "$T7/$META")" '"guardHookInstalled": false'
+
+# (.install-local.json carries a timestamp, so compare only the files this
+# fix touches rather than the whole tree.)
+fp7() { cksum <"$T7/$SETTINGS"; cksum <"$T7/$META"; ls "$T7/.claude/skills/repo/hooks"; }
+FP7="$(fp7)"
+OUT7B="$(bash "$INSTALL_SH" -y "$T7" 2>&1)"
+assert_eq "a second run is a no-op" "$FP7" "$(fp7)"
+assert_not_contains "a second run removes nothing" "$OUT7B" "Removed"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "========================================="
 echo "  Total:  $TOTAL"

@@ -48,7 +48,6 @@ hooks/logs/
 .loom/claims/
 .loom/locks/
 .loom/signals/
-.loom/sweep-dispatch-tap/
 .loom/status/
 .loom/retry-state/
 .loom/exit-codes/
@@ -99,7 +98,7 @@ hooks/logs/
 .loom/gh-config-by-owner/
 .loom/gh-config-by-owner.*/
 .loom/gh-config-by-owner-*/
-.loom-local/
+/.loom-local/
 # <<< loom-managed <<<
 
 # Repo Skills dev-mode Codex surface (machine-local, do not commit)
@@ -107,3 +106,6 @@ hooks/logs/
 
 # squad runtime state — live SQLite db + WAL/SHM (machine-local, never commit)
 .squad/
+
+# Repo Skills dev-mode per-command Codex skills (machine-local, do not commit)
+.agents/skills/repo-*/

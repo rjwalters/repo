@@ -49,8 +49,14 @@
 # commands/repo/tests/test-git-fixture-hermeticity.sh,
 # commands/repo/tests/test-deps-security-updates-paused.sh,
 # commands/repo/tests/test-deps-dependabot-alerts.sh,
-# commands/repo/tests/test-handoff-preflight.sh, and
+# commands/repo/tests/test-deps-no-ci.sh,
+# commands/repo/tests/test-handoff-preflight.sh,
+# commands/repo/tests/test-update-tools-squad.sh, and
 # commands/repo/tests/test_optimize_ci.py.
+#
+# A completeness check at the end fails the run for any test-*.sh / test_*.py under
+# commands/repo/tests/ or hooks/repo/tests/ that is neither delegated here nor
+# named in a .github/workflows/*.yml file (#774).
 #
 # `pnpm test` is this repo's only automated gate — there is no CI — so it must
 # run every case, not a smoke subset (repo#36).
@@ -1807,6 +1813,42 @@ else
     record_suite "test-deps-dependabot-alerts.sh" "$DA_PASS" "$DA_FAIL" "deps open Dependabot alerts"
 fi
 
+# /repo:deps steps 8/9's CI value `none` — a repo with no workflows produced
+# none of green/red/pending, the agent improvised a local build, and the
+# summary read as plain green; one of three majors did not compile (repo#731).
+# Also pins step 2's uv ecosystem row (repo#730). Same delegation shape as
+# every suite above.
+echo
+echo "-- deps CI none and uv ecosystem (delegated suite) --"
+DN_TEST="$TESTS_DIR/../../../commands/repo/tests/test-deps-no-ci.sh"
+if [[ ! -f "$DN_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-deps-no-ci.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-deps-no-ci.sh" "$DN_TEST"
+else
+    DN_OUT="$(bash "$DN_TEST" 2>&1)"
+    DN_STATUS=$?
+    DN_PASS="$(suite_count Passed "$DN_OUT")"
+    DN_FAIL="$(suite_count Failed "$DN_OUT")"
+    if ! [[ "$DN_PASS" =~ ^[0-9]+$ && "$DN_FAIL" =~ ^[0-9]+$ ]]; then
+        DN_PASS=0
+        DN_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-deps-no-ci.sh" "$DN_STATUS"
+        strip_ansi "$DN_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$DN_STATUS" -ne 0 || "$DN_FAIL" -ne 0 ]]; then
+        [[ "$DN_FAIL" -eq 0 ]] && DN_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-deps-no-ci.sh" "$DN_PASS" "$DN_FAIL" "$DN_STATUS"
+        strip_ansi "$DN_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-deps-no-ci.sh" "$DN_PASS"
+    fi
+    PASS=$((PASS + DN_PASS))
+    FAIL=$((FAIL + DN_FAIL))
+    record_suite "test-deps-no-ci.sh" "$DN_PASS" "$DN_FAIL" "deps CI none and uv ecosystem"
+fi
+
 # /repo:handoff's step-0 reader preflight — the command writes .claude/handoff.md
 # but a SEPARATE artifact (session-start-handoff.sh + its settings.json wiring)
 # reads it, and handoff.md used to assert that reader existed rather than check
@@ -1840,6 +1882,40 @@ else
     PASS=$((PASS + HP_PASS))
     FAIL=$((FAIL + HP_FAIL))
     record_suite "test-handoff-preflight.sh" "$HP_PASS" "$HP_FAIL" "handoff step-0 reader preflight"
+fi
+
+# update-tools / followups squad release-install guidance (repo#744): doc-
+# contract pins for the squad slug rule, update commands and adoption
+# signature. Same delegation shape as every suite above.
+echo
+echo "-- update-tools squad guidance (delegated suite) --"
+US_TEST="$TESTS_DIR/../../../commands/repo/tests/test-update-tools-squad.sh"
+if [[ ! -f "$US_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-update-tools-squad.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-update-tools-squad.sh" "$US_TEST"
+else
+    US_OUT="$(bash "$US_TEST" 2>&1)"
+    US_STATUS=$?
+    US_PASS="$(suite_count Passed "$US_OUT")"
+    US_FAIL="$(suite_count Failed "$US_OUT")"
+    if ! [[ "$US_PASS" =~ ^[0-9]+$ && "$US_FAIL" =~ ^[0-9]+$ ]]; then
+        US_PASS=0
+        US_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-update-tools-squad.sh" "$US_STATUS"
+        strip_ansi "$US_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$US_STATUS" -ne 0 || "$US_FAIL" -ne 0 ]]; then
+        [[ "$US_FAIL" -eq 0 ]] && US_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-update-tools-squad.sh" "$US_PASS" "$US_FAIL" "$US_STATUS"
+        strip_ansi "$US_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-update-tools-squad.sh" "$US_PASS"
+    fi
+    PASS=$((PASS + US_PASS))
+    FAIL=$((FAIL + US_FAIL))
+    record_suite "test-update-tools-squad.sh" "$US_PASS" "$US_FAIL" "update-tools squad guidance"
 fi
 
 # git-fixture hermeticity (repo#518): pins that lib/git-fixture.sh keeps the
@@ -1922,6 +1998,29 @@ fi
 PASS=$((PASS + OC_PASS)); FAIL=$((FAIL + OC_FAIL))
 record_suite "test_optimize_ci.py" "$OC_PASS" "$OC_FAIL" "optimize-ci workflow audit"
 printf '  optimize-ci: %s passed, %s failed\n' "$OC_PASS" "$OC_FAIL"
+# Completeness guard (#774): every test file must be wired into the gate.
+# Enumerate the suites and require each basename to appear either in this
+# file's CODE (comment lines stripped, so the header list alone cannot satisfy
+# it) or in a CI workflow. An unwired file counts one failure naming its path.
+# lib/ helpers are not enumerated.
+REPO_TOP="$(cd "$TESTS_DIR/../../.." && pwd)"
+RUN_SH_CODE="$(grep -v '^[[:space:]]*#' "${BASH_SOURCE[0]}")"
+WF_TEXT="$(cat "$REPO_TOP"/.github/workflows/*.yml 2>/dev/null || true)"
+WIRE_PASS=0; WIRE_FAIL=0
+for wf_path in "$REPO_TOP"/commands/repo/tests/test-*.sh \
+               "$REPO_TOP"/commands/repo/tests/test_*.py \
+               "$REPO_TOP"/hooks/repo/tests/test-*.sh; do
+    [[ -f "$wf_path" ]] || continue
+    wf_base="${wf_path##*/}"
+    if [[ "$RUN_SH_CODE" == *"$wf_base"* || "$WF_TEXT" == *"$wf_base"* ]]; then
+        WIRE_PASS=$((WIRE_PASS + 1))
+    else
+        WIRE_FAIL=$((WIRE_FAIL + 1))
+        echo "FAIL: test file not wired into run.sh or a workflow: ${wf_path#"$REPO_TOP"/}"
+    fi
+done
+PASS=$((PASS + WIRE_PASS)); FAIL=$((FAIL + WIRE_FAIL))
+record_suite "test-file wiring check" "$WIRE_PASS" "$WIRE_FAIL" "every test file delegated or in CI"
 echo
 echo "Per-suite breakdown"
 printf '%s\n' ${SUITE_LINES[@]+"${SUITE_LINES[@]}"}
