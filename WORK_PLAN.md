@@ -7,7 +7,6 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 - **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
 - **#786**: fix: treat >(cmd) process substitution as non-redirect in write-confinement guard
 
@@ -75,7 +74,7 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
