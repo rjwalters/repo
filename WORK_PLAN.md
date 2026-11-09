@@ -9,6 +9,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 - **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
+- **#786**: fix: treat >(cmd) process substitution as non-redirect in write-confinement guard
 
 ## Very Important
 
@@ -34,6 +35,7 @@ Issues currently being built (`loom:building`).
 
 - **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills
 - **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one
+- **#785**: guard-destructive: process substitution >(cmd) misread as a worktree write
 
 ## PRs Awaiting Review
 
@@ -47,6 +49,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 - **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
+- **#786**: fix: treat >(cmd) process substitution as non-redirect in write-confinement guard
 
 ## Proposed
 
@@ -58,6 +61,7 @@ Issues carrying `loom:curated`.
 - **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
 - **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills *(curated)*
 - **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one *(curated)*
+- **#785**: guard-destructive: process substitution >(cmd) misread as a worktree write *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -71,14 +75,14 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 7 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
