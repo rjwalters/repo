@@ -387,7 +387,7 @@ echo "10. The Codex surface honors the same list"
 # time, which is the same class of bug as a pin honored by one writer only.
 T10="$SCRATCH/t10"; new_target "$T10"
 do_install "$SRC" "$T10"
-CODEX_REF=".agents/skills/repo/references/scrub.md"
+CODEX_REF=".agents/skills/repo-scrub/SKILL.md"
 if [[ -f "$T10/$CODEX_REF" ]]; then
     customize "$T10/$CODEX_REF"
     pin "$T10" "$CODEX_REF"
