@@ -8,6 +8,11 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - [2026-08](work_log/WORK_LOG_2026-08.md)
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 
+### 2026-11-10
+
+- **PR #786**: fix: treat >(cmd) process substitution as non-redirect in write-confinement guard
+- **Issue #785** (closed): guard-destructive: process substitution >(cmd) misread as a worktree write
+
 ### 2026-11-07
 
 - **PR #778**: chore: drop dangling worktree:return script from package.json
