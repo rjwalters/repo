@@ -108,6 +108,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 HANDOFF="$REPO_ROOT/commands/repo/handoff.md"
 HOOK="$REPO_ROOT/hooks/repo/session-start-handoff.sh"
@@ -535,7 +537,7 @@ echo "-- 9b. variable vs absolute spelling --"
 # Behavioral: drive the real installer against a seeded settings.json.
 if command -v jq >/dev/null 2>&1; then
     T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-    T_REPO="$T/my repo"; mkdir -p "$T_REPO/.claude"; git -C "$T_REPO" init -q 2>/dev/null
+    T_REPO="$T/my repo"; mkdir -p "$T_REPO/.claude"; git_fixture_init "$T_REPO" -b main >/dev/null 2>&1
     T_REPO="$(cd "$T_REPO" && pwd)"
     REL=".claude/skills/repo/hooks/session-start-handoff.sh"
     seed() {  # <startup-cmd> <resume-cmd>
