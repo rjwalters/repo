@@ -4178,6 +4178,21 @@ assert_deny "write-confinement: cp into main checkout denies" \
 assert_deny "write-confinement: mv into main checkout denies" \
     "mv /tmp/src.txt $WTC_MAIN/evil.sh" "$WTC_WT"
 
+# ---- repo#785: process substitution `>(cmd)` / `<(cmd)` is not a redirect
+# ---- to a file named `(cmd)`; the inner command is still judged. ----
+assert_allow "write-confinement (#785): 'ls >(true)' allows" \
+    "ls >(true)" "$WTC_MAIN"
+assert_allow "write-confinement (#785): 'ls >(true) >/dev/null' allows" \
+    "ls >(true) >/dev/null" "$WTC_MAIN"
+assert_allow "write-confinement (#785): 'diff <(a) <(b)' allows" \
+    "diff <(a) <(b)" "$WTC_MAIN"
+assert_allow "write-confinement (#785): '2>(cmd)' allows" \
+    "ls 2>(true)" "$WTC_MAIN"
+assert_allow "write-confinement (#785): '&>(cmd)' allows" \
+    "ls &>(true)" "$WTC_MAIN"
+assert_allow "write-confinement (#785): '>>(cmd)' allows" \
+    "ls >>(true)" "$WTC_MAIN"
+
 # The decision tag itself — dedicated check since assert_deny only inspects
 # permissionDecision, and this is the exact probe Loom's dispatcher greps for
 # (grep -q 'worktree-write-confinement' hooks/repo/guard-destructive.sh). The
@@ -4351,6 +4366,12 @@ assert_deny_tag 'write-confinement (#293): quoted "$VAR" redirect into the main 
     "V=\"$WTC_MAIN\"; echo x > \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement"
 assert_deny_tag 'write-confinement (#293): resolved literal with `..` escaping into main denies' \
     "V=\"$WTC_WT/../../..\"; cp /tmp/src.txt \"\$V/evil.sh\"" "$WTC_WT" "worktree-write-confinement"
+
+# repo#785: the inner command of a `>(...)` process substitution is still judged.
+assert_deny_tag "write-confinement (#785): '>(tee main/x)' still denies" \
+    "echo x >(tee $WTC_MAIN/evil.sh)" "$WTC_WT" "worktree-write-confinement"
+assert_allow "write-confinement (#785): '>(true) cd /tmp' allows" \
+    ">(true) cd /tmp" "$WTC_MAIN"
 
 # ---- (c) Anything not provably a static literal still fails CLOSED, with the
 # ---- unresolved-var tag unchanged. ----
