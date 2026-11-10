@@ -39,7 +39,7 @@
 #   .claude/commands/repo/scrub.md
 #   # our own fork of the fork sweeper, whole directory of local helpers
 #   .claude/skills/repo/scripts/repo-scrub-forks.sh
-#   .agents/skills/repo/references/scrub.md
+#   .agents/skills/repo-scrub/SKILL.md
 #
 # WHAT IT COVERS: the rendered payload copies, i.e. every destination
 # install.sh writes through install_file() and every destination

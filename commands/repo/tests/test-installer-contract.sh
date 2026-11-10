@@ -212,7 +212,7 @@ if [[ -x "$OPTIMIZE_CI_HELPER" ]] && python3 "$OPTIMIZE_CI_HELPER" scan --root "
 else
     no "optimize-ci helper runs from a client install"
 fi
-if [[ -f "$C3_T/.agents/skills/repo/references/org-policy.md" ]]; then
+if [[ -f "$C3_T/.agents/skills/repo-org-policy/SKILL.md" ]]; then
     ok "organization policy command is discoverable in the Codex install"
 else
     no "organization policy command is discoverable in the Codex install"

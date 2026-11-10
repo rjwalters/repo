@@ -2,7 +2,29 @@
 
 ## Unreleased
 
-- **`CHANGELOG.md` is cut into dated version sections again, and a CI check keeps it that way (#769).** `## Unreleased` had piled up ~25 releases since 0.16.2, so `/repo:release` Phase 1.5 reported every recent tag as MISSING. The backlog is regrouped under `## 0.24.2` … `## 0.25.8` by the first tag containing each entry. `scripts/version.sh bump|set` now renames `## Unreleased` to `## <new> (date)` (leaving a fresh empty `## Unreleased`), and the new `scripts/check-changelog-version.sh` (run in the `version-bump-gate` CI job, using Phase 1.5's heading regex) fails when `VERSION` has no matching heading. VERSION 0.24.0 and 0.24.1 were bumped but never tagged, so their entries sit under 0.24.2.
+- **`CHANGELOG.md` is cut into dated version sections again, and a CI check keeps it that way (#769).** `## Unreleased` had piled up ~25 releases since 0.16.2, so `/repo:release` Phase 1.5 reported every recent tag as MISSING. The backlog is regrouped under `## 0.24.2` … `## 0.26.0` by the first tag containing each entry. `scripts/version.sh bump|set` now renames `## Unreleased` to `## <new> (date)` (leaving a fresh empty `## Unreleased`), and the new `scripts/check-changelog-version.sh` (run in the `version-bump-gate` CI job, using Phase 1.5's heading regex) fails when `VERSION` has no matching heading. VERSION 0.24.0 and 0.24.1 were bumped but never tagged, so their entries sit under 0.24.2.
+
+## 0.26.0 (2026-11-10)
+
+- **`$repo` is now a thin router; the `references/` copies are gone (#676, part 2).** The umbrella Codex skill no longer installs `.agents/skills/repo/references/<verb>.md`; its "Command skills" section lists the `$repo-<verb>` skills instead, and each per-command skill points at `../repo/SKILL.md` (skill-relative) for the shared safety rules. **Migration:** `install.sh` and `resync-installed.sh` delete a legacy `references/` directory once, only when `repo/SKILL.md` carries the ownership marker; an unmarked `repo/` is untouched and re-runs are idempotent. `uninstall.sh` and drift reporting no longer expect `references/`. Pins on `references/` paths must move to `.agents/skills/repo-<verb>/SKILL.md`. New `--dev` and migration tests.
+
+## 0.25.11 (2026-11-09)
+
+- **`/repo:update-tools` and `/repo:followups` recognize squad release installs (#744).** squad installs from a release (`<SQUAD_HOME>/current`), so its sidecar `source` has no git remote. When `install-metadata.json` names `package: @rjwalters/squad`, update-tools resolves the GitHub slug (from the metadata, or inferred from the package name and labelled inferred), takes the version-file fallback instead of reporting UNKNOWN, and reports commit drift as unknown: `current (commit drift unknown — source is a release install, not a source clone)`. It lists squad's update commands (`release-install.sh`, then the release's `install.sh`), notes squad ships no C7 resync, and names the adoption signature for a legacy pre-receipt install. `/repo:followups` applies the same slug rule when routing an issue upstream. New doc-contract suite `test-update-tools-squad.sh`.
+
+- **In a Loom-managed repo, `/repo:docs` treats the default branch as PR-only (#748).** `default_branch_requires_pr()` now reports the branch as protected, with a Loom-managed `PROTECTION_SOURCE`, even when the forge reports no protection rules, because Loom lands work only through `loom:pr` and `merge-pr.sh`. The ladder therefore takes arm 2 (a `chore/repo-hygiene-<date>` branch plus a PR) instead of arm 3 committing work on `main` that cannot be landed. `/repo:gitignore` and `/repo:links` share the ladder. Gitea, no-`gh`, `FORCE_BRANCH` and API-failure behaviour are unchanged.
+
+- **The worktree-confinement guard names opaque interpreter-heredoc writes accurately (#722).** A `python`/`perl`/`ruby`/`node` heredoc containing a write marker is still judged to write to the cwd and denied (fail-closed, unchanged), but the deny now says so under the new tag `worktree-write-confinement-opaque-heredoc` instead of blaming a redirection. New cases in `test-guard-destructive.sh`.
+
+- **`repo-remote` keeps recently-authorized SSH ingress rules when the egress IP alternates (#703).** A tool-owned `tcp/22` rule for another address is revoked only when its Description date is older than the new `REPO_REMOTE_SSH_STALE_DAYS` (default 7; `0` revokes immediately). The date is refreshed when the current address's rule already exists, and a failed SSH-readiness check logs the security group's `tcp/22` ingress and the authorized address.
+
+## 0.25.10 (2026-11-06)
+
+- Maintenance release; no user-facing changelog entries were recorded for this tag.
+
+## 0.25.9 (2026-11-04)
+
+- **New `guards.rmAllowDirs` lets a repo allow `rm` in chosen directories outside it (#747).** Under the default `guards.rmScope=repo`, an `rm` target equal to or under a listed absolute directory is now admitted (path-boundary, lexical match), so a consumer can allow its clone/scratch dir without `rmScope:"off"`. Config-only, no env var. Entries that are non-strings, relative, `/`, `$HOME`, single-segment, or contain `..` or `$` are ignored; a non-array value reads as empty. The catastrophic floor and the `rmScope` default are unchanged, and the `rm-scope-outside-repo` deny now names the option. `guard_cfg_array` now yields nothing for a non-array value instead of an object's values.
 
 ## 0.25.8 (2026-11-05)
 
@@ -38,7 +60,7 @@
 
 ## 0.25.0 (2026-10-29)
 
-- **Each command is also its own Codex skill, `$repo-<verb>` (#676, part 1).** `install.sh` now writes `.agents/skills/repo-<verb>/SKILL.md` for every selected command (name equals directory, the command's own description, ownership marker, `/repo:<verb>` cross-references rewritten to `$repo-<verb>`), `uninstall.sh` removes only marked `repo-*` directories, and `resync-installed.sh` repairs them and drops marked ones whose verb left the install. Unmarked `repo-*` directories are never overwritten or removed. Dev-mode installs gitignore `.agents/skills/repo-*/`. The umbrella `repo` skill and `references/` are unchanged in this release. 18 new test cases.
+- **Each command is also its own Codex skill, `$repo-<verb>` (#676, part 1).** `install.sh` now writes `.agents/skills/repo-<verb>/SKILL.md` for every selected command (name equals directory, the command's own description, ownership marker, `/repo:<verb>` cross-references rewritten to `$repo-<verb>`), `uninstall.sh` removes only marked `repo-*` directories, and `resync-installed.sh` repairs them and drops marked ones whose verb left the install. Unmarked `repo-*` directories are never overwritten or removed. Dev-mode installs gitignore `.agents/skills/repo-*/`. 18 new test cases.
 
 - **The installer warns about a legacy `.agents/` mirror and ignores its sidecar (#670).** Re-running `install.sh` over a repo that still has `.agents/commands/repo/` or `.agents/skills/repo/hooks/` now prints a warning naming those paths and the remedy; nothing under `.agents/` is migrated or deleted. With the Codex surface enabled (and not foreign), the installer also adds a gitignore entry for `.agents/skills/repo/.install-local.json`, once, so a leftover sidecar cannot be committed. `INSTALLER-CONTRACT.md` C6 notes that this path is ignored but never written.
 

@@ -1,10 +1,9 @@
 {
   "name": "repo-skills",
-  "version": "0.25.8",
+  "version": "0.26.0",
   "description": "General-purpose repository skills for Claude Code",
   "private": true,
   "scripts": {
-    "worktree:return": "./.loom/scripts/worktree-return.sh",
     "check:ci": "pnpm test",
     "check:all": "pnpm test",
     "test": "./hooks/repo/tests/run.sh",

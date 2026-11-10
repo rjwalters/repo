@@ -157,7 +157,14 @@ FOUND_NUMBERS=()
 while IFS= read -r n; do
     [[ -z "$n" ]] && continue
     FOUND_NUMBERS+=("$n")
-done < <(docs_entry_numbers "$WORK_LOG")
+done < <(
+    # The 30-day rotation moves older day-sections into work_log/*.md; the
+    # historical record is the union of WORK_LOG.md and those archives.
+    docs_entry_numbers "$WORK_LOG"
+    for archive in "$REPO_ROOT"/work_log/*.md; do
+        [[ -f "$archive" ]] && docs_entry_numbers "$archive"
+    done
+)
 
 NEW_OCCURRENCES=()
 for n in ${FOUND_NUMBERS[@]+"${FOUND_NUMBERS[@]}"}; do

@@ -391,9 +391,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $TARGET/$CODEX_SKILL_REL/SKILL.md (Codex skill: canonical body, Codex-native frontmatter)"
     echo "  $TARGET/$CODEX_SKILL_REL/install-metadata.json"
     echo "  $TARGET/$CODEX_SKILLS_ROOT_REL/$CODEX_COMMAND_SLUG_PREFIX<verb>/SKILL.md (one Codex skill per command)"
-    while IFS= read -r cmd; do
-      echo "  $TARGET/$CODEX_REFERENCES_REL/$cmd.md"
-    done <<<"$COMMANDS"
+    [[ -d "$TARGET/$CODEX_REFERENCES_REL" ]] && echo "  (migration: removes $TARGET/$CODEX_REFERENCES_REL/ — now redundant with the repo-<verb> skills)"
   fi
   if [[ "$DEV" == true ]]; then
     echo "  $TARGET/.gitignore (.claude/ entry$([[ "$CODEX" == true ]] && ! codex_target_is_foreign && echo " + $CODEX_SKILL_REL/ entry"); CLAUDE.md skipped in dev mode)"
@@ -526,6 +524,46 @@ merge_settings_hook() {
   else
     rm -f "$tmp"
     warning "Failed to update $settings — left unchanged"
+  fi
+}
+
+# Deferral heal (repo#733). When another guard-destructive.sh is wired and we
+# defer to it (GUARD_HOOK_INSTALLED=false), our OWN entry from an earlier
+# install must not stay behind: it would keep running a copy this run no longer
+# refreshes, and doubles the guard. Remove only our exact $HOOK_CMD entry (other
+# hooks sharing the Bash matcher are kept; a matcher block is dropped only if
+# our removal emptied it) and delete the script/symlink, so the recorded
+# guardHookInstalled:false matches the tree. No-op when neither is present, so
+# a second run changes nothing. (The --no-guard branch deliberately does NOT
+# call this: opt-out leftovers stay an explicit operator action, repo#557.)
+unwire_own_guard() {
+  local settings="$SETTINGS_JSON" cmd="$HOOK_CMD" script="$TARGET/$HOOK_INSTALL_REL" tmp
+  if [[ -f "$settings" ]]; then
+    if ! jq -e . "$settings" >/dev/null 2>&1; then
+      warning "Skipping guard unwiring: $settings is not valid JSON (remove the Repo Skills guard entry by hand)"
+    elif jq -e --arg c "$cmd" '
+          (.hooks.PreToolUse // []) | any(.[]?;
+            (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c)))
+        ' "$settings" >/dev/null 2>&1; then
+      tmp="$(mktemp)"
+      if jq --arg c "$cmd" '
+            .hooks.PreToolUse |= [.[]
+              | if (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c))
+                then (.hooks |= map(select(.command != $c)))
+                     | if (.hooks | length) == 0 then empty else . end
+                else . end]
+          ' "$settings" >"$tmp"; then
+        mv "$tmp" "$settings"
+        success "Removed duplicate Repo Skills guard entry from .claude/settings.json (another guard is wired)"
+      else
+        rm -f "$tmp"
+        warning "Failed to update $settings — left unchanged"
+      fi
+    fi
+  fi
+  if [[ -e "$script" || -L "$script" ]]; then
+    rm -f "$script"
+    info "Removed stale .claude/skills/repo/hooks/guard-destructive.sh (another guard is wired)"
   fi
 }
 
@@ -763,8 +801,8 @@ elif [[ "$GUARD_POLICY" == disabled ]]; then
     warning "entry). The opt-out does not remove it; delete it by hand (or run uninstall.sh) if wanted."
   fi
 else
-  info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it)"
-  merge_settings_hook
+  info "Another destructive-command guard is already wired in .claude/settings.json — skipping the guard-destructive.sh copy (nothing would run it) — deferring to it"
+  unwire_own_guard
 fi
 
 # 3c. SessionStart handoff hook + settings.json wiring. Same colocation and
@@ -827,21 +865,18 @@ success_installed ".claude/skills/repo/scripts/resync-installed.sh"
 
 # 3f. Codex-side skill surface (.agents/skills/repo/). Codex CLI discovers
 # skills by scanning `.agents/skills` from the cwd up to the repo root, in the
-# open Agent Skills format — a directory holding SKILL.md plus optional
-# references/ — so this is a repo-scoped install that needs no config file and
+# open Agent Skills format — a directory holding SKILL.md — so this is a repo-scoped install that needs no config file and
 # no write outside the target. lib/codex-skill.sh's header records how that
 # format was confirmed and which single adaptation it forces (the `name` must be
 # a lowercase slug matching its directory, which "Repo Skills" is not).
 #
-# The BODY is the canonical skills/repo/SKILL.md, and the references/ files are
-# the same commands/repo/*.md Claude Code registers as /repo:<verb> — one
-# procedure body per workflow, packaged for a second runtime rather than
-# rewritten for it.
+# The BODY is the canonical skills/repo/SKILL.md (a thin router), and each
+# repo-<verb> skill is rendered from the same commands/repo/*.md Claude Code
+# registers as /repo:<verb> — one procedure body per workflow, packaged for a
+# second runtime rather than rewritten for it.
 #
 # SKILL.md is generated (never symlinked) even under --dev, because the whole
 # point of the Codex copy is frontmatter a symlink to the source would not have.
-# The references/ files follow the normal install_file rules, so --dev still
-# gives live per-command edits.
 # A legacy `.agents/` mirror of the .claude/ tree (an older/other writer) is warned
 # about, never migrated or deleted — the layout is unverifiable, so it is the
 # operator's call.
@@ -865,7 +900,7 @@ elif codex_target_is_foreign; then
   warning "it untouched — the Claude Code surface installed normally. Move or rename that"
   warning "skill and re-run to install the Codex surface too, or pass --no-codex to silence this."
 else
-  mkdir -p "$TARGET/$CODEX_REFERENCES_REL"
+  mkdir -p "$TARGET/$CODEX_SKILL_REL"
   # Not an install_file() call (it is generated, never symlinked), so the C10 pin
   # has to be consulted explicitly here — a pin honored on the Claude surface but
   # not the Codex one would be a pin only half the time.
@@ -883,18 +918,11 @@ else
     fi
   fi
 
-  CODEX_REF_WRITTEN=0
-  CODEX_REF_PINNED=0
-  while IFS= read -r cmd; do
-    install_file "$SOURCE_ROOT/commands/repo/$cmd.md" \
-      "$TARGET/$CODEX_REFERENCES_REL/$cmd.md" "$CODEX_REFERENCES_REL/$cmd.md"
-    if [[ "$INSTALL_FILE_SKIPPED" == true ]]; then
-      CODEX_REF_PINNED=$((CODEX_REF_PINNED + 1))
-    else
-      CODEX_REF_WRITTEN=$((CODEX_REF_WRITTEN + 1))
-    fi
-  done <<<"$COMMANDS"
-  success "Installed $CODEX_REF_WRITTEN command procedures into $CODEX_REFERENCES_REL/$([[ "$CODEX_REF_PINNED" -gt 0 ]] && echo " ($CODEX_REF_PINNED pinned as repo-owned, left alone)")"
+  # Migration (repo#676): the umbrella no longer carries references/. Only
+  # removed once SKILL.md is proven ours (codex_target_is_foreign was false above).
+  if [[ -n "$(codex_migrate_references "$TARGET")" ]]; then
+    success "Removed legacy $CODEX_REFERENCES_REL/ (the command procedures are now the repo-<verb> skills)"
+  fi
   CODEX_INSTALLED=true
 
   # Per-command skills (repo#676): each selected command is also its own
@@ -1022,8 +1050,8 @@ if [[ "$DEV" == true ]]; then
     { [[ -f "$GITIGNORE" && -s "$GITIGNORE" ]] && echo ""; echo "# Repo Skills dev-mode symlinks (machine-local, do not commit)"; echo ".claude/"; } >>"$GITIGNORE"
     success "Added .claude/ to .gitignore"
   fi
-  # The Codex surface is half symlinks too (references/), so it is machine-local
-  # in dev mode for the same reason and gets the same treatment. Scoped to this
+  # The Codex surface is machine-local in dev mode too (it records the source
+  # clone), so it gets the same treatment. Scoped to this
   # package's own directory rather than all of .agents/skills/, which other tools
   # and the consumer share.
   #

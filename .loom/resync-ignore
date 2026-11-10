@@ -89,5 +89,13 @@
 #    step 2: if a resync ever reverts either port, the six `wt:` corpus rows
 #    (the repo#438 and repo#439 blocks of `guard-equivalence-cases.txt`) come
 #    back as UNDECLARED stricter divergences and say so by name.
+#
+# KNOWN FALSE POSITIVE: `resync-installed.sh` may print "pin had no effect" for
+# `hooks/guard-destructive-generic.sh`. It is harmless -- DO NOT remove the pin
+# because of it. When the canonical guard is present (CANONICAL_GUARD_PRESENT=1)
+# the hooks walk takes an early `continue` before `sync_one`, which is the only
+# caller of `is_ignored`, so the pin is never recorded as hit. The pin still
+# protects every run where the canonical guard is absent. Upstream fix:
+# rjwalters/loom#13680. Do not patch the vendored `resync-installed.sh` here.
 # ---------------------------------------------------------------------------
 hooks/guard-destructive-generic.sh
