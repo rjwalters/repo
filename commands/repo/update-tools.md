@@ -78,6 +78,10 @@ inline → unknown resolution order, including the repo#96 "sidecar deleted by a
 pull" signature and the exact suggestion to append). Read C6 before implementing
 this step; do not re-derive the rules from what a given tool happens to do.
 
+When running from a linked worktree (which never has the gitignored sidecar),
+also check the primary checkout's sidecar — `git rev-parse --git-common-dir`
+locates it — before treating the source as unknown.
+
 Two things are *this command's* behavior rather than the contract's, so they
 stay here: an unresolved source means **skip to the GitHub check in step 2**
 (not an error), and the repo#96 signature gets its own distinct report row —

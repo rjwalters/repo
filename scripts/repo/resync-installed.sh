@@ -97,7 +97,10 @@
 #   2. .claude/skills/repo/.install-local.json -> "source" (the gitignored,
 #      machine-local sidecar).
 #   3. install-metadata.json -> "source" (pre-split installs embedded it inline).
-#   4. Otherwise: error. A source clone is required — this script refreshes FROM
+#   4. When TARGET is a linked git worktree: the PRIMARY checkout's
+#      .claude/skills/repo/.install-local.json -> "source" (primary found via
+#      git rev-parse --git-common-dir; a worktree never has the gitignored sidecar).
+#   5. Otherwise: error. A source clone is required — this script refreshes FROM
 #      something; it cannot invent the new bytes.
 #
 # ATOMIC WRITES + DEFERRED SELF-UPDATE: every file is written by rendering into a
@@ -253,13 +256,27 @@ else
     SOURCE_ROOT="$(json_string "$METADATA" source)"
     [[ -n "$SOURCE_ROOT" ]] && SOURCE_ORIGIN="legacy inline field (install-metadata.json)"
   fi
+  if [[ -z "$SOURCE_ROOT" ]]; then
+    # A linked worktree never has the gitignored sidecar; the primary checkout
+    # (where install.sh ran) does. Any failure here just falls through.
+    PRIMARY_ROOT=""
+    if COMMON_DIR="$(git -C "$TARGET" rev-parse --git-common-dir 2>/dev/null)" && [[ -n "$COMMON_DIR" ]]; then
+      [[ "$COMMON_DIR" == /* ]] || COMMON_DIR="$TARGET/$COMMON_DIR"
+      PRIMARY_ROOT="$(cd "$COMMON_DIR/.." 2>/dev/null && pwd -P)" || PRIMARY_ROOT=""
+    fi
+    if [[ -n "$PRIMARY_ROOT" && "$PRIMARY_ROOT" != "$TARGET" \
+          && -f "$PRIMARY_ROOT/.claude/skills/repo/.install-local.json" ]]; then
+      SOURCE_ROOT="$(json_string "$PRIMARY_ROOT/.claude/skills/repo/.install-local.json" source)"
+      [[ -n "$SOURCE_ROOT" ]] && SOURCE_ORIGIN="sidecar in primary checkout ($PRIMARY_ROOT)"
+    fi
+  fi
 fi
 
 if [[ -z "$SOURCE_ROOT" ]]; then
   # This is exactly the repo#96 signature /repo:update-tools reports: installed
   # here once, but the machine-local pointer is gone (typically deleted by
   # pulling a commit that untracked it).
-  die "Source clone unknown: no --source given, no $SIDECAR, and no legacy inline 'source' in install-metadata.json.
+  die "Source clone unknown: no --source given, no $SIDECAR, no legacy inline 'source' in install-metadata.json, and no sidecar in a primary checkout (when run from a linked worktree).
        Pass --source /path/to/repo-skills, or re-run that clone's install.sh once to regenerate the sidecar."
 fi
 
