@@ -8,8 +8,18 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - [2026-08](work_log/WORK_LOG_2026-08.md)
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 
+### 2026-11-11
+
+- **PR #791**: fix: accept expanded and variable hook spellings in handoff preflight
+- **Issue #789** (closed): handoff preflight 2a misses hooks written with a ${CLAUDE_PROJECT_DIR} prefix
+- **PR #794**: resync-installed: fall back to primary checkout's sidecar in linked worktrees
+- **Issue #793** (closed): resync-installed.sh from a linked worktree fails 'Source clone unknown' — sidecar only exists in the primary checkout
+- **PR #795**: docs: recommend resync --output staging over --allow-worktree in update-tools
+- **Issue #792** (closed): update-tools: recommend Loom's resync --output staging mode over --allow-worktree
+
 ### 2026-11-10
 
+- **PR #728**: feat(codex): make $repo a thin router and migrate away umbrella references/
 - **PR #786**: fix: treat >(cmd) process substitution as non-redirect in write-confinement guard
 - **Issue #785** (closed): guard-destructive: process substitution >(cmd) misread as a worktree write
 
