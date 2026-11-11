@@ -108,6 +108,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-fixture.sh"
+git_fixture_scrub_env
 
 HANDOFF="$REPO_ROOT/commands/repo/handoff.md"
 HOOK="$REPO_ROOT/hooks/repo/session-start-handoff.sh"
@@ -526,6 +528,54 @@ assert_matches "--dry-run suppresses the gitignore auto-fix" "$PRE_FLAT" \
     'add nothing|apply no repair'
 assert_not_contains "the gitignore row is no longer a blocking repair row" \
     "$PRE_SECTION" "| \`.claude/handoff.md\` not gitignored |"
+
+# ---------------------------------------------------------------------------
+# 9b. Both spellings of the installed command (repo#789)
+# ---------------------------------------------------------------------------
+echo
+echo "-- 9b. variable vs absolute spelling --"
+# Behavioral: drive the real installer against a seeded settings.json.
+if command -v jq >/dev/null 2>&1; then
+    T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+    T_REPO="$T/my repo"; mkdir -p "$T_REPO/.claude"; git_fixture_init "$T_REPO" -b main >/dev/null 2>&1
+    T_REPO="$(cd "$T_REPO" && pwd)"
+    REL=".claude/skills/repo/hooks/session-start-handoff.sh"
+    seed() {  # <startup-cmd> <resume-cmd>
+        jq -n --arg a "$1" --arg b "$2" '{hooks:{SessionStart:[
+          {matcher:"startup",hooks:[{type:"command",command:$a}]},
+          {matcher:"resume",hooks:[{type:"command",command:$b}]}]}}' >"$T_REPO/.claude/settings.json"
+    }
+    S="$T_REPO/.claude/settings.json"
+    ABS_CMD="$T_REPO/$REL"
+
+    seed "$ABS_CMD" "$ABS_CMD"; BEFORE="$(jq -c .hooks.SessionStart "$S")"
+    OUT="$(cd "$T_REPO" && "$INSTALL" --yes "$T_REPO" 2>&1)"
+    assert_contains "absolute-spelling wiring is satisfied: install leaves settings.json unchanged (idempotent path, not foreign deferral)" "$OUT" "already wired in .claude/settings.json (no change)"
+    assert_eq "absolute-spelling wiring is satisfied: install leaves settings.json unchanged" \
+        "$BEFORE" "$(jq -c .hooks.SessionStart "$S")"
+
+    seed "$ABS_CMD" "\${CLAUDE_PROJECT_DIR}/$REL"; BEFORE="$(jq -c .hooks.SessionStart "$S")"
+    OUT="$(cd "$T_REPO" && "$INSTALL" --yes "$T_REPO" 2>&1)"
+    assert_contains "mixed spellings across the two matchers are both satisfied (idempotent path, not foreign deferral)" "$OUT" "already wired in .claude/settings.json (no change)"
+    assert_eq "mixed spellings across the two matchers are both satisfied" \
+        "$BEFORE" "$(jq -c .hooks.SessionStart "$S")"
+
+    seed "$ABS_CMD" "/elsewhere/$REL"
+    (cd "$T_REPO" && "$INSTALL" --yes "$T_REPO" >/dev/null 2>&1)
+    assert_eq "a genuinely foreign path is still treated as foreign (nothing appended)" \
+        "2" "$(jq '[.hooks.SessionStart[].hooks[]] | length' "$S")"
+    assert_eq "the foreign entry survives untouched" \
+        "/elsewhere/$REL" "$(jq -r '.hooks.SessionStart[1].hooks[0].command' "$S")"
+fi
+assert_contains "doc defines the absolute spelling" "$PRE_SECTION" 'ABS="$(git rev-parse --show-toplevel)'
+assert_contains "2a accepts either spelling" "$PRE_SECTION" '.command == $c or .command == $abs'
+assert_contains "2b excludes both spellings" "$PRE_SECTION" '.command != $c and .command != $abs'
+assert_matches "check 3 expands CLAUDE_PROJECT_DIR before test -x" "$PRE_FLAT" \
+    'Expand `\$\{CLAUDE_PROJECT_DIR\}`[[:space:]]*to the repo root'
+assert_contains "install.sh accepts either spelling in its idempotency test" \
+    "$(cat "$INSTALL")" '.command == $c or .command == $abs'
+assert_contains "install.sh coexistence excludes both spellings" \
+    "$(cat "$INSTALL")" '.command != $c and .command != $abs'
 
 # ---------------------------------------------------------------------------
 # 10. What handoff.md now depends on still exists and still says so

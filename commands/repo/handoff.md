@@ -55,26 +55,31 @@ regex, and a rewrite that drops a pin silently reopens the branch it guards.
 
 ```bash
 HOOK='${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/session-start-handoff.sh'
+# The same script spelled with the repo root already expanded (single-quoted
+# $HOOK above is a literal; a harness or agent may have expanded it).
+ABS="$(git rev-parse --show-toplevel)/.claude/skills/repo/hooks/session-start-handoff.sh"
 
 # 1. Which of three states is settings.json in? They do NOT share a repair.
 test -f .claude/settings.json              # absent, or present?
 jq -e . .claude/settings.json >/dev/null   # malformed, or genuinely unwired?
 
-# 2a. Our exact command, under every matcher we manage.
-jq -e --arg c "$HOOK" '
+# 2a. Our command (either spelling), under every matcher we manage.
+jq -e --arg c "$HOOK" --arg abs "$ABS" '
       (.hooks.SessionStart // []) as $ss |
       (["startup","resume"] | all(. as $m | $ss | any(.[]?;
-        (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c)))))
+        (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c or .command == $abs)))))
     ' .claude/settings.json
 
 # 2b. Only if 2a fails: is a DIFFERENT session-start-handoff.sh already wired?
-jq -e --arg c "$HOOK" '
+jq -e --arg c "$HOOK" --arg abs "$ABS" '
       (.hooks.SessionStart // []) | any(.[]?;
         (.hooks // []) | any(.[]?;
-          ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c)))
+          ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c and .command != $abs)))
     ' .claude/settings.json
 
 # 3. Is the script that will actually run present and executable?
+#    Take the matched command (the foreign one when 2b matched), expand
+#    ${CLAUDE_PROJECT_DIR} to the repo root, THEN test it.
 test -x .claude/skills/repo/hooks/session-start-handoff.sh
 
 # 4. Is the note safe from being committed?
@@ -95,6 +100,9 @@ sentence here even when compressing:
   theoretical — the test header has the worked example.
 - **Malformed is not repairable by `install.sh`.** That same guard refuses to
   touch invalid JSON and returns having wired nothing.
+- **Both spellings are ours.** `${CLAUDE_PROJECT_DIR}/<rel>` and
+  `<abs repo root>/<rel>` name the same installed script; 2a accepts either and
+  2b excludes both, so an expanded entry is never reported as foreign.
 - **Mirror both predicates.** `install.sh`'s `merge_settings_sessionstart_hook`
   has **two** predicates, not one: 2a is its idempotency test and 2b its
   coexistence branch. `test-handoff-preflight.sh` extracts both jq programs
@@ -105,7 +113,10 @@ sentence here even when compressing:
   preflight produces a false block and an operator loop. A 2b match is a
   satisfied reader — report the foreign path as information and continue.
 - **Check 3 follows the hook that will actually run**, which is the foreign
-  path when 2b matched, not the installed path. When *that* script is missing,
+  path when 2b matched, not the installed path. **Expand `${CLAUDE_PROJECT_DIR}`
+  to the repo root in that command before `test -x`** — a variable-form entry
+  (the installer's own spelling, or a hand-written one) is not a file path
+  until expanded, and testing the raw string reports a false "not executable". When *that* script is missing,
   `./install.sh` is the wrong repair: it only ever copies to
   `.claude/skills/repo/hooks/`, and 2b makes it defer on the wiring, so the
   dangling entry survives. Fix or delete the foreign entry by hand first.

@@ -576,6 +576,9 @@ unwire_own_guard() {
 # or another tool's — are appended to, never replaced.
 merge_settings_sessionstart_hook() {
   local settings="$SETTINGS_JSON" cmd="$SESSIONSTART_HOOK_CMD" tmp sources_json
+  # Absolute spelling of the same script (a harness or agent may have expanded
+  # ${CLAUDE_PROJECT_DIR}); equivalent to $cmd, so never wired twice or "foreign".
+  local abs="$TARGET/$SESSIONSTART_HOOK_INSTALL_REL"
   sources_json="$(jq -nc '$ARGS.positional' --args "${SESSIONSTART_SOURCES[@]}")"
   [[ -f "$settings" ]] || echo '{}' >"$settings"
 
@@ -586,10 +589,10 @@ merge_settings_sessionstart_hook() {
 
   # Idempotent re-install: our exact command is already present under EVERY
   # source matcher we manage (a partial wiring falls through and is completed).
-  if jq -e --arg c "$cmd" --argjson sources "$sources_json" '
+  if jq -e --arg c "$cmd" --arg abs "$abs" --argjson sources "$sources_json" '
         (.hooks.SessionStart // []) as $ss |
         ($sources | all(. as $m | $ss | any(.[]?;
-          (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c)))))
+          (.matcher == $m) and ((.hooks // []) | any(.[]?; .command == $c or .command == $abs)))))
       ' "$settings" >/dev/null 2>&1; then
     info "SessionStart handoff hook already wired in .claude/settings.json (no change)"
     return
@@ -597,23 +600,23 @@ merge_settings_sessionstart_hook() {
 
   # Coexistence: a DIFFERENT session-start-handoff.sh is already wired (e.g. a
   # copy living at another path). Defer rather than surfacing the note twice.
-  if jq -e --arg c "$cmd" '
+  if jq -e --arg c "$cmd" --arg abs "$abs" '
         (.hooks.SessionStart // []) | any(.[]?;
           (.hooks // []) | any(.[]?;
-            ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c)))
+            ((.command // "") | test("session-start-handoff\\.sh")) and (.command != $c and .command != $abs)))
       ' "$settings" >/dev/null 2>&1; then
     info "A handoff SessionStart hook is already wired in .claude/settings.json — deferring to it (not adding a duplicate)"
     return
   fi
 
   tmp="$(mktemp)"
-  if jq --arg c "$cmd" --argjson sources "$sources_json" '
+  if jq --arg c "$cmd" --arg abs "$abs" --argjson sources "$sources_json" '
         .hooks //= {} |
         .hooks.SessionStart //= [] |
         reduce ($sources[]) as $m (.;
           if (.hooks.SessionStart | any(.[]?; .matcher == $m))
           then .hooks.SessionStart |= map(
-            if (.matcher == $m) and (((.hooks // []) | any(.[]?; .command == $c)) | not)
+            if (.matcher == $m) and (((.hooks // []) | any(.[]?; .command == $c or .command == $abs)) | not)
             then .hooks = ((.hooks // []) + [{type: "command", command: $c}])
             else . end)
           else .hooks.SessionStart += [{matcher: $m, hooks: [{type: "command", command: $c}]}]
