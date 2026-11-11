@@ -149,6 +149,10 @@ as "source unknown" rather than an error:
 2. **Legacy inline fallback** — pre-split installs embedded `source` /
    `installed_at` directly in `install-metadata.json`. Read them from there so
    existing installs keep their fast path.
+   A consumer MAY also consult the primary checkout's sidecar when running
+   from a linked worktree (the primary is found via
+   `git rev-parse --git-common-dir`), after the legacy fallback and before
+   giving up; a linked worktree never has its own gitignored sidecar.
 3. **Unknown** — neither yields a usable path. Normal on a fresh clone; not a
    failure.
 

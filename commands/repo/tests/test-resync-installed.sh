@@ -666,6 +666,26 @@ assert_contains "uninstall.sh enumerates the resync script" "$UN" "resync-instal
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "-- linked worktree resolves the source from the primary's sidecar --"
+WSRC="$SCRATCH/wt-src"; WPRIM="$SCRATCH/wt-primary"; WLINK="$SCRATCH/wt-linked"
+new_source "$WSRC"
+new_target "$WPRIM"
+do_install "$WSRC" "$WPRIM"
+git -C "$WPRIM" add -f .claude >/dev/null 2>&1
+git -C "$WPRIM" -c user.email=t@example.com -c user.name=Test commit -qm "install" >/dev/null 2>&1
+git -C "$WPRIM" worktree add -q "$WLINK" -b wt-branch >/dev/null 2>&1
+rm -f "$WLINK/.claude/skills/repo/.install-local.json"
+run_resync "$WLINK" --dry-run
+assert_eq "linked worktree with no sidecar and no --source exits 0" "0" "$RS_RC"
+assert_contains "origin names the primary checkout's sidecar" "$RS_OUT" "sidecar in primary checkout"
+
+rm -f "$WPRIM/.claude/skills/repo/.install-local.json"
+run_resync "$WLINK" --dry-run
+assert_eq "primary without a sidecar still errors" "1" "$RS_RC"
+assert_contains "error mentions the primary-checkout lookup" "$RS_OUT" "primary checkout"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "-- the contract document backs the script --"
 assert_file "INSTALLER-CONTRACT.md exists at the repo root" "$CONTRACT"
 if [[ -f "$CONTRACT" ]]; then
