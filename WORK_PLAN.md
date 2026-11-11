@@ -25,14 +25,13 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#676**: Codex: register each repo command as a discoverable native skill
+- **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills
-- **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one
+_None._
 
 ## PRs Awaiting Review
 
@@ -53,10 +52,8 @@ Issues carrying `loom:curated`.
 - **#478**: Live-verify org-policy's absent/inaccessible heuristic against a real organization *(curated)*
 - **#565**: repo:remote: support short-lived or brokered GitHub credentials instead of a long-lived PAT on the VM *(curated)*
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
-- **#676**: Codex: register each repo command as a discoverable native skill *(curated)*
 - **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills *(curated)*
 - **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one *(curated)*
-- **#789**: handoff preflight 2a misses hooks written with a ${CLAUDE_PROJECT_DIR} prefix *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -74,10 +71,10 @@ _None._
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 7 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
