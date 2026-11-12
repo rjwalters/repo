@@ -78,6 +78,10 @@ HOOK_CMD="\${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh"
 # .claude/skills/repo/hooks/ and goes with the skills dir.
 SESSIONSTART_HOOK_CMD="\${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/session-start-handoff.sh"
 
+# jq predicate (repo#798): our entry is the bare command OR the same command
+# wrapped in one pair of double quotes. Exact match, never a substring.
+IS_OURS_JQ='def is_ours($c): ((.command // "") | (. == $c or . == ("\"" + $c + "\""))); '
+
 # Remove only the Repo-Skills-owned hook entry for a given hook key (e.g.
 # PreToolUse's guard command, or SessionStart's handoff command) from
 # .claude/settings.json, leaving any other entries (a hand-authored hook, or
@@ -90,13 +94,12 @@ remove_settings_hook_entry() {  # <settings-path> <hook-key> <command> <label>
   [[ -f "$settings" ]] || return 0
   jq -e . "$settings" >/dev/null 2>&1 || return 0
   # Only act if our command is actually present.
-  jq -e --arg key "$key" --arg c "$cmd" \
-    '(.hooks[$key] // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
+  jq -e --arg key "$key" --arg c "$cmd" "$IS_OURS_JQ"'(.hooks[$key] // []) | any(.[]?; (.hooks // []) | any(.[]?; is_ours($c)))' \
     "$settings" >/dev/null 2>&1 || return 0
   tmp="$(mktemp)"
-  if jq --arg key "$key" --arg c "$cmd" '
+  if jq --arg key "$key" --arg c "$cmd" "$IS_OURS_JQ"'
         if (.hooks[$key] | type) == "array" then
-          .hooks[$key] |= map(.hooks |= ((. // []) | map(select(.command != $c))))
+          .hooks[$key] |= map(.hooks |= ((. // []) | map(select(is_ours($c) | not))))
           | .hooks[$key] |= map(select(((.hooks // []) | length) > 0))
           | (if (.hooks[$key] | length) == 0 then .hooks |= del(.[$key]) else . end)
           | (if (.hooks | length) == 0 then del(.hooks) else . end)
@@ -172,7 +175,7 @@ if [[ -n "$CODEX_CMD_FOREIGN" ]]; then
 fi
 grep -qF "$MARKER_BEGIN" "$TARGET/CLAUDE.md" 2>/dev/null && echo "  CLAUDE.md REPO-SKILLS block"
 if [[ -f "$TARGET/.claude/settings.json" ]] && \
-   jq -e --arg c "$HOOK_CMD" '(.hooks.PreToolUse // []) | any(.[]?; (.hooks // []) | any(.[]?; .command == $c))' \
+   jq -e --arg c "$HOOK_CMD" "$IS_OURS_JQ"'(.hooks.PreToolUse // []) | any(.[]?; (.hooks // []) | any(.[]?; is_ours($c)))' \
      "$TARGET/.claude/settings.json" >/dev/null 2>&1; then
   echo "  .claude/settings.json PreToolUse guard entry"
 fi
