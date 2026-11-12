@@ -54,6 +54,7 @@ Issues carrying `loom:curated`.
 - **#638**: Repo Skills: make Dependabot (with cooldown) the default provider again; Renovate becomes opt-in (2am#4351) *(curated)*
 - **#765**: Remove /repo:remote (cloud dev-VM command) from Repo Skills *(curated)*
 - **#769**: CHANGELOG has no version headings since 0.16.2; tagged bumps never cut one *(curated)*
+- **#798**: 0.26.1 installer leaves the quoted guard-destructive.sh entry in .claude/settings.json after deleting the script *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -74,7 +75,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 5 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
