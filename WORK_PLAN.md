@@ -8,6 +8,7 @@ Prioritized roadmap generated from current GitHub label state, maintained automa
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 - **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
+- **#800**: fix: match quoted guard-destructive.sh hook entry in installer and uninstaller
 
 ## Very Important
 
@@ -31,7 +32,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#798**: 0.26.1 installer leaves the quoted guard-destructive.sh entry in .claude/settings.json after deleting the script
 
 ## PRs Awaiting Review
 
@@ -44,6 +45,7 @@ _None._
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#770**: fix: cut CHANGELOG version headings on bump and gate on a matching heading
+- **#800**: fix: match quoted guard-destructive.sh hook entry in installer and uninstaller
 
 ## Proposed
 
@@ -68,13 +70,13 @@ _None._
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 0 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 1 |
+| Approved PRs awaiting merge | 2 |
 | Curated | 6 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
