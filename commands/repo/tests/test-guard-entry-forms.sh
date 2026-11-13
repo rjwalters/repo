@@ -76,6 +76,8 @@ for form in unquoted quoted; do
 done
 
 echo ""
-echo "  Total: $TOTAL  Passed: $PASS  Failed: $FAIL"
+echo "  Total:  $TOTAL"
+echo "  Passed: $PASS"
+echo "  Failed: $FAIL"
 [[ $FAIL -gt 0 ]] && exit 1
 exit 0
