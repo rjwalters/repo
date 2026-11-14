@@ -1163,6 +1163,40 @@ else
     record_suite "test-guard-equivalence.sh" "$GE_PASS" "$GE_FAIL" "vendored-guard equivalence"
 fi
 
+# Quoted vs unquoted guard-destructive.sh settings entry (repo#798): the
+# installer's deferral heal and the uninstaller must remove both forms, keep
+# other hooks, and be a no-op on re-run. Same delegation shape as above.
+echo
+echo "-- guard entry forms, quoted vs unquoted (delegated suite) --"
+GF_TEST="$TESTS_DIR/../../../commands/repo/tests/test-guard-entry-forms.sh"
+if [[ ! -f "$GF_TEST" ]]; then
+    FAIL=$((FAIL + 1))
+    record_suite "test-guard-entry-forms.sh" 0 1 "not found"
+    printf '  FAIL %-52s -> not found at %s\n' "test-guard-entry-forms.sh" "$GF_TEST"
+else
+    GF_OUT="$(bash "$GF_TEST" 2>&1)"
+    GF_STATUS=$?
+    GF_PASS="$(suite_count Passed "$GF_OUT")"
+    GF_FAIL="$(suite_count Failed "$GF_OUT")"
+    if ! [[ "$GF_PASS" =~ ^[0-9]+$ && "$GF_FAIL" =~ ^[0-9]+$ ]]; then
+        GF_PASS=0
+        GF_FAIL=1
+        printf '  FAIL %-52s -> no parseable summary (exit %s); output tail follows\n' \
+            "test-guard-entry-forms.sh" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | tail -30 | sed 's/^/    /'
+    elif [[ "$GF_STATUS" -ne 0 || "$GF_FAIL" -ne 0 ]]; then
+        [[ "$GF_FAIL" -eq 0 ]] && GF_FAIL=1
+        printf '  FAIL %-52s -> %s pass, %s fail (exit %s); failures follow\n' \
+            "test-guard-entry-forms.sh" "$GF_PASS" "$GF_FAIL" "$GF_STATUS"
+        strip_ansi "$GF_OUT" | grep -E '^ *FAIL' | sed 's/^/  /'
+    else
+        printf '  ok   %-52s -> %s cases pass\n' "test-guard-entry-forms.sh" "$GF_PASS"
+    fi
+    PASS=$((PASS + GF_PASS))
+    FAIL=$((FAIL + GF_FAIL))
+    record_suite "test-guard-entry-forms.sh" "$GF_PASS" "$GF_FAIL" "guard entry forms"
+fi
+
 # README.md's Repository layout block vs disk (repo#212): every row/glob's
 # leading path must resolve, and every hooks/commands test-*.sh file must be
 # covered by a row/glob, so the block cannot silently drift in either

@@ -295,6 +295,14 @@ saved_guard_policy() {  # -> the saved guardHook string, or empty
   fi
 }
 
+# jq predicate (repo#798): true when a hook command IS our guard entry — the
+# bare command, or the same command wrapped in ONE pair of double quotes (the
+# quoted form some consumers' settings.json carries). Exact match only, never a
+# substring, so a foreign guard that merely mentions our path is not ours.
+# Prepended to every jq program that needs it; used by existing_guard_wired,
+# merge_settings_hook and unwire_own_guard so they cannot drift apart.
+GUARD_IS_OURS_JQ='def is_ours($c): ((.command // "") | (. == $c or . == ("\"" + $c + "\""))); '
+
 # existing_guard_wired <settings-file> <our-cmd>
 # True (0) when a destructive-command guard matching guard-destructive.sh is
 # ALREADY wired under a PreToolUse/Bash hook in <settings-file>, under some
@@ -315,10 +323,10 @@ saved_guard_policy() {  # -> the saved guardHook string, or empty
 existing_guard_wired() {
   local settings="$1" cmd="$2"
   [[ -f "$settings" ]] || return 1
-  jq -e --arg c "$cmd" '
+  jq -e --arg c "$cmd" "$GUARD_IS_OURS_JQ"'
         (.hooks.PreToolUse // []) | any(.[]?;
           (.matcher == "Bash") and ((.hooks // []) | any(.[]?;
-            ((.command // "") | test("guard-destructive\\.sh")) and (.command != $c))))
+            ((.command // "") | test("guard-destructive\\.sh")) and (is_ours($c) | not))))
       ' "$settings" >/dev/null 2>&1
 }
 
@@ -488,9 +496,9 @@ merge_settings_hook() {
   fi
 
   # Idempotent re-install: our exact command is already present.
-  if jq -e --arg c "$cmd" '
+  if jq -e --arg c "$cmd" "$GUARD_IS_OURS_JQ"'
         (.hooks.PreToolUse // []) | any(.[]?;
-          (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c)))
+          (.matcher == "Bash") and ((.hooks // []) | any(.[]?; is_ours($c))))
       ' "$settings" >/dev/null 2>&1; then
     info "PreToolUse guard already wired in .claude/settings.json (no change)"
     return
@@ -530,7 +538,7 @@ merge_settings_hook() {
 # Deferral heal (repo#733). When another guard-destructive.sh is wired and we
 # defer to it (GUARD_HOOK_INSTALLED=false), our OWN entry from an earlier
 # install must not stay behind: it would keep running a copy this run no longer
-# refreshes, and doubles the guard. Remove only our exact $HOOK_CMD entry (other
+# refreshes, and doubles the guard. Remove only our $HOOK_CMD entry, bare or double-quoted (repo#798) (other
 # hooks sharing the Bash matcher are kept; a matcher block is dropped only if
 # our removal emptied it) and delete the script/symlink, so the recorded
 # guardHookInstalled:false matches the tree. No-op when neither is present, so
@@ -541,15 +549,15 @@ unwire_own_guard() {
   if [[ -f "$settings" ]]; then
     if ! jq -e . "$settings" >/dev/null 2>&1; then
       warning "Skipping guard unwiring: $settings is not valid JSON (remove the Repo Skills guard entry by hand)"
-    elif jq -e --arg c "$cmd" '
+    elif jq -e --arg c "$cmd" "$GUARD_IS_OURS_JQ"'
           (.hooks.PreToolUse // []) | any(.[]?;
-            (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c)))
+            (.matcher == "Bash") and ((.hooks // []) | any(.[]?; is_ours($c))))
         ' "$settings" >/dev/null 2>&1; then
       tmp="$(mktemp)"
-      if jq --arg c "$cmd" '
+      if jq --arg c "$cmd" "$GUARD_IS_OURS_JQ"'
             .hooks.PreToolUse |= [.[]
-              | if (.matcher == "Bash") and ((.hooks // []) | any(.[]?; .command == $c))
-                then (.hooks |= map(select(.command != $c)))
+              | if (.matcher == "Bash") and ((.hooks // []) | any(.[]?; is_ours($c)))
+                then (.hooks |= map(select(is_ours($c) | not)))
                      | if (.hooks | length) == 0 then empty else . end
                 else . end]
           ' "$settings" >"$tmp"; then
