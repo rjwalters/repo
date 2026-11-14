@@ -2150,25 +2150,56 @@ echo "-- write_ssh_alias() concurrency (repo#213) --"
 # write_ssh_alias() directly instead of going through the full `up` flow --
 # there is no need to mock aws/gcp just to exercise this one function.
 CONC_CFG="$SCRATCH/concurrent_ssh_config"
-rm -f "$CONC_CFG" "$CONC_CFG.lock"
+# repo#806: this block used to discard each writer's exit status and stderr
+# (`>/dev/null` on write_ssh_alias, bare `wait`), so CI's one observed loss
+# ("first writer's block survives" failing while beta's stanza landed) could
+# not distinguish "alpha never wrote" (die 4 on lock timeout, ssh -G backstop,
+# any failure inside the writer shell) from "alpha's write was overwritten".
+# Capture each writer's stderr and exit code, assert both exited 0, and dump
+# the captured diagnostics whenever a stanza assertion fails below.
+CONC_A_ERR="$SCRATCH/concurrent_alpha.stderr"
+CONC_B_ERR="$SCRATCH/concurrent_beta.stderr"
+CONC_A_RC_FILE="$SCRATCH/concurrent_alpha.rc"
+CONC_B_RC_FILE="$SCRATCH/concurrent_beta.rc"
+rm -f "$CONC_CFG" "$CONC_CFG.lock" "$CONC_A_ERR" "$CONC_B_ERR" "$CONC_A_RC_FILE" "$CONC_B_RC_FILE"
 (
   REPO_REMOTE_SSH_CONFIG="$CONC_CFG" bash -c "
     source '$RR'
     NAME=alpha
     write_ssh_alias '10.0.0.1' >/dev/null
-  " &
+  " 2>"$CONC_A_ERR" &
   P1=$!
   REPO_REMOTE_SSH_CONFIG="$CONC_CFG" bash -c "
     source '$RR'
     NAME=beta
     write_ssh_alias '10.0.0.2' >/dev/null
-  " &
+  " 2>"$CONC_B_ERR" &
   P2=$!
-  wait "$P1" "$P2"
+  wait "$P1"; printf '%s' "$?" >"$CONC_A_RC_FILE"
+  wait "$P2"; printf '%s' "$?" >"$CONC_B_RC_FILE"
 )
 CONC_OUT="$(cat "$CONC_CFG" 2>/dev/null || true)"
-assert_contains "concurrent write_ssh_alias: first writer's block survives" "$CONC_OUT" "Host repo-remote-alpha"
-assert_contains "concurrent write_ssh_alias: second writer's block survives" "$CONC_OUT" "Host repo-remote-beta"
+CONC_A_RC="$(cat "$CONC_A_RC_FILE" 2>/dev/null || echo missing)"
+CONC_B_RC="$(cat "$CONC_B_RC_FILE" 2>/dev/null || echo missing)"
+# Diagnostics for the stanza assertions: each writer's exit status, its
+# captured stderr (die 4 / log() refusals land here), and the final config.
+conc_diag() {
+  printf 'alpha rc=[%s] stderr=[%s]\n' "$CONC_A_RC" "$(cat "$CONC_A_ERR" 2>/dev/null || true)"
+  printf 'beta rc=[%s] stderr=[%s]\n' "$CONC_B_RC" "$(cat "$CONC_B_ERR" 2>/dev/null || true)"
+  printf 'config=[%s]\n' "$CONC_OUT"
+}
+assert_eq "concurrent write_ssh_alias: alpha writer exited 0" "0" "$CONC_A_RC"
+assert_eq "concurrent write_ssh_alias: beta writer exited 0" "0" "$CONC_B_RC"
+if [[ "$CONC_OUT" == *"Host repo-remote-alpha"* ]]; then
+  ok "concurrent write_ssh_alias: first writer's block survives"
+else
+  no "concurrent write_ssh_alias: first writer's block survives" "missing [Host repo-remote-alpha]; $(conc_diag)"
+fi
+if [[ "$CONC_OUT" == *"Host repo-remote-beta"* ]]; then
+  ok "concurrent write_ssh_alias: second writer's block survives"
+else
+  no "concurrent write_ssh_alias: second writer's block survives" "missing [Host repo-remote-beta]; $(conc_diag)"
+fi
 assert_eq "concurrent write_ssh_alias: no leftover lock dir" "" "$( [[ -e "$CONC_CFG.lock" ]] && echo present )"
 
 # The temp file used for the read-modify-write swap must be created alongside
