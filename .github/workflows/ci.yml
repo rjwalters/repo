@@ -98,44 +98,49 @@ jobs:
       - name: Run test suite
         run: pnpm test
 
-  # macOS (BSD / one-true-awk) run of the repo-remote.sh suite (#771, follow-up
-  # to #754 / #762). #754: `prune --yes` emptied ~/.ssh/config under macOS awk
-  # while Linux CI (gawk/mawk) stayed green, because BSD awk rejects a newline
-  # inside `awk -v`. The Linux suite only emulates that with a shim awk; this
-  # job runs the real /usr/bin/awk. It also guards the `awk -v` call sites in
-  # lib/ that consumers run on Macs.
+  # macOS (bash 3.2, BSD userland) run of the FULL hooks/repo/tests/run.sh suite
+  # (#805; supersedes the single-suite job from #771, a follow-up to #754 / #762).
+  # Two defects were macOS-only and invisible to Linux CI: #754 (`prune --yes`
+  # emptied ~/.ssh/config because BSD awk rejects a newline inside `awk -v`) and
+  # #755 (guard cases failed on the logical-vs-physical /private/var path). The
+  # installed scripts and hooks run on consumers' Macs, so the whole suite runs
+  # here against the real /usr/bin/awk and /usr/bin/sed.
   #
-  # Bash decision: invoke the suite with /bin/bash, the system bash 3.2 that a
+  # Bash decision: invoke run.sh with /bin/bash, the system bash 3.2 that a
   # stock Mac has, NOT Homebrew bash 5. It is the worst case: a script passing
   # on 3.2 passes on 5. Runner images may put Homebrew bash first on PATH, so
-  # the interpreter is named explicitly instead of relying on `env bash`.
+  # the interpreter is named explicitly instead of relying on `env bash`. We
+  # call run.sh directly rather than `pnpm test` so no Node/pnpm is needed.
   #
   # Visible, NON-required check, same policy as the `test` job (#73): do not add
   # this to required status checks. A `paths:` filter is workflow-wide (it would
   # also skip the Linux jobs), so this job runs on every PR/push; macOS minutes
-  # are free on a public repo and it runs only this one suite.
-  # Out of scope: the full `pnpm test` hooks/guard suite on macOS.
+  # are free on a public repo.
   test-macos:
-    name: test-repo-remote.sh (macOS, BSD awk)
+    name: hooks/repo/tests/run.sh (macOS, bash 3.2, BSD userland)
     runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Report toolchain (proves BSD awk and bash 3.2 are in use)
+      - name: Report toolchain (proves BSD awk/sed and bash 3.2 are in use)
         run: |
+          PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
           echo "awk on PATH: $(command -v awk)"
           ls -l /usr/bin/awk
           # one-true-awk has no --version; -version is its flag. Tolerate failure.
           /usr/bin/awk -version 2>&1 || /usr/bin/awk --version 2>&1 || true
+          # BSD sed has no --version; report which binary resolves.
+          echo "sed on PATH: $(command -v sed)"
+          ls -l /usr/bin/sed
           /bin/bash --version | head -1
           git --version
 
-      - name: Run test-repo-remote.sh with system awk and bash
+      - name: Run hooks/repo/tests/run.sh with system bash, awk and sed
         run: |
-          # Put /usr/bin first so `awk` resolves to the BSD one even if a
-          # Homebrew gawk is on the image.
-          PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" /bin/bash commands/repo/tests/test-repo-remote.sh
+          # Put /usr/bin first so awk/sed resolve to the BSD ones even if
+          # Homebrew gawk/gnu-sed are on the image.
+          PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" /bin/bash hooks/repo/tests/run.sh
 
   # Adopts loom's "VERSION on main is the release" CI gate (#387, mirroring
   # loom#5874): any PR that changes this repo's installed surface (commands/,
