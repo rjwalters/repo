@@ -8,6 +8,10 @@ Chronological record of merged PRs and closed issues, maintained automatically b
 - [2026-08](work_log/WORK_LOG_2026-08.md)
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 
+### 2026-11-14
+
+- **PR #802**: docs: roadmap as of 2026-11-13
+
 ### 2026-11-11
 
 - **PR #791**: fix: accept expanded and variable hook spellings in handoff preflight
