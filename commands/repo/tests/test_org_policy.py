@@ -77,6 +77,7 @@ class FakeGitHub:
         self.client_private = False
         self.client_admin = True
         self.client_status = None
+        self.target_status = None
 
     @property
     def writes(self):
@@ -97,6 +98,9 @@ class FakeGitHub:
             name = route.split("/contents/", 1)[1]
             return self.file_response(self.source.get(name))
         if route == target_root:
+            if self.target_status is not None:
+                raise policy.PolicyError(
+                    f"GitHub GET {endpoint} failed: gh: Forbidden (HTTP {self.target_status})")
             return {"default_branch": "trunk"} if self.exists else None
         if route == f"{target_root}/commits/trunk":
             return {"sha": self.base, "commit": {"tree": {"sha": "base-tree"}}}
@@ -271,6 +275,30 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.PolicyError, "--create-repository"):
             self.plan()
         self.assertEqual(self.plan(create_repository="public")["createRepository"], "public")
+        self.assertEqual(self.api.writes, [])
+
+    def test_403_on_the_target_is_named_and_never_treated_as_absent(self):
+        self.api.target_status = 403
+        for kwargs in ({}, {"create_repository": "public"}):
+            with self.subTest(kwargs=kwargs), \
+                    self.assertRaisesRegex(policy.PolicyError, r"refused access to example/\.github") as ctx:
+                self.plan(**kwargs)
+            self.assertIn("No change was made", str(ctx.exception))
+            self.assertIn("not known to be absent", str(ctx.exception))
+        self.assertEqual(self.api.writes, [])
+        self.assertNotIn("repos/example/client", [call[0] for call in self.api.calls])
+
+    def test_403_on_the_target_stops_plan_cli_and_apply(self):
+        plan = self.plan()
+        self.api.target_status = 403
+        with self.assertRaisesRegex(policy.PolicyError, "refused access"):
+            policy.apply_plan(self.api, plan)
+        with patch.object(policy, "GitHub", return_value=self.api), \
+                patch.object(sys, "argv", ["repo-org-policy.py", "plan", "--repo", "example/client"]), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = policy.main()
+        self.assertEqual(code, 1)
+        self.assertIn("refused access to example/.github", err.getvalue())
         self.assertEqual(self.api.writes, [])
 
     def test_admin_on_visible_sibling_reports_target_as_likely_absent(self):

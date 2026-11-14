@@ -125,6 +125,11 @@ plan again with --create-repository public (or private)
 | `is absent or inaccessible, and this token cannot tell which` | A hidden repository cannot be ruled out (no admin on the sibling, or the sibling itself is invisible, or a third-party personal account). |
 | `is absent or inaccessible, and the access check was inconclusive` | The check itself could not answer (the account or sibling could not be read). |
 
+A 403 on `OWNER/.github` is a different outcome and is never treated as absence.
+`plan` and `apply` stop with `GitHub refused access to OWNER/.github (HTTP 403)`,
+say the repository is not known to be absent, and say no change was made. No
+create-repository plan is offered; fix the token's access and run again.
+
 Only the first verdict is evidence for creating the repository. For the other
 two, establish access before passing `--create-repository`; the message names
 the specific gap it could not close.
