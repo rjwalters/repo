@@ -15,6 +15,10 @@
 #   scripts/version.sh bump <level> [--tag] [--no-commit]  # level = major|minor|patch
 #   scripts/version.sh set <version> [--tag] [--no-commit] # set VERSION (and package.json) to an exact value
 #
+# CHANGELOG: `bump` and `set` also turn `## Unreleased` into `## <new> (date)`
+# (leaving a fresh empty `## Unreleased` above it) when CHANGELOG.md exists and
+# has no heading for <new> yet (#769).
+#
 # Committing: `bump` and `set` write VERSION (plus package.json), `git add` them
 # — along with CHANGELOG.md when present — and then commit them. They STAGE the
 # files WITHOUT committing, leaving them for the caller to fold into a commit of
@@ -118,6 +122,25 @@ resolve_commit_mode() {
   fi
 }
 
+# cut_changelog_heading <new>: when CHANGELOG.md has a `## Unreleased` heading
+# and no heading for <new> yet, emit `## Unreleased` (now empty) followed by
+# `## <new> (YYYY-MM-DD)`, so the entries that shipped under this bump land under
+# their release and scripts/check-changelog-version.sh stays green (#769).
+# No-op without CHANGELOG.md, without an Unreleased heading, or when <new>
+# already has a heading (a re-run, or a heading cut by hand).
+cut_changelog_heading() {
+  local new="$1" f="$ROOT/CHANGELOG.md" re tmp
+  [ -f "$f" ] || return 0
+  re="$(printf '%s' "$new" | sed 's/\./\\./g')"
+  if grep -Eq "^##[[:space:]]+v?\[?${re}\]?([[:space:]]|\$)" "$f"; then return 0; fi
+  grep -Eq '^##[[:space:]]+Unreleased[[:space:]]*$' "$f" || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/changelog.XXXXXX")"
+  awk -v hdr="## $new ($(date +%F))" '
+    !done && /^##[[:space:]]+Unreleased[[:space:]]*$/ { print; print ""; print hdr; done=1; next }
+    { print }' "$f" > "$tmp"
+  mv "$tmp" "$f"
+}
+
 # apply_version <new> <commit-message>: write + stage the version files, then
 # commit them unless resolve_commit_mode said not to. Shared by bump and set,
 # whose commit plumbing was otherwise identical.
@@ -125,6 +148,7 @@ apply_version() {
   local new="$1" msg="$2"
   printf '%s\n' "$new" > "$VERSION_FILE"
   sync_pkg "$new"
+  cut_changelog_heading "$new"
   git -C "$ROOT" add VERSION package.json
   [ -f "$ROOT/CHANGELOG.md" ] && git -C "$ROOT" add CHANGELOG.md || true
   if [ -n "$COMMIT_SKIP_REASON" ]; then
