@@ -362,20 +362,25 @@ The other three columns are point-in-time observations — each carries the
 tool's tracking issue, and each requirement above carries a spot-check command
 you can run against that tool's clone to re-derive its row in seconds.
 
-Other tools' columns observed 2026-08-06 (repo#156), C10 observed 2026-09-29
-(repo#511); `repo` column verified on every test run.
+Other tools' columns were re-observed 2026-11-14 (repo#804) from fresh clones
+at loom `96f5053`, anvil `1403d9c` and squad `7031ae6`. The anvil and squad
+columns re-derive every cell C1-C10. The loom column re-derives only C1, C2, C4
+and C8: loom's installer builds `loom-daemon` and provisions host-wide binaries,
+so a scratch install was not possible. Its C3, C5-C7 and C9 cells stay as
+observed 2026-08-06 (repo#156) and C10 as observed 2026-09-29 (repo#511). The
+`repo` column is verified on every test run.
 
 | # | loom | anvil | repo | squad |
 |---|---|---|---|---|
-| C1 entry point | ✅ | ❌ `scripts/install-anvil.sh` only | ✅ | ✅ |
-| C2 target arg | ✅ | ✅ | ✅ | ✅ |
+| C1 entry point | ✅ | ✅ `install.sh` → `scripts/install-anvil.sh` | ✅ | ✅ |
+| C2 target arg | ❌ prompts when no target given | ❌ target required, no `.` default | ✅ | ✅ |
 | C3 `-y` | ✅ | ✅ | ✅ | ✅ |
-| C4 `--dry-run` | ❌ | ✅ | ✅ | ❌ |
-| C5 tracked metadata | ✅ | ✅ | ✅ | ❌ none |
-| C6 gitignored sidecar | ✅ | ❌ inline (legacy) | ✅ | ❌ |
-| C7 consumer resync | ✅ | ❌ | ✅ | ❌ |
-| C8 honest `VERSION` | ❌ empty | ❌ scraped from prose | ✅ | ❌ empty |
-| C9 gitignore sweep | ❌ not yet checked (repo#385) | ❌ not yet checked (repo#385) | ✅ | ❌ not yet checked (repo#385) |
+| C4 `--dry-run` | ✅ | ✅ | ✅ | ✅ |
+| C5 tracked metadata | ✅ | ❌ `anvil_version`, not `version` | ✅ | ✅ |
+| C6 gitignored sidecar | ✅ | ✅ | ✅ | ✅ |
+| C7 consumer resync | ✅ | ✅ | ✅ | ❌ none shipped |
+| C8 honest `VERSION` | ✅ | ✅ | ✅ | ✅ |
+| C9 gitignore sweep | ❌ not yet checked (repo#385) | ❌ no warning | ✅ | ❌ no warning |
 | C10 repo-owned pins | ✅ `.loom/resync-ignore` | ❌ | ✅ | ❌ |
 
 Conformance work is tracked per tool: Loom
