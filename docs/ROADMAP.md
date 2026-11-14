@@ -59,19 +59,19 @@ Can start today. Every merge in this repo currently needs a human (see
    error before `classify_absence()` runs (the case #478 calls out as
    unanticipated). Done when: a stubbed 403 on the target produces a message
    that says the repository exists or is hidden and that access was refused,
-   with a test in `commands/repo/tests/test_org_policy.py`. No issue yet.
+   with a test in `commands/repo/tests/test_org_policy.py`. Tracked as #803.
 3. **Re-observe the other tools' columns of the conformance table.**
    `INSTALLER-CONTRACT.md` says the loom/anvil/squad columns were observed
    2026-08-06 (C10 on 2026-09-29) and its C9 row still reads "not yet checked
    (repo#385)" for all three. Done when: each cell of every column whose
    clone the builder can read is re-derived with the section's own spot-check
-   commands and the observation date is updated. No issue yet.
+   commands and the observation date is updated. Tracked as #804.
 4. **Run the full suite on macOS in CI.** The `test-macos` job runs only
    `test-repo-remote.sh` and states the full `pnpm test` suite is out of
    scope; #754 and #755 were both macOS-only failures that Linux CI missed.
    Done when: a non-required job runs `hooks/repo/tests/run.sh` under
    `/bin/bash` on `macos-latest` and is green, with any portability failures
-   it exposes fixed or filed. No issue yet. This touches
+   it exposes fixed or filed. Tracked as #805. This touches
    `.github/workflows/`, so its merge will be held for a human like #770.
 
 ## Next
@@ -119,7 +119,8 @@ Can start today. Every merge in this repo currently needs a human (see
   the command #765 removes. #424 is an auto-maintained digest, not work.
 
 Open issues with buildable work and no PR: none. Items 2-4 above are the only
-new work a builder can pick up, and none has an issue yet.
+new work a builder can pick up, and each now has an issue (#803, #804, #805),
+filed alongside this roadmap.
 
 ## Not planned
 
